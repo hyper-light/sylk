@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -84,6 +85,33 @@ func TestPrependBoardPreamblePrepends(t *testing.T) {
 	}
 	if !strings.HasSuffix(result, "do the work") {
 		t.Error("should end with original message")
+	}
+}
+
+func TestRenderBoardPreambleShowsCarryForwardContinuity(t *testing.T) {
+	board := carryForwardTestBoard()
+	submitCarrySource(t, board, "librarian", "CLI context", []*Artifact{
+		{AgentID: "librarian", Kind: "workspace_read", Reference: "Existing Click CLI evidence."},
+	})
+	result, err := CarryForward(context.Background(), board, CarryForwardOptions{
+		AgentID: "architect",
+		Topic:   "python cli plan",
+	})
+	if err != nil {
+		t.Fatalf("carry forward failed: %v", err)
+	}
+
+	preamble := RenderBoardPreamble(board.Projection(), "architect")
+	for _, want := range []string{
+		"My Carry-Forward Continuity",
+		`recall_forward(topic=...)`,
+		`topic "python cli plan"`,
+		result.TestamentID,
+		"carried testaments/artifacts",
+	} {
+		if !strings.Contains(preamble, want) {
+			t.Fatalf("preamble missing %q:\n%s", want, preamble)
+		}
 	}
 }
 

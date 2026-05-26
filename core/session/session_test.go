@@ -51,11 +51,9 @@ func TestSession_ExplicitIDIsHonored(t *testing.T) {
 	assert.NotEqual(t, "default", autoID.ID())
 }
 
-// TestSession_BootstrapDefaultConfigPinsID pins the bootstrap helper
-// that ties the runtime default session to the canonical "default" ID
-// used by the storage layer (.sylk/sessions/default/). Without this
-// alignment, runtime requests tagged SessionID="default" would write
-// to a different directory than the one SylkDir initialized.
+// TestSession_BootstrapDefaultConfigPinsID pins the helper for
+// legacy/backcompat callers that must address the canonical
+// storage-layer default session (.sylk/sessions/default/).
 func TestSession_BootstrapDefaultConfigPinsID(t *testing.T) {
 	cfg := session.BootstrapDefaultConfig()
 	assert.Equal(t, "default", cfg.ID)

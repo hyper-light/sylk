@@ -71,10 +71,13 @@ func TestDefaultSystemPrompt_IncludesGlobalReviewChallengeGuidance(t *testing.T)
 
 func TestDefaultSystemPrompt_IncludesDiscussionTimeConsultationGuidance(t *testing.T) {
 	for _, want := range []string{
-		"Resolve missing context through Guide-routed knowledge agents as the conversation evolves, not only once formal planning starts.",
+		"Resolve missing context through your own carried-forward testaments/artifacts first, then through Guide-routed knowledge agents as the conversation evolves.",
+		"When the user continues, approves, revises, or asks to formalize the same stable topic, call `recall_forward(topic=…)` before issuing another `consult_peer`.",
+		"If recall returns `status=usable` with `usable=true` and answers the repository, historical, or design uncertainty, use it and skip the duplicate consult.",
 		"Use consultation continuously during discussion and discovery, not only after you decide to create a plan.",
 		"start building a consultation-backed evidence base immediately",
-		"Prefer repeated, targeted consults over one broad omnibus consult.",
+		"do not invoke `plan(action=start)` or `plan(action=analyze)` before that first targeted `consult_peer`",
+		"Prefer targeted consults over one broad omnibus consult, but do not repeat a fresh target/query unless new information creates a material gap.",
 		"Re-evaluate Academic research depth continuously based on the user's latest input",
 		"Do not treat the Academic as a rare keyword-triggered escalation.",
 		"`architect_forest_consult(purpose=get_plan_precedents, query=…)`",
@@ -91,7 +94,10 @@ func TestDefaultSystemPrompt_IncludesDiscussionTimeConsultationGuidance(t *testi
 
 func TestArchitectConversationPrompt_UsesContinuousTargetedConsultation(t *testing.T) {
 	for _, want := range []string{
+		"call `recall_forward(topic=…)` before consulting a knowledge agent again.",
+		"If recall returns `status=usable` with `usable=true` and answers the uncertainty, use that source-indexed continuity and skip the duplicate consult.",
 		"start by consulting the most relevant knowledge agent with the narrowest question that can materially reduce the next uncertainty.",
+		"do not invoke `plan(action=start)` or `plan(action=analyze)` before that first targeted `consult_peer`",
 		"Continue consulting as the conversation unfolds whenever the user adds material new information, constraints, preferences, scope changes, or technical direction.",
 		"Prefer targeted consults over one broad consult, but do not repeat a fresh target/query unless new information creates a material gap.",
 		"Re-evaluate Academic research depth as the conversation sharpens.",
@@ -106,7 +112,10 @@ func TestArchitectConversationPrompt_UsesContinuousTargetedConsultation(t *testi
 func TestPlannerConversationModeConverse_InsistsOnDiscussionTimeConsultation(t *testing.T) {
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
+		"use recall_forward(topic=...) first when the user is continuing, approving, revising, or asking to plan the same stable topic.",
+		"If recall_forward returns status=usable with usable=true, use that source-indexed continuity and do not repeat a fresh consult_peer call.",
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty.",
+		"do not invoke plan(action=start) or plan(action=analyze) before the first targeted consult_peer",
 		"Prefer targeted consult_peer calls over one broad omnibus consult, but do not repeat a fresh target/query unless new information creates a material gap.",
 		"Re-evaluate Academic depth as the user's constraints evolve and your own understanding improves:",
 		"invoke recall_recent before claiming the earlier discussion is unavailable",
@@ -146,6 +155,22 @@ func TestBuildPlannerConversationSystemPrompt_IncludesConsultationAndSkillsPolic
 	}
 }
 
+func TestArchitectPlannerStagePromptsIncludeFabricContinuity(t *testing.T) {
+	for _, stage := range []string{"requirements", "design", "tasks"} {
+		text := ArchitectPlannerPromptForStage(stage)
+		for _, want := range []string{
+			"# Activity Fabric Awareness",
+			"`recall_forward(topic",
+			"`carry_forward(topic",
+			"Fresh carried-forward testaments/artifacts outrank duplicate live consults",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s stage prompt missing %q", stage, want)
+			}
+		}
+	}
+}
+
 func TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools(t *testing.T) {
 	tools := toolsForConversationMode(plannerConversationModeConverse)
 	for _, want := range []string{
@@ -153,6 +178,8 @@ func TestToolsForConversationMode_ConverseIncludesPlanningProtocolTools(t *testi
 		// ask_user_question → ask_user_clarification,
 		// route_requirements_research → academic_research,
 		// start_planning → plan(action=start).
+		"recall_forward",
+		"carry_forward",
 		"consult_peer",
 		"forest",
 		"ask_user_clarification",
@@ -232,7 +259,7 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 	// start_planning → plan(action=start).
 	text := compactPromptWhitespace(plannerConversationModeInstructions(plannerConversationModeConverse))
 	for _, want := range []string{
-		"invoke plan(action=analyze), review attached evidence, make consult_peer calls only for concrete missing/stale/contradicted gaps, then plan(action=design), then plan(action=generate_tasks)",
+		"first review attached planning evidence and make any required consult_peer call for concrete missing/stale/contradicted gaps that usable recall did not answer, then invoke plan(action=analyze), then plan(action=design), then plan(action=generate_tasks)",
 		"emits the user-reviewable plan_markdown artifact",
 		"Do NOT invoke plan_acceptance — wait for the user's next message.",
 		"Frame it as plan review, not execution kickoff.",
@@ -243,7 +270,7 @@ func TestPlannerConversationModeConverse_ToolSurfaceMatchesProtocolInstructions(
 		}
 	}
 	tools := toolsForConversationMode(plannerConversationModeConverse)
-	for _, wantTool := range []string{"plan", "consult_peer", "forest"} {
+	for _, wantTool := range []string{"plan", "recall_forward", "carry_forward", "consult_peer", "forest"} {
 		if !containsToolName(tools, wantTool) {
 			t.Fatalf("converse tools missing protocol-required tool %q: %v", wantTool, tools)
 		}
@@ -266,6 +293,21 @@ func TestGenerateTasksNextAction_UsesPlanReviewNotExecutionKickoff(t *testing.T)
 		if !strings.Contains(text, want) {
 			t.Fatalf("generateTasksNextAction(false) missing %q", want)
 		}
+	}
+}
+
+func TestPlanningProtocolInstructions_GateEvidenceBeforeAnalyze(t *testing.T) {
+	text := startPlanningProtocolInstructions(false)
+	evidenceIdx := strings.Index(text, "1. Evidence review")
+	analyzeIdx := strings.Index(text, "2. plan(action=analyze")
+	if evidenceIdx < 0 || analyzeIdx < 0 {
+		t.Fatalf("protocol instructions missing evidence/analyze ordering:\n%s", text)
+	}
+	if evidenceIdx > analyzeIdx {
+		t.Fatalf("protocol instructions analyze before evidence:\n%s", text)
+	}
+	if !strings.Contains(text, "If plan(action=analyze) or plan(action=design) returns requires_consultation=true") {
+		t.Fatalf("protocol instructions missing analyze/design consultation gate:\n%s", text)
 	}
 }
 

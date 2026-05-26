@@ -835,6 +835,7 @@ func (a *Academic) handleBusRequest(msg *guide.Message) error {
 		Successful:  err == nil,
 	})
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, "academic", fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

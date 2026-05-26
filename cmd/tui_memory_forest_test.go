@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/adalundhe/sylk/core/session"
 )
 
 func TestBuildMemoryForest_BootstrapsSessionScopedSchema(t *testing.T) {
@@ -70,6 +72,56 @@ func TestBuildMemoryForest_ReopensSessionScopedSchema(t *testing.T) {
 
 	assertSQLiteTableExists(t, reopenedVectorDB.DB(), "nodes")
 	assertSQLiteTableExists(t, reopenedVectorDB.DB(), "forest_events")
+}
+
+func TestBuildMemoryForestForSession_UsesRequestedSessionPath(t *testing.T) {
+	t.Parallel()
+
+	projectRoot := t.TempDir()
+	sessionID := "run-session-123"
+
+	forest, contentStore, vectorDB, err := buildMemoryForestForSession(projectRoot, sessionID, nil)
+	if err != nil {
+		t.Fatalf("buildMemoryForestForSession() error = %v", err)
+	}
+	defer forest.Close()
+	defer contentStore.Close()
+	defer vectorDB.Close()
+
+	basePath := filepath.Join(projectRoot, ".sylk", "sessions", sessionID, "state", "memory_forest")
+	if _, err := os.Stat(filepath.Join(basePath, "content.sqlite")); err != nil {
+		t.Fatalf("memory forest db missing at requested session path: %v", err)
+	}
+}
+
+func TestTUIRunSessionConfig_MintsIndependentRuntimeSession(t *testing.T) {
+	t.Parallel()
+
+	cfg := tuiRunSessionConfig()
+	if cfg.ID != "" {
+		t.Fatalf("tuiRunSessionConfig().ID = %q, want empty for generated ID", cfg.ID)
+	}
+	if cfg.Name != "default" {
+		t.Fatalf("tuiRunSessionConfig().Name = %q, want default", cfg.Name)
+	}
+
+	first := session.NewSession(cfg)
+	second := session.NewSession(cfg)
+	if first.ID() == "default" || second.ID() == "default" {
+		t.Fatalf("TUI run sessions must not reuse storage default ID: first=%q second=%q", first.ID(), second.ID())
+	}
+	if first.ID() == second.ID() {
+		t.Fatalf("TUI run sessions should mint independent IDs, both got %q", first.ID())
+	}
+}
+
+func TestOnDemandDepsDefaultSessionID_UsesRunSessionFallback(t *testing.T) {
+	t.Parallel()
+
+	deps := onDemandAgentCreatorDeps{fallbackSessionID: "run-session-123"}
+	if got := deps.defaultSessionID(); got != "run-session-123" {
+		t.Fatalf("defaultSessionID() = %q, want run-session-123", got)
+	}
 }
 
 func assertSQLiteTableExists(t *testing.T, db *sql.DB, table string) {

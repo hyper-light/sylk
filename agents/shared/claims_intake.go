@@ -92,6 +92,33 @@ func deltaConsultID(d claims.Delta) string {
 	return ""
 }
 
+func shouldSuppressForwardedPromptEntry(role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {
+	if role.Has(claims.RoleObserver) || entry == nil || entry.Node.Claim == nil {
+		return false
+	}
+	claim := entry.Node.Claim
+	if claim.ActionType != claims.ActionTypePrompt {
+		return false
+	}
+	if claims.IssuerAgentID(claim.Relations) != "guide" {
+		return false
+	}
+	return claimHasTag(claim.Tags, "user_prompt")
+}
+
+func claimHasTag(tags []string, want string) bool {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return false
+	}
+	for _, tag := range tags {
+		if strings.TrimSpace(tag) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func deliverExpectedPeerTestamentToContinuation(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
 	if cfg.ContinuationStore == nil || entry == nil || entry.Expectation == nil || entry.Delta == nil {
 		return false
@@ -388,6 +415,19 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				return
 			}
 			if deliverExpectedPeerTestamentToContinuation(cfg, entry) {
+				return
+			}
+			if shouldSuppressForwardedPromptEntry(role, entry) {
+				claimID := ""
+				if entry.Node.Claim != nil {
+					claimID = entry.Node.Claim.ID
+				}
+				slog.Info("claims_intake_suppressed_forwarded_prompt_entry",
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"role", role,
+					"claim_id", claimID,
+				)
 				return
 			}
 			slog.Info("claims_intake_resolved",

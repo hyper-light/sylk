@@ -26,6 +26,15 @@ const (
 	carryForwardAgentScopeKind = "continuity_agent"
 )
 
+const (
+	RecallForwardStatusUsable       = "usable"
+	RecallForwardStatusMiss         = "miss"
+	RecallForwardStatusInsufficient = "insufficient"
+	RecallForwardStatusPartial      = "partial"
+	RecallForwardStatusStale        = "stale"
+	RecallForwardStatusContradicted = "contradicted"
+)
+
 type CarryForwardOptions struct {
 	AgentID                       string
 	Topic                         string
@@ -135,21 +144,27 @@ type RecallForwardEnrichment struct {
 }
 
 type RecallForwardResult struct {
-	AgentID          string                    `json:"agent_id"`
-	Topic            string                    `json:"topic"`
-	LookbackSessions int                       `json:"lookback_sessions"`
-	IncludeSources   string                    `json:"include_sources"`
-	Partial          bool                      `json:"partial"`
-	Stale            bool                      `json:"stale,omitempty"`
-	Contradicted     bool                      `json:"contradicted,omitempty"`
-	Diagnostics      []string                  `json:"diagnostics,omitempty"`
-	Items            []ContinuityRecallItem    `json:"items"`
-	WorkingContext   string                    `json:"working_context,omitempty"`
-	EvidenceDigest   string                    `json:"evidence_digest,omitempty"`
-	Sources          []ForwardSource           `json:"sources,omitempty"`
-	FullTestaments   []*Testament              `json:"full_testaments,omitempty"`
-	FullArtifacts    []*Artifact               `json:"full_artifacts,omitempty"`
-	Enrichment       []RecallForwardEnrichment `json:"enrichment,omitempty"`
+	AgentID               string                    `json:"agent_id"`
+	Topic                 string                    `json:"topic"`
+	LookbackSessions      int                       `json:"lookback_sessions"`
+	IncludeSources        string                    `json:"include_sources"`
+	Status                string                    `json:"status"`
+	Usable                bool                      `json:"usable"`
+	Reason                string                    `json:"reason,omitempty"`
+	RecommendedNextAction string                    `json:"recommended_next_action,omitempty"`
+	SourceIndexCount      int                       `json:"source_index_count"`
+	HydrationAvailable    bool                      `json:"hydration_available"`
+	Partial               bool                      `json:"partial"`
+	Stale                 bool                      `json:"stale,omitempty"`
+	Contradicted          bool                      `json:"contradicted,omitempty"`
+	Diagnostics           []string                  `json:"diagnostics,omitempty"`
+	Items                 []ContinuityRecallItem    `json:"items"`
+	WorkingContext        string                    `json:"working_context,omitempty"`
+	EvidenceDigest        string                    `json:"evidence_digest,omitempty"`
+	Sources               []ForwardSource           `json:"sources,omitempty"`
+	FullTestaments        []*Testament              `json:"full_testaments,omitempty"`
+	FullArtifacts         []*Artifact               `json:"full_artifacts,omitempty"`
+	Enrichment            []RecallForwardEnrichment `json:"enrichment,omitempty"`
 }
 
 type ContinuityRecallItem struct {
@@ -161,6 +176,9 @@ type ContinuityRecallItem struct {
 	ThroughSequence      uint64          `json:"through_sequence"`
 	Stale                bool            `json:"stale,omitempty"`
 	Contradicted         bool            `json:"contradicted,omitempty"`
+	SourceIndexCount     int             `json:"source_index_count"`
+	SourceIndexReturned  bool            `json:"source_index_returned"`
+	HydrationAvailable   bool            `json:"hydration_available"`
 	WorkingContext       string          `json:"working_context,omitempty"`
 	EvidenceDigest       string          `json:"evidence_digest,omitempty"`
 	Sources              []ForwardSource `json:"sources,omitempty"`
@@ -439,7 +457,7 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 			BoardID:   board.BoardID(),
 		})
 		synthesizeLegacyContinuity(board, result)
-		return result, nil
+		return finalizeRecallForwardResult(result), nil
 	}
 	for {
 		chain := appendContinuityChain(ctx, current, rec, include, maxItems, result)
@@ -511,7 +529,96 @@ func RecallForward(ctx context.Context, board *ClaimsBoard, opts RecallForwardOp
 		BoardID:   board.BoardID(),
 	})
 	synthesizeLegacyContinuity(board, result)
-	return result, nil
+	return finalizeRecallForwardResult(result), nil
+}
+
+func finalizeRecallForwardResult(result *RecallForwardResult) *RecallForwardResult {
+	if result == nil {
+		return nil
+	}
+	sourceIndexCount := 0
+	hydrationAvailable := false
+	usableItem := false
+	for _, item := range result.Items {
+		sourceIndexCount += item.SourceIndexCount
+		hydrationAvailable = hydrationAvailable || item.HydrationAvailable
+		if recallForwardItemIsUsable(item) {
+			usableItem = true
+		}
+	}
+	result.SourceIndexCount = sourceIndexCount
+	result.HydrationAvailable = hydrationAvailable || len(result.FullTestaments) > 0 || len(result.FullArtifacts) > 0
+	result.Status = ""
+	result.Usable = false
+	result.Reason = ""
+	result.RecommendedNextAction = ""
+
+	switch {
+	case result.Contradicted:
+		result.Status = RecallForwardStatusContradicted
+		result.Reason = "carried-forward continuity is marked contradicted"
+	case result.Stale:
+		result.Status = RecallForwardStatusStale
+		result.Reason = "carried-forward continuity is marked stale"
+	case result.Partial:
+		result.Status = RecallForwardStatusPartial
+		result.Reason = "continuity traversal or enrichment was incomplete"
+	case len(result.Items) == 0:
+		if len(result.Enrichment) > 0 {
+			result.Status = RecallForwardStatusInsufficient
+			result.Reason = "related enrichment exists, but no source-indexed carry_forward continuity was found for this agent/topic"
+		} else {
+			result.Status = RecallForwardStatusMiss
+			result.Reason = "no carried-forward continuity was found for this agent/topic"
+		}
+	case usableItem:
+		result.Status = RecallForwardStatusUsable
+		result.Usable = true
+		if result.IncludeSources == "digest" && result.SourceIndexCount > len(result.Sources) {
+			result.RecommendedNextAction = "reuse_recalled_evidence; call recall_forward(include_sources=source_index or full) only if exact source IDs or hydrated evidence are needed"
+		} else {
+			result.RecommendedNextAction = "reuse_recalled_evidence"
+		}
+	default:
+		result.Status = RecallForwardStatusInsufficient
+		result.Reason = recallForwardInsufficiencyReason(result)
+	}
+	if !result.Usable && result.RecommendedNextAction == "" {
+		result.RecommendedNextAction = "perform the narrowest necessary evidence-gathering step, then call carry_forward(topic=..., mode=advance) to publish source-indexed continuity"
+	}
+	return result
+}
+
+func recallForwardItemIsUsable(item ContinuityRecallItem) bool {
+	if item.Stale || item.Contradicted || item.Reconstructed {
+		return false
+	}
+	if strings.TrimSpace(item.TestamentID) == "" || item.SourceIndexCount <= 0 {
+		return false
+	}
+	return strings.TrimSpace(item.WorkingContext) != "" || strings.TrimSpace(item.EvidenceDigest) != ""
+}
+
+func recallForwardInsufficiencyReason(result *RecallForwardResult) string {
+	if result == nil {
+		return "recall result was empty"
+	}
+	if len(result.Items) == 0 {
+		return "no carried-forward continuity items were returned"
+	}
+	reconstructed := 0
+	for _, item := range result.Items {
+		if item.Reconstructed {
+			reconstructed++
+		}
+	}
+	if reconstructed == len(result.Items) {
+		return "only reconstructed legacy continuity was available; it lacks source-indexed carry_forward artifacts"
+	}
+	if result.SourceIndexCount == 0 {
+		return "continuity items did not expose source_index artifacts back to durable testaments/artifacts"
+	}
+	return "continuity did not contain enough source-backed context to replace fresh evidence gathering"
 }
 
 func appendRecallEnrichment(ctx context.Context, board *ClaimsBoard, provider RecallForwardEnrichmentProvider, result *RecallForwardResult, maxItems int, fallback RecallForwardEnrichmentQuery) {
@@ -1109,17 +1216,20 @@ func continuityArtifacts(agentID, topic string, board *ClaimsBoard, fromSeq, thr
 
 func continuityRecallItem(board *ClaimsBoard, rec continuityRecord, include string) ContinuityRecallItem {
 	item := ContinuityRecallItem{
-		SessionID:       board.SessionID(),
-		BoardID:         board.BoardID(),
-		ClaimID:         rec.ClaimID,
-		TestamentID:     rec.Testament.ID,
-		FromSequence:    rec.FromSequence,
-		ThroughSequence: rec.ThroughSequence,
-		Stale:           rec.Stale,
-		Contradicted:    rec.Contradicted,
-		WorkingContext:  rec.WorkingContext,
-		EvidenceDigest:  rec.EvidenceDigest,
-		Cursor:          cloneAnyMap(rec.Cursor),
+		SessionID:           board.SessionID(),
+		BoardID:             board.BoardID(),
+		ClaimID:             rec.ClaimID,
+		TestamentID:         rec.Testament.ID,
+		FromSequence:        rec.FromSequence,
+		ThroughSequence:     rec.ThroughSequence,
+		Stale:               rec.Stale,
+		Contradicted:        rec.Contradicted,
+		SourceIndexCount:    len(rec.Sources),
+		SourceIndexReturned: include == "source_index" || include == "full",
+		HydrationAvailable:  len(rec.Sources) > 0,
+		WorkingContext:      rec.WorkingContext,
+		EvidenceDigest:      rec.EvidenceDigest,
+		Cursor:              cloneAnyMap(rec.Cursor),
 	}
 	if include == "source_index" || include == "full" {
 		item.Sources = rec.Sources

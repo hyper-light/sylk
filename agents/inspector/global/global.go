@@ -16,9 +16,9 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
@@ -731,6 +731,7 @@ func (gi *GlobalInspector) handleBusRequest(msg *guide.Message) error {
 
 	result, err := gi.Handle(ctx, fwd)
 	agentShared.LogResponse(gi.steering.EventLogger(), fwd.CorrelationID, gi.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {

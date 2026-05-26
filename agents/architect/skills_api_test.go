@@ -22,3 +22,16 @@ func TestArchitectManifestExcludesFilesystemTools(t *testing.T) {
 		}
 	}
 }
+
+func TestArchitectManifestExposesCarryForwardContinuityTools(t *testing.T) {
+	manifest := architectToolManifest()
+	for _, name := range []string{"recall_forward", "carry_forward"} {
+		policy, ok := manifest.Policy(name)
+		if !ok {
+			t.Fatalf("architect manifest missing %q", name)
+		}
+		if !policy.VisibleByDefault {
+			t.Fatalf("%s must be visible by default", name)
+		}
+	}
+}

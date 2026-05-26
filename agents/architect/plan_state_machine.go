@@ -95,6 +95,13 @@ func (sm *PlanStateMachine) Epoch() uint64 {
 	return sm.epoch.Load()
 }
 
+// BumpEpoch advances the monotonic plan version without changing lifecycle
+// state. Revisions of a Ready plan need this because the review artifact and
+// approval gate are versioned even when the plan remains in Ready.
+func (sm *PlanStateMachine) BumpEpoch() uint64 {
+	return sm.epoch.Add(1)
+}
+
 // State returns the current plan status via atomic load.
 func (sm *PlanStateMachine) State() PlanStatus {
 	return PlanStatus(sm.state.Load())

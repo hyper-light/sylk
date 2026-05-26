@@ -362,9 +362,30 @@ func finalizeToolCallsSyntheticRecursive(calls []ToolCallRecord, doneAt time.Tim
 		if calls[i].InterAgent == nil {
 			continue
 		}
-		for c := range calls[i].InterAgent.Children {
-			finalizeToolCallsSyntheticRecursive(calls[i].InterAgent.Children[c].ToolCalls, doneAt, success, errorMsg)
+		finalizeInterAgentChildrenSynthetic(calls[i].InterAgent, doneAt, success, errorMsg)
+	}
+}
+
+func finalizeInterAgentChildrenSynthetic(row *InterAgentTool, doneAt time.Time, success bool, errorMsg string) {
+	if row == nil {
+		return
+	}
+	for c := range row.Children {
+		child := &row.Children[c]
+		if success {
+			if !child.Completed {
+				child.Completed = true
+			}
+		} else if !child.Completed {
+			child.Failed = true
 		}
+		if summary := strings.TrimSpace(errorMsg); summary != "" && strings.TrimSpace(child.ResultSummary) == "" {
+			child.ResultSummary = summary
+		}
+		child.ThinkingText = ""
+		child.ThinkingStatus = ""
+		child.ThinkingColor = ""
+		finalizeToolCallsSyntheticRecursive(child.ToolCalls, doneAt, success, errorMsg)
 	}
 }
 

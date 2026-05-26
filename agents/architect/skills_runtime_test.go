@@ -30,6 +30,12 @@ func TestArchitect_SkillsLoaded(t *testing.T) {
 	if !toolDefsContain(defs, "academic_research") {
 		t.Fatal("expected academic_research to be loaded")
 	}
+	if !toolDefsContain(defs, "recall_forward") {
+		t.Fatal("expected recall_forward to be loaded")
+	}
+	if !toolDefsContain(defs, "carry_forward") {
+		t.Fatal("expected carry_forward to be loaded")
+	}
 }
 
 func TestArchitect_SkillCount(t *testing.T) {
@@ -300,7 +306,7 @@ func TestArchitect_GenerateTasks_ReusesReadyPlanArtifacts(t *testing.T) {
 	}
 }
 
-func TestArchitect_PlanDesign_AllowsAnalyzeWithoutConsultHop(t *testing.T) {
+func TestArchitect_PlanDesign_RequiresFreshConsultBeforeDesign(t *testing.T) {
 	a := newTestArchitect(t, Config{AllowPlanningWithoutConsultation: true})
 
 	// Phase 2.K / CR-4 refactor: start_planning → plan(action=start).
@@ -346,7 +352,34 @@ func TestArchitect_PlanDesign_AllowsAnalyzeWithoutConsultHop(t *testing.T) {
 	}
 	designResult := a.InvokeSkill(context.Background(), "plan", designPayload)
 	if designResult == nil || !designResult.Success {
-		t.Fatalf("plan design failed: %+v", designResult)
+		t.Fatalf("plan design without evidence = %+v, want structured consultation gate", designResult)
+	}
+	designGate, ok := designResult.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("plan design without evidence data type = %T, want map[string]any", designResult.Data)
+	}
+	if designGate["requires_consultation"] != true || designGate["ready_for_design"] != false {
+		t.Fatalf("plan design without evidence = %+v, want requires_consultation gate", designResult)
+	}
+
+	designPayload, err = json.Marshal(map[string]any{
+		"action":  "design",
+		"plan_id": planID,
+		"evidence": []map[string]any{{
+			"Kind":       EvidenceKindConsult,
+			"Target":     "librarian",
+			"Query":      "current project structure for a minimal Python CLI",
+			"Success":    true,
+			"Summary":    "No existing Python package structure; keep the CLI minimal.",
+			"ReceivedAt": time.Now(),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshal design payload with evidence: %v", err)
+	}
+	designResult = a.InvokeSkill(context.Background(), "plan", designPayload)
+	if designResult == nil || !designResult.Success {
+		t.Fatalf("plan design with evidence failed: %+v", designResult)
 	}
 	designData, ok := designResult.Data.(map[string]any)
 	if !ok {

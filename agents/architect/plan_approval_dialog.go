@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -139,6 +140,7 @@ func (a *Architect) requestPlanApprovalDialog(ctx context.Context, plan *DesignP
 			"plan_artifact_id":           strings.TrimSpace(plan.PlanMarkdownArtifactID),
 			"plan_artifact_replace_key":  strings.TrimSpace(plan.PlanMarkdownReplaceKey),
 			"plan_artifact_content_hash": strings.TrimSpace(plan.PlanMarkdownContentHash),
+			"plan_status":                plan.SM().State().String(),
 			"task_count":                 len(plan.Tasks),
 		},
 	}
@@ -221,6 +223,14 @@ func (a *Architect) handlePlanApprovalContinuation(
 		return err
 	}
 	plan := a.planForContinuation(record)
+	if err := validateCurrentPlanApprovalContinuation(plan, record); err != nil {
+		if plan != nil && plan.PendingWork != nil && plan.PendingWork.CorrelationID == record.ResponseCorrelationID {
+			a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "stale plan approval verdict")
+		}
+		a.completeContinuationBestEffort(record, continuationStatusFailed, respJSON, err.Error(), "stale plan approval verdict")
+		a.publishNotificationPush("That plan approval is stale because the plan has changed. Please review the latest plan before approving.")
+		return nil
+	}
 	if plan != nil {
 		a.clearPlanPendingContinuationBestEffort(plan, record.ResponseCorrelationID, "plan approval verdict received")
 	}
@@ -343,4 +353,90 @@ func decodePlanApprovalVerdict(data any) (planapproval.Verdict, string, error) {
 		return "", "", fmt.Errorf("decode plan approval verdict: %w", err)
 	}
 	return result.Verdict, result.Reason, nil
+}
+
+func validateCurrentPlanApprovalContinuation(plan *DesignPlan, record *ArchitectContinuation) error {
+	if record == nil || record.Kind != continuationKindPlanApproval || plan == nil {
+		return nil
+	}
+	if plan.PendingWork != nil &&
+		plan.PendingWork.Kind == string(continuationKindPlanApproval) &&
+		strings.TrimSpace(plan.PendingWork.CorrelationID) != "" &&
+		strings.TrimSpace(plan.PendingWork.CorrelationID) != strings.TrimSpace(record.ResponseCorrelationID) &&
+		planHasActivePendingWork(plan, time.Now().UTC()) {
+		return fmt.Errorf("newer plan approval is pending for plan %s", plan.ID)
+	}
+	if !planHasCurrentMarkdownArtifact(plan) {
+		return fmt.Errorf("plan %s has no current review artifact", plan.ID)
+	}
+	var req planApprovalGateRequest
+	if strings.TrimSpace(record.RequestJSON) != "" {
+		if err := json.Unmarshal([]byte(record.RequestJSON), &req); err != nil {
+			return fmt.Errorf("decode plan approval request: %w", err)
+		}
+	}
+	if req.PlanID != "" && strings.TrimSpace(req.PlanID) != strings.TrimSpace(plan.ID) {
+		return fmt.Errorf("approval request plan %s does not match current plan %s", req.PlanID, plan.ID)
+	}
+	if req.PlanArtifactID != "" && strings.TrimSpace(req.PlanArtifactID) != strings.TrimSpace(plan.PlanMarkdownArtifactID) {
+		return fmt.Errorf("approval artifact %s is stale; current artifact is %s", req.PlanArtifactID, plan.PlanMarkdownArtifactID)
+	}
+	if req.PlanArtifactReplaceKey != "" && strings.TrimSpace(req.PlanArtifactReplaceKey) != strings.TrimSpace(plan.PlanMarkdownReplaceKey) {
+		return fmt.Errorf("approval replace key %s is stale; current replace key is %s", req.PlanArtifactReplaceKey, plan.PlanMarkdownReplaceKey)
+	}
+	if hash := planApprovalRequestMetadataString(req.Metadata, "plan_artifact_content_hash", "content_hash"); hash != "" &&
+		hash != strings.TrimSpace(plan.PlanMarkdownContentHash) {
+		return fmt.Errorf("approval artifact hash %s is stale; current hash is %s", hash, plan.PlanMarkdownContentHash)
+	}
+	if epoch := planApprovalRequestMetadataUint64(req.Metadata, "epoch", "plan_artifact_epoch"); epoch > 0 &&
+		epoch != planMarkdownArtifactEpoch(plan) {
+		return fmt.Errorf("approval epoch %d is stale; current epoch is %d", epoch, planMarkdownArtifactEpoch(plan))
+	}
+	return nil
+}
+
+func planApprovalRequestMetadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if metadata == nil {
+			return ""
+		}
+		if value := stringFromAny(metadata[key]); strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func planApprovalRequestMetadataUint64(metadata map[string]any, keys ...string) uint64 {
+	for _, key := range keys {
+		if metadata == nil {
+			return 0
+		}
+		switch value := metadata[key].(type) {
+		case uint64:
+			return value
+		case uint:
+			return uint64(value)
+		case int:
+			if value > 0 {
+				return uint64(value)
+			}
+		case int64:
+			if value > 0 {
+				return uint64(value)
+			}
+		case float64:
+			if value > 0 {
+				return uint64(value)
+			}
+		case json.Number:
+			if n, err := value.Int64(); err == nil && n > 0 {
+				return uint64(n)
+			}
+		case string:
+			n, _ := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+			return n
+		}
+	}
+	return 0
 }

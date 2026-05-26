@@ -106,6 +106,7 @@ type AgentState struct {
 	toolSummaryPinned         bool
 	pinnedToolCallKey         string
 	activeCorrelationID       string
+	interruptCorrelationID    string
 	lastTerminalCorrelationID string
 
 	// Identity carries the typed AgentIdentity once an activity event
@@ -2193,6 +2194,9 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 			agent.activeCorrelationID = cid
 			agent.lastTerminalCorrelationID = ""
 		}
+		if cid := firstNonEmptyTrimmed(ev.StreamCorrelationID, ev.CycleID); strings.TrimSpace(cid) != "" {
+			agent.interruptCorrelationID = strings.TrimSpace(cid)
+		}
 		m.rowsDirty = true
 		return nil
 	}
@@ -2215,6 +2219,7 @@ func (m *Model) handleClaimsAgentStatus(ev msg.ClaimsAgentStatusMsg) tea.Cmd {
 	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
 		markAgentCorrelationTerminal(agent, cid)
 	}
+	agent.interruptCorrelationID = ""
 	agent.toolSummaryPinned = false
 	agent.pinnedToolCallKey = ""
 	m.rowsDirty = true
@@ -2236,6 +2241,9 @@ func (m *Model) handleClaimContext(ev msg.ClaimContextMsg) tea.Cmd {
 	}
 	if cid := strings.TrimSpace(ev.CycleID); cid != "" {
 		agent.activeCorrelationID = cid
+		if strings.TrimSpace(agent.interruptCorrelationID) == "" {
+			agent.interruptCorrelationID = cid
+		}
 	}
 	m.rowsDirty = true
 	return nil
@@ -3297,6 +3305,120 @@ func (m *Model) SelectedTargetAgentID() string {
 		return ""
 	}
 	return m.ResolveTargetAgentID(agentID)
+}
+
+// InterruptTarget identifies an active agent request that can be cancelled.
+// CorrelationID prefers the routed stream correlation when the claims bridge
+// supplied one, falling back to the claims cycle ID for claim-native work.
+type InterruptTarget struct {
+	CorrelationID string
+	AgentID       string
+	RoutingID     string
+	AgentType     string
+}
+
+// SelectedInterruptTarget returns the selected row's active cancellation
+// target, if that row is currently working.
+func (m *Model) SelectedInterruptTarget() (InterruptTarget, bool) {
+	if m == nil {
+		return InterruptTarget{}, false
+	}
+	return m.InterruptTargetForAgent(m.SelectedAgentID())
+}
+
+// InterruptTargetForAgent returns the active cancellation target for an agent
+// row, concrete routing ID, alias, or agent type.
+func (m *Model) InterruptTargetForAgent(agentID string) (InterruptTarget, bool) {
+	if m == nil {
+		return InterruptTarget{}, false
+	}
+	agent := m.agentForInterrupt(agentID)
+	if agent == nil {
+		return InterruptTarget{}, false
+	}
+	return interruptTargetFromAgent(agent)
+}
+
+// ActiveInterruptTargets returns every active row with a known cancellation
+// correlation. The order follows the panel's visible agent order where possible.
+func (m *Model) ActiveInterruptTargets() []InterruptTarget {
+	if m == nil || len(m.agents) == 0 {
+		return nil
+	}
+	m.ensureRows()
+	seen := make(map[string]struct{}, len(m.agents))
+	targets := make([]InterruptTarget, 0, len(m.agents))
+	for _, row := range m.rows {
+		if row.Kind != rowAgent {
+			continue
+		}
+		agent := m.agents[row.ID]
+		target, ok := interruptTargetFromAgent(agent)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[target.CorrelationID]; exists {
+			continue
+		}
+		seen[target.CorrelationID] = struct{}{}
+		targets = append(targets, target)
+	}
+	for _, agent := range m.agents {
+		target, ok := interruptTargetFromAgent(agent)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[target.CorrelationID]; exists {
+			continue
+		}
+		seen[target.CorrelationID] = struct{}{}
+		targets = append(targets, target)
+	}
+	return targets
+}
+
+func (m *Model) agentForInterrupt(agentID string) *AgentState {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return nil
+	}
+	resolved := m.resolveAgentID(agentID)
+	if agent := m.agents[resolved]; agent != nil {
+		return agent
+	}
+	if agent := m.findAgentByType(agentID); agent != nil {
+		return agent
+	}
+	for _, agent := range m.agents {
+		if agent == nil {
+			continue
+		}
+		if strings.TrimSpace(agent.RoutingID) == agentID {
+			return agent
+		}
+	}
+	return nil
+}
+
+func interruptTargetFromAgent(agent *AgentState) (InterruptTarget, bool) {
+	if agent == nil || !isActiveStatus(agent.Status) {
+		return InterruptTarget{}, false
+	}
+	correlationID := firstNonEmptyTrimmed(agent.interruptCorrelationID, agent.activeCorrelationID)
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return InterruptTarget{}, false
+	}
+	routingID := strings.TrimSpace(agent.RoutingID)
+	if routingID == "" {
+		routingID = defaultRoutingAgentID(agent.ID, agent.AgentType, agent.PipelineID)
+	}
+	return InterruptTarget{
+		CorrelationID: correlationID,
+		AgentID:       strings.TrimSpace(agent.ID),
+		RoutingID:     routingID,
+		AgentType:     strings.TrimSpace(agent.AgentType),
+	}, true
 }
 
 // ResolveTargetAgentID maps a panel-facing agent row ID to the concrete worker

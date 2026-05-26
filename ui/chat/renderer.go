@@ -3,12 +3,19 @@ package chat
 import (
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	codepkg "github.com/adalundhe/sylk/ui/code"
 	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
+
+// userBadgeEpoch anchors the user badge ripple phase. Sampling
+// time.Since(epoch) gives a continuously advancing elapsed value that
+// drives the rainbow animation across DecorTick re-renders without
+// needing per-entry state.
+var userBadgeEpoch = time.Now()
 
 // thinkingSummaryGlyph is the bullet used for the collapsed thinking line.
 const thinkingSummaryGlyph = "◉"
@@ -287,9 +294,20 @@ func truncatePlainDisplayWidth(text string, width int, suffix string) string {
 }
 
 // renderBadge produces the styled icon + label string for the entry header.
+// User entries render with the prismatic rainbow ripple to give the
+// "you" header the same per-source color delimitation that agent badges
+// get from AgentColor; the timestamp suffix remains muted (rendered by
+// the caller) so the source label is the only animated element.
 func renderBadge(entry *ChatEntry, th *theme.Theme) string {
 	icon := sourceIcon(entry.Source)
 	label := badgeLabel(entry)
+	if entry.Source == SourceUser {
+		grad := th.Palette.ThinkingGradient()
+		if grad != nil {
+			elapsed := time.Since(userBadgeEpoch)
+			return theme.RenderRippleText(icon+" "+label, elapsed, grad, 0)
+		}
+	}
 	style := badgeStyle(entry, th)
 	return style.Render(icon + " " + label)
 }

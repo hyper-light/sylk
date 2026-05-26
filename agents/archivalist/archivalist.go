@@ -969,6 +969,7 @@ func (a *Archivalist) handleBusRequest(msg *guide.Message) error {
 		Successful:  err == nil,
 	})
 	shared.LogResponse(a.steering.EventLogger(), fwd.CorrelationID, a.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if publishStreamLifecycle {

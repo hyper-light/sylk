@@ -358,6 +358,11 @@ func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
 		}
 		m.syncClaimsBridgeToActiveSession()
 	}
+	if m.proposalBridge != nil {
+		if err := m.proposalBridge.Start(program); err != nil {
+			return err
+		}
+	}
 	m.startIndexProgressObserver(program)
 	return nil
 }
@@ -378,6 +383,30 @@ func (m *AppModel) syncClaimsBridgeToActiveSession() {
 	}
 	uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_switch", "session_id", sessionID)
 	m.claimsBridge.SwitchSession(sessionID)
+}
+
+func (m *AppModel) handleSessionSwitched(switched msg.SessionSwitchedMsg) tea.Cmd {
+	activeID := strings.TrimSpace(switched.ActiveID)
+	if activeID == "" && switched.Event != nil {
+		activeID = strings.TrimSpace(switched.Event.SessionID)
+	}
+	if activeID == "" {
+		return nil
+	}
+	if m.claimsBridge != nil {
+		m.claimsBridge.SwitchSession(activeID)
+	}
+	if m.chat != nil {
+		m.chat.Clear()
+	}
+	m.commandApproval = nil
+	m.commandApprovalQ = nil
+	m.planApproval = nil
+	m.planApprovalQ = nil
+	m.layerDecision = nil
+	m.layerDecisionQ = nil
+	m.invalidateRenderedSlots()
+	return nil
 }
 
 // pipelinePhaseMap maps boot pipeline phase strings to UI IndexPhase constants.

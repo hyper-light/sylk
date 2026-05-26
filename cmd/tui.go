@@ -424,11 +424,10 @@ type bootstrapPhase1 struct {
 	anthropicGateway *gateway.ProviderGateway
 	openaiGateway    *gateway.ProviderGateway
 
-	// Typed identity + accounting surface. Both are constructed at
-	// phase4 once the default session id is known — phase1 leaves
-	// them nil and the gateway hook is the plain activity publisher
-	// until phase4 swaps in the MultiHook that fans out to the
-	// accountant as well.
+	// Typed identity + accounting surface. The identity factory is
+	// constructed in phase1 against this run's default session; the
+	// accountant is added in phase4, when the gateway hook swaps to a
+	// MultiHook that fans out to accounting as well as activity.
 	identityFactory atomic.Pointer[identity.Factory]
 	accountant      atomic.Pointer[accounting.Accountant]
 	llmEventHookRef atomic.Pointer[providers.MultiHook]
@@ -542,12 +541,17 @@ func buildBleveSearcher(projectRoot string) (*query.BleveSearcher, io.Closer, er
 }
 
 func buildMemoryForest(projectRoot string, budget *concurrency.GoroutineBudget) (*forestsvc.MemoryForest, *ctxpkg.UniversalContentStore, *vectorgraphdb.VectorGraphDB, error) {
+	return buildMemoryForestForSession(projectRoot, "default", budget)
+}
+
+func buildMemoryForestForSession(projectRoot, sessionID string, budget *concurrency.GoroutineBudget) (*forestsvc.MemoryForest, *ctxpkg.UniversalContentStore, *vectorgraphdb.VectorGraphDB, error) {
 	sd := sylkdir.New(projectRoot)
 	if err := sd.Init(); err != nil {
 		return nil, nil, nil, fmt.Errorf("init sylk dir for memory forest: %w", err)
 	}
+	sessionID = bootstrapSessionID(sessionID)
 
-	basePath := filepath.Join(sd.SessionPath("default"), "state", "memory_forest")
+	basePath := filepath.Join(sd.SessionPath(sessionID), "state", "memory_forest")
 	if err := os.MkdirAll(basePath, 0o755); err != nil {
 		return nil, nil, nil, fmt.Errorf("create memory forest state dir: %w", err)
 	}
@@ -656,6 +660,30 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 	return buildBootstrapDeps(phase1, phase2, phase3, phase4), buildBootstrapCleanup(phase1, phase3, phase4), nil
 }
 
+func tuiRunSessionConfig() session.Config {
+	cfg := session.DefaultConfig()
+	cfg.Name = "default"
+	if cfg.Metadata == nil {
+		cfg.Metadata = make(map[string]any)
+	}
+	cfg.Metadata["scope"] = "tui_run"
+	return cfg
+}
+
+func bootstrapSessionID(sessionID string) string {
+	if sid := strings.TrimSpace(sessionID); sid != "" {
+		return sid
+	}
+	return "default"
+}
+
+func phaseDefaultSessionID(phase1 *bootstrapPhase1) string {
+	if phase1 != nil && phase1.defaultSession != nil {
+		return bootstrapSessionID(phase1.defaultSession.ID())
+	}
+	return "default"
+}
+
 func loadBootstrapDotenv(projectRoot string) {
 	if err := boot.LoadDotenv(projectRoot); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to load .env.local", "error", err)
@@ -720,12 +748,11 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	})
 	phase1.descriptors = handoff.NewDescriptorRegistry()
 
-	// Create the default session eagerly so the identity Factory can
-	// bind to it at phase1. Every agent constructor — daemon or
-	// on-demand — receives a non-nil Factory; there is no late-bind
-	// path. If session.Manager.Create fails, the whole bootstrap
-	// fails loud rather than silently leaving Factory nil.
-	defaultSession, err := phase1.sessionMgr.Create(ctx, session.BootstrapDefaultConfig())
+	// Create the run's default session eagerly so the identity Factory
+	// can bind to it at phase1. The ID is intentionally fresh for each
+	// TUI process; the storage-layer "default" session is retained for
+	// legacy paths, but it must not be replayed into a new run's UI.
+	defaultSession, err := phase1.sessionMgr.Create(ctx, tuiRunSessionConfig())
 	if err != nil {
 		return phase1, fmt.Errorf("create default session: %w", err)
 	}
@@ -826,7 +853,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		&busReadinessPublisher{bus: phase1.guideBus},
 		slog.Default(),
 	)
-	forest, forestContent, forestVectorDB, err := buildMemoryForest(projectRoot, phase1.budget)
+	forest, forestContent, forestVectorDB, err := buildMemoryForestForSession(projectRoot, phase1.defaultSession.ID(), phase1.budget)
 	if err != nil {
 		return phase1, fmt.Errorf("bootstrap memory forest: %w", err)
 	}
@@ -1114,7 +1141,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	}
 	phase1.guideRef.Store(g)
 
-	// Bind the Guide's event logger to the default session directory
+	// Bind the Guide's event logger to this run's default session directory
 	// eagerly. Without this the logger binds lazily on the first
 	// incoming route request — which means if the user never routes
 	// anything, the guide's WAL + events.jsonl never get written.
@@ -1208,7 +1235,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		Bus:                    phase1.guideBus,
 		Scope:                  phase1.scope,
 		AgentID:                orch.AgentID(),
-		SessionID:              "default",
+		SessionID:              phaseDefaultSessionID(phase1),
 		OnVisibleRouteTerminal: nil,
 	}))
 	if phase3.activator != nil {
@@ -1383,7 +1410,7 @@ func registerPhase4Architect(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) er
 		return nil
 	}
 	_ = registerArchitectWithGuide(phase3.guide, arch)
-	wireGlobalAgentPod(arch, "architect", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	wireGlobalAgentPod(arch, "architect", phaseDefaultSessionID(phase1), phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
 	return nil
 }
 
@@ -1393,7 +1420,7 @@ func registerPhase4Inspector(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) er
 		return nil
 	}
 	_ = registerAgentWithGuide(phase3.guide, inspectorAgent, "inspector")
-	wireGlobalAgentPod(inspectorAgent, "inspector", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	wireGlobalAgentPod(inspectorAgent, "inspector", phaseDefaultSessionID(phase1), phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
 	return nil
 }
 
@@ -1403,7 +1430,7 @@ func registerPhase4Tester(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) error
 		return nil
 	}
 	_ = registerAgentWithGuide(phase3.guide, testerAgent, "tester")
-	wireGlobalAgentPod(testerAgent, "tester", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	wireGlobalAgentPod(testerAgent, "tester", phaseDefaultSessionID(phase1), phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
 	return nil
 }
 
@@ -1555,7 +1582,7 @@ func registerPhase4Librarian(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) er
 		return nil
 	}
 	_ = registerAgentWithGuide(phase3.guide, lib, "librarian")
-	wireGlobalAgentPod(lib, "librarian", phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
+	wireGlobalAgentPod(lib, "librarian", phaseDefaultSessionID(phase1), phase3.scribeFactory, phase3.activator, phase1.activityPub, slog.Default())
 
 	// Attach the session VFS so the librarian can see the live
 	// global overlay (and through the workspace-view layer, pipeline
@@ -1564,7 +1591,7 @@ func registerPhase4Librarian(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) er
 	// reduced to disk-only by the SetSessionVFS default, and
 	// workspace_read(op=list_changes) fails with "file access is
 	// unavailable". The librarian is a singleton across sessions;
-	// we bind it to the default session's VFS at registration time.
+	// we bind it to this run's default session VFS at registration time.
 	// Multi-session deployments that want per-session binding would
 	// re-attach on session switch.
 	if phase1.defaultSession != nil {
@@ -1674,13 +1701,13 @@ func startBootstrapPhase4(
 	phase3 bootstrapPhase3,
 ) (*bootstrapPhase4, error) {
 	phase4Start := time.Now()
-	// The default session + identity.Factory were created eagerly at
+	// The run default session + identity.Factory were created eagerly at
 	// phase1 so daemon agents receive a non-nil Factory at New() time
 	// (see buildBootstrapPhase1). phase4 just wires the Accountant
 	// and the gateway MultiHook against the already-live factory.
 	defaultSession := phase1.defaultSession
 	if defaultSession == nil {
-		return nil, fmt.Errorf("default session not initialized at phase1")
+		return nil, fmt.Errorf("run default session not initialized at phase1")
 	}
 	if err := wireAccounting(phase1, defaultSession.ID()); err != nil {
 		return nil, fmt.Errorf("accounting: %w", err)
@@ -2156,7 +2183,7 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, forest, scope, func(sessionID string) *versioning.SessionVFS {
+		return bootstrapLiveGuide(ctx, bus, actPub, h, googleGw, authRegistry, projectRoot, defaultSessionID, forest, scope, func(sessionID string) *versioning.SessionVFS {
 			if orch := orchRef.Load(); orch != nil {
 				return orch.GetSessionVFS(sessionID)
 			}
@@ -2183,7 +2210,7 @@ func registerAgentCreators(
 		if h == nil {
 			h = hydratedRef.Load()
 		}
-		return bootstrapOrchestrator(ctx, orchestratorID, bus, actPub, projectRoot, h, authRegistry, googleGw, forest, factoryRef.Load(), scope)
+		return bootstrapOrchestrator(ctx, orchestratorID, defaultSessionID, bus, actPub, projectRoot, h, authRegistry, googleGw, forest, factoryRef.Load(), scope)
 	})
 
 	// Guardian — safety sidecar daemon.
@@ -2206,30 +2233,31 @@ func registerAgentCreators(
 	})
 
 	// On-demand agents — created lazily by the ActivationController.
-	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, forest, guardianRef, orchRef, quarantineRef, quota, factoryRef, scope)
+	registerOnDemandAgentCreators(reg, ids, bus, actPub, projectRoot, defaultSessionID, googleGw, anthropicGw, openaiGw, authRegistry, actCtrlRef, knowledgeStore, knowledgeBackend, forest, guardianRef, orchRef, quarantineRef, quota, factoryRef, scope)
 }
 
 // registerOnDemandAgentCreators registers factories for knowledge and pipeline agents.
 // These are created lazily by the ActivationController when the Guide routes to them.
 type onDemandAgentCreatorDeps struct {
-	reg              *container.AgentCreatorRegistry
-	ids              *container.AgentIdentityRegistry
-	bus              guide.EventBus
-	actPub           events.ActivityPublisher
-	projectRoot      string
-	googleGw         *gateway.ProviderGateway
-	anthropicGw      *gateway.ProviderGateway
-	openaiGw         *gateway.ProviderGateway
-	authRegistry     *credentials.AuthRegistry
-	actCtrlRef       *atomic.Pointer[activation.ActivationController]
-	knowledgeStore   *knowledge.KnowledgeStore
-	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
-	forest           agentShared.MemoryForestService
-	guardianRef      *atomic.Pointer[guardian.Guardian]
-	orchRef          *atomic.Pointer[orchestrator.Orchestrator]
-	quarantineRef    *atomic.Pointer[fetch.QuarantineBuffer]
-	quota            *container.ResourceQuota
-	factoryRef       *atomic.Pointer[identity.Factory]
+	reg               *container.AgentCreatorRegistry
+	ids               *container.AgentIdentityRegistry
+	bus               guide.EventBus
+	actPub            events.ActivityPublisher
+	projectRoot       string
+	fallbackSessionID string
+	googleGw          *gateway.ProviderGateway
+	anthropicGw       *gateway.ProviderGateway
+	openaiGw          *gateway.ProviderGateway
+	authRegistry      *credentials.AuthRegistry
+	actCtrlRef        *atomic.Pointer[activation.ActivationController]
+	knowledgeStore    *knowledge.KnowledgeStore
+	knowledgeBackend  *knowledgeruntime.CommittedKnowledgeBackend
+	forest            agentShared.MemoryForestService
+	guardianRef       *atomic.Pointer[guardian.Guardian]
+	orchRef           *atomic.Pointer[orchestrator.Orchestrator]
+	quarantineRef     *atomic.Pointer[fetch.QuarantineBuffer]
+	quota             *container.ResourceQuota
+	factoryRef        *atomic.Pointer[identity.Factory]
 	// scope is the top-level tui scope. Every on-demand agent's
 	// SetScope is called with this before Start so claims-intake
 	// OnResolved dispatches and accumulator flushes go through a
@@ -2287,10 +2315,12 @@ func (d onDemandAgentCreatorDeps) sessionLookup(sessionID string) *versioning.Se
 }
 
 func (d onDemandAgentCreatorDeps) defaultSessionID() string {
-	if orch := d.orchRef.Load(); orch != nil {
-		return orch.SessionID()
+	if d.orchRef != nil {
+		if orch := d.orchRef.Load(); orch != nil {
+			return orch.SessionID()
+		}
 	}
-	return "default"
+	return bootstrapSessionID(d.fallbackSessionID)
 }
 
 func (d onDemandAgentCreatorDeps) workspaceViews(defaultView versioning.WorkspaceView) *versioning.SessionWorkspaceViews {
@@ -2321,6 +2351,7 @@ func registerOnDemandAgentCreators(
 	bus guide.EventBus,
 	actPub events.ActivityPublisher,
 	projectRoot string,
+	defaultSessionID string,
 	googleGw *gateway.ProviderGateway,
 	anthropicGw *gateway.ProviderGateway,
 	openaiGw *gateway.ProviderGateway,
@@ -2337,26 +2368,27 @@ func registerOnDemandAgentCreators(
 	scope *concurrency.GoroutineScope,
 ) {
 	deps := onDemandAgentCreatorDeps{
-		reg:              reg,
-		ids:              ids,
-		bus:              bus,
-		actPub:           actPub,
-		projectRoot:      projectRoot,
-		googleGw:         googleGw,
-		anthropicGw:      anthropicGw,
-		openaiGw:         openaiGw,
-		authRegistry:     authRegistry,
-		actCtrlRef:       actCtrlRef,
-		knowledgeStore:   knowledgeStore,
-		knowledgeBackend: knowledgeBackend,
-		forest:           forest,
-		guardianRef:      guardianRef,
-		orchRef:          orchRef,
-		quarantineRef:    quarantineRef,
-		quota:            quota,
-		providerPool:     newProviderWarmPool(),
-		factoryRef:       factoryRef,
-		scope:            scope,
+		reg:               reg,
+		ids:               ids,
+		bus:               bus,
+		actPub:            actPub,
+		projectRoot:       projectRoot,
+		fallbackSessionID: defaultSessionID,
+		googleGw:          googleGw,
+		anthropicGw:       anthropicGw,
+		openaiGw:          openaiGw,
+		authRegistry:      authRegistry,
+		actCtrlRef:        actCtrlRef,
+		knowledgeStore:    knowledgeStore,
+		knowledgeBackend:  knowledgeBackend,
+		forest:            forest,
+		guardianRef:       guardianRef,
+		orchRef:           orchRef,
+		quarantineRef:     quarantineRef,
+		quota:             quota,
+		providerPool:      newProviderWarmPool(),
+		factoryRef:        factoryRef,
+		scope:             scope,
 	}
 	registerOnDemandKnowledgeAgentCreators(deps)
 	registerOnDemandQualityAgentCreators(deps)
@@ -2950,22 +2982,23 @@ func quotaFromSpecs(specReg *container.AgentSpecRegistry) container.ResourceQuot
 // When hydrated is non-nil, it reuses pre-resolved auth (skipping duplicate
 // OAuth + Code Assist setup). If provider auth is unavailable, it falls back
 // to a local rule-based classifier so the UI can launch without authorization.
-func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, forest agentShared.MemoryForestService, scope *concurrency.GoroutineScope, sessionVFSLookup func(string) *versioning.SessionVFS, factory *identity.Factory) (*guide.Guide, error) {
+func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.ActivityPublisher, hydrated *providers.HydratedGoogleAuth, googleGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, projectRoot string, sessionID string, forest agentShared.MemoryForestService, scope *concurrency.GoroutineScope, sessionVFSLookup func(string) *versioning.SessionVFS, factory *identity.Factory) (*guide.Guide, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("guide bootstrap: nil identity factory")
 	}
+	sessionID = bootstrapSessionID(sessionID)
 	googleCfg := defaultGuideGoogleConfig(authRegistry)
 	cfg := guide.Config{
 		Bus:          bus,
 		ActivityPub:  actPub,
 		AgentID:      "guide",
-		SessionID:    "default",
+		SessionID:    sessionID,
 		GoogleConfig: &googleCfg,
 		Forest:       forest,
 		Factory:      factory,
 		WorkspaceViews: versioning.NewSessionWorkspaceViews(versioning.SessionWorkspaceViewsConfig{
 			DefaultView:      versioning.WorkspaceViewDisk,
-			DefaultSessionID: "default",
+			DefaultSessionID: sessionID,
 			WorkingDir:       projectRoot,
 			SessionLookup:    sessionVFSLookup,
 			DiskFallback:     versioning.NewDiskFileAccess(projectRoot, true),
@@ -3006,6 +3039,7 @@ func bootstrapLiveGuide(ctx context.Context, bus guide.EventBus, actPub events.A
 }
 
 func bootstrapArchitect(ctx context.Context, canonicalID string, sessionID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, anthropicGw *gateway.ProviderGateway, authRegistry *credentials.AuthRegistry, actCtrlRef *atomic.Pointer[activation.ActivationController], planStore *architect.PlanStore, forest agentShared.MemoryForestService, sessionVFSLookup func(string) *versioning.SessionVFS, factoryRef *atomic.Pointer[identity.Factory], scope *concurrency.GoroutineScope) (*architect.Architect, error) {
+	sessionID = bootstrapSessionID(sessionID)
 	bootstrapStart := time.Now()
 	deadline, hasDL := ctx.Deadline()
 	guide.DebugFileLog().Info("DEBUG: bootstrap_architect_start", "has_deadline", hasDL, "deadline", deadline)
@@ -3874,10 +3908,11 @@ func defaultOrchestratorGoogleConfig(authRegistry *credentials.AuthRegistry) pro
 	return cfg
 }
 
-func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway, forest agentShared.MemoryForestService, factory *identity.Factory, scope *concurrency.GoroutineScope) (*orchestrator.Orchestrator, error) {
+func bootstrapOrchestrator(ctx context.Context, agentID, sessionID string, bus guide.EventBus, actPub events.ActivityPublisher, projectRoot string, hydrated *providers.HydratedGoogleAuth, authRegistry *credentials.AuthRegistry, googleGw *gateway.ProviderGateway, forest agentShared.MemoryForestService, factory *identity.Factory, scope *concurrency.GoroutineScope) (*orchestrator.Orchestrator, error) {
 	if factory == nil {
 		return nil, fmt.Errorf("orchestrator bootstrap: nil identity factory")
 	}
+	sessionID = bootstrapSessionID(sessionID)
 	googleCfg := defaultOrchestratorGoogleConfig(authRegistry)
 
 	// Best-effort provider creation. If Google auth isn't available yet,
@@ -3892,7 +3927,7 @@ func bootstrapOrchestrator(ctx context.Context, agentID string, bus guide.EventB
 
 	cfg := orchestrator.DefaultConfig()
 	cfg.AgentID = agentID
-	cfg.SessionID = "default"
+	cfg.SessionID = sessionID
 	cfg.EnableLLM = true
 	cfg.Forest = forest
 	cfg.Factory = factory
@@ -4644,6 +4679,7 @@ type agentPodSetter interface {
 func wireGlobalAgentPod(
 	agent agentPodSetter,
 	agentType string,
+	sessionID string,
 	scribeFactory agentShared.ScribeFactory,
 	activator guide.PodActivator,
 	activityPub events.ActivityPublisher,
@@ -4651,7 +4687,7 @@ func wireGlobalAgentPod(
 ) {
 	pod := agentShared.NewAgentPod(agentShared.AgentPodConfig{
 		PodID:         agentType + "-global-pod",
-		SessionID:     "default",
+		SessionID:     bootstrapSessionID(sessionID),
 		Activator:     activator,
 		ActivityPub:   activityPub,
 		Logger:        logger,

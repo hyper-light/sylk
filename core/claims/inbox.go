@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -408,6 +409,12 @@ type ClaimsInbox struct {
 	// Expect(), consumed when a matching delta arrives via Ingest.
 	expectations map[string]*Expectation
 
+	// expectationSubs holds one-shot, claim-specific bus subscriptions
+	// created by Expect(). RoleSubject deliberately does not subscribe to
+	// the claim.*.testified firehose, so issuer-side expectations need a
+	// narrow return channel for the specific claim they issued.
+	expectationSubs map[string]DeltaSubscription
+
 	board *ClaimsBoard
 
 	// onResolved is called when a delta matches. Runs on the bus
@@ -451,15 +458,16 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 	// Pre-size dedup at queueCap (one pattern's worth). Start grows
 	// it to queueCap × pattern count once patterns resolve.
 	return &ClaimsInbox{
-		agentID:      cfg.AgentID,
-		sessionID:    cfg.SessionID,
-		role:         role,
-		subscriber:   subscribeOrNoop(cfg.Subscriber),
-		board:        cfg.Board,
-		onResolved:   cfg.OnResolved,
-		seen:         newDedupLRU(queueCap),
-		expectations: make(map[string]*Expectation),
-		queueCap:     queueCap,
+		agentID:         cfg.AgentID,
+		sessionID:       cfg.SessionID,
+		role:            role,
+		subscriber:      subscribeOrNoop(cfg.Subscriber),
+		board:           cfg.Board,
+		onResolved:      cfg.OnResolved,
+		seen:            newDedupLRU(queueCap),
+		expectations:    make(map[string]*Expectation),
+		expectationSubs: make(map[string]DeltaSubscription),
+		queueCap:        queueCap,
 	}, nil
 }
 
@@ -540,6 +548,7 @@ func (i *ClaimsInbox) Close() error {
 	i.subscriptions = nil
 	i.seen = nil
 	i.expectations = nil
+	i.expectationSubs = nil
 	i.mu.Unlock()
 
 	var firstErr error
@@ -561,11 +570,73 @@ func (i *ClaimsInbox) Expect(e *Expectation) {
 	if i == nil || e == nil || i.closed.Load() {
 		return
 	}
+	claimID := strings.TrimSpace(e.ClaimID)
+	if claimID == "" {
+		return
+	}
+	copied := *e
+	copied.ClaimID = claimID
+	topic := expectationTopic(i.sessionID, &copied)
+
 	i.mu.Lock()
 	if i.expectations != nil {
-		i.expectations[e.ClaimID] = e
+		i.expectations[claimID] = &copied
+	}
+	needsSubscribe := topic != "" && i.expectationSubs[claimID] == nil
+	i.mu.Unlock()
+
+	if needsSubscribe {
+		i.subscribeExpectationTopic(claimID, topic)
+	}
+}
+
+func expectationTopic(sessionID string, e *Expectation) string {
+	if e == nil {
+		return ""
+	}
+	switch strings.TrimSpace(e.ExpectedDelta) {
+	case DeltaKindTestament:
+		return ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified)
+	default:
+		return ""
+	}
+}
+
+func (i *ClaimsInbox) subscribeExpectationTopic(claimID, topic string) {
+	if i == nil || i.closed.Load() || strings.TrimSpace(claimID) == "" || strings.TrimSpace(topic) == "" {
+		return
+	}
+	handler := i.handler()
+	sub, err := i.subscriber.SubscribeDelta(topic, handler)
+	if err != nil {
+		slog.Error("claims_inbox_expectation_subscribe_failed",
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"claim_id", claimID,
+			"topic", topic,
+			"error", err.Error(),
+		)
+		return
+	}
+
+	keep := false
+	i.mu.Lock()
+	if !i.closed.Load() && i.expectations[claimID] != nil && i.expectationSubs[claimID] == nil {
+		i.expectationSubs[claimID] = sub
+		i.subscriptions = append(i.subscriptions, sub)
+		keep = true
 	}
 	i.mu.Unlock()
+	if !keep {
+		_ = sub.Unsubscribe()
+		return
+	}
+	slog.Info("claims_inbox_expectation_subscribed",
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"claim_id", claimID,
+		"topic", topic,
+	)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -583,8 +654,13 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 	}
 	i.deliveredByClass[DeltaClass(d)].Add(1)
 	i.mu.Lock()
-	entry := i.ingestLocked(d)
+	entry, releaseSubs := i.ingestLocked(d)
 	i.mu.Unlock()
+	for _, sub := range releaseSubs {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}
 
 	slog.Info("claims_inbox_delta_received",
 		"agent_id", i.agentID,
@@ -626,15 +702,15 @@ func deltaDirectedAgentID(d Delta) string {
 	return ""
 }
 
-func (i *ClaimsInbox) ingestLocked(d Delta) *GraphEntryPoint {
+func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscription) {
 	// Dedup.
 	key := d.DeltaKey()
 	seq := d.DeltaSequence()
 	if i.seen == nil {
-		return nil
+		return nil, nil
 	}
 	if !i.seen.observe(key, seq) {
-		return nil
+		return nil, nil
 	}
 
 	// Match against expectations first (O(1) by claim_id).
@@ -642,8 +718,9 @@ func (i *ClaimsInbox) ingestLocked(d Delta) *GraphEntryPoint {
 	if claimID != "" && i.expectations != nil {
 		if exp, ok := i.expectations[claimID]; ok && exp.ExpectedDelta == d.DeltaKind() {
 			delete(i.expectations, claimID)
+			releaseSubs := i.releaseExpectationSubscriptionsLocked(claimID)
 			i.matchCount.Add(1)
-			return ResolveEntryPoint(i.board, d, exp.Priority, exp)
+			return ResolveEntryPoint(i.board, d, exp.Priority, exp), releaseSubs
 		}
 	}
 
@@ -651,11 +728,23 @@ func (i *ClaimsInbox) ingestLocked(d Delta) *GraphEntryPoint {
 	if i.matchesStandingSubscription(d) {
 		priority := derivePriority(d)
 		i.matchCount.Add(1)
-		return ResolveEntryPoint(i.board, d, priority, nil)
+		return ResolveEntryPoint(i.board, d, priority, nil), nil
 	}
 
 	// Unmatched — discard.
-	return nil
+	return nil, nil
+}
+
+func (i *ClaimsInbox) releaseExpectationSubscriptionsLocked(claimID string) []DeltaSubscription {
+	if i == nil || i.expectationSubs == nil {
+		return nil
+	}
+	sub := i.expectationSubs[claimID]
+	if sub == nil {
+		return nil
+	}
+	delete(i.expectationSubs, claimID)
+	return []DeltaSubscription{sub}
 }
 
 // matchesStandingSubscription is a defense-in-depth guard that the

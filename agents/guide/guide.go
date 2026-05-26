@@ -917,7 +917,7 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		},
 	))
 
-	g.applyPendingPlanMetadata(request.SessionID, classification)
+	g.applyPendingPlanMetadata(request.SessionID, request.Input, classification)
 
 	corrID := g.resolveCorrelationID(request)
 	if !request.FireAndForget || metadataHasNestedInterAgentBranch(request.Metadata) {
@@ -1165,10 +1165,11 @@ func (g *Guide) tryConversationFastPath(ctx context.Context, request *RouteReque
 	return result, activeAgentID, true
 }
 
-// applyPendingPlanMetadata attaches plan_id and epoch metadata to a
-// classification when the LLM classifier routes to the pending plan's agent
-// with a planning intent. Clears the pending plan on consume.
-func (g *Guide) applyPendingPlanMetadata(sessionID string, classification *RouteResult) {
+// applyPendingPlanMetadata attaches plan_id and epoch metadata only when the
+// user is responding to the pending plan approval gate. Fresh planning/design
+// requests can still route to the architect while a plan is pending; those must
+// not inherit the old plan_id or they will be misread as resume/freshness work.
+func (g *Guide) applyPendingPlanMetadata(sessionID string, input string, classification *RouteResult) {
 	if g == nil || g.conversation == nil || classification == nil {
 		return
 	}
@@ -1184,10 +1185,51 @@ func (g *Guide) applyPendingPlanMetadata(sessionID string, classification *Route
 	case classification.Intent == IntentExecute && isArchitectPlanningDomain(classification.Domain):
 		classification.PhaseMetadata = map[string]any{"plan_id": pending.PlanID, "epoch": pending.Epoch}
 		g.conversation.ClearPendingPlan(sessionID)
-	case classification.Intent == IntentPlan && isArchitectPlanningDomain(classification.Domain):
+	case isPendingPlanFeedbackIntent(classification.Intent) &&
+		isArchitectPlanningDomain(classification.Domain) &&
+		isPendingPlanFeedbackInput(input):
 		classification.PhaseMetadata = map[string]any{"plan_id": pending.PlanID, "epoch": pending.Epoch}
 		g.conversation.ClearPendingPlan(sessionID)
 	}
+}
+
+func isPendingPlanFeedbackIntent(intent Intent) bool {
+	switch intent {
+	case IntentPlan, IntentDesign, IntentChat, IntentUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func isPendingPlanFeedbackInput(input string) bool {
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	if isPlanAcceptanceApprovalSignal(input) || isPlanAcceptanceRejectSignal(input) {
+		return true
+	}
+	if containsFreshPlanningRequestSignal(lower) && !containsPendingPlanModificationSignal(lower) {
+		return false
+	}
+	return containsPendingPlanModificationSignal(lower)
+}
+
+func containsFreshPlanningRequestSignal(lower string) bool {
+	return containsAny(lower,
+		"let's create", "lets create", "create a ", "create an ",
+		"build a ", "build an ", "make a ", "make an ",
+		"implement a ", "implement an ", "start a new ", "from scratch",
+	)
+}
+
+func containsPendingPlanModificationSignal(lower string) bool {
+	return containsAny(lower,
+		"change", "modify", "revise", "adjust", "instead", "swap",
+		"replace", "remove", "without", "use ", "make it", "make this",
+		"update the plan", "change the plan", "modify the plan",
+	)
 }
 
 func isArchitectPlanningDomain(domain Domain) bool {
@@ -3386,11 +3428,23 @@ func (g *Guide) handleRequestMessage(msg *Message) error {
 func (g *Guide) forwardActionMessage(msg *Message) error {
 	action, ok := msg.GetActionRequest()
 	if !ok || action == nil {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_action_forward_invalid",
+			"message_correlation_id", interruptMessageCorrelationID(msg),
+		)
 		return nil
 	}
 
 	resolved := g.resolveAgentID(action.TargetAgentID)
 	topic := g.agentRequestTopic(resolved)
+	if strings.EqualFold(strings.TrimSpace(action.Action), "cancel") {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_action_forward_cancel",
+			"topic", topic,
+			"target_agent", action.TargetAgentID,
+			"resolved_agent", resolved,
+			"correlation_id", action.CorrelationID,
+			"source_agent", action.SourceAgentID,
+		)
+	}
 
 	g.logEvent(agentlog.EventForwardDispatched, action.CorrelationID, "info", &agentlog.ForwardPayload{
 		TargetAgent: resolved,
@@ -4947,9 +5001,18 @@ func (g *Guide) discardInterruptedPending(correlationID string) {
 func (g *Guide) interruptCorrelationTree(req *UserInterruptRequest, rootCorrelationID string) {
 	rootCorrelationID = strings.TrimSpace(rootCorrelationID)
 	if g == nil || g.pending == nil || rootCorrelationID == "" {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_interrupt_tree_skipped",
+			"root_correlation_id", rootCorrelationID,
+			"has_guide", g != nil,
+		)
 		return
 	}
 
+	guideFileLog().Info("INTERRUPT_DEBUG: guide_interrupt_tree_start",
+		"root_correlation_id", rootCorrelationID,
+		"scope", interruptScopeString(req),
+		"session_id", interruptSessionID(req),
+	)
 	queue := []string{rootCorrelationID}
 	visited := make(map[string]struct{}, 4)
 	for len(queue) > 0 {
@@ -4967,6 +5030,12 @@ func (g *Guide) interruptCorrelationTree(req *UserInterruptRequest, rootCorrelat
 		g.markInterruptedCorrelation(correlationID)
 		g.cancelRequestContext(correlationID)
 		pending := g.pending.Remove(correlationID)
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_interrupt_tree_visit",
+			"correlation_id", correlationID,
+			"pending_found", pending != nil,
+			"children", len(children),
+			"target_agent", pendingTargetAgentID(pending),
+		)
 		if pending != nil || correlationID == rootCorrelationID {
 			g.reclaimRequestEpoch(correlationID, pending)
 		}
@@ -4987,6 +5056,13 @@ func (g *Guide) interruptCorrelationTree(req *UserInterruptRequest, rootCorrelat
 
 func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 	req, correlationID := g.interruptRequestFromMessage(msg)
+	guideFileLog().Info("INTERRUPT_DEBUG: guide_user_interrupt_received",
+		"message_correlation_id", interruptMessageCorrelationID(msg),
+		"request_correlation_id", correlationID,
+		"scope", interruptScopeString(req),
+		"session_id", interruptSessionID(req),
+		"source_agent", interruptMessageSourceAgentID(msg),
+	)
 	if req != nil && req.Scope == UserInterruptScopeSession && strings.TrimSpace(req.SessionID) != "" {
 		g.handleSessionInterrupt(req)
 		return nil
@@ -5000,14 +5076,23 @@ func (g *Guide) handleUserInterruptMessage(msg *Message) error {
 
 func (g *Guide) handleSessionInterrupt(req *UserInterruptRequest) {
 	if g == nil || g.pending == nil || req == nil {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_session_interrupt_skipped",
+			"has_guide", g != nil,
+			"has_request", req != nil,
+		)
 		return
 	}
 	sessionID := strings.TrimSpace(req.SessionID)
 	if sessionID == "" {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_session_interrupt_empty_session")
 		return
 	}
 
 	pendings := g.pending.GetBySession(sessionID)
+	guideFileLog().Info("INTERRUPT_DEBUG: guide_session_interrupt_pending",
+		"session_id", sessionID,
+		"pending_count", len(pendings),
+	)
 
 	// Corrective claim: user interrupt cancels all pending work.
 	cancelledIDs := make([]string, 0, len(pendings))
@@ -5117,16 +5202,75 @@ func (g *Guide) interruptRequestFromMessage(msg *Message) (*UserInterruptRequest
 	return req, correlationID
 }
 
+func interruptScopeString(req *UserInterruptRequest) string {
+	if req == nil {
+		return ""
+	}
+	return string(req.Scope)
+}
+
+func interruptSessionID(req *UserInterruptRequest) string {
+	if req == nil {
+		return ""
+	}
+	return strings.TrimSpace(req.SessionID)
+}
+
+func interruptMessageCorrelationID(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	return strings.TrimSpace(msg.CorrelationID)
+}
+
+func interruptMessageSourceAgentID(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	return strings.TrimSpace(msg.SourceAgentID)
+}
+
+func pendingTargetAgentID(pending *PendingRequest) string {
+	if pending == nil {
+		return ""
+	}
+	return strings.TrimSpace(pending.TargetAgentID)
+}
+
+func pendingCorrelationID(pending *PendingRequest) string {
+	if pending == nil {
+		return ""
+	}
+	return strings.TrimSpace(pending.CorrelationID)
+}
+
 func (g *Guide) forwardUserInterruptToTarget(req *UserInterruptRequest, pending *PendingRequest) {
 	if g == nil || pending == nil || strings.TrimSpace(pending.TargetAgentID) == "" {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_forward_user_interrupt_skipped",
+			"has_guide", g != nil,
+			"has_pending", pending != nil,
+			"target_agent", pendingTargetAgentID(pending),
+			"correlation_id", pendingCorrelationID(pending),
+		)
 		return
 	}
 	if g.isGuideTarget(pending.TargetAgentID) {
+		guideFileLog().Info("INTERRUPT_DEBUG: guide_forward_user_interrupt_skip_guide_target",
+			"target_agent", pending.TargetAgentID,
+			"correlation_id", pending.CorrelationID,
+		)
 		return
 	}
 	action := g.userInterruptAction(req, pending)
 	msg := NewActionMessage(generateMessageID(), action)
-	if err := g.bus.Publish(g.agentRequestTopic(pending.TargetAgentID), msg); err != nil {
+	topic := g.agentRequestTopic(pending.TargetAgentID)
+	guideFileLog().Info("INTERRUPT_DEBUG: guide_forward_user_interrupt",
+		"topic", topic,
+		"target_agent", pending.TargetAgentID,
+		"correlation_id", pending.CorrelationID,
+		"session_id", interruptSessionID(req),
+	)
+	if err := g.bus.Publish(topic, msg); err != nil {
 		slog.Warn("guide_user_interrupt_forward_publish_failed",
 			"target_agent", pending.TargetAgentID,
 			"correlation_id", pending.CorrelationID,

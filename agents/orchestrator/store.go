@@ -4,6 +4,8 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +60,13 @@ func DefaultStoreConfig(dbPath string) StoreConfig {
 // historical DSN bug that dropped busy_timeout entirely) produced
 // sub-millisecond "database is locked" failures under coord_* bursts.
 func OpenStore(cfg StoreConfig) (*Store, error) {
+	if path := strings.TrimSpace(cfg.Path); path != "" {
+		if dir := filepath.Dir(path); dir != "." && dir != "" {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return nil, fmt.Errorf("orchestrator store: create dir: %w", err)
+			}
+		}
+	}
 	bunCfg := database.DefaultBunSQLiteConfig(cfg.Path)
 	if cfg.MaxOpenConns > 0 {
 		bunCfg.MaxOpen = cfg.MaxOpenConns

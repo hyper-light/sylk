@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -162,7 +163,9 @@ type pendingContinuation struct {
 	awaiting   map[string]struct{}                     // consult_ids still pending
 	resolved   map[string]*claims.ConsultResolvedDelta // consult_id → resolved delta
 	deadline   time.Time
-	deadlineFn context.CancelFunc // cancels the deadline watcher
+	idleWindow time.Duration
+	activity   map[string]time.Time // consult_id -> most recent observed claim activity
+	deadlineFn context.CancelFunc   // cancels the deadline watcher
 
 	// dispatched serializes resume invocation. Two concurrent
 	// completing consults (last-awaiting + last-awaiting due to
@@ -268,9 +271,16 @@ type AwaitOptions struct {
 	AwaitToolName string
 
 	// Deadline is the absolute time at which the await should give
-	// up and resume with whatever has arrived (timeouts emitted for
-	// the rest). Zero value defaults to 5 minutes from now.
+	// its first inactivity window. Activity on the awaited consult
+	// claim moves the effective timeout forward. Zero value defaults
+	// to 5 minutes from now.
 	Deadline time.Time
+
+	// IdleTimeout is the inactivity window for awaited consults.
+	// When zero, it is derived from Deadline-now. The continuation
+	// times out only after an awaited consult has produced no claim
+	// activity for this window.
+	IdleTimeout time.Duration
 
 	// Snapshot is the TurnSnapshot to persist. The caller (the
 	// await_consults tool handler) constructs this from the active
@@ -323,10 +333,19 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 		opts.AwaitToolName = "await_consults"
 	}
 
+	now := time.Now().UTC()
 	deadline := opts.Deadline
 	if deadline.IsZero() {
-		deadline = time.Now().Add(5 * time.Minute)
+		deadline = now.Add(5 * time.Minute)
 	}
+	idleWindow := opts.IdleTimeout
+	if idleWindow <= 0 {
+		idleWindow = time.Until(deadline)
+	}
+	if idleWindow <= 0 {
+		idleWindow = 0
+	}
+	deadline = now.Add(idleWindow)
 
 	s.mu.Lock()
 
@@ -366,9 +385,9 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	snapshot.AwaitToolCallID = opts.AwaitToolCallID
 	snapshot.AwaitToolName = opts.AwaitToolName
 	snapshot.AwaitDeadline = deadline
-	snapshot.YieldedAt = time.Now().UTC()
+	snapshot.YieldedAt = now
 
-	continuationID, err := s.persistContinuationLocked(ctx, snapshot, opts.ConsultIDs, deadline, preResolved)
+	continuationID, err := s.persistContinuationLocked(ctx, snapshot, opts.ConsultIDs, deadline, idleWindow, preResolved)
 	if err != nil {
 		s.mu.Unlock()
 		// Persist failure: degrade to fast path with whatever
@@ -382,11 +401,13 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	}
 
 	pending := &pendingContinuation{
-		id:       continuationID,
-		snapshot: snapshot,
-		awaiting: stillAwaiting,
-		resolved: preResolved,
-		deadline: deadline,
+		id:         continuationID,
+		snapshot:   snapshot,
+		awaiting:   stillAwaiting,
+		resolved:   preResolved,
+		deadline:   deadline,
+		idleWindow: idleWindow,
+		activity:   initialConsultActivity(stillAwaiting, now),
 	}
 	s.pending[continuationID] = pending
 	for id := range stillAwaiting {
@@ -394,10 +415,10 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	}
 	s.mu.Unlock()
 
-	// Start the deadline watcher in a tracked goroutine. When the
-	// deadline elapses, force-resume with synthetic timeout
-	// resolutions for any still-awaiting consults.
-	s.startDeadlineWatcher(continuationID, deadline)
+	// Start the inactivity watcher in a tracked goroutine. The first
+	// window begins at yield time; each observed consult-claim
+	// activity moves that consult's timeout forward.
+	s.startDeadlineWatcher(continuationID, idleWindow)
 
 	return nil, true, ErrConsultYielded
 }
@@ -509,11 +530,12 @@ func (s *ContinuationStore) dispatchResume(ctx context.Context, pending *pending
 
 // startDeadlineWatcher kicks off a tracked goroutine that fires
 // synthetic timeout resolutions for any still-awaiting consults
-// when the deadline elapses. Idempotent: if all consults resolve
-// before the deadline, the watcher exits cleanly via cancel.
-func (s *ContinuationStore) startDeadlineWatcher(continuationID string, deadline time.Time) {
-	wait := time.Until(deadline)
-	if wait <= 0 {
+// after an inactivity window. Claim activity on an awaited consult
+// moves that consult's timeout forward, so a responder that is still
+// reading, thinking, or using tools does not get cut off by a fixed
+// wall-clock deadline.
+func (s *ContinuationStore) startDeadlineWatcher(continuationID string, idleWindow time.Duration) {
+	if idleWindow <= 0 {
 		s.fireDeadline(continuationID)
 		return
 	}
@@ -526,17 +548,31 @@ func (s *ContinuationStore) startDeadlineWatcher(continuationID string, deadline
 	s.mu.Unlock()
 
 	watch := func(workerCtx context.Context) error {
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		select {
-		case <-workerCtx.Done():
-			return nil
-		case <-watcherCtx.Done():
-			return nil
-		case <-timer.C:
-			s.fireDeadline(continuationID)
+		for {
+			wait, ok := s.nextDeadlineWait(continuationID)
+			if !ok {
+				return nil
+			}
+			if wait <= 0 {
+				if s.fireDeadline(continuationID) {
+					return nil
+				}
+				continue
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-workerCtx.Done():
+				timer.Stop()
+				return nil
+			case <-watcherCtx.Done():
+				timer.Stop()
+				return nil
+			case <-timer.C:
+				if s.fireDeadline(continuationID) {
+					return nil
+				}
+			}
 		}
-		return nil
 	}
 	if s.scope != nil {
 		if err := s.scope.Go("continuation_deadline_watcher", 0, watch); err != nil {
@@ -553,29 +589,247 @@ func (s *ContinuationStore) startDeadlineWatcher(continuationID string, deadline
 	go func() { _ = watch(watcherCtx) }()
 }
 
+func (s *ContinuationStore) nextDeadlineWait(continuationID string) (time.Duration, bool) {
+	s.refreshContinuationActivity(continuationID)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.pending[continuationID]
+	if !ok || len(pending.awaiting) == 0 {
+		return 0, false
+	}
+	idleWindow := pending.idleWindow
+	if idleWindow <= 0 {
+		idleWindow = time.Until(pending.deadline)
+	}
+	if idleWindow <= 0 {
+		return 0, true
+	}
+	var next time.Time
+	for id := range pending.awaiting {
+		last := pending.activity[id]
+		if last.IsZero() {
+			last = pending.snapshot.YieldedAt
+		}
+		due := last.Add(idleWindow)
+		if next.IsZero() || due.Before(next) {
+			next = due
+		}
+	}
+	if next.IsZero() {
+		return 0, false
+	}
+	return time.Until(next), true
+}
+
 // fireDeadline materializes synthetic timeout resolutions for any
 // still-awaiting consults of the named continuation, then dispatches
 // resume.
-func (s *ContinuationStore) fireDeadline(continuationID string) {
+func (s *ContinuationStore) fireDeadline(continuationID string) bool {
+	s.refreshContinuationActivity(continuationID)
+
 	s.mu.Lock()
 	pending, ok := s.pending[continuationID]
 	if !ok {
 		s.mu.Unlock()
-		return
+		return true
+	}
+	now := time.Now().UTC()
+	idleWindow := pending.idleWindow
+	if idleWindow <= 0 {
+		idleWindow = time.Until(pending.deadline)
 	}
 	for id := range pending.awaiting {
+		last := pending.activity[id]
+		if last.IsZero() {
+			last = pending.snapshot.YieldedAt
+		}
+		if idleWindow > 0 && now.Sub(last) < idleWindow {
+			continue
+		}
 		pending.resolved[id] = &claims.ConsultResolvedDelta{
 			ConsultID:         id,
 			OriginatorAgentID: s.agentID,
 			Status:            claims.ConsultStatusTimeout,
 			ErrorMessage:      "consult deadline elapsed",
-			EmittedAt:         time.Now().UTC(),
+			EmittedAt:         now,
 		}
 		delete(s.consultIndex, id)
+		delete(pending.activity, id)
+		delete(pending.awaiting, id)
 	}
-	pending.awaiting = nil
+	complete := len(pending.awaiting) == 0
 	s.mu.Unlock()
-	s.dispatchResume(context.Background(), pending)
+	if complete {
+		s.dispatchResume(context.Background(), pending)
+	}
+	return complete
+}
+
+func (s *ContinuationStore) refreshContinuationActivity(continuationID string) {
+	ids, ok := s.awaitingConsultIDs(continuationID)
+	if !ok || len(ids) == 0 {
+		return
+	}
+	activity := s.consultActivitySnapshot(ids)
+	if len(activity) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.pending[continuationID]
+	if !ok {
+		return
+	}
+	if pending.activity == nil {
+		pending.activity = make(map[string]time.Time, len(pending.awaiting))
+	}
+	for id, at := range activity {
+		if at.After(pending.activity[id]) {
+			pending.activity[id] = at
+		}
+	}
+}
+
+func (s *ContinuationStore) awaitingConsultIDs(continuationID string) ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.pending[continuationID]
+	if !ok || len(pending.awaiting) == 0 {
+		return nil, false
+	}
+	ids := make([]string, 0, len(pending.awaiting))
+	for id := range pending.awaiting {
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+func initialConsultActivity(awaiting map[string]struct{}, at time.Time) map[string]time.Time {
+	out := make(map[string]time.Time, len(awaiting))
+	for id := range awaiting {
+		out[id] = at
+	}
+	return out
+}
+
+func (s *ContinuationStore) recoveredConsultActivity(consultIDs []string, fallback time.Time) map[string]time.Time {
+	out := make(map[string]time.Time, len(consultIDs))
+	for _, id := range consultIDs {
+		if id != "" {
+			out[id] = fallback
+		}
+	}
+	for id, at := range s.consultActivitySnapshot(consultIDs) {
+		if at.After(out[id]) {
+			out[id] = at
+		}
+	}
+	return out
+}
+
+func (s *ContinuationStore) consultActivitySnapshot(consultIDs []string) map[string]time.Time {
+	if s == nil || s.board == nil || len(consultIDs) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(consultIDs))
+	for _, id := range consultIDs {
+		if id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	proj := s.board.Projection()
+	if proj == nil {
+		return nil
+	}
+	out := make(map[string]time.Time, len(wanted))
+	for i := range proj.Claims {
+		claim := proj.Claims[i]
+		for id := range wanted {
+			if !continuationAwaitMatchesClaim(id, claim) {
+				continue
+			}
+			at := latestClaimActivityTime(claim)
+			if at.After(out[id]) {
+				out[id] = at
+			}
+		}
+	}
+	for i := range proj.Testaments {
+		testament := proj.Testaments[i]
+		claimID := claims.ClaimIDFromRelations(testament.Relations)
+		if _, ok := wanted[claimID]; !ok {
+			continue
+		}
+		at := latestTestamentActivityTime(testament)
+		if at.After(out[claimID]) {
+			out[claimID] = at
+		}
+	}
+	return out
+}
+
+func continuationAwaitMatchesClaim(awaitID string, claim claims.Claim) bool {
+	if claim.ID == awaitID {
+		return true
+	}
+	for _, entry := range claim.Scope {
+		switch strings.TrimSpace(entry.Kind) {
+		case "consult_id", "challenge_id", "await_id":
+			if strings.TrimSpace(entry.Key) == awaitID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func latestClaimActivityTime(claim claims.Claim) time.Time {
+	latest := claim.Created
+	if claim.Accessed.After(latest) {
+		latest = claim.Accessed
+	}
+	for _, status := range claim.StatusHistory {
+		if status.Changed.After(latest) {
+			latest = status.Changed
+		}
+	}
+	for _, validation := range claim.Validations {
+		if validation == nil {
+			continue
+		}
+		if validation.Accessed.After(latest) {
+			latest = validation.Accessed
+		}
+		for _, status := range validation.StatusHistory {
+			if status.Changed.After(latest) {
+				latest = status.Changed
+			}
+		}
+	}
+	return latest
+}
+
+func latestTestamentActivityTime(testament claims.Testament) time.Time {
+	latest := testament.Created
+	if testament.Accessed.After(latest) {
+		latest = testament.Accessed
+	}
+	for _, artifact := range testament.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		if artifact.Created.After(latest) {
+			latest = artifact.Created
+		}
+		if artifact.Accessed.After(latest) {
+			latest = artifact.Accessed
+		}
+	}
+	return latest
 }
 
 // persistContinuationLocked writes a ConsultContinuation claim to the
@@ -586,6 +840,7 @@ func (s *ContinuationStore) persistContinuationLocked(
 	snapshot *TurnSnapshot,
 	consultIDs []string,
 	deadline time.Time,
+	idleWindow time.Duration,
 	alreadyResolved map[string]*claims.ConsultResolvedDelta,
 ) (string, error) {
 	if s.board == nil {
@@ -623,8 +878,11 @@ func (s *ContinuationStore) persistContinuationLocked(
 			SessionID: s.sessionID,
 			Kind:      claims.ArtifactKindContinuationAwait,
 			Reference: cid,
-			Metadata:  map[string]any{"deadline": deadline.UTC().Format(time.RFC3339Nano)},
-			Created:   time.Now().UTC(),
+			Metadata: map[string]any{
+				"deadline":        deadline.UTC().Format(time.RFC3339Nano),
+				"idle_timeout_ms": idleWindow.Milliseconds(),
+			},
+			Created: time.Now().UTC(),
 		})
 	}
 
@@ -851,7 +1109,7 @@ func (s *ContinuationStore) RecoverPendingContinuations(ctx context.Context) int
 			// (cancelled / abandoned) — don't reload.
 			continue
 		}
-		snapshot, awaitedIDs, deadline, err := loadContinuationFromBoard(s.board, c.ID)
+		snapshot, awaitedIDs, deadline, idleWindow, err := loadContinuationFromBoard(s.board, c.ID)
 		if err != nil {
 			slog.Warn("continuation_recovery_load_failed",
 				"agent_id", s.agentID, "continuation_id", c.ID,
@@ -882,18 +1140,20 @@ func (s *ContinuationStore) RecoverPendingContinuations(ctx context.Context) int
 			awaiting[id] = struct{}{}
 		}
 		pending := &pendingContinuation{
-			id:       c.ID,
-			snapshot: snapshot,
-			awaiting: awaiting,
-			resolved: make(map[string]*claims.ConsultResolvedDelta),
-			deadline: deadline,
+			id:         c.ID,
+			snapshot:   snapshot,
+			awaiting:   awaiting,
+			resolved:   make(map[string]*claims.ConsultResolvedDelta),
+			deadline:   deadline,
+			idleWindow: idleWindow,
+			activity:   s.recoveredConsultActivity(awaitedIDs, snapshot.YieldedAt),
 		}
 		s.pending[c.ID] = pending
 		for id := range awaiting {
 			s.consultIndex[id] = c.ID
 		}
 		s.mu.Unlock()
-		s.startDeadlineWatcher(c.ID, deadline)
+		s.startDeadlineWatcher(c.ID, idleWindow)
 		recovered++
 	}
 	if recovered > 0 {
@@ -940,18 +1200,19 @@ func claimHasPendingReceipt(c claims.Claim) bool {
 // continuation_context artifact into a TurnSnapshot, and extracts
 // the awaited consult IDs from continuation_await artifacts. Returns
 // the snapshot, awaited IDs, deadline (latest of any await
-// artifact's deadline metadata), and any decode error.
-func loadContinuationFromBoard(board *claims.ClaimsBoard, continuationID string) (*TurnSnapshot, []string, time.Time, error) {
+// artifact's deadline metadata), idle timeout, and any decode error.
+func loadContinuationFromBoard(board *claims.ClaimsBoard, continuationID string) (*TurnSnapshot, []string, time.Time, time.Duration, error) {
 	if board == nil {
-		return nil, nil, time.Time{}, fmt.Errorf("nil board")
+		return nil, nil, time.Time{}, 0, fmt.Errorf("nil board")
 	}
 	proj := board.Projection()
 	if proj == nil {
-		return nil, nil, time.Time{}, fmt.Errorf("nil projection")
+		return nil, nil, time.Time{}, 0, fmt.Errorf("nil projection")
 	}
 	var snapshot *TurnSnapshot
 	awaitedIDs := make([]string, 0, 4)
 	var deadline time.Time
+	var idleTimeout time.Duration
 	for i := range proj.Testaments {
 		t := proj.Testaments[i]
 		if !testamentRelatesToClaim(t, continuationID) {
@@ -965,7 +1226,7 @@ func loadContinuationFromBoard(board *claims.ClaimsBoard, continuationID string)
 			case claims.ArtifactKindContinuationContext:
 				var s TurnSnapshot
 				if err := json.Unmarshal([]byte(art.Reference), &s); err != nil {
-					return nil, nil, time.Time{}, fmt.Errorf("decode continuation_context: %w", err)
+					return nil, nil, time.Time{}, 0, fmt.Errorf("decode continuation_context: %w", err)
 				}
 				snapshot = &s
 			case claims.ArtifactKindContinuationAwait:
@@ -975,17 +1236,58 @@ func loadContinuationFromBoard(board *claims.ClaimsBoard, continuationID string)
 						deadline = dl
 					}
 				}
+				if raw, ok := art.Metadata["idle_timeout_ms"]; ok {
+					if ms := metadataInt64(raw); ms > 0 {
+						d := time.Duration(ms) * time.Millisecond
+						if d > idleTimeout {
+							idleTimeout = d
+						}
+					}
+				}
 			}
 		}
 	}
 	if snapshot == nil {
-		return nil, nil, time.Time{}, fmt.Errorf("no continuation_context artifact found")
+		return nil, nil, time.Time{}, 0, fmt.Errorf("no continuation_context artifact found")
 	}
 	if deadline.IsZero() {
 		// Fall back to snapshot's own AwaitDeadline.
 		deadline = snapshot.AwaitDeadline
 	}
-	return snapshot, awaitedIDs, deadline, nil
+	if idleTimeout <= 0 {
+		idleTimeout = awaitIdleTimeout(snapshot, deadline)
+	}
+	return snapshot, awaitedIDs, deadline, idleTimeout, nil
+}
+
+func awaitIdleTimeout(snapshot *TurnSnapshot, deadline time.Time) time.Duration {
+	if snapshot != nil && !snapshot.YieldedAt.IsZero() && deadline.After(snapshot.YieldedAt) {
+		return deadline.Sub(snapshot.YieldedAt)
+	}
+	if deadline.After(time.Now()) {
+		return time.Until(deadline)
+	}
+	return 5 * time.Minute
+}
+
+func metadataInt64(value any) int64 {
+	switch v := value.(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	case json.Number:
+		n, _ := v.Int64()
+		return n
+	case string:
+		var n int64
+		if _, err := fmt.Sscan(v, &n); err == nil {
+			return n
+		}
+	}
+	return 0
 }
 
 // testamentRelatesToClaim reports whether t carries a RelationshipClaim

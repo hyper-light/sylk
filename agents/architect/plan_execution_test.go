@@ -11,9 +11,11 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/dag"
 	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/skills"
 )
 
 func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
@@ -30,7 +32,22 @@ func testArchitectWithStore(t *testing.T, plans ...*DesignPlan) *Architect {
 		logger:      slog.Default(),
 		pendingBus:  make(map[string]*agentshared.PendingSyncWait),
 		knownAgents: make(map[string]*guide.AgentAnnouncement),
+		steering:    agentshared.NewSteeringManager(),
 	}
+}
+
+func stampPlanReviewArtifactForTest(plan *DesignPlan) {
+	if plan == nil {
+		return
+	}
+	markdown := strings.TrimSpace(formatPlanForChat(plan))
+	if markdown == "" {
+		return
+	}
+	plan.PlanMarkdownArtifactID = "artifact-" + plan.ID
+	plan.PlanMarkdownReplaceKey = planMarkdownReplaceKey(plan.ID)
+	plan.PlanMarkdownContentHash = planMarkdownContentHash(markdown)
+	plan.PlanMarkdownArtifactEpoch = planMarkdownArtifactEpoch(plan)
 }
 
 type captureConversationPlanner struct {
@@ -265,6 +282,564 @@ func TestLatestStalledPlanForRequest_FiltersByCorrelation(t *testing.T) {
 	}
 }
 
+func TestShouldFallbackToPlanningProtocolAfterConversation(t *testing.T) {
+	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, nil, nil) {
+		t.Fatal("plan intent without a current plan should fall back to protocol")
+	}
+	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentDesign}, nil, nil) {
+		t.Fatal("design intent without a current plan should fall back to protocol")
+	}
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentChat}, nil, nil) {
+		t.Fatal("chat intent should not fall back to planning protocol")
+	}
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, &DesignPlan{}, nil) {
+		t.Fatal("ready plan should satisfy the planning conversation")
+	}
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, nil, &DesignPlan{}) {
+		t.Fatal("stalled current-request plan should be recovered instead of falling back")
+	}
+}
+
+func TestShouldDeferPlanningProtocolForUserConfirmation(t *testing.T) {
+	cases := []string{
+		"The whole thing is maybe five files. Want me to put together a plan for it, or would you prefer a different shape?",
+		"Would you like me to draft the plan now?",
+		"Let me know if you want me to formalize this into a plan.",
+	}
+	for _, tc := range cases {
+		if !shouldDeferPlanningProtocolForUserConfirmation(tc) {
+			t.Fatalf("shouldDeferPlanningProtocolForUserConfirmation(%q) = false, want true", tc)
+		}
+	}
+	if shouldDeferPlanningProtocolForUserConfirmation("The plan is ready for review.") {
+		t.Fatal("ready-plan narrative should not defer planning fallback")
+	}
+	if shouldDeferPlanningProtocolForUserConfirmation("This is a straightforward Python CLI with no external dependencies.") {
+		t.Fatal("non-plan advisory text should not defer planning fallback")
+	}
+}
+
+func TestExecuteConversation_DefersProtocolFallbackWhenAskingUserToConfirmPlanning(t *testing.T) {
+	a := testArchitectWithStore(t)
+	planner := &captureConversationPlanner{
+		response: "The whole thing is maybe five files. Want me to put together a plan for it, or would you prefer a different shape?",
+	}
+	a.config.EnableLLM = true
+	a.planner = planner
+
+	result, err := a.executeConversation(context.Background(), &ArchitectRequest{
+		Intent:    IntentPlan,
+		Query:     "Let's create a toy python hello world cli app.",
+		SessionID: "sess-confirm-plan",
+	})
+	if err != nil {
+		t.Fatalf("executeConversation error = %v", err)
+	}
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != planner.response {
+		t.Fatalf("response = %q, want planner confirmation offer", conv.Response)
+	}
+	if conv.Directive != nil {
+		t.Fatalf("directive = %+v, want nil before the user confirms planning", conv.Directive)
+	}
+}
+
+func TestResponseDirectiveForDesignPlanRequestsApprovalDialog(t *testing.T) {
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 16})
+	t.Cleanup(func() { _ = bus.Close() })
+
+	requests := make(chan *guide.RouteRequest, 1)
+	sub, err := bus.Subscribe(guide.TopicGuideRequests, func(m *guide.Message) error {
+		if m == nil {
+			return nil
+		}
+		switch payload := m.Payload.(type) {
+		case *guide.RouteRequest:
+			requests <- payload
+		case guide.RouteRequest:
+			req := payload
+			requests <- &req
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	a := newTestArchitect(t, Config{
+		SessionID:                        "approval-dialog-session",
+		AllowPlanningWithoutConsultation: true,
+	})
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-approval-dialog-session",
+		SessionID: "approval-dialog-session",
+	})
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.ReplaceForReason("approval-dialog-session", board, "test approval dialog review artifact")
+	t.Cleanup(func() { registry.Remove("approval-dialog-session") })
+	if err := a.Start(bus); err != nil {
+		t.Fatalf("start architect: %v", err)
+	}
+
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:           "plan-ready-dialog",
+		SessionID:    "approval-dialog-session",
+		Query:        "Create a toy CLI",
+		Status:       PlanStatusReady,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		UserResponse: "The plan is ready for your review.",
+		Tasks: []*AtomicTask{{
+			ID:          "task-1",
+			Name:        "Create CLI",
+			AgentType:   "engineer",
+			Status:      TaskStatusPending,
+			Description: "Build the CLI entrypoint.",
+		}},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusReady)
+	plan.PlanMarkdownArtifactID = "artifact-plan-ready-dialog"
+	plan.PlanMarkdownReplaceKey = planMarkdownReplaceKey(plan.ID)
+	plan.PlanMarkdownContentHash = planMarkdownContentHash(strings.TrimSpace(formatPlanForChat(plan)))
+	plan.PlanMarkdownArtifactEpoch = planMarkdownArtifactEpoch(plan)
+	if err := a.planStore.Upsert(plan); err != nil {
+		t.Fatalf("upsert plan: %v", err)
+	}
+
+	ctx := withArchitectStreamContext(context.Background(), "architect-corr", "tui")
+	directive := a.responseDirectiveForResult(ctx, plan)
+	if directive == nil || directive.Phase != guide.PhasePlanApproval {
+		t.Fatalf("expected plan approval directive, got %#v", directive)
+	}
+
+	select {
+	case req := <-requests:
+		if req.TargetAgentID != "guardian" {
+			t.Fatalf("approval request target = %q, want guardian", req.TargetAgentID)
+		}
+		if req.Metadata["direct_skill"] != planApprovalGateSkillName {
+			t.Fatalf("direct_skill = %#v, want %q", req.Metadata["direct_skill"], planApprovalGateSkillName)
+		}
+		if req.Metadata["plan_id"] != plan.ID {
+			t.Fatalf("plan_id metadata = %#v, want %q", req.Metadata["plan_id"], plan.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for plan approval dialog request")
+	}
+
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil || stored.PendingWork == nil {
+		t.Fatalf("expected pending plan approval work, got %#v", stored)
+	}
+	if stored.PendingWork.Kind != string(continuationKindPlanApproval) {
+		t.Fatalf("pending work kind = %q, want %q", stored.PendingWork.Kind, continuationKindPlanApproval)
+	}
+}
+
+func TestHandlePlanSkillGenerateTasksPublishesApprovalDialog(t *testing.T) {
+	sessionID := "generate-dialog-session"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-" + sessionID,
+		SessionID: sessionID,
+	})
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.ReplaceForReason(sessionID, board, "test generate_tasks approval dialog")
+	t.Cleanup(func() { registry.Remove(sessionID) })
+
+	bus := guide.NewChannelBus(guide.ChannelBusConfig{BufferSize: 16})
+	t.Cleanup(func() { _ = bus.Close() })
+	requests := make(chan *guide.RouteRequest, 8)
+	sub, err := bus.Subscribe(guide.TopicGuideRequests, func(m *guide.Message) error {
+		if m == nil {
+			return nil
+		}
+		switch payload := m.Payload.(type) {
+		case *guide.RouteRequest:
+			requests <- payload
+		case guide.RouteRequest:
+			req := payload
+			requests <- &req
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("subscribe guide requests: %v", err)
+	}
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	a := newTestArchitect(t, Config{
+		SessionID:                        sessionID,
+		AllowPlanningWithoutConsultation: true,
+	})
+	if err := a.Start(bus); err != nil {
+		t.Fatalf("start architect: %v", err)
+	}
+
+	requirements := &Requirements{
+		Query: "Create a toy Python hello world CLI application.",
+		Goals: []string{
+			"Create a toy Python hello world CLI application.",
+		},
+		Metadata: map[string]any{metadataRecommendedPath: metadataMinimalPath},
+	}
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:                   "plan-generate-dialog",
+		SessionID:            sessionID,
+		Query:                requirements.Query,
+		Status:               PlanStatusDesigning,
+		Revision:             1,
+		Requirements:         requirements,
+		Architecture:         minimalArchitectureFromRequirements(requirements),
+		Constraints:          &PlanConstraints{MaxTasksPerAgent: 5, AllowParallel: true},
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		RequestCorrelationID: "corr-generate-dialog",
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusDesigning)
+	if err := a.planStore.Upsert(plan); err != nil {
+		t.Fatalf("upsert plan: %v", err)
+	}
+
+	result, err := handlePlanSkillGenerateTasks(a, withArchitectStreamContext(context.Background(), "corr-generate-dialog", "tui"), &planInput{PlanID: plan.ID})
+	if err != nil {
+		t.Fatalf("handlePlanSkillGenerateTasks: %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["plan_status"] != PlanStatusReady.String() {
+		t.Fatalf("plan_status = %#v, want ready", payload["plan_status"])
+	}
+
+	var approvalReq *guide.RouteRequest
+	deadline := time.After(time.Second)
+	for approvalReq == nil {
+		select {
+		case req := <-requests:
+			if req != nil && req.Metadata["direct_skill"] == planApprovalGateSkillName {
+				approvalReq = req
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for plan approval dialog request")
+		}
+	}
+	if approvalReq.TargetAgentID != "guardian" {
+		t.Fatalf("approval request target = %q, want guardian", approvalReq.TargetAgentID)
+	}
+	if approvalReq.Metadata["plan_id"] != plan.ID {
+		t.Fatalf("approval request plan_id = %#v, want %q", approvalReq.Metadata["plan_id"], plan.ID)
+	}
+
+	stored := a.planStore.Get(plan.ID)
+	if stored == nil || stored.PendingWork == nil {
+		t.Fatalf("expected pending plan approval work, got %#v", stored)
+	}
+	if stored.PendingWork.Kind != string(continuationKindPlanApproval) {
+		t.Fatalf("pending work kind = %q, want %q", stored.PendingWork.Kind, continuationKindPlanApproval)
+	}
+	if strings.TrimSpace(stored.PlanMarkdownArtifactID) == "" {
+		t.Fatal("expected plan markdown artifact to be recorded")
+	}
+}
+
+func TestHandlePlanSkillDesignRequiresFreshConsultationEvidence(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-needs-evidence",
+		SessionID: "sess1",
+		Status:    PlanStatusAnalyzing,
+		Requirements: &Requirements{
+			Query: "create a toy hello world cli",
+			Goals: []string{"create a toy hello world cli"},
+			Scope: "project",
+		},
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillDesign(a, context.Background(), &planInput{PlanID: plan.ID})
+	if err != nil {
+		t.Fatalf("handlePlanSkillDesign error = %v, want structured consultation gate", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["requires_consultation"] != true || payload["ready_for_design"] != false {
+		t.Fatalf("design gate payload = %#v, want requires_consultation=true and ready_for_design=false", payload)
+	}
+	if payload["required_tool"] != "consult_peer" {
+		t.Fatalf("required_tool = %#v, want consult_peer", payload["required_tool"])
+	}
+}
+
+func TestHandlePlanSkillStartRequiresFreshPlanningEvidence(t *testing.T) {
+	a := newTestArchitect(t, Config{SessionID: "sess-start-gate"})
+	ctx := architectEvidenceTestContext("sess-start-gate", "corr-start-gate")
+
+	payload, err := json.Marshal(map[string]any{
+		"action": "start",
+		"query":  "Create a toy Python hello world CLI application.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	result := a.InvokeSkill(ctx, "plan", payload)
+	if result == nil || !result.Success {
+		t.Fatalf("plan(action=start) should return a structured gate, got %+v", result)
+	}
+	data, ok := result.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("start result data type = %T", result.Data)
+	}
+	if data["requires_consultation"] != true || data["ready_for_start"] != false {
+		t.Fatalf("start gate payload = %#v, want requires_consultation=true and ready_for_start=false", data)
+	}
+	if data["required_before"] != "plan(action=start)" || data["required_tool"] != "consult_peer" {
+		t.Fatalf("start gate required fields = %#v", data)
+	}
+	if _, ok := data["plan_id"]; ok {
+		t.Fatalf("start gate must not create a plan_id before evidence: %#v", data)
+	}
+	if got := len(a.planStore.Snapshot()); got != 0 {
+		t.Fatalf("plan store count = %d, want 0 before first-phase evidence", got)
+	}
+}
+
+func TestHandlePlanSkillStartAllowsFreshStagedPlanningEvidence(t *testing.T) {
+	a := newTestArchitect(t, Config{SessionID: "sess-start-evidence"})
+	ctx := architectEvidenceTestContext("sess-start-evidence", "corr-start-evidence")
+	if err := a.captureConsultPeerEvidence(ctx, &skills.ToolCallHookData{
+		ToolName: "consult_peer",
+		Input: map[string]any{
+			"target_agent_type": "librarian",
+			"query":             "Find Python CLI patterns.",
+		},
+		Output: map[string]any{
+			"consult_id": "consult-before-start",
+			"status":     "completed",
+			"response": map[string]any{
+				"summary": "No existing Python package structure; keep the CLI minimal.",
+			},
+		},
+	}); err != nil {
+		t.Fatalf("captureConsultPeerEvidence: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"action": "start",
+		"query":  "Create a toy Python hello world CLI application.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	result := a.InvokeSkill(ctx, "plan", payload)
+	if result == nil || !result.Success {
+		t.Fatalf("plan(action=start) failed after staged evidence: %+v", result)
+	}
+	data, ok := result.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("start result data type = %T", result.Data)
+	}
+	planID, _ := data["plan_id"].(string)
+	if planID == "" {
+		t.Fatalf("expected plan_id after fresh evidence, got %#v", data)
+	}
+	plan := a.planStore.Get(planID)
+	if plan == nil || !planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+		t.Fatalf("created plan missing fresh staged evidence: %+v", plan)
+	}
+}
+
+func TestHandlePlanSkillAnalyzeRequiresFreshPlanningEvidence(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-analyze-needs-evidence",
+		SessionID: "sess1",
+		Query:     "create a toy hello world cli",
+		Status:    PlanStatusPending,
+		UpdatedAt: now,
+		CreatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.MandatoryConsultation = true
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillAnalyze(a, context.Background(), &planInput{
+		PlanID: plan.ID,
+		Query:  "create a toy hello world cli",
+	})
+	if err != nil {
+		t.Fatalf("handlePlanSkillAnalyze error = %v, want structured consultation gate", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["requires_consultation"] != true || payload["ready_for_analyze"] != false {
+		t.Fatalf("analyze gate payload = %#v, want requires_consultation=true and ready_for_analyze=false", payload)
+	}
+	if payload["required_before"] != "plan(action=analyze)" || payload["required_tool"] != "consult_peer" {
+		t.Fatalf("analyze gate required fields = %#v", payload)
+	}
+}
+
+func TestHandlePlanSkillAnalyzeAllowsFreshPlanningEvidence(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-analyze-with-evidence",
+		SessionID: "sess1",
+		Query:     "create a toy hello world cli",
+		Status:    PlanStatusPending,
+		EvidenceTrail: []*PlanEvidence{{
+			Kind:       EvidenceKindConsult,
+			Target:     "librarian",
+			Query:      "current project structure for toy hello world cli",
+			Success:    true,
+			Summary:    "No existing Python package structure; keep it minimal.",
+			ReceivedAt: now,
+		}},
+		UpdatedAt: now,
+		CreatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.MandatoryConsultation = true
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillAnalyze(a, context.Background(), &planInput{
+		PlanID: plan.ID,
+		Query:  "create a toy hello world cli",
+	})
+	if err != nil {
+		t.Fatalf("handlePlanSkillAnalyze error = %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["requirements"] == nil {
+		t.Fatal("expected requirements after fresh evidence")
+	}
+}
+
+func TestHandlePlanSkillDesignAllowsFreshConsultationEvidence(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-with-evidence",
+		SessionID: "sess1",
+		Status:    PlanStatusAnalyzing,
+		Requirements: &Requirements{
+			Query: "create a toy hello world cli",
+			Goals: []string{"create a toy hello world cli"},
+			Scope: "project",
+		},
+		EvidenceTrail: []*PlanEvidence{{
+			Kind:       EvidenceKindConsult,
+			Target:     "librarian",
+			Query:      "current project structure for toy hello world cli",
+			Success:    true,
+			Summary:    "No existing Python package structure; keep it minimal.",
+			ReceivedAt: now,
+		}},
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillDesign(a, context.Background(), &planInput{PlanID: plan.ID})
+	if err != nil {
+		t.Fatalf("handlePlanSkillDesign error = %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["architecture"] == nil {
+		t.Fatal("expected architecture in design result")
+	}
+}
+
+func TestHandlePlanSkillDesignAllowsFreshContinuityEvidence(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-with-continuity",
+		SessionID: "sess1",
+		Status:    PlanStatusAnalyzing,
+		Requirements: &Requirements{
+			Query: "create a toy hello world cli",
+			Goals: []string{"create a toy hello world cli"},
+			Scope: "project",
+		},
+		EvidenceTrail: []*PlanEvidence{{
+			Kind:       EvidenceKindContinuity,
+			Target:     "continuity",
+			Query:      "python cli plan",
+			Success:    true,
+			Summary:    "Carried-forward Librarian evidence says there is no existing Python package structure; keep it minimal.",
+			ReceivedAt: now,
+			SourceTool: recallForwardToolName,
+		}},
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillDesign(a, context.Background(), &planInput{PlanID: plan.ID})
+	if err != nil {
+		t.Fatalf("handlePlanSkillDesign error = %v", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["architecture"] == nil {
+		t.Fatal("expected architecture in design result")
+	}
+	if payload["fresh_planning_evidence"] != true {
+		t.Fatalf("fresh_planning_evidence = %#v, want true", payload["fresh_planning_evidence"])
+	}
+}
+
+func TestHandlePlanSkillGenerateTasksRequiresFreshConsultationBeforeMinimalShortcut(t *testing.T) {
+	now := time.Now()
+	plan := &DesignPlan{
+		ID:        "plan-generate-needs-evidence",
+		SessionID: "sess1",
+		Status:    PlanStatusAnalyzing,
+		Requirements: &Requirements{
+			Query: "create a toy hello world cli",
+			Goals: []string{"create a toy hello world cli"},
+			Scope: "project",
+			Metadata: map[string]any{
+				metadataMinimalPath: true,
+			},
+		},
+		UpdatedAt: now,
+	}
+	a := testArchitectWithStore(t, plan)
+	a.config.ConsultationMaxAge = DefaultConsultationMaxAge
+
+	result, err := handlePlanSkillGenerateTasks(a, context.Background(), &planInput{PlanID: plan.ID})
+	if err != nil {
+		t.Fatalf("handlePlanSkillGenerateTasks error = %v, want structured consultation gate", err)
+	}
+	payload, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]any", result)
+	}
+	if payload["requires_consultation"] != true || payload["ready_for_design"] != false {
+		t.Fatalf("generate_tasks gate payload = %#v, want consultation gate", payload)
+	}
+	if plan.Architecture != nil {
+		t.Fatal("generate_tasks should not synthesize architecture before consultation evidence")
+	}
+}
+
 func TestLatestActivePendingPlan_SelectsMostRecent(t *testing.T) {
 	now := time.Now().UTC()
 	a := testArchitectWithStore(t,
@@ -388,6 +963,118 @@ func TestHandleConversation_UsesMetadataPlanIDAcrossSessionDrift(t *testing.T) {
 	}
 	if conv.Response != "Guardian is still reviewing the plan." {
 		t.Fatalf("response = %q, want pending message", conv.Response)
+	}
+}
+
+func TestHandleConversation_FreshDesignIgnoresActivePendingPlan(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-pending-old",
+		SessionID: "sess1",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+		PendingWork: &PendingContinuation{
+			Kind:      string(continuationKindGuardianApproval),
+			Status:    string(continuationStatusPending),
+			Message:   "Guardian is still reviewing the old plan.",
+			ExpiresAt: now.Add(time.Minute),
+		},
+	}
+	currentPlan := &DesignPlan{
+		ID:                   "plan-current-request",
+		SessionID:            "sess1",
+		Status:               PlanStatusReady,
+		RequestCorrelationID: "corr-fresh-design",
+		UpdatedAt:            now,
+		Tasks: []*AtomicTask{{
+			ID:          "task-current",
+			Name:        "Build CLI",
+			AgentType:   "engineer",
+			Status:      TaskStatusPending,
+			Description: "Build the current request.",
+		}},
+	}
+	stampPlanReviewArtifactForTest(currentPlan)
+	a := testArchitectWithStore(t, plan, currentPlan)
+	planner := &captureConversationPlanner{response: "planner handled fresh request"}
+	a.config.EnableLLM = true
+	a.planner = planner
+
+	ctx := withArchitectStreamContext(context.Background(), "corr-fresh-design", "tui")
+	result, err := a.handleConversation(ctx, &guide.ForwardedRequest{
+		Input:     "Let's create a toy python hello world cli app.",
+		SessionID: "sess1",
+		Intent:    guide.IntentDesign,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner handled fresh request" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
+	}
+	if conv.Directive == nil || conv.Directive.Metadata["plan_id"] != currentPlan.ID {
+		t.Fatalf("directive = %+v, want current request plan %q", conv.Directive, currentPlan.ID)
+	}
+	if planner.lastRequest.Mode != plannerConversationModeConverse {
+		t.Fatalf("mode = %q, want %q", planner.lastRequest.Mode, plannerConversationModeConverse)
+	}
+	if planner.lastRequest.PlanID != "" || planner.lastRequest.PlanSummary != "" {
+		t.Fatalf("unexpected old plan context: plan_id=%q summary=%q", planner.lastRequest.PlanID, planner.lastRequest.PlanSummary)
+	}
+}
+
+func TestHandleConversation_FreshPlanIgnoresStalePlanApprovalMetadata(t *testing.T) {
+	now := time.Now().UTC()
+	plan := &DesignPlan{
+		ID:        "plan-ready-old",
+		SessionID: "sess1",
+		Query:     "old ready plan",
+		Status:    PlanStatusReady,
+		UpdatedAt: now,
+	}
+	currentPlan := &DesignPlan{
+		ID:                   "plan-current-fresh",
+		SessionID:            "sess1",
+		Status:               PlanStatusReady,
+		RequestCorrelationID: "corr-fresh-plan",
+		UpdatedAt:            now,
+		Tasks: []*AtomicTask{{
+			ID:          "task-current",
+			Name:        "Build CLI",
+			AgentType:   "engineer",
+			Status:      TaskStatusPending,
+			Description: "Build the current request.",
+		}},
+	}
+	stampPlanReviewArtifactForTest(currentPlan)
+	a := testArchitectWithStore(t, plan, currentPlan)
+	planner := &captureConversationPlanner{response: "planner handled fresh plan"}
+	a.config.EnableLLM = true
+	a.planner = planner
+
+	ctx := withArchitectStreamContext(context.Background(), "corr-fresh-plan", "tui")
+	result, err := a.handleConversation(ctx, &guide.ForwardedRequest{
+		Input:     "Let's create a toy python hello world cli app.",
+		SessionID: "sess1",
+		Metadata:  map[string]any{"plan_id": plan.ID, "epoch": uint64(1)},
+		Intent:    guide.IntentPlan,
+	})
+	if err != nil {
+		t.Fatalf("handleConversation error = %v", err)
+	}
+	conv := unwrapConversationResult(t, result)
+	if conv.Response != "planner handled fresh plan" {
+		t.Fatalf("response = %q, want planner response", conv.Response)
+	}
+	if conv.Directive == nil || conv.Directive.Metadata["plan_id"] != currentPlan.ID {
+		t.Fatalf("directive = %+v, want current request plan %q", conv.Directive, currentPlan.ID)
+	}
+	if planner.lastRequest.Mode != plannerConversationModeConverse {
+		t.Fatalf("mode = %q, want %q", planner.lastRequest.Mode, plannerConversationModeConverse)
+	}
+	if planner.lastRequest.PlanID != "" || planner.lastRequest.PlanSummary != "" {
+		t.Fatalf("unexpected old plan context: plan_id=%q summary=%q", planner.lastRequest.PlanID, planner.lastRequest.PlanSummary)
 	}
 }
 

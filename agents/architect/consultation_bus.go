@@ -280,11 +280,12 @@ func (a *Architect) requestConsultationWithMetadata(
 	// if any gate fails we fall through to a real consultation. The
 	// gates are derived from observable quantities — no thresholds.
 	// See agents/shared/consultation_cache.go for the full rationale.
-	if cacheHit := shared.LookupSessionConsultationCache(
+	if cacheHit := shared.LookupSessionConsultationCacheWithScope(
 		shared.DefaultSessionConsultationCache,
 		sessionID,
 		target,
 		query,
+		scope,
 		shared.ConsultationResearchDepth(req.Metadata),
 		shared.ConsultationDepthFromMetadata(req.Metadata)+1,
 	); cacheHit.Hit {
@@ -355,11 +356,12 @@ func (a *Architect) requestConsultationWithMetadata(
 	// validity window. Missing/zero ⇒ cache stores the entry but the
 	// lookup gate refuses to serve it (explicit contract).
 	if evidence != nil {
-		shared.StoreSessionConsultationCache(
+		shared.StoreSessionConsultationCacheWithScope(
 			shared.DefaultSessionConsultationCache,
 			sessionID,
 			target,
 			query,
+			scope,
 			evidence.Data,
 			shared.ExtractFreshnessHorizon(evidence.Data),
 			0, // reward: not yet computed at write time; cache uses similarity, not reward, for serve decisions
@@ -524,6 +526,12 @@ func (a *Architect) handleCancelAction(req *guide.ActionRequest) error {
 	} else if a.steering != nil {
 		cancelledCount = a.steering.CancelSession(sessionID)
 	}
+	a.logInfo("INTERRUPT_DEBUG: architect_cancel_action_applied",
+		"correlation_id", correlationID,
+		"session_id", sessionID,
+		"cancelled_count", cancelledCount,
+		"fire_and_forget", req.FireAndForget,
+	)
 
 	// Supersede any stalled plans for this session so the next request
 	// starts fresh rather than recovering old plans with stale intent.

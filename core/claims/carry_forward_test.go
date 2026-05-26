@@ -103,8 +103,14 @@ func TestCarryForwardAdvanceWritesContinuityAndRecallReadsIt(t *testing.T) {
 	if recall.Partial {
 		t.Fatalf("recall unexpectedly partial: %+v", recall.Diagnostics)
 	}
+	if !recall.Usable || recall.Status != RecallForwardStatusUsable {
+		t.Fatalf("recall status=%q usable=%v reason=%q, want usable", recall.Status, recall.Usable, recall.Reason)
+	}
 	if len(recall.Items) != 1 {
 		t.Fatalf("recall items = %d, want 1", len(recall.Items))
+	}
+	if recall.SourceIndexCount != 1 || !recall.HydrationAvailable || recall.Items[0].SourceIndexCount != 1 {
+		t.Fatalf("recall source index metadata = result count %d hydration %v item %+v", recall.SourceIndexCount, recall.HydrationAvailable, recall.Items[0])
 	}
 	if !strings.Contains(recall.WorkingContext, "pyproject.toml") {
 		t.Fatalf("working context did not include source digest: %q", recall.WorkingContext)
@@ -222,6 +228,12 @@ func TestRecallForwardUnknownTopicReturnsEmptySuccess(t *testing.T) {
 	}
 	if recall.Partial || len(recall.Items) != 0 || len(recall.Sources) != 0 {
 		t.Fatalf("unknown topic recall = partial=%v items=%d sources=%d diagnostics=%+v", recall.Partial, len(recall.Items), len(recall.Sources), recall.Diagnostics)
+	}
+	if recall.Usable || recall.Status != RecallForwardStatusMiss {
+		t.Fatalf("unknown topic status=%q usable=%v reason=%q, want miss", recall.Status, recall.Usable, recall.Reason)
+	}
+	if recall.RecommendedNextAction == "" || !strings.Contains(recall.RecommendedNextAction, "carry_forward") {
+		t.Fatalf("unknown topic next action = %q, want carry_forward guidance", recall.RecommendedNextAction)
 	}
 }
 
@@ -379,6 +391,9 @@ func TestRecallForwardCrossSessionUsesSessionCursorAndReportsPartialWithoutOpene
 	if !partial.Partial || len(partial.Items) != 1 {
 		t.Fatalf("recall without opener = partial=%v items=%d diagnostics=%+v", partial.Partial, len(partial.Items), partial.Diagnostics)
 	}
+	if partial.Usable || partial.Status != RecallForwardStatusPartial {
+		t.Fatalf("partial recall status=%q usable=%v reason=%q, want partial unusable", partial.Status, partial.Usable, partial.Reason)
+	}
 
 	full, err := RecallForward(context.Background(), current, RecallForwardOptions{
 		AgentID:          "architect",
@@ -397,6 +412,9 @@ func TestRecallForwardCrossSessionUsesSessionCursorAndReportsPartialWithoutOpene
 	}
 	if full.Partial {
 		t.Fatalf("full recall unexpectedly partial: %+v", full.Diagnostics)
+	}
+	if !full.Usable || full.Status != RecallForwardStatusUsable {
+		t.Fatalf("full recall status=%q usable=%v reason=%q, want usable", full.Status, full.Usable, full.Reason)
 	}
 	if len(full.Items) != 2 {
 		t.Fatalf("full recall items = %d, want current + previous", len(full.Items))
@@ -736,6 +754,9 @@ func TestRecallForwardReportsStaleContradictedAndProjectionDiagnostics(t *testin
 	if !recall.Stale || !recall.Contradicted {
 		t.Fatalf("recall stale=%v contradicted=%v, want both true", recall.Stale, recall.Contradicted)
 	}
+	if recall.Usable || recall.Status != RecallForwardStatusContradicted {
+		t.Fatalf("recall status=%q usable=%v reason=%q, want contradicted unusable", recall.Status, recall.Usable, recall.Reason)
+	}
 	if !diagnosticsContain(recall.Diagnostics, "projection_error projector=knowledge") {
 		t.Fatalf("projection diagnostic missing: %+v", recall.Diagnostics)
 	}
@@ -813,6 +834,9 @@ func TestCarryForwardAndRecallForwardSkillsInvoke(t *testing.T) {
 	if len(recallResult.Sources) != 1 {
 		t.Fatalf("recall skill sources = %+v, want one", recallResult.Sources)
 	}
+	if !recallResult.Usable || recallResult.Status != RecallForwardStatusUsable {
+		t.Fatalf("recall skill status=%q usable=%v reason=%q, want usable", recallResult.Status, recallResult.Usable, recallResult.Reason)
+	}
 }
 
 func TestRecallForwardUsesEnrichmentWithoutDirectContinuity(t *testing.T) {
@@ -839,6 +863,9 @@ func TestRecallForwardUsesEnrichmentWithoutDirectContinuity(t *testing.T) {
 	}
 	if len(recall.Enrichment) != 1 {
 		t.Fatalf("enrichment = %+v, want one deterministic hit", recall.Enrichment)
+	}
+	if recall.Usable || recall.Status != RecallForwardStatusInsufficient {
+		t.Fatalf("enrichment-only status=%q usable=%v reason=%q, want insufficient", recall.Status, recall.Usable, recall.Reason)
 	}
 	if provider.last.SessionID != board.SessionID() || provider.last.BoardID != board.BoardID() {
 		t.Fatalf("fallback enrichment query = %+v, want board/session scoped", provider.last)
@@ -885,6 +912,9 @@ func TestRecallForwardEnrichmentErrorCreatesProjectionArtifact(t *testing.T) {
 	}
 	if !recall.Partial || !diagnosticsContain(recall.Diagnostics, "archivalist enrichment lookup") {
 		t.Fatalf("recall diagnostics = %+v, want partial enrichment warning", recall.Diagnostics)
+	}
+	if recall.Usable || recall.Status != RecallForwardStatusPartial {
+		t.Fatalf("enrichment error status=%q usable=%v reason=%q, want partial unusable", recall.Status, recall.Usable, recall.Reason)
 	}
 	if !projectionArtifactExists(board, ArtifactKindProjectionError) {
 		t.Fatal("recall enrichment failure did not create projection_error artifact")
@@ -948,6 +978,9 @@ func TestLegacyRecall_ReconstructedContinuityMarked(t *testing.T) {
 	}
 	if !strings.Contains(recall.WorkingContext, "Click") {
 		t.Fatalf("working context not reconstructed from summary: %q", recall.WorkingContext)
+	}
+	if recall.Usable || recall.Status != RecallForwardStatusInsufficient {
+		t.Fatalf("legacy reconstructed status=%q usable=%v reason=%q, want insufficient", recall.Status, recall.Usable, recall.Reason)
 	}
 }
 

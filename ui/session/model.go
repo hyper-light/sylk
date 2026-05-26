@@ -244,11 +244,19 @@ func (m *Model) switchSession() tea.Cmd {
 // createSession creates a new session with a default configuration.
 func (m *Model) createSession() tea.Cmd {
 	cfg := coresession.DefaultConfig()
-	_, err := m.manager.Create(context.Background(), cfg)
+	created, err := m.manager.Create(context.Background(), cfg)
 	if err != nil {
 		return nil
 	}
+	createdID := ""
+	if created != nil {
+		createdID = created.ID()
+		_ = m.manager.Switch(created.ID())
+	}
 	m.refreshSummaries()
+	if createdID != "" {
+		m.selectSession(createdID)
+	}
 	return nil
 }
 
@@ -325,6 +333,15 @@ func (m *Model) selectedSummary() (SessionSummary, bool) {
 		return SessionSummary{}, false
 	}
 	return m.summaries[m.selected], true
+}
+
+func (m *Model) selectSession(sessionID string) {
+	for i, s := range m.summaries {
+		if s.ID == sessionID {
+			m.selected = i
+			return
+		}
+	}
 }
 
 // refreshSummaries rebuilds the summary list from the session manager.

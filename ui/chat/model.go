@@ -1901,6 +1901,8 @@ func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 			slot.planMarkdown = content
 			slot.planOffset = len(slot.accumulator.Content())
 			m.planID = update.PlanID
+			m.syncSlotToEntry(slot)
+			m.viewDirty = true
 			return
 		}
 		for _, slot := range m.streams {
@@ -1909,6 +1911,8 @@ func (m *Model) HandlePlanUpdate(update msg.PlanUpdateMsg) {
 				slot.planMarkdown = content
 				slot.planOffset = len(slot.accumulator.Content())
 				m.planID = update.PlanID
+				m.syncSlotToEntry(slot)
+				m.viewDirty = true
 				return
 			}
 		}
@@ -4231,8 +4235,39 @@ func (m *Model) handleDecorTick(now time.Time) {
 	// Invalidate entries with active (incomplete) tool calls for live timer.
 	m.tickActiveToolCalls()
 
+	// Invalidate user entries so the "you" badge ripple animates.
+	m.tickUserBadges()
+
 	// Flush buffered stream chunks to the history entry.
 	m.flushStreamRender()
+}
+
+// tickUserBadges clears the cached render of user entries so the
+// rainbow ripple on the "you" badge advances each DecorTick. The body
+// of a user prompt is stable text, so re-rendering is cheap (single
+// header + wrapped content) but necessary because the gradient phase
+// shifts with elapsed time.
+func (m *Model) tickUserBadges() {
+	m.history.mu.Lock()
+	dirty := false
+	for i := 0; i < m.history.count; i++ {
+		physical := m.history.logicalToPhysical(i)
+		if m.history.entries[physical].Source != SourceUser {
+			continue
+		}
+		if m.history.entries[physical].RenderedLines == nil {
+			continue
+		}
+		m.history.entries[physical].RenderedLines = nil
+		m.history.entries[physical].CodeRegions = nil
+		m.history.entries[physical].ToolCallRegions = nil
+		m.history.entries[physical].Height = -1
+		dirty = true
+	}
+	m.history.mu.Unlock()
+	if dirty {
+		m.viewDirty = true
+	}
 }
 
 // tickActiveToolCalls invalidates the render cache for entries with in-progress
@@ -4489,6 +4524,193 @@ func (m *Model) HasPendingCorrelation(correlationID string) bool {
 		return true
 	}
 	return false
+}
+
+// InterruptTarget identifies an active chat-side correlation that can be
+// cancelled through the Guide interrupt path.
+type InterruptTarget struct {
+	CorrelationID  string
+	AgentID        string
+	AgentType      string
+	RuntimeAgentID string
+	SessionID      string
+	StartedAt      time.Time
+}
+
+// ActiveInterruptTargets returns active stream, nested stream, and claims-cycle
+// correlations known to the chat panel. It is a fallback for app-level
+// interrupt targeting when the agent panel has not yet observed a richer
+// claims status event.
+func (m *Model) ActiveInterruptTargets() []InterruptTarget {
+	if m == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(m.streams)+len(m.nestedStreams)+len(m.claimCycleAnimations))
+	targets := make([]InterruptTarget, 0, len(seen))
+	add := func(target InterruptTarget) {
+		target.CorrelationID = strings.TrimSpace(target.CorrelationID)
+		if target.CorrelationID == "" {
+			return
+		}
+		if _, ok := seen[target.CorrelationID]; ok {
+			return
+		}
+		seen[target.CorrelationID] = struct{}{}
+		targets = append(targets, target)
+	}
+	for correlationID, slot := range m.streams {
+		if slot == nil || slot.accumulator == nil {
+			continue
+		}
+		entry := m.history.Get(slot.accumulator.EntryIndex())
+		started := slot.thinkingStart
+		if started.IsZero() && entry != nil {
+			started = entry.Timestamp
+		}
+		target := InterruptTarget{
+			CorrelationID: strings.TrimSpace(correlationID),
+			AgentID:       strings.TrimSpace(slot.agentID),
+			StartedAt:     started,
+		}
+		if entry != nil {
+			target.AgentID = firstNonEmptyString(entryVisibleAgentID(entry), entry.AgentID, target.AgentID)
+			target.AgentType = badgeAgentType(entry)
+			target.RuntimeAgentID = strings.TrimSpace(entry.RuntimeAgentID)
+			target.SessionID = strings.TrimSpace(entry.SessionID)
+		}
+		add(target)
+	}
+	for correlationID, slot := range m.nestedStreams {
+		if slot == nil || slot.done {
+			continue
+		}
+		add(InterruptTarget{
+			CorrelationID:  strings.TrimSpace(correlationID),
+			AgentID:        strings.TrimSpace(slot.activity.AgentID),
+			AgentType:      strings.TrimSpace(slot.activity.AgentType),
+			RuntimeAgentID: strings.TrimSpace(slot.activity.AgentID),
+			StartedAt:      slot.thinkingStart,
+		})
+	}
+	for cycleID, anim := range m.claimCycleAnimations {
+		idx := m.historyIndexForCorrelation(cycleID)
+		if idx < 0 {
+			continue
+		}
+		entry := m.history.Get(idx)
+		if entry == nil || !entry.Streaming {
+			continue
+		}
+		started := anim.started
+		if started.IsZero() {
+			started = entry.Timestamp
+		}
+		add(InterruptTarget{
+			CorrelationID:  interruptCorrelationForCycleEntry(entry, cycleID),
+			AgentID:        firstNonEmptyString(entryVisibleAgentID(entry), entry.AgentID, anim.agentID),
+			AgentType:      badgeAgentType(entry),
+			RuntimeAgentID: strings.TrimSpace(entry.RuntimeAgentID),
+			SessionID:      strings.TrimSpace(entry.SessionID),
+			StartedAt:      started,
+		})
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if targets[i].StartedAt.Equal(targets[j].StartedAt) {
+			return targets[i].CorrelationID < targets[j].CorrelationID
+		}
+		if targets[i].StartedAt.IsZero() {
+			return true
+		}
+		if targets[j].StartedAt.IsZero() {
+			return false
+		}
+		return targets[i].StartedAt.Before(targets[j].StartedAt)
+	})
+	return targets
+}
+
+// LatestActiveInterruptTarget returns the most recently started active target.
+func (m *Model) LatestActiveInterruptTarget() (InterruptTarget, bool) {
+	targets := m.ActiveInterruptTargets()
+	if len(targets) == 0 {
+		return InterruptTarget{}, false
+	}
+	return targets[len(targets)-1], true
+}
+
+func interruptCorrelationForCycleEntry(entry *ChatEntry, cycleID string) string {
+	cycleID = strings.TrimSpace(cycleID)
+	if entry == nil {
+		return cycleID
+	}
+	if cid := strings.TrimSpace(entry.CorrelationID); cid != "" && cid != cycleID {
+		return cid
+	}
+	for _, alt := range entry.AdditionalCorrelationIDs {
+		if cid := strings.TrimSpace(alt); cid != "" && cid != cycleID {
+			return cid
+		}
+	}
+	return cycleID
+}
+
+// MarkInterrupted stops any visible stream/claim animation associated with
+// correlationID. It is an optimistic UI projection for user-initiated
+// cancellation; authoritative terminal events may still arrive later.
+func (m *Model) MarkInterrupted(correlationID string) bool {
+	if m == nil {
+		return false
+	}
+	correlationID = strings.TrimSpace(correlationID)
+	if correlationID == "" {
+		return false
+	}
+	now := time.Now()
+	updated := false
+	idx := -1
+	if slot, ok := m.streams[correlationID]; ok && slot != nil && slot.accumulator != nil {
+		idx = slot.accumulator.EntryIndex()
+		m.finalizeCompletedStreamSlot(correlationID, slot, false, "interrupted")
+		updated = true
+	}
+	if idx < 0 {
+		idx = m.historyIndexForCorrelation(correlationID)
+	}
+	if idx >= 0 {
+		m.history.UpdateAt(idx, func(e *ChatEntry) {
+			finalizeToolCallsSyntheticRecursive(e.ToolCalls, now, false, "interrupted")
+			e.Streaming = false
+			if e.ThinkingElapsed <= 0 {
+				elapsed := now.Sub(e.Timestamp)
+				if elapsed < 0 {
+					elapsed = 0
+				}
+				e.ThinkingElapsed = elapsed
+			}
+			e.ThinkingText = ""
+			e.ThinkingStatus = "Interrupted"
+			e.ThinkingColor = ""
+			e.SteeringPending = false
+			invalidateChatEntryRender(e)
+		})
+		for cycleID := range m.claimCycleAnimations {
+			if m.historyIndexForCorrelation(cycleID) == idx {
+				delete(m.claimCycleAnimations, cycleID)
+			}
+		}
+		updated = true
+	}
+	if m.thinkingIdx == idx {
+		m.clearThinkingState()
+	}
+	if updated {
+		if idx >= 0 {
+			m.viewport.RemoveStreamState(idx)
+		}
+		m.streamRenderPending = len(m.streams) > 0
+		m.viewDirty = true
+	}
+	return updated
 }
 
 func (m *Model) updateThinkingAgent(agentID string) {
@@ -5937,7 +6159,7 @@ func (m *Model) startClaimCycleAnimation(cycleID, agentID, status string, idx in
 	if cycleID == "" || idx < 0 {
 		return
 	}
-	if m.historyEntryTerminalComplete(idx) {
+	if m.historyEntryTerminal(idx) {
 		delete(m.claimCycleAnimations, cycleID)
 		return
 	}
@@ -5963,7 +6185,7 @@ func (m *Model) seedClaimCycleThinkingEntry(idx int, agentID, status string, sta
 	}
 	text := fmt.Sprintf("%s  %s", spinnerFrames[0], formatToolDuration(thinkingElapsed(started, now)))
 	m.history.UpdateAt(idx, func(e *ChatEntry) {
-		if entryTerminalComplete(e) {
+		if entryTerminal(e) {
 			return
 		}
 		if e.ThinkingText == "" {
@@ -5985,10 +6207,27 @@ func (m *Model) historyEntryTerminalComplete(idx int) bool {
 	return entryTerminalComplete(m.history.Get(idx))
 }
 
+func (m *Model) historyEntryTerminal(idx int) bool {
+	if m == nil || idx < 0 {
+		return false
+	}
+	return entryTerminal(m.history.Get(idx))
+}
+
+func entryTerminal(e *ChatEntry) bool {
+	return entryTerminalComplete(e) || entryTerminalInterrupted(e)
+}
+
 func entryTerminalComplete(e *ChatEntry) bool {
 	return e != nil &&
 		!e.Streaming &&
 		strings.EqualFold(strings.TrimSpace(e.ThinkingStatus), "complete")
+}
+
+func entryTerminalInterrupted(e *ChatEntry) bool {
+	return e != nil &&
+		!e.Streaming &&
+		strings.EqualFold(strings.TrimSpace(e.ThinkingStatus), "interrupted")
 }
 
 // adoptCycleAttribution fills missing attribution on a cycle entry
@@ -6170,11 +6409,7 @@ func (m *Model) applyPresentationToActiveStream(ev msg.ClaimPresentationMsg, con
 }
 
 func (m *Model) presentationStreamSlot(ev msg.ClaimPresentationMsg) (string, *streamSlot) {
-	candidates := []string{
-		strings.TrimSpace(ev.CycleID),
-		strings.TrimSpace(ev.ClaimID),
-		metadataString(ev.Metadata, "stream_correlation_id", "correlation_id"),
-	}
+	candidates := presentationCorrelationCandidates(ev)
 	for _, id := range candidates {
 		if id == "" {
 			continue
@@ -6317,12 +6552,8 @@ func (m *Model) upsertStreamPresentation(slot *streamSlot, ev msg.ClaimPresentat
 }
 
 func (m *Model) applyPresentationToCycleEntry(ev msg.ClaimPresentationMsg, content string, state presentationDisplayState) bool {
-	cycleID := firstNonEmptyString(strings.TrimSpace(ev.CycleID), strings.TrimSpace(ev.ClaimID))
-	if cycleID == "" {
-		return false
-	}
-	idx := m.historyIndexForCorrelation(cycleID)
-	if idx < 0 {
+	cycleID, idx := m.presentationCycleEntry(ev)
+	if cycleID == "" || idx < 0 {
 		return false
 	}
 	placement := normalizePresentationPlacement(ev.Placement)
@@ -6356,6 +6587,43 @@ func (m *Model) applyPresentationToCycleEntry(ev msg.ClaimPresentationMsg, conte
 	}
 	m.viewDirty = true
 	return true
+}
+
+func (m *Model) presentationCycleEntry(ev msg.ClaimPresentationMsg) (string, int) {
+	for _, cycleID := range presentationCorrelationCandidates(ev) {
+		if cycleID == "" {
+			continue
+		}
+		if idx := m.historyIndexForCorrelation(cycleID); idx >= 0 {
+			return cycleID, idx
+		}
+	}
+	return "", -1
+}
+
+func presentationCorrelationCandidates(ev msg.ClaimPresentationMsg) []string {
+	raw := []string{
+		strings.TrimSpace(ev.CycleID),
+		strings.TrimSpace(ev.ClaimID),
+		metadataString(ev.Metadata, "stream_correlation_id"),
+		metadataString(ev.Metadata, "correlation_id"),
+		metadataString(ev.Metadata, "request_correlation_id"),
+		metadataString(ev.Metadata, "cycle_id"),
+	}
+	candidates := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		candidates = append(candidates, id)
+	}
+	return candidates
 }
 
 func (m *Model) upsertCyclePresentation(cycleID string, ev msg.ClaimPresentationMsg, content, placement string) {

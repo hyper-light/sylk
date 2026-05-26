@@ -22,31 +22,31 @@ const (
 )
 
 type plannerConversationRequest struct {
-	Mode                    plannerConversationMode  `json:"mode"`
-	UserQuery               string                   `json:"user_query"`
-	IntentHint              string                   `json:"intent_hint,omitempty"`
-	PlanID                  string                   `json:"plan_id,omitempty"`
-	PriorQuery              string                   `json:"prior_query,omitempty"`
-	Scope                   string                   `json:"scope,omitempty"`
-	RecommendationNarrative string                   `json:"recommendation_narrative,omitempty"`
-	Recommendations         []string                 `json:"recommendations,omitempty"`
-	Tradeoffs               []string                 `json:"tradeoffs,omitempty"`
-	Assumptions             []string                 `json:"assumptions,omitempty"`
-	ClarificationQuestions  []string                 `json:"clarification_questions,omitempty"`
-	TaskCount               int                      `json:"task_count,omitempty"`
-	LayerCount              int                      `json:"layer_count,omitempty"`
-	FirstTask               string                   `json:"first_task,omitempty"`
-	PlanSummary             string                   `json:"plan_summary,omitempty"`
-	ApprovalRequired        bool                     `json:"approval_required,omitempty"`
+	Mode                    plannerConversationMode `json:"mode"`
+	UserQuery               string                  `json:"user_query"`
+	IntentHint              string                  `json:"intent_hint,omitempty"`
+	PlanID                  string                  `json:"plan_id,omitempty"`
+	PriorQuery              string                  `json:"prior_query,omitempty"`
+	Scope                   string                  `json:"scope,omitempty"`
+	RecommendationNarrative string                  `json:"recommendation_narrative,omitempty"`
+	Recommendations         []string                `json:"recommendations,omitempty"`
+	Tradeoffs               []string                `json:"tradeoffs,omitempty"`
+	Assumptions             []string                `json:"assumptions,omitempty"`
+	ClarificationQuestions  []string                `json:"clarification_questions,omitempty"`
+	TaskCount               int                     `json:"task_count,omitempty"`
+	LayerCount              int                     `json:"layer_count,omitempty"`
+	FirstTask               string                  `json:"first_task,omitempty"`
+	PlanSummary             string                  `json:"plan_summary,omitempty"`
+	ApprovalRequired        bool                    `json:"approval_required,omitempty"`
 	// FreshnessSummary, DriftSignals, OrchestratorStateHint surface
 	// the freshness audit's findings to the LLM so it can include them
 	// in the narrative response. Populated by the architect's compose
 	// path before the LLM runs; the dialog itself shows only buttons,
 	// so the chat narrative is the only place this information lives.
-	FreshnessSummary       string   `json:"freshness_summary,omitempty"`
-	FreshnessDriftSignals  []string `json:"freshness_drift_signals,omitempty"`
-	OrchestratorStateHint  string   `json:"orchestrator_state_hint,omitempty"`
-	FreshnessRecommendation string  `json:"freshness_recommendation,omitempty"`
+	FreshnessSummary        string                   `json:"freshness_summary,omitempty"`
+	FreshnessDriftSignals   []string                 `json:"freshness_drift_signals,omitempty"`
+	OrchestratorStateHint   string                   `json:"orchestrator_state_hint,omitempty"`
+	FreshnessRecommendation string                   `json:"freshness_recommendation,omitempty"`
 	RecentContextSummary    string                   `json:"recent_context_summary,omitempty"`
 	RecentContextFocus      []string                 `json:"recent_context_focus,omitempty"`
 	SessionID               string                   `json:"session_id,omitempty"`
@@ -417,27 +417,44 @@ Planning flow:
    when the user first needs help shaping the problem, scope, constraints, or success
    criteria. Use ask_user_clarification only for one or two narrow decisions after the
    plan is already mostly understood.
-0b. During discussion before planning, use consult_peer(target_agent_type="librarian"),
+0b. During discussion before planning, use recall_forward(topic=...) first when the user is
+    continuing, approving, revising, or asking to plan the same stable topic. If recall_forward
+    returns status=usable with usable=true, use that source-indexed continuity and do not repeat
+    a fresh consult_peer call. Treat miss, insufficient, partial, stale, and contradicted recall
+    as non-evidence. Use consult_peer(target_agent_type="librarian"),
     consult_peer(target_agent_type="archivalist"), and consult_peer(target_agent_type="academic")
-    as new material information arrives. Do not wait until plan(action=start) to gather obvious
-    codebase, historical, or Academic evidence. Consult the Librarian for codebase reality and
-    local patterns, the Archivalist for precedent and preserved preferences, and the Academic for
-    stronger alternatives, best practices, correctness, performance, testing, infrastructure, and
-    tradeoffs. On the first substantive implementation, planning, or architecture turn on a new
-    problem, start with the most relevant knowledge agent and the narrowest question that can
-    materially reduce the next uncertainty. Prefer targeted consult_peer calls over one
-    broad omnibus consult, but do not repeat a fresh target/query unless new information creates
-    a material gap. Re-evaluate Academic depth as the user's constraints evolve and your
-    own understanding improves: begin with minimal/quick for narrow validation, and escalate only
-    when broader corroboration could materially change the decision. Continue consulting as the
-    user's constraints or direction materially change.
+    only when new material information creates a concrete evidence gap that carried continuity
+    does not answer. Do not wait until plan(action=start) to gather obvious codebase, historical,
+    or Academic evidence. Consult the Librarian for codebase reality and local patterns, the
+    Archivalist for precedent and preserved preferences, and the Academic for stronger alternatives,
+    best practices, correctness, performance, testing, infrastructure, and tradeoffs. On the first
+    substantive implementation, planning, or architecture turn on a truly new problem with no usable
+    continuity, start with the most relevant knowledge agent and the narrowest question that can
+    materially reduce the next uncertainty. Prefer targeted consult_peer calls over one broad
+    omnibus consult, but do not repeat a fresh target/query unless new information creates a
+    material gap. Re-evaluate Academic depth as the user's constraints evolve and your own
+    understanding improves: begin with minimal/quick for narrow validation, and escalate only when
+    broader corroboration could materially change the decision. Continue consulting as the user's
+    constraints or direction materially change.
+0c. For fresh new planning work, do not invoke plan(action=start) or plan(action=analyze)
+    before the first targeted consult_peer unless recall_forward returned concrete, fresh
+    evidence that already answers the same repository, historical, or design uncertainty.
+    Empty, stale, reconstructed, enrichment-only, insufficient, or generic continuity is not
+    enough, and Memory Forest recall does not replace the first Guide-routed knowledge-agent
+    consult.
 1. When the user confirms they want to proceed with planning, invoke plan(action=start) with a
-   comprehensive query synthesizing all gathered requirements and the consultation evidence you
-   accumulated during discussion.
+   comprehensive query synthesizing all gathered requirements, carried-forward continuity, and the consultation evidence you
+   accumulated during discussion. For plan/design intents, do not finish with advisory prose
+   instead of a plan unless you are explicitly asking the user to confirm planning or choose
+   between materially different shapes; after they confirm, the successful outcome is a
+   current-request plan entering the protocol.
 2. After plan(action=start) returns, it gives you a plan_id and protocol instructions. Follow
-   those instructions: invoke plan(action=analyze), review attached evidence, make consult_peer
-   calls only for concrete missing/stale/contradicted gaps, then plan(action=design), then
-   plan(action=generate_tasks) in order, passing the plan_id to each.
+   those instructions: first review attached planning evidence and make any required
+   consult_peer call for concrete missing/stale/contradicted gaps that usable recall did not answer,
+   then invoke plan(action=analyze), then plan(action=design), then plan(action=generate_tasks)
+   in order, passing the plan_id to each plan call. If plan(action=analyze) or
+   plan(action=design) returns requires_consultation=true, treat it as a normal phase gate:
+   invoke the requested consult_peer call, wait for it to complete, then retry the same plan action.
 3. After generate_tasks completes, the plan reaches Ready, emits the
    user-reviewable plan_markdown artifact, and automatically publishes the
    Approve / Modify / Reject dialog. Once that artifact is available, the UI
@@ -458,9 +475,12 @@ Planning flow:
 
 CRITICAL — Affirmative detection:
 If the user's message is an affirmative response to a prior offer to plan (e.g., "yes", "yep",
-"go ahead", "do it", "sure", "sounds good", "let's do it"), you MUST invoke plan(action=start)
-immediately. Do NOT write text about planning — call the tool. The plan query must synthesize
-the full conversation context including the original request from prior turns.
+"go ahead", "do it", "sure", "sounds good", "let's do it"), you MUST continue the planning
+tool flow rather than writing text about planning. If the prior discussion already contains
+fresh recall_forward or consult_peer evidence for the same uncertainty, invoke plan(action=start)
+immediately. If it does not, first invoke one targeted consult_peer against the most relevant
+knowledge agent, wait for the result, then invoke plan(action=start). The plan query must
+synthesize the full conversation context including the original request from prior turns.
 
 The user is in conversation with you — an expert software architect. They may be:
 - Requesting implementation — gather requirements and clarify constraints first
@@ -475,6 +495,9 @@ Requirements:
 - Draw on your architectural expertise — be opinionated with clear reasoning.
 - For general conversation (no planning intent), engage naturally. If the conversation
   leads to a concrete task, ask if they'd like you to create a plan.
+- If the user is asking you to continue or formalize a topic you already discussed, call
+  recall_forward(topic=...) before issuing another knowledge-agent consult. Treat fresh carried
+  testaments/artifacts as planning evidence.
 - If the conversation reveals that the problem is too underspecified to plan safely,
   hand the user to the Academic via academic_research(action=request) instead of
   pretending the missing requirements are already known.
@@ -653,6 +676,8 @@ General rules:
 // typically wants op=recall_recent, but op=resolve_intent and op=recall
 // are harmless reads on the same tool).
 var discussionConversationTools = []string{
+	"recall_forward",
+	"carry_forward",
 	"consult_peer",
 	"forest",
 	"ask_user_clarification",
@@ -661,6 +686,8 @@ var discussionConversationTools = []string{
 }
 
 var planningConversationTools = []string{
+	"recall_forward",
+	"carry_forward",
 	"consult_peer",
 	"forest",
 	"ask_user_clarification",

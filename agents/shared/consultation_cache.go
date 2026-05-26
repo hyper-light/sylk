@@ -13,10 +13,10 @@
 // would re-asking now be admitted?" If admission says no — i.e. the
 // new query is too similar to a prior cached consultation given the
 // pressure-vs-gain math — AND the cached entry is still fresh AND
-// covers the new query, we serve it. No new threshold; the existing
-// math is the threshold.
+// scoped to the same local surface, we serve it. No new threshold;
+// the existing math is the threshold.
 //
-// Two principled gates compose the serve decision:
+// Three principled gates compose the serve decision:
 //
 //  1. PRESSURE — would evaluateAdmission deny re-asking against a
 //     virtual ledger seeded with this cached observation? If allowed,
@@ -28,7 +28,12 @@
 //     stopwords like "does", "the", "have" rarely appear verbatim
 //     in responses).
 //
-//  2. FRESHNESS — is age < FreshnessHorizon (agent-self-reported)?
+//  2. SCOPE — is the requested repository/file/subsystem scope the
+//     same as the cached observation's scope? Similar questions
+//     against different local surfaces must not reuse each other's
+//     answers.
+//
+//  3. FRESHNESS — is age < FreshnessHorizon (agent-self-reported)?
 //     A missing or zero horizon is treated as "expires immediately";
 //     the agent has not committed to a validity window so cache
 //     re-use is unsafe. This makes freshness an explicit contract,
@@ -41,6 +46,7 @@
 package shared
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -98,6 +104,7 @@ type SessionCacheLookupResult struct {
 	Response         any
 	Target           string
 	Query            string
+	Scope            string
 	StoredAt         time.Time
 	FreshnessHorizon time.Duration
 	Reason           string // diagnostic: why a hit (or near-miss) was decided
@@ -122,12 +129,25 @@ func LookupSessionConsultationCache(
 	researchDepth ResearchDepth,
 	nextDepth int,
 ) SessionCacheLookupResult {
+	return LookupSessionConsultationCacheWithScope(cache, sessionID, target, query, "", researchDepth, nextDepth)
+}
+
+func LookupSessionConsultationCacheWithScope(
+	cache *SessionConsultationCache,
+	sessionID string,
+	target string,
+	query string,
+	scope string,
+	researchDepth ResearchDepth,
+	nextDepth int,
+) SessionCacheLookupResult {
 	if cache == nil {
 		return SessionCacheLookupResult{Reason: "cache disabled"}
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	target = strings.ToLower(strings.TrimSpace(target))
 	query = strings.TrimSpace(query)
+	scope = normalizeConsultationScope(scope)
 	if sessionID == "" || target == "" || query == "" {
 		return SessionCacheLookupResult{Reason: "missing session/target/query"}
 	}
@@ -156,6 +176,11 @@ func LookupSessionConsultationCache(
 	)
 	_ = queryFingerprint
 	for _, entry := range entries {
+		if normalizeConsultationScope(entry.Scope) != scope {
+			bestReason = "scope mismatch"
+			continue
+		}
+
 		// Freshness gate: missing or zero horizon ⇒ no cache re-use
 		// (agent didn't commit a validity window). Past horizon ⇒
 		// stale; the world may have moved, force re-ask.
@@ -205,6 +230,7 @@ func LookupSessionConsultationCache(
 		Response:         bestEntry.Response,
 		Target:           bestEntry.Target,
 		Query:            bestEntry.Query,
+		Scope:            bestEntry.Scope,
 		StoredAt:         bestEntry.StoredAt,
 		FreshnessHorizon: bestEntry.FreshnessHorizon,
 		Reason:           bestReason,
@@ -226,12 +252,26 @@ func StoreSessionConsultationCache(
 	freshnessHorizon time.Duration,
 	reward float64,
 ) {
+	StoreSessionConsultationCacheWithScope(cache, sessionID, target, query, "", response, freshnessHorizon, reward)
+}
+
+func StoreSessionConsultationCacheWithScope(
+	cache *SessionConsultationCache,
+	sessionID string,
+	target string,
+	query string,
+	scope string,
+	response any,
+	freshnessHorizon time.Duration,
+	reward float64,
+) {
 	if cache == nil {
 		return
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	target = strings.ToLower(strings.TrimSpace(target))
 	query = strings.TrimSpace(query)
+	scope = normalizeConsultationScope(scope)
 	if sessionID == "" || target == "" || query == "" {
 		return
 	}
@@ -241,6 +281,7 @@ func StoreSessionConsultationCache(
 		Fingerprint:      fingerprint,
 		SessionID:        sessionID,
 		Query:            query,
+		Scope:            scope,
 		Response:         response,
 		FreshnessHorizon: freshnessHorizon,
 		StoredAt:         time.Now(),
@@ -292,6 +333,17 @@ func InvalidateSessionConsultationCacheForSession(cache *SessionConsultationCach
 	}
 	delete(cache.bySess, sessionID)
 	cache.mu.Unlock()
+}
+
+func normalizeConsultationScope(scope string) string {
+	scope = strings.Join(strings.Fields(strings.TrimSpace(scope)), " ")
+	if scope == "" {
+		return ""
+	}
+	if !strings.Contains(scope, " ") && strings.ContainsAny(scope, `/\`) {
+		return filepath.Clean(scope)
+	}
+	return scope
 }
 
 func (c *SessionConsultationCache) bucket(sessionID string, create bool) *sessionConsultationBucket {
@@ -452,4 +504,3 @@ func ExtractFreshnessHorizon(response any) time.Duration {
 	}
 	return 0
 }
-

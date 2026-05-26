@@ -46,6 +46,7 @@ func plannerPromptModules(stage string) []string {
 	case "requirements":
 		return []string{
 			ArchitectSystemCorePrompt,
+			ArchitectFabricAwareness,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemGuardrailsPrompt,
@@ -54,6 +55,7 @@ func plannerPromptModules(stage string) []string {
 	case "design":
 		return []string{
 			ArchitectSystemCorePrompt,
+			ArchitectFabricAwareness,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemOutputPrompt,
@@ -62,6 +64,7 @@ func plannerPromptModules(stage string) []string {
 	case "tasks":
 		return []string{
 			ArchitectSystemCorePrompt,
+			ArchitectFabricAwareness,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemDelegationPrompt,
 			ArchitectSystemSkillsPrompt,

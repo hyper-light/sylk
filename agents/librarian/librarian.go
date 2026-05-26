@@ -817,6 +817,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 		Successful:  err == nil,
 	})
 	shared.LogResponse(l.steering.EventLogger(), fwd.CorrelationID, l.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
@@ -889,6 +890,10 @@ func (l *Librarian) cancelRequest(correlationID string) {
 	cancel := l.requestCancels[correlationID]
 	delete(l.requestCancels, correlationID)
 	l.requestMu.Unlock()
+	l.logger.Info("INTERRUPT_DEBUG: librarian_cancel_request_lookup",
+		"correlation_id", correlationID,
+		"found", cancel != nil,
+	)
 	if cancel != nil {
 		cancel()
 	}
@@ -903,6 +908,11 @@ func (l *Librarian) handleActionMessage(msg *guide.Message) error {
 		return nil
 	}
 	if action.Action == "cancel" {
+		l.logger.Info("INTERRUPT_DEBUG: librarian_cancel_action_received",
+			"correlation_id", action.CorrelationID,
+			"target_agent", action.TargetAgentID,
+			"source_agent", action.SourceAgentID,
+		)
 		shared.LogAgentEvent(l.steering.EventLogger(), agentlog.EventError,
 			l.id, "", action.CorrelationID, "warn",
 			&agentlog.ErrorPayload{Error: "request cancelled via action"})

@@ -387,6 +387,26 @@ func extractResponseDirective(data any) *guide.ResponseDirective {
 	return nil
 }
 
+// responseDirectiveForResult is the stateful architect-side directive
+// extraction path. A ready DesignPlan is not just metadata for the Guide's
+// phase gate; presenting it must also publish the Guardian-mediated approval
+// dialog. Keep that side effect here so formal protocol results and
+// conversation-tool-loop results share the same acceptance path.
+func (a *Architect) responseDirectiveForResult(ctx context.Context, data any) *guide.ResponseDirective {
+	inner := unwrapArchitectResult(data)
+	switch v := inner.(type) {
+	case *DesignPlan:
+		if v != nil {
+			return a.feedbackReadyDirectiveWithContext(ctx, v)
+		}
+	case *ConversationResult:
+		if v != nil {
+			return v.Directive
+		}
+	}
+	return nil
+}
+
 func directivePhaseStr(d *guide.ResponseDirective) string {
 	if d == nil {
 		return "<nil>"

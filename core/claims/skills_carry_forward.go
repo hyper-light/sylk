@@ -86,7 +86,7 @@ func RecallForwardSkillWithEnrichment(bp BoardProvider, defaultAgentID string, e
 		opener = openers[0]
 	}
 	return skills.NewSkill("recall_forward").
-		Description("Recall the calling agent's carried-forward testaments and artifacts for a topic. Prefer this before repeating a consult, search, design, planning, testing, or analysis step on a stable topic. Reads continuity testaments written by the same agent, follows amends/supersedes/session cursors, and returns compact working context plus evidence digests. It does not consult peers.").
+		Description("Recall the calling agent's carried-forward testaments and artifacts for a topic. Prefer this before repeating a consult, search, design, planning, testing, or analysis step on a stable topic. Reads continuity testaments written by the same agent, follows amends/supersedes/session cursors, and returns compact working context plus evidence digests backed by source indexes. It does not consult peers.").
 		Domain("memory").
 		Keywords("recall", "forward", "continuity", "testaments", "artifacts", "memory", "history").
 		Priority(100).
@@ -95,8 +95,8 @@ func RecallForwardSkillWithEnrichment(bp BoardProvider, defaultAgentID string, e
 		IntParam("lookback_sessions", "How many session boundaries to walk backward. 0 means current session only.", false).
 		IntParam("max_items", "Maximum continuity/source items to return. Default 8.", false).
 		EnumParam("include_sources", "digest returns compact context; source_index includes source IDs/reasons; full hydrates source testaments/artifacts.", []string{"digest", "source_index", "full"}, false).
-		Usage("Call recall_forward(topic=...) at the start of a repeated or resumed topic before consulting Archivalist, Librarian, Academic, or rerunning equivalent discovery. Use include_sources=source_index when you need exact evidence IDs. Use include_sources=full only when the compact digest is insufficient.").
-		BestPractice("If recall_forward returns no continuity for the topic, proceed with normal discovery or consults, then call carry_forward when useful evidence exists.").
+		Usage("Call recall_forward(topic=...) at the start of a repeated or resumed topic before consulting Archivalist, Librarian, Academic, or rerunning equivalent discovery. Treat only status=usable and usable=true as reusable evidence. Use include_sources=source_index when you need exact evidence IDs. Use include_sources=full only when the compact digest is insufficient.").
+		BestPractice("A miss, insufficient, partial, stale, or contradicted recall result is not evidence. Do one narrow discovery/consult step for the remaining gap, then call carry_forward when useful source-indexed evidence exists.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := requireBoard(bp)
 			if err != nil {

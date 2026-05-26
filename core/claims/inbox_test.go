@@ -446,6 +446,59 @@ func TestInbox_TestamentDelta_RoleGated(t *testing.T) {
 	}
 }
 
+func TestInbox_ExpectSubscribesSpecificTestamentTopic(t *testing.T) {
+	bus := newRecordingBus()
+	var got *GraphEntryPoint
+	inbox, err := NewClaimsInbox(InboxConfig{
+		AgentID:    "architect",
+		SessionID:  "sess",
+		Role:       RoleSubject,
+		Subscriber: bus,
+		OnResolved: func(entry *GraphEntryPoint) {
+			got = entry
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inbox.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	claimID := "claim-consult-1"
+	topic := ClaimStatusTopic("sess", claimID, ClaimStatusTestified)
+	if count := bus.SubscriptionCount(topic); count != 0 {
+		t.Fatalf("precondition: exact expectation topic subscriptions = %d, want 0", count)
+	}
+
+	inbox.Expect(&Expectation{
+		ClaimID:       claimID,
+		ExpectedDelta: DeltaKindTestament,
+		ActionID:      "action-1",
+		Priority:      PriorityResponse,
+	})
+	if count := bus.SubscriptionCount(topic); count != 1 {
+		t.Fatalf("exact expectation topic subscriptions = %d, want 1", count)
+	}
+
+	bus.Fire(topic, TestamentDelta{
+		ClaimID:       claimID,
+		TestamentID:   "testament-1",
+		ActionKind:    ActionTypeConsultation,
+		IssuerAgentID: "architect",
+		Sequence:      1,
+	})
+	if got == nil {
+		t.Fatal("expected testament delta to resolve via expectation")
+	}
+	if got.Expectation == nil || got.Expectation.ClaimID != claimID {
+		t.Fatalf("expectation = %#v, want claim %q", got.Expectation, claimID)
+	}
+	if count := bus.SubscriptionCount(topic); count != 0 {
+		t.Fatalf("one-shot expectation topic subscriptions after match = %d, want 0", count)
+	}
+}
+
 func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
 	// Subject-only inbox does not match claim status deltas via
 	// standing — issuer/subject identity flows are Expect()-driven.

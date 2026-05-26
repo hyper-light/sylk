@@ -1082,6 +1082,94 @@ func TestClaimsNative_TestamentContextUpdatesNestedChildStatus(t *testing.T) {
 	}
 }
 
+func TestClaimsNative_InterruptTargetPrefersRouteCorrelationForClaimCycle(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.StreamStartMsg{
+		SessionID:     "ses-1",
+		CorrelationID: "route-architect",
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	m.Update(msg.ClaimsAgentStatusMsg{
+		AgentID:             "architect",
+		SessionID:           "ses-1",
+		Active:              true,
+		CycleID:             "cycle-architect",
+		ActionType:          "prompt",
+		Reason:              "Building a plan",
+		StreamCorrelationID: "route-architect",
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "consult-librarian",
+		CycleID:        "cycle-architect",
+		ClaimID:        "cycle-architect",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "consult_started",
+		Reference:      "librarian",
+		TargetAgentID:  "librarian",
+		CreatedAt:      time.Now(),
+	})
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "workspace-read",
+		ParentRowID:    "consult-librarian",
+		CycleID:        "cycle-architect",
+		ClaimID:        "claim-librarian",
+		OwnerAgentID:   "librarian",
+		OwnerAgentType: "librarian",
+		AgentID:        "librarian",
+		Kind:           "tool_started",
+		Reference:      "workspace_read",
+		CreatedAt:      time.Now(),
+	})
+
+	target, ok := m.LatestActiveInterruptTarget()
+	if !ok {
+		t.Fatal("LatestActiveInterruptTarget returned no target")
+	}
+	if target.CorrelationID != "route-architect" {
+		t.Fatalf("interrupt correlation = %q, want route-architect", target.CorrelationID)
+	}
+	if !m.MarkInterrupted("route-architect") {
+		t.Fatal("MarkInterrupted(route-architect) returned false")
+	}
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("missing chat entry")
+	}
+	if entry.Streaming {
+		t.Fatal("entry still streaming after MarkInterrupted")
+	}
+	if entry.ThinkingStatus != "Interrupted" {
+		t.Fatalf("ThinkingStatus = %q, want Interrupted", entry.ThinkingStatus)
+	}
+	if len(entry.ToolCalls) != 1 {
+		t.Fatalf("ToolCalls len = %d, want 1", len(entry.ToolCalls))
+	}
+	consult := entry.ToolCalls[0]
+	if !consult.Completed || consult.Success {
+		t.Fatalf("consult completion = completed:%v success:%v, want interrupted failure", consult.Completed, consult.Success)
+	}
+	if consult.InterAgent == nil || consult.InterAgent.Status != InterAgentToolFailed {
+		t.Fatalf("consult InterAgent status = %+v, want failed", consult.InterAgent)
+	}
+	if len(consult.InterAgent.Children) != 1 {
+		t.Fatalf("consult children len = %d, want 1", len(consult.InterAgent.Children))
+	}
+	child := consult.InterAgent.Children[0]
+	if !child.Failed || child.ThinkingText != "" || child.ThinkingStatus != "" {
+		t.Fatalf("child after interrupt = %+v, want failed with cleared thinking", child)
+	}
+	if len(child.ToolCalls) != 1 || !child.ToolCalls[0].Completed || child.ToolCalls[0].Success {
+		t.Fatalf("nested child tool after interrupt = %+v, want completed failure", child.ToolCalls)
+	}
+	if len(m.claimCycleAnimations) != 0 {
+		t.Fatalf("claimCycleAnimations len = %d, want 0", len(m.claimCycleAnimations))
+	}
+}
+
 // guardChainOK keeps the import set tight: the test file must compile
 // against core/claims even when an individual test doesn't reference
 // it directly, so the build catches drift early.

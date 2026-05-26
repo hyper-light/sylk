@@ -259,7 +259,7 @@ var profiles = map[string]Profile{
 }
 
 func ProfileFor(agentType string) Profile {
-	trimmed := strings.TrimSpace(agentType)
+	trimmed := CanonicalAgentType(agentType)
 	if profile, ok := profiles[trimmed]; ok {
 		return cloneProfile(profile)
 	}
@@ -278,6 +278,16 @@ func cloneProfile(profile Profile) Profile {
 	return cloned
 }
 
+// CanonicalAgentType normalizes an agent type slug for authority checks.
+// Agent-facing schemas use lowercase hyphenated names, but route metadata and
+// model-authored JSON can drift in case or separators. Authority decisions must
+// not depend on that surface spelling.
+func CanonicalAgentType(agentType string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(agentType))
+	trimmed = strings.ReplaceAll(trimmed, "_", "-")
+	return trimmed
+}
+
 // PermittedConsultTargets returns the agent types this agent may
 // address via consult_peer, with the caller's own type filtered out.
 // Result is sorted and deduplicated so consumers (skill enum, tests,
@@ -286,7 +296,7 @@ func cloneProfile(profile Profile) Profile {
 //
 // An unknown agent type returns nil (no permitted targets).
 func PermittedConsultTargets(agentType string) []string {
-	agentType = strings.TrimSpace(agentType)
+	agentType = CanonicalAgentType(agentType)
 	return filterSelfAndDedupe(ProfileFor(agentType).PeerConsultTargets, agentType)
 }
 
@@ -296,20 +306,20 @@ func PermittedConsultTargets(agentType string) []string {
 // consult lists by design: challenges cast doubt on peer commitments
 // and should be harder to initiate.
 func PermittedChallengeTargets(agentType string) []string {
-	agentType = strings.TrimSpace(agentType)
+	agentType = CanonicalAgentType(agentType)
 	return filterSelfAndDedupe(ProfileFor(agentType).PeerChallengeTargets, agentType)
 }
 
 // CanConsult reports whether callerType may address targetType via
 // consult_peer. Self-target always returns false.
 func CanConsult(callerType, targetType string) bool {
-	callerType = strings.TrimSpace(callerType)
-	targetType = strings.TrimSpace(targetType)
+	callerType = CanonicalAgentType(callerType)
+	targetType = CanonicalAgentType(targetType)
 	if callerType == "" || targetType == "" || callerType == targetType {
 		return false
 	}
 	for _, t := range ProfileFor(callerType).PeerConsultTargets {
-		if strings.TrimSpace(t) == targetType {
+		if CanonicalAgentType(t) == targetType {
 			return true
 		}
 	}
@@ -319,13 +329,13 @@ func CanConsult(callerType, targetType string) bool {
 // CanChallenge reports whether callerType may address targetType via
 // challenge_peer. Self-target always returns false.
 func CanChallenge(callerType, targetType string) bool {
-	callerType = strings.TrimSpace(callerType)
-	targetType = strings.TrimSpace(targetType)
+	callerType = CanonicalAgentType(callerType)
+	targetType = CanonicalAgentType(targetType)
 	if callerType == "" || targetType == "" || callerType == targetType {
 		return false
 	}
 	for _, t := range ProfileFor(callerType).PeerChallengeTargets {
-		if strings.TrimSpace(t) == targetType {
+		if CanonicalAgentType(t) == targetType {
 			return true
 		}
 	}
@@ -342,7 +352,7 @@ func filterSelfAndDedupe(raw []string, selfType string) []string {
 	seen := make(map[string]struct{}, len(raw))
 	out := make([]string, 0, len(raw))
 	for _, entry := range raw {
-		entry = strings.TrimSpace(entry)
+		entry = CanonicalAgentType(entry)
 		if entry == "" || entry == selfType {
 			continue
 		}

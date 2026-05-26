@@ -791,6 +791,7 @@ func (e *Engineer) handleBusRequest(msg *guide.Message) error {
 
 	result, err := e.processForwardedRequest(ctx, fwd)
 	shared.LogResponse(e.steering.EventLogger(), fwd.CorrelationID, e.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {

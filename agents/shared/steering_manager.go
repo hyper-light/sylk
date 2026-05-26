@@ -322,6 +322,7 @@ func (sm *SteeringManager) RegisterCancel(correlationID, sessionID string, cance
 		cancelFn: cancel,
 		done:     make(chan struct{}),
 	}
+	correlationID = strings.TrimSpace(correlationID)
 	sm.mu.Lock()
 	sm.cancels[correlationID] = entry
 	sessionID = strings.TrimSpace(sessionID)
@@ -332,19 +333,30 @@ func (sm *SteeringManager) RegisterCancel(correlationID, sessionID string, cance
 		sm.bySession[sessionID][correlationID] = struct{}{}
 	}
 	sm.mu.Unlock()
+	slog.Info("INTERRUPT_DEBUG: steering_register_cancel",
+		"correlation_id", correlationID,
+		"session_id", sessionID,
+	)
 	return entry
 }
 
 // CancelRequest fires the cancel entry for the given correlation.
 // Returns true if the entry existed and was fired.
 func (sm *SteeringManager) CancelRequest(correlationID string) bool {
+	correlationID = strings.TrimSpace(correlationID)
 	sm.mu.Lock()
 	entry := sm.cancels[correlationID]
 	sm.mu.Unlock()
 	if entry == nil {
+		slog.Info("INTERRUPT_DEBUG: steering_cancel_request_miss",
+			"correlation_id", correlationID,
+		)
 		return false
 	}
 	entry.Fire()
+	slog.Info("INTERRUPT_DEBUG: steering_cancel_request_fired",
+		"correlation_id", correlationID,
+	)
 	return true
 }
 
@@ -353,12 +365,16 @@ func (sm *SteeringManager) CancelRequest(correlationID string) bool {
 func (sm *SteeringManager) CancelSession(sessionID string) int {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
+		slog.Info("INTERRUPT_DEBUG: steering_cancel_session_empty")
 		return 0
 	}
 	sm.mu.Lock()
 	corrIDs := sm.bySession[sessionID]
 	if len(corrIDs) == 0 {
 		sm.mu.Unlock()
+		slog.Info("INTERRUPT_DEBUG: steering_cancel_session_miss",
+			"session_id", sessionID,
+		)
 		return 0
 	}
 	entries := make([]*CancelEntry, 0, len(corrIDs))
@@ -371,6 +387,10 @@ func (sm *SteeringManager) CancelSession(sessionID string) int {
 	for _, entry := range entries {
 		entry.Fire()
 	}
+	slog.Info("INTERRUPT_DEBUG: steering_cancel_session_fired",
+		"session_id", sessionID,
+		"count", len(entries),
+	)
 	return len(entries)
 }
 
@@ -403,7 +423,14 @@ func (sm *SteeringManager) HandleAction(req *guide.ActionRequest) bool {
 	case "pace":
 		return sm.handlePace(req)
 	case "cancel", "interrupt", "stop":
-		return sm.handleCancel(req)
+		handled := sm.handleCancel(req)
+		slog.Info("INTERRUPT_DEBUG: steering_handle_cancel_action",
+			"action", action,
+			"target_agent", req.TargetAgentID,
+			"correlation_id", req.CorrelationID,
+			"handled", handled,
+		)
+		return handled
 	default:
 		return false
 	}

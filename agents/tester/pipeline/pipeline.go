@@ -16,17 +16,17 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/agents/tester"
 	"github.com/adalundhe/sylk/agents/tester/shared"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/events"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -865,6 +865,7 @@ func (pt *PipelineTester) handleBusRequest(msg *guide.Message) error {
 
 	result, err := pt.Handle(ctx, fwd)
 	agentshared.LogResponse(pt.steering.EventLogger(), fwd.CorrelationID, pt.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if fwd.FireAndForget {
 		return nil

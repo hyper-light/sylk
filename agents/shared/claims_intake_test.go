@@ -135,3 +135,47 @@ func TestClaimsIntakeExpectedConsultTestamentWithoutResolutionIDIsConsumed(t *te
 		t.Fatal("expected missing-id peer testament to be consumed rather than dispatched as fresh inference")
 	}
 }
+
+func TestClaimsIntakeSuppressesGuideUserPromptForActionAgents(t *testing.T) {
+	entry := guideUserPromptEntry()
+	if !shouldSuppressForwardedPromptEntry(claims.RoleSubject, entry) {
+		t.Fatal("expected guide user prompt claim to be suppressed for action agent")
+	}
+	if !shouldSuppressForwardedPromptEntry(claims.RoleSubject|claims.RoleAuditor, entry) {
+		t.Fatal("expected guide user prompt claim to be suppressed for auditor action agent")
+	}
+}
+
+func TestClaimsIntakeDoesNotSuppressGuideUserPromptForObserver(t *testing.T) {
+	if shouldSuppressForwardedPromptEntry(claims.RoleObserver, guideUserPromptEntry()) {
+		t.Fatal("observer inbox must still receive guide user prompt claims for rendering")
+	}
+}
+
+func TestClaimsIntakeDoesNotSuppressNonPromptClaims(t *testing.T) {
+	entry := guideUserPromptEntry()
+	entry.Node.Claim.ActionType = claims.ActionTypeConsultation
+	if shouldSuppressForwardedPromptEntry(claims.RoleSubject, entry) {
+		t.Fatal("consultation claim should not be suppressed")
+	}
+}
+
+func guideUserPromptEntry() *claims.GraphEntryPoint {
+	return &claims.GraphEntryPoint{
+		Delta: claims.InboxDelta{
+			AgentID: "architect",
+			ClaimID: "claim-guide-prompt",
+		},
+		Node: claims.GraphNode{
+			Claim: &claims.Claim{
+				ID:         "claim-guide-prompt",
+				ActionType: claims.ActionTypePrompt,
+				Tags:       []string{"guide_classification", "user_prompt"},
+				Relations: []claims.Relation{
+					{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+					{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				},
+			},
+		},
+	}
+}

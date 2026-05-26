@@ -17,6 +17,7 @@ import (
 
 const (
 	consultPeerToolName          = "consult_peer"
+	recallForwardToolName        = "recall_forward"
 	defaultEvidenceSummaryMaxLen = 600
 )
 
@@ -25,14 +26,21 @@ func registerArchitectEvidenceCaptureHook(a *Architect) {
 		return
 	}
 	a.hooks.RegisterPostToolCallHook(
-		"architect_consult_peer_evidence_capture",
+		"architect_planning_evidence_capture",
 		skills.HookPriorityLow,
 		func(ctx context.Context, data *skills.ToolCallHookData) skills.HookResult {
-			if data == nil || strings.TrimSpace(data.ToolName) != consultPeerToolName {
+			if data == nil {
 				return skills.HookResult{Continue: true}
 			}
-			if err := a.captureConsultPeerEvidence(ctx, data); err != nil {
-				a.logWarn("consult_peer evidence capture skipped", "error", err)
+			switch strings.TrimSpace(data.ToolName) {
+			case consultPeerToolName:
+				if err := a.captureConsultPeerEvidence(ctx, data); err != nil {
+					a.logWarn("consult_peer evidence capture skipped", "error", err)
+				}
+			case recallForwardToolName:
+				if err := a.captureRecallForwardEvidence(ctx, data); err != nil {
+					a.logWarn("recall_forward evidence capture skipped", "error", err)
+				}
 			}
 			return skills.HookResult{Continue: true}
 		},
@@ -136,7 +144,97 @@ func (a *Architect) captureConsultPeerEvidence(ctx context.Context, data *skills
 		}
 		ev.ID = planEvidenceID(ev)
 		a.attachPlanEvidence(ctx, ev)
+		if success {
+			a.cacheCapturedConsultEvidence(ctx, data, target, query, scope, ev.Data)
+		}
 	}
+	return nil
+}
+
+func (a *Architect) captureRecallForwardEvidence(ctx context.Context, data *skills.ToolCallHookData) error {
+	topic := strings.TrimSpace(firstNonEmptyString(
+		stringFromAny(data.Input["topic"]),
+		recallForwardString(data.Output, "topic"),
+	))
+	if topic == "" {
+		return fmt.Errorf("recall_forward evidence missing topic")
+	}
+	output := recallForwardMap(data.Output)
+	if len(output) == 0 {
+		return fmt.Errorf("recall_forward output is not structured")
+	}
+	workingContext := strings.TrimSpace(stringFromAny(output["working_context"]))
+	evidenceDigest := strings.TrimSpace(stringFromAny(output["evidence_digest"]))
+	itemCount := anySliceLen(output["items"])
+	sourceCount := anySliceLen(output["sources"])
+	enrichmentCount := anySliceLen(output["enrichment"])
+	if workingContext == "" && evidenceDigest == "" && itemCount == 0 && sourceCount == 0 && enrichmentCount == 0 {
+		return nil
+	}
+	status := strings.ToLower(strings.TrimSpace(stringFromAny(output["status"])))
+	usable := boolFromAny(output["usable"]) || status == "usable"
+	stale := boolFromAny(output["stale"])
+	contradicted := boolFromAny(output["contradicted"])
+	partial := boolFromAny(output["partial"])
+	errText := ""
+	if data.Error != nil {
+		errText = data.Error.Error()
+	}
+	if errText != "" || !usable || stale || contradicted || partial {
+		return nil
+	}
+	now := time.Now()
+	summary := firstNonEmptyString(
+		workingContext,
+		evidenceDigest,
+		fmt.Sprintf("Recalled %d continuity item(s) for %s", itemCount, topic),
+	)
+	ev := &PlanEvidence{
+		Kind:        EvidenceKindContinuity,
+		PlanID:      strings.TrimSpace(stringFromAny(data.Input["plan_id"])),
+		Target:      "continuity",
+		Query:       topic,
+		Scope:       strings.TrimSpace(stringFromAny(data.Input["scope"])),
+		Correlation: firstNonEmptyString(correlationIDFromHookData(data), originalCIDFromContext(ctx), shared.LogMetaFromContext(ctx).CorrID),
+		Success:     true,
+		Data: map[string]any{
+			"topic":                   topic,
+			"status":                  status,
+			"usable":                  true,
+			"reason":                  output["reason"],
+			"recommended_next_action": output["recommended_next_action"],
+			"working_context":         workingContext,
+			"evidence_digest":         evidenceDigest,
+			"items_count":             itemCount,
+			"sources_count":           sourceCount,
+			"enrichment_count":        enrichmentCount,
+			"source_index_count":      output["source_index_count"],
+			"hydration_available":     output["hydration_available"],
+			"include_sources":         stringFromAny(output["include_sources"]),
+			"lookback_sessions":       output["lookback_sessions"],
+			"partial":                 partial,
+			"stale":                   stale,
+			"contradicted":            contradicted,
+			"diagnostics":             output["diagnostics"],
+			"items":                   output["items"],
+			"sources":                 output["sources"],
+			"enrichment":              output["enrichment"],
+			"full_testaments":         output["full_testaments"],
+			"full_artifacts":          output["full_artifacts"],
+			"source_description":      "recall_forward source-indexed carried testaments and artifacts",
+		},
+		Summary:     truncatePlannerEvidenceString(summary, defaultEvidenceSummaryMaxLen),
+		Error:       errText,
+		RequestedAt: now,
+		ReceivedAt:  now,
+		SourceTool:  recallForwardToolName,
+		SourceArtifactID: firstNonEmptyString(
+			firstRecallForwardItemString(output["items"], "testament_id"),
+			topic,
+		),
+	}
+	ev.ID = planEvidenceID(ev)
+	a.attachPlanEvidence(ctx, ev)
 	return nil
 }
 
@@ -366,18 +464,7 @@ func (a *Architect) attachPlanInputEvidence(ctx context.Context, plan *DesignPla
 		return
 	}
 	a.evidenceMu.Lock()
-	changed := false
-	for _, ev := range evidence {
-		if ev == nil {
-			continue
-		}
-		if ev.Kind == "" {
-			ev.Kind = EvidenceKindConsult
-		}
-		if appendPlanEvidence(plan, ev) {
-			changed = true
-		}
-	}
+	changed := mergePlanInputEvidence(plan, evidence)
 	if changed {
 		plan.CodebasePatterns = extractLibrarianPatterns(plan)
 		plan.UpdatedAt = time.Now()
@@ -445,17 +532,23 @@ func (a *Architect) stagePlanEvidence(ctx context.Context, evidence *PlanEvidenc
 	if key == "" {
 		return
 	}
+	keys := []string{key}
+	if sessionKey := stagedEvidenceKey(sessionID, ""); sessionKey != "" && sessionKey != key {
+		keys = append(keys, sessionKey)
+	}
 	a.evidenceMu.Lock()
 	if a.stagedEvidence == nil {
 		a.stagedEvidence = make(map[string][]*PlanEvidence)
 	}
-	a.stagedEvidence[key] = appendDedupedEvidence(a.stagedEvidence[key], evidence)
+	for _, key := range keys {
+		a.stagedEvidence[key] = appendDedupedEvidence(a.stagedEvidence[key], evidence)
+	}
 	a.evidenceMu.Unlock()
 }
 
-func (a *Architect) drainStagedEvidenceIntoPlan(plan *DesignPlan) {
+func (a *Architect) drainStagedEvidenceIntoPlan(plan *DesignPlan) bool {
 	if a == nil || plan == nil {
-		return
+		return false
 	}
 	keys := []string{
 		stagedEvidenceKey(plan.SessionID, plan.RequestCorrelationID),
@@ -470,14 +563,18 @@ func (a *Architect) drainStagedEvidenceIntoPlan(plan *DesignPlan) {
 		staged = append(staged, a.stagedEvidence[key]...)
 		delete(a.stagedEvidence, key)
 	}
+	changed := false
 	for _, evidence := range staged {
-		appendPlanEvidence(plan, evidence)
+		if appendPlanEvidence(plan, evidence) {
+			changed = true
+		}
 	}
-	if len(staged) > 0 {
+	if changed {
 		plan.CodebasePatterns = extractLibrarianPatterns(plan)
 		plan.UpdatedAt = time.Now()
 	}
 	a.evidenceMu.Unlock()
+	return changed
 }
 
 func stagedEvidenceKey(sessionID, correlationID string) string {
@@ -509,6 +606,25 @@ func appendPlanEvidence(plan *DesignPlan, evidence *PlanEvidence) bool {
 	plan.EvidenceTrail = append(plan.EvidenceTrail, normalized)
 	syncConsultationIndexFromTrail(plan)
 	return true
+}
+
+func mergePlanInputEvidence(plan *DesignPlan, evidence []*PlanEvidence) bool {
+	if plan == nil || len(evidence) == 0 {
+		return false
+	}
+	changed := false
+	for _, ev := range evidence {
+		if ev == nil {
+			continue
+		}
+		if ev.Kind == "" {
+			ev.Kind = EvidenceKindConsult
+		}
+		if appendPlanEvidence(plan, ev) {
+			changed = true
+		}
+	}
+	return changed
 }
 
 func appendDedupedEvidence(list []*PlanEvidence, evidence *PlanEvidence) []*PlanEvidence {
@@ -615,6 +731,49 @@ func correlationIDFromHookData(data *skills.ToolCallHookData) string {
 	return stringFromAny(data.Metadata["correlation_id"])
 }
 
+func sessionIDFromHookData(data *skills.ToolCallHookData) string {
+	if data == nil || data.Metadata == nil {
+		return ""
+	}
+	return stringFromAny(data.Metadata["session_id"])
+}
+
+func (a *Architect) cacheCapturedConsultEvidence(
+	ctx context.Context,
+	data *skills.ToolCallHookData,
+	target string,
+	query string,
+	scope string,
+	response any,
+) {
+	if a == nil || response == nil {
+		return
+	}
+	sessionID := firstNonEmptyString(
+		architectSessionIDFromContext(ctx),
+		sessionIDFromHookData(data),
+		shared.LogMetaFromContext(ctx).SessionID,
+		a.config.SessionID,
+	)
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	horizon := shared.ExtractFreshnessHorizon(response)
+	if horizon <= 0 {
+		return
+	}
+	shared.StoreSessionConsultationCacheWithScope(
+		shared.DefaultSessionConsultationCache,
+		sessionID,
+		target,
+		query,
+		scope,
+		response,
+		horizon,
+		0,
+	)
+}
+
 func consultSummaryFromResponse(response any) string {
 	switch typed := response.(type) {
 	case nil:
@@ -665,6 +824,63 @@ func artifactsFromAny(value any) []map[string]any {
 	return out
 }
 
+func recallForwardString(output any, key string) string {
+	m := recallForwardMap(output)
+	if len(m) == 0 {
+		return ""
+	}
+	return stringFromAny(m[key])
+}
+
+func recallForwardMap(output any) map[string]any {
+	decoded := decodeConsultOutput(output)
+	if m, ok := asMap(decoded); ok {
+		return m
+	}
+	if decoded == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+func firstRecallForwardItemString(items any, key string) string {
+	for _, item := range anySlice(items) {
+		if m, ok := asMap(item); ok {
+			if value := stringFromAny(m[key]); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func anySliceLen(value any) int {
+	return len(anySlice(value))
+}
+
+func anySlice(value any) []any {
+	switch typed := value.(type) {
+	case []any:
+		return typed
+	case []map[string]any:
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, item)
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func asMap(value any) (map[string]any, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
@@ -677,6 +893,22 @@ func asMap(value any) (map[string]any, bool) {
 		return out, true
 	default:
 		return nil, false
+	}
+}
+
+func boolFromAny(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		switch strings.ToLower(strings.TrimSpace(typed)) {
+		case "true", "yes", "1":
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
 	}
 }
 

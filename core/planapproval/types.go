@@ -51,9 +51,9 @@ func (v Verdict) IsValid() bool {
 }
 
 // Proposal is the architect-published payload that triggers the UI's
-// plan acceptance dialog. The dialog renders the plan text, the
-// freshness summary (when present — Phase 2 attaches drift signals and
-// orchestrator state context), and three buttons.
+// plan acceptance dialog. The dialog renders only the decision controls;
+// the reviewable plan text is a user-facing claims artifact rendered in
+// chat. PlanText is retained as a migration/integrity fallback.
 //
 // Identity:
 //   - PlanID is the canonical plan identifier the decision routes back
@@ -63,7 +63,7 @@ func (v Verdict) IsValid() bool {
 //   - SessionID scopes the proposal to a session for routing.
 //
 // Content:
-//   - PlanName is the human-readable name shown in the dialog header.
+//   - PlanName is a human-readable name for logs/fallback metadata.
 //   - PlanSummary is a short one-paragraph synopsis (architect-derived).
 //   - PlanArtifactID / PlanArtifactReplaceKey point at the canonical
 //     user-reviewable claims artifact when available.

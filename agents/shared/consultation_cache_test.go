@@ -185,6 +185,50 @@ func TestSessionConsultationCache_TargetScopingIsolatesEntries(t *testing.T) {
 	}
 }
 
+func TestSessionConsultationCache_LocalScopeIsolatesEntries(t *testing.T) {
+	cache := NewSessionConsultationCache()
+	StoreSessionConsultationCacheWithScope(
+		cache,
+		"sess-1",
+		"librarian",
+		"what are the local CLI patterns",
+		"cmd/alpha",
+		map[string]any{"summary": "alpha command pattern"},
+		15*time.Minute,
+		0,
+	)
+	hit := LookupSessionConsultationCacheWithScope(
+		cache,
+		"sess-1",
+		"librarian",
+		"what are the local CLI patterns",
+		"cmd/beta",
+		ResearchDepthStandard,
+		2,
+	)
+	if hit.Hit {
+		t.Fatalf("different local scope must miss, got reason=%q", hit.Reason)
+	}
+	if hit.Reason != "scope mismatch" {
+		t.Fatalf("expected reason=scope mismatch, got %q", hit.Reason)
+	}
+	hit = LookupSessionConsultationCacheWithScope(
+		cache,
+		"sess-1",
+		"librarian",
+		"what are the local CLI patterns",
+		"cmd/alpha",
+		ResearchDepthStandard,
+		2,
+	)
+	if !hit.Hit {
+		t.Fatalf("same local scope should hit, got reason=%q", hit.Reason)
+	}
+	if hit.Scope != "cmd/alpha" {
+		t.Fatalf("scope = %q, want cmd/alpha", hit.Scope)
+	}
+}
+
 // TestExtractFreshnessHorizon_DurationStringsAndNumeric pins the
 // contract for how agents communicate freshness horizon. Accepts Go
 // duration strings ("15m"), float64 seconds, int seconds. Anything

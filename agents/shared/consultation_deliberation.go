@@ -46,6 +46,12 @@ type consultationObservation struct {
 	// and reconstruction of cached evidence at serve-time.
 	Query string `json:"query,omitempty"`
 
+	// Scope is the consult's local surface area. Cache lookups require
+	// the requested scope to match the stored scope so a similar query
+	// for a different package, file, or subsystem does not reuse stale
+	// evidence from the wrong part of the repository.
+	Scope string `json:"scope,omitempty"`
+
 	// Response payload from a successful consultation. Stored at
 	// outcome-record time so the session cache can serve the answer
 	// back without a fresh bus round-trip when the existing pressure

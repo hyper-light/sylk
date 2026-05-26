@@ -131,6 +131,9 @@ func markAgentCorrelationActive(agent *AgentState, correlationID string) {
 		return
 	}
 	agent.activeCorrelationID = correlationID
+	if strings.TrimSpace(agent.interruptCorrelationID) == "" {
+		agent.interruptCorrelationID = correlationID
+	}
 }
 
 func markAgentCorrelationTerminal(agent *AgentState, correlationID string) {
@@ -144,6 +147,9 @@ func markAgentCorrelationTerminal(agent *AgentState, correlationID string) {
 	agent.lastTerminalCorrelationID = correlationID
 	if strings.TrimSpace(agent.activeCorrelationID) == correlationID {
 		agent.activeCorrelationID = ""
+	}
+	if strings.TrimSpace(agent.interruptCorrelationID) == correlationID {
+		agent.interruptCorrelationID = ""
 	}
 }
 

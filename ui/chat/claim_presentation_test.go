@@ -141,3 +141,75 @@ func TestClaimPresentation_ActiveStreamBeforeResponseFinalizesOnce(t *testing.T)
 		t.Fatalf("entry.Content = %q, want plan before prose", entry.Content)
 	}
 }
+
+func TestClaimPresentation_CompletedStreamMatchesMetadataCorrelation(t *testing.T) {
+	m := newChatForPresentationTest(t)
+	m.handleStreamStart(msg.StreamStartMsg{
+		SessionID:     "ses-1",
+		CorrelationID: "cycle-stream",
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	m.handleStreamChunk(msg.StreamChunkMsg{CorrelationID: "cycle-stream", Text: "Assessment prose."})
+	m.handleStreamComplete(msg.StreamCompleteMsg{CorrelationID: "cycle-stream"})
+
+	m.Update(msg.ClaimPresentationMsg{
+		SessionID:  "ses-1",
+		CycleID:    "claim-cycle",
+		ClaimID:    "claim-cycle",
+		SourceType: "artifact",
+		SourceID:   "plan-artifact",
+		AgentID:    "architect",
+		Content:    "### Plan\n\n1. Build it.",
+		Format:     "markdown",
+		Placement:  "before_response",
+		ReplaceKey: "plan:p1:review",
+		Metadata: map[string]any{
+			"plan_id":               "p1",
+			"stream_correlation_id": "cycle-stream",
+		},
+		Sequence: 1,
+	})
+
+	if m.history.Len() != 1 {
+		t.Fatalf("history len = %d, want 1", m.history.Len())
+	}
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("expected stream entry")
+	}
+	if !strings.Contains(entry.Content, "### Plan\n\n1. Build it.\n\nAssessment prose.") {
+		t.Fatalf("entry.Content = %q, want plan attached to completed stream", entry.Content)
+	}
+	if strings.Count(entry.Content, "### Plan") != 1 {
+		t.Fatalf("entry.Content = %q, want one plan", entry.Content)
+	}
+}
+
+func TestPlanUpdateReadySyncsActiveStreamImmediately(t *testing.T) {
+	m := newChatForPresentationTest(t)
+	m.handleStreamStart(msg.StreamStartMsg{
+		SessionID:     "ses-1",
+		CorrelationID: "cycle-stream",
+		AgentID:       "architect",
+		AgentType:     "architect",
+	})
+	m.handleStreamChunk(msg.StreamChunkMsg{CorrelationID: "cycle-stream", Text: "Assessment prose."})
+
+	m.HandlePlanUpdate(msg.PlanUpdateMsg{
+		PlanID:        "p1",
+		CorrelationID: "cycle-stream",
+		Status:        "ready",
+	})
+
+	entry := m.history.Get(0)
+	if entry == nil {
+		t.Fatal("expected active stream entry")
+	}
+	if !strings.Contains(entry.Content, "## Plan") {
+		t.Fatalf("entry.Content = %q, want visible plan immediately", entry.Content)
+	}
+	if !strings.Contains(entry.Content, "Assessment prose.") {
+		t.Fatalf("entry.Content = %q, want accumulated prose preserved", entry.Content)
+	}
+}

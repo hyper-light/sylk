@@ -24,7 +24,7 @@ func TestApplyPendingPlanMetadata_ExecuteAttachesAndClears(t *testing.T) {
 		TargetAgent: TargetAgent("architect"),
 	}
 
-	g.applyPendingPlanMetadata("s1", classification)
+	g.applyPendingPlanMetadata("s1", "go ahead", classification)
 
 	if classification.PhaseMetadata == nil {
 		t.Fatal("expected PhaseMetadata to be set")
@@ -59,7 +59,7 @@ func TestApplyPendingPlanMetadata_PlanFeedbackAttachesAndClears(t *testing.T) {
 		TargetAgent: TargetAgent("architect"),
 	}
 
-	g.applyPendingPlanMetadata("s1", classification)
+	g.applyPendingPlanMetadata("s1", "change step 2 to use argparse", classification)
 
 	if classification.PhaseMetadata == nil {
 		t.Fatal("expected PhaseMetadata to be set for plan feedback")
@@ -91,7 +91,7 @@ func TestApplyPendingPlanMetadata_DifferentTargetLeavesInPlace(t *testing.T) {
 		TargetAgent: TargetAgent("librarian"),
 	}
 
-	g.applyPendingPlanMetadata("s1", classification)
+	g.applyPendingPlanMetadata("s1", "go ahead", classification)
 
 	if classification.PhaseMetadata != nil {
 		t.Fatal("expected PhaseMetadata to be nil when target differs")
@@ -110,7 +110,7 @@ func TestApplyPendingPlanMetadata_NoPendingNoop(t *testing.T) {
 		TargetAgent: TargetAgent("architect"),
 	}
 
-	g.applyPendingPlanMetadata("s1", classification)
+	g.applyPendingPlanMetadata("s1", "go ahead", classification)
 
 	if classification.PhaseMetadata != nil {
 		t.Fatal("expected PhaseMetadata to be nil when no pending plan")
@@ -136,12 +136,41 @@ func TestApplyPendingPlanMetadata_OffTopicLeavesInPlace(t *testing.T) {
 		TargetAgent: TargetAgent("guide"),
 	}
 
-	g.applyPendingPlanMetadata("s1", classification)
+	g.applyPendingPlanMetadata("s1", "what is the weather?", classification)
 
 	if classification.PhaseMetadata != nil {
 		t.Fatal("expected PhaseMetadata to be nil for off-topic")
 	}
 	if flow.PendingPlan("s1") == nil {
 		t.Fatal("expected pending plan to remain for off-topic")
+	}
+}
+
+func TestApplyPendingPlanMetadata_FreshPlanRequestDoesNotConsumePendingPlan(t *testing.T) {
+	flow := NewConversationFlowManager(ConversationFlowConfig{})
+	flow.SetPendingPlan("s1", &ResponseDirective{
+		Phase:   PhasePlanApproval,
+		AgentID: "architect",
+		Metadata: map[string]any{
+			"plan_id": "plan-stay",
+			"epoch":   uint64(3),
+		},
+		TTL: 5 * time.Minute,
+	})
+
+	g := &Guide{conversation: flow}
+	classification := &RouteResult{
+		Intent:      IntentPlan,
+		Domain:      DomainPlanning,
+		TargetAgent: TargetAgent("architect"),
+	}
+
+	g.applyPendingPlanMetadata("s1", "Let's create a toy python hello world cli app.", classification)
+
+	if classification.PhaseMetadata != nil {
+		t.Fatalf("expected PhaseMetadata to be nil for fresh planning request, got %#v", classification.PhaseMetadata)
+	}
+	if flow.PendingPlan("s1") == nil {
+		t.Fatal("expected pending plan to remain for fresh planning request")
 	}
 }

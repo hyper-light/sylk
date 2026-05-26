@@ -379,6 +379,176 @@ func TestBridgeIntegration_PresentableArtifactEmitsClaimPresentation(t *testing.
 	}
 }
 
+func TestBridgeIntegration_FreeFloatingPlanMarkdownEmitsPresentation(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-free-floating-plan")
+	defer cleanup()
+
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			AgentID:    "architect",
+			Summary:    "Plan ready for review.",
+			Confidence: "committed",
+			Artifacts: []*claims.Artifact{{
+				ID:        "artifact-free-floating-plan",
+				AgentID:   "architect",
+				Kind:      claims.ArtifactKindPlanMarkdown,
+				Reference: "### Plan\n\n1. Build it.",
+				Presentation: &claims.Presentation{
+					Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+					Surfaces: []claims.PresentationSurface{
+						claims.PresentationSurfaceChat,
+						claims.PresentationSurfaceApproval,
+					},
+					Format:     claims.PresentationFormatMarkdown,
+					Title:      "Plan",
+					Placement:  claims.PresentationPlacementBeforeResponse,
+					ReplaceKey: "plan:p-free:review",
+				},
+				Metadata: map[string]any{
+					"plan_id":               "p-free",
+					"stream_correlation_id": "corr-free-plan",
+				},
+			}},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	drainBridge(t, prog, "free-floating plan presentation")
+
+	var got *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-free-floating-plan" {
+			cp := p
+			got = &cp
+			break
+		}
+	}
+	if got == nil {
+		debugSnapshot(t, prog, "free-floating plan presentation")
+		t.Fatal("expected ClaimPresentationMsg for free-floating plan markdown")
+	}
+	if got.CycleID != "corr-free-plan" || got.ClaimID != "" {
+		t.Fatalf("unexpected presentation ids: %+v", got)
+	}
+	if got.Content != "### Plan\n\n1. Build it." {
+		t.Fatalf("content = %q", got.Content)
+	}
+	if got.Format != "markdown" || got.Placement != "before_response" || got.ReplaceKey != "plan:p-free:review" {
+		t.Fatalf("unexpected presentation render fields: %+v", got)
+	}
+}
+
+func TestBridgeIntegration_FreeFloatingLongPlanMarkdownEmitsFullPresentation(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-free-floating-long-plan")
+	defer cleanup()
+
+	content := "### Plan\n\n" + strings.Repeat("- Build the CLI with enough implementation detail to exceed projection inline limits.\n", 20)
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			AgentID:    "architect",
+			Summary:    "Plan ready for review.",
+			Confidence: "committed",
+			Artifacts: []*claims.Artifact{{
+				ID:        "artifact-long-free-floating-plan",
+				AgentID:   "architect",
+				Kind:      claims.ArtifactKindPlanMarkdown,
+				Reference: content,
+				Presentation: &claims.Presentation{
+					Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+					Surfaces: []claims.PresentationSurface{
+						claims.PresentationSurfaceChat,
+						claims.PresentationSurfaceApproval,
+					},
+					Format:     claims.PresentationFormatMarkdown,
+					Title:      "Plan",
+					Placement:  claims.PresentationPlacementBeforeResponse,
+					ReplaceKey: "plan:p-long-free:review",
+				},
+				Metadata: map[string]any{
+					"plan_id":               "p-long-free",
+					"stream_correlation_id": "corr-long-free-plan",
+				},
+			}},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	if len(content) <= 500 {
+		t.Fatalf("test content length = %d, want projection-truncated content", len(content))
+	}
+	drainBridge(t, prog, "free-floating long plan presentation")
+
+	var got *msg.ClaimPresentationMsg
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-long-free-floating-plan" {
+			cp := p
+			got = &cp
+			break
+		}
+	}
+	if got == nil {
+		debugSnapshot(t, prog, "free-floating long plan presentation")
+		t.Fatal("expected ClaimPresentationMsg for long free-floating plan markdown")
+	}
+	if got.Content != content {
+		t.Fatalf("content was not hydrated from canonical artifact:\n got %q\nwant %q", got.Content, content)
+	}
+	if strings.Contains(strings.ToLower(got.Content), "inline projection was truncated") {
+		t.Fatalf("presentation leaked truncation diagnostic: %q", got.Content)
+	}
+	if got.Format != "markdown" {
+		t.Fatalf("format = %q, want markdown", got.Format)
+	}
+}
+
+func TestBridgeIntegration_ResolveArtifactHydratesTruncatedProjection(t *testing.T) {
+	br, board, _, cleanup := setupBridgeOnSession(t, "ses-resolve-long-plan")
+	defer cleanup()
+
+	content := "### Plan\n\n" + strings.Repeat("- Preserve this markdown when resolving from a projection copy.\n", 24)
+	if err := board.SubmitTestaments(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTestament},
+		[]claims.Testament{{
+			AgentID:    "architect",
+			Summary:    "Plan ready for review.",
+			Confidence: "committed",
+			Artifacts: []*claims.Artifact{{
+				ID:        "artifact-resolve-long-plan",
+				AgentID:   "architect",
+				Kind:      claims.ArtifactKindPlanMarkdown,
+				Reference: content,
+				Presentation: &claims.Presentation{
+					Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+					Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat, claims.PresentationSurfaceApproval},
+					Format:    claims.PresentationFormatMarkdown,
+				},
+			}},
+		}},
+	); err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
+	}
+	projectionArtifact := findArtifact(board.Projection(), "artifact-resolve-long-plan")
+	if projectionArtifact == nil {
+		t.Fatal("projection artifact missing")
+	}
+	if !claimMetadataBool(projectionArtifact.Metadata, claims.ArtifactMetadataContentTruncated) {
+		t.Fatalf("projection artifact was not marked truncated; len(content)=%d", len(content))
+	}
+
+	got, ok := br.ResolveArtifact("ses-resolve-long-plan", "artifact-resolve-long-plan")
+	if !ok {
+		t.Fatal("ResolveArtifact returned !ok")
+	}
+	if got.Reference != content {
+		t.Fatalf("resolved reference = %q, want full content", got.Reference)
+	}
+	if claimMetadataBool(got.Metadata, claims.ArtifactMetadataContentTruncated) {
+		t.Fatalf("resolved artifact still carries projection truncation metadata: %+v", got.Metadata)
+	}
+}
+
 func TestBridgeIntegration_PresentableArtifactPreservesReferenceContent(t *testing.T) {
 	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-content")
 	defer cleanup()
@@ -545,6 +715,67 @@ func TestBridgeIntegration_TruncatedPresentableArtifactEmitsDiagnostic(t *testin
 	}
 	debugSnapshot(t, prog, "truncated presentation")
 	t.Fatal("expected ClaimPresentationMsg for truncated artifact")
+}
+
+func TestBridgeIntegration_TruncatedPlanMarkdownFallsBackToMarkdownNotDiagnostic(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-presentation-truncated-plan")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "plan",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	br.OnArtifactAdded(claimID, "architect", "ses-presentation-truncated-plan", &claims.Artifact{
+		ID:        "artifact-truncated-plan",
+		AgentID:   "architect",
+		Kind:      claims.ArtifactKindPlanMarkdown,
+		Reference: "### Plan\n\n- Build the CLI.\n…",
+		Metadata: map[string]any{
+			claims.ArtifactMetadataContentTruncated: true,
+			claims.ArtifactMetadataContentSize:      1400,
+			"plan_id":                               "p-truncated",
+			"stream_correlation_id":                 "corr-plan-review",
+		},
+		Presentation: &claims.Presentation{
+			Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+			Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat, claims.PresentationSurfaceApproval},
+			Format:    claims.PresentationFormatMarkdown,
+			Placement: claims.PresentationPlacementBeforeResponse,
+		},
+		Sequence: 5,
+		Created:  time.Now(),
+	})
+	drainBridge(t, prog, "truncated plan presentation")
+
+	for _, m := range prog.Snapshot() {
+		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceID == "artifact-truncated-plan" {
+			if strings.Contains(strings.ToLower(p.Content), "inline projection was truncated") {
+				t.Fatalf("plan markdown leaked truncation diagnostic: %q", p.Content)
+			}
+			if !strings.Contains(p.Content, "### Plan") {
+				t.Fatalf("plan markdown content missing: %q", p.Content)
+			}
+			if p.Format != string(claims.PresentationFormatMarkdown) {
+				t.Fatalf("format = %q, want markdown", p.Format)
+			}
+			if p.CycleID != "corr-plan-review" {
+				t.Fatalf("cycle_id = %q, want stream correlation", p.CycleID)
+			}
+			return
+		}
+	}
+	debugSnapshot(t, prog, "truncated plan presentation")
+	t.Fatal("expected ClaimPresentationMsg for truncated plan markdown")
 }
 
 func TestBridgeIntegration_InternalArtifactDoesNotEmitPresentation(t *testing.T) {

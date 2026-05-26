@@ -9,10 +9,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -266,7 +266,7 @@ type planInput struct {
 	Constraints      []string              `json:"constraints,omitempty"`
 	Requirements     *Requirements         `json:"requirements,omitempty"`
 	Patterns         []string              `json:"patterns,omitempty"`
-	Evidence         []*PlanEvidence        `json:"evidence,omitempty"`
+	Evidence         []*PlanEvidence       `json:"evidence,omitempty"`
 	Architecture     *SolutionArchitecture `json:"architecture,omitempty"`
 	MaxTasksPerAgent int                   `json:"max_tasks_per_agent,omitempty"`
 	AllowParallel    bool                  `json:"allow_parallel,omitempty"`
@@ -279,12 +279,12 @@ type planInput struct {
 	// Phase 2.K / CR-4 refactor: start_planning + plan_workflow folded
 	// into plan. Keep their typed fields directly on the input struct
 	// so callers don't need to build a nested object.
-	SessionID      string        `json:"session_id,omitempty"`       // start
-	WorkflowType   string        `json:"workflow_type,omitempty"`    // workflow: standard|fix
-	Tasks          []*AtomicTask `json:"tasks,omitempty"`            // workflow=standard
-	Policy         string        `json:"policy,omitempty"`           // workflow=standard
-	MaxConcurrency int           `json:"max_concurrency,omitempty"`  // workflow=standard
-	Corrections    []any         `json:"corrections,omitempty"`      // workflow=fix
+	SessionID      string        `json:"session_id,omitempty"`      // start
+	WorkflowType   string        `json:"workflow_type,omitempty"`   // workflow: standard|fix
+	Tasks          []*AtomicTask `json:"tasks,omitempty"`           // workflow=standard
+	Policy         string        `json:"policy,omitempty"`          // workflow=standard
+	MaxConcurrency int           `json:"max_concurrency,omitempty"` // workflow=standard
+	Corrections    []any         `json:"corrections,omitempty"`     // workflow=fix
 }
 
 func planSkill(a *Architect) *skills.Skill {
@@ -293,7 +293,7 @@ func planSkill(a *Architect) *skills.Skill {
 			"Actions:\n"+
 			"- start: Create a new plan and return plan_id + protocol instructions (params: query [required], session_id)\n"+
 			"- analyze: Synthesize project requirements from the user discussion, existing evidence, and known constraints (params: query [required], scope, goals, constraints, plan_id)\n"+
-			"- design: Synthesize system architecture from requirements and consultation evidence (params: requirements [required] OR plan_id, patterns)\n"+
+			"- design: Synthesize system architecture from requirements and planning evidence (params: requirements [required] OR plan_id, patterns)\n"+
 			"- generate_tasks: Synthesize atomic tasks from architecture (params: architecture [required] OR plan_id, max_tasks_per_agent, allow_parallel)\n"+
 			"- workflow: Build workflow DAG from tasks (workflow_type=standard: tasks [required], policy, max_concurrency) or from corrections (workflow_type=fix: corrections [required], plan_id, session_id)\n"+
 			"- estimate: Estimate task complexity and token usage (params: description [required], context)\n"+
@@ -322,7 +322,7 @@ func planSkill(a *Architect) *skills.Skill {
 			"scope": {Type: "string", Description: "Scope of the design"},
 		}, false).
 		ArrayParam("patterns", "Existing patterns to incorporate (for design)", "string", false).
-		ArrayParam("evidence", "Normalized consultation evidence to carry into this planning phase", "object", false).
+		ArrayParam("evidence", "Normalized planning evidence to carry into this planning phase, including consultation or recall_forward continuity evidence", "object", false).
 		ObjectParam("architecture", "Architecture to generate tasks from (for generate_tasks)", map[string]*skills.Property{
 			"name":        {Type: "string", Description: "Architecture name"},
 			"description": {Type: "string", Description: "Architecture description"},
@@ -358,8 +358,8 @@ func planSkill(a *Architect) *skills.Skill {
 		EnumParam("policy", "Execution policy (for workflow=standard)", []string{"fail_fast", "continue"}, false).
 		IntParam("max_concurrency", "Maximum concurrent tasks (for workflow=standard, default 10)", false).
 		ArrayParam("corrections", "Correction list from inspector/tester feedback (for workflow=fix)", "object", false).
-		Usage("Use this skill to formalize and synthesize what the architect has already learned from the user discussion and consultations. The goal is a high-quality planning artifact, not a replacement for live discovery. If material evidence is still missing, perform the targeted consultation first or immediately after the relevant planning step instead of guessing.").
-		BestPractice("For action=analyze, synthesize the whole conversation and consultation evidence into the query and inputs — do not treat analyze as the first moment to discover obvious requirements.").
+		Usage("Use this skill to formalize and synthesize what the architect has already learned from the user discussion, carried-forward continuity, and consultations. The goal is a high-quality planning artifact, not a replacement for live discovery. If material evidence is still missing, call recall_forward for stable topics and perform only the targeted consultation still needed instead of guessing.").
+		BestPractice("For action=analyze, synthesize the whole conversation, carried-forward testaments/artifacts, and consultation evidence into the query and inputs — do not treat analyze as the first moment to discover obvious requirements.").
 		BestPractice("For action=design and action=generate_tasks, preserve the current output shape while grounding the result in the strongest evidence already gathered. Additional targeted research is still allowed when a real gap remains.").
 		BestPractice("For action=generate_tasks, prefer short markdown-ready examples when they materially reduce ambiguity. Use example languages like sh, json, go, ts, or mermaid, and do not include surrounding triple backticks in the example code field.").
 		BestPractice("Use compact mermaid flow or sequence diagrams when task sequencing, ownership, or data flow is easier to understand visually than in prose.").
@@ -402,20 +402,36 @@ func handlePlanSkillStart(a *Architect, ctx context.Context, p *planInput) (any,
 		sessionID = normalizeSessionID(p.SessionID)
 	}
 	requestCorrelationID := originalCIDFromContext(ctx)
+	if a.config.MandatoryConsultation &&
+		!planningStartHasFreshEvidence(a, p, sessionID, requestCorrelationID) {
+		result := startRequiresConsultationResult(query)
+		result["session_id"] = sessionID
+		return result, nil
+	}
 	if reusable := a.reusablePlanForRequest(sessionID, requestCorrelationID); reusable != nil {
+		stagedChanged := a.drainStagedEvidenceIntoPlan(reusable)
+		if len(p.Evidence) > 0 {
+			a.attachPlanInputEvidence(ctx, reusable, p.Evidence)
+		} else if stagedChanged {
+			if err := a.persistPlanState(reusable); err != nil {
+				return nil, err
+			}
+		}
 		a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, reusable.ID)
 		a.logInfo("plan(start): reusing request-scoped plan",
 			"plan_id", reusable.ID,
 			"session_id", sessionID,
 			"request_correlation_id", requestCorrelationID,
 			"status", reusable.SM().State().String())
-		return map[string]any{
+		result := map[string]any{
 			"plan_id":    reusable.ID,
 			"session_id": sessionID,
 			"status":     reusable.SM().State().String(),
 			"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
 			"reused":     true,
-		}, nil
+		}
+		addPlanEvidenceResult(result, reusable, query, a.config.ConsultationMaxAge)
+		return result, nil
 	}
 	req := &ArchitectRequest{
 		ID:        uuid.NewString(),
@@ -427,6 +443,14 @@ func handlePlanSkillStart(a *Architect, ctx context.Context, p *planInput) (any,
 	req = a.enrichPlanningRequest(req)
 	plan := newProtocolPlan(req, requestCorrelationID)
 	a.drainStagedEvidenceIntoPlan(plan)
+	if len(p.Evidence) > 0 {
+		a.evidenceMu.Lock()
+		if mergePlanInputEvidence(plan, p.Evidence) {
+			plan.CodebasePatterns = extractLibrarianPatterns(plan)
+			plan.UpdatedAt = time.Now()
+		}
+		a.evidenceMu.Unlock()
+	}
 	if err := a.persistPlanState(plan); err != nil {
 		return nil, err
 	}
@@ -439,13 +463,15 @@ func handlePlanSkillStart(a *Architect, ctx context.Context, p *planInput) (any,
 	shared.LogAgentEvent(a.steering.EventLogger(), agentlog.EventPlanCreated,
 		a.id, sessionID, "", "info",
 		&agentlog.PlanPayload{PlanID: plan.ID, Status: plan.Status.String()})
-	return map[string]any{
+	result := map[string]any{
 		"plan_id":    plan.ID,
 		"session_id": sessionID,
 		"status":     plan.Status.String(),
 		"protocol":   startPlanningProtocolInstructions(a.config.AutoApprove),
 		"reused":     false,
-	}, nil
+	}
+	addPlanEvidenceResult(result, plan, query, a.config.ConsultationMaxAge)
+	return result, nil
 }
 
 // handlePlanSkillWorkflow absorbs the former plan_workflow skill. Builds
@@ -506,12 +532,21 @@ func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (an
 		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
 		if hasReachedPlanPhase(plan.SM().State(), PlanStatusAnalyzing) &&
 			plan.Requirements != nil {
-			return map[string]any{
+			result := map[string]any{
 				"requirements": plan.Requirements,
 				"analysis":     requirementsAnalysisSummary(plan.Requirements),
 				"plan_status":  plan.SM().State().String(),
 				"reused":       true,
-			}, nil
+			}
+			addPlanEvidenceResult(result, plan, firstNonEmptyString(p.Query, plan.Requirements.Query), a.config.ConsultationMaxAge)
+			return result, nil
+		}
+		if a.config.MandatoryConsultation &&
+			plan.Requirements == nil &&
+			!planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+			result := analyzeRequiresConsultationResult(plan, p.Query)
+			addPlanEvidenceResult(result, plan, p.Query, a.config.ConsultationMaxAge)
+			return result, nil
 		}
 	}
 	reqParams := map[string]any{}
@@ -547,6 +582,7 @@ func handlePlanSkillAnalyze(a *Architect, ctx context.Context, p *planInput) (an
 			return nil, err
 		}
 		result["plan_status"] = plan.SM().State().String()
+		addPlanEvidenceResult(result, plan, p.Query, a.config.ConsultationMaxAge)
 	}
 	return result, nil
 }
@@ -559,12 +595,14 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
 		if hasReachedPlanPhase(plan.SM().State(), PlanStatusDesigning) &&
 			plan.Architecture != nil {
-			return map[string]any{
+			result := map[string]any{
 				"architecture": plan.Architecture,
 				"summary":      architectureSummary(plan.Architecture),
 				"plan_status":  plan.SM().State().String(),
 				"reused":       true,
-			}, nil
+			}
+			addPlanEvidenceResult(result, plan, architectureEvidenceFocus(plan), a.config.ConsultationMaxAge)
+			return result, nil
 		}
 		requirements = plan.Requirements
 		codebasePatterns = plan.CodebasePatterns
@@ -575,6 +613,11 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 	}
 	if requirements == nil {
 		return nil, fmt.Errorf("requirements is required for action=design")
+	}
+	if hasPlan && plan.Architecture == nil && !planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+		result := designRequiresConsultationResult(plan)
+		addPlanEvidenceResult(result, plan, requirements.Query, a.config.ConsultationMaxAge)
+		return result, nil
 	}
 	if hasPlan {
 		attachRequirementsEvidenceDigest(requirements, planningEvidenceDigest(plan, requirements.Query))
@@ -609,8 +652,209 @@ func handlePlanSkillDesign(a *Architect, ctx context.Context, p *planInput) (any
 			return nil, err
 		}
 		result["plan_status"] = plan.SM().State().String()
+		addPlanEvidenceResult(result, plan, requirements.Query, a.config.ConsultationMaxAge)
 	}
 	return result, nil
+}
+
+func addPlanEvidenceResult(result map[string]any, plan *DesignPlan, focus string, maxAge time.Duration) {
+	if result == nil || plan == nil {
+		return
+	}
+	digest := planningEvidenceDigest(plan, focus)
+	result["attached_consultation_evidence"] = len(digest) > 0
+	result["attached_planning_evidence"] = len(digest) > 0
+	result["fresh_consultation_evidence"] = planHasFreshConsultationEvidence(plan, maxAge)
+	result["fresh_planning_evidence"] = planHasFreshPlanningEvidence(plan, maxAge)
+	result["consultation_evidence_count"] = len(digest)
+	result["planning_evidence_count"] = len(digest)
+	if len(digest) > 0 {
+		result["consultation_evidence"] = digest
+	}
+}
+
+func architectureEvidenceFocus(plan *DesignPlan) string {
+	if plan == nil {
+		return ""
+	}
+	if plan.Architecture != nil {
+		return plan.Architecture.Description
+	}
+	if plan.Requirements != nil {
+		return plan.Requirements.Query
+	}
+	return plan.Query
+}
+
+func designRequiresConsultationResult(plan *DesignPlan) map[string]any {
+	status := ""
+	query := ""
+	if plan != nil {
+		status = plan.SM().State().String()
+		if plan.Requirements != nil {
+			query = plan.Requirements.Query
+		}
+	}
+	return map[string]any{
+		"plan_status":           status,
+		"ready_for_design":      false,
+		"requires_consultation": true,
+		"required_before":       "plan(action=design)",
+		"required_tool":         "consult_peer",
+		"message":               "Fresh planning evidence is required before design. For stable or resumed topics, call recall_forward first. If carried-forward continuity is absent or insufficient, invoke one targeted consult_peer call, wait for it to complete, then retry plan(action=design).",
+		"query_hint":            query,
+		"target_selection":      planningConsultTargetSelection(),
+	}
+}
+
+func planningStartHasFreshEvidence(a *Architect, p *planInput, sessionID, correlationID string) bool {
+	if p != nil && len(p.Evidence) > 0 {
+		plan := &DesignPlan{EvidenceTrail: append([]*PlanEvidence(nil), p.Evidence...)}
+		if planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+			return true
+		}
+	}
+	for _, evidence := range a.stagedPlanningEvidenceSnapshot(sessionID, correlationID) {
+		plan := &DesignPlan{EvidenceTrail: []*PlanEvidence{evidence}}
+		if planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+			return true
+		}
+	}
+	// If a prior same-request plan already exists and has evidence, a repeated
+	// start call can reuse it. This keeps the guard idempotent without allowing
+	// a first plan start from zero evidence.
+	if plan := a.reusablePlanForRequest(sessionID, correlationID); plan != nil {
+		if planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Architect) stagedPlanningEvidenceSnapshot(sessionID, correlationID string) []*PlanEvidence {
+	if a == nil {
+		return nil
+	}
+	keys := []string{
+		stagedEvidenceKey(sessionID, correlationID),
+		stagedEvidenceKey(sessionID, ""),
+	}
+	a.evidenceMu.Lock()
+	defer a.evidenceMu.Unlock()
+	var out []*PlanEvidence
+	seen := map[string]struct{}{}
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		for _, evidence := range a.stagedEvidence[key] {
+			if evidence == nil {
+				continue
+			}
+			id := strings.TrimSpace(evidence.ID)
+			if id == "" {
+				id = planEvidenceID(evidence)
+			}
+			if id != "" {
+				if _, ok := seen[id]; ok {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			out = append(out, clonePlanEvidence(evidence))
+		}
+	}
+	return out
+}
+
+func startRequiresConsultationResult(query string) map[string]any {
+	return map[string]any{
+		"ready_for_start":       false,
+		"requires_consultation": true,
+		"required_before":       "plan(action=start)",
+		"required_tool":         "consult_peer",
+		"message":               "Fresh planning evidence is required before creating a formal plan. For stable or resumed topics, call recall_forward first. If carried-forward continuity is absent or insufficient, invoke one targeted consult_peer call to the most relevant knowledge agent, wait for it to complete, then retry plan(action=start).",
+		"query_hint":            strings.TrimSpace(query),
+		"target_selection":      planningConsultTargetSelection(),
+	}
+}
+
+func analyzeRequiresConsultationResult(plan *DesignPlan, query string) map[string]any {
+	status := ""
+	if plan != nil {
+		status = plan.SM().State().String()
+		query = firstNonEmptyString(query, plan.Query)
+	}
+	return map[string]any{
+		"plan_status":           status,
+		"ready_for_analyze":     false,
+		"requires_consultation": true,
+		"required_before":       "plan(action=analyze)",
+		"required_tool":         "consult_peer",
+		"message":               "Fresh planning evidence is required before requirements analysis. For stable or resumed topics, call recall_forward first. If carried-forward continuity is absent or insufficient, invoke one targeted consult_peer call to the most relevant knowledge agent, wait for it to complete, then retry plan(action=analyze).",
+		"query_hint":            strings.TrimSpace(query),
+		"target_selection":      planningConsultTargetSelection(),
+	}
+}
+
+func planningConsultTargetSelection() map[string]string {
+	return map[string]string{
+		"librarian":   "codebase structure, repository files, local patterns, and implementation conventions",
+		"archivalist": "prior decisions, preserved preferences, precedent, and historical context",
+		"academic":    "architecture quality, correctness, testing, infrastructure, performance, and tradeoffs",
+	}
+}
+
+func planHasFreshConsultationEvidence(plan *DesignPlan, maxAge time.Duration) bool {
+	if plan == nil {
+		return false
+	}
+	for _, evidence := range plan.EvidenceTrail {
+		if evidence == nil || evidence.Kind != EvidenceKindConsult || !evidence.Success {
+			continue
+		}
+		if isPlanEvidenceFresh(evidence, maxAge) {
+			return true
+		}
+	}
+	for _, evidence := range plan.Consultations {
+		if evidence != nil && evidence.Success && isConsultationFresh(evidence, maxAge) {
+			return true
+		}
+	}
+	return false
+}
+
+func planHasFreshPlanningEvidence(plan *DesignPlan, maxAge time.Duration) bool {
+	if plan == nil {
+		return false
+	}
+	for _, evidence := range plan.EvidenceTrail {
+		if evidence == nil || !evidence.Success {
+			continue
+		}
+		if evidence.Kind != EvidenceKindConsult && evidence.Kind != EvidenceKindContinuity {
+			continue
+		}
+		if isPlanEvidenceFresh(evidence, maxAge) {
+			return true
+		}
+	}
+	return planHasFreshConsultationEvidence(plan, maxAge)
+}
+
+func isPlanEvidenceFresh(evidence *PlanEvidence, maxAge time.Duration) bool {
+	if evidence == nil {
+		return false
+	}
+	if maxAge <= 0 {
+		return true
+	}
+	receivedAt := evidence.ReceivedAt
+	if receivedAt.IsZero() {
+		return false
+	}
+	return time.Since(receivedAt) <= maxAge
 }
 
 func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInput) (any, error) {
@@ -624,6 +868,9 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		a.attachPlanInputEvidence(ctx, plan, p.Evidence)
 		if hasReachedPlanPhase(plan.SM().State(), PlanStatusGenerating) &&
 			len(plan.Tasks) > 0 && plan.Workflow != nil {
+			if plan.SM().State() == PlanStatusReady && !a.config.AutoApprove {
+				a.presentPlanApprovalDialogBestEffort(ctx, plan)
+			}
 			return map[string]any{
 				"tasks":        plan.Tasks,
 				"summary":      taskGenerationSummary(plan.Tasks),
@@ -637,6 +884,20 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 		architecture = plan.Architecture
 		if plan.Constraints != nil {
 			constraints = plan.Constraints
+		}
+	}
+	if hasPlan && plan.Architecture == nil && !planHasFreshPlanningEvidence(plan, a.config.ConsultationMaxAge) {
+		return designRequiresConsultationResult(plan), nil
+	}
+	if architecture == nil && hasPlan && isMinimalPlanningPath(plan.Requirements) {
+		architecture = minimalArchitectureFromRequirements(plan.Requirements)
+		plan.Architecture = architecture
+		if plan.SM().State() == PlanStatusAnalyzing {
+			if err := a.advancePlan(ctx, plan, PlanStatusDesigning, func() {
+				plan.Architecture = architecture
+			}); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if architecture == nil {
@@ -692,8 +953,8 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	// Guardian preflight — REQUIRED before plan ships to user. Plans
 	// never reach the dialog without Guardian's verdict (canon: Guardian
 	// gates dispatch, user consents to a vetted plan). The verdict is
-	// folded into PlanHandoff.GuardianAttestation; the dialog renders
-	// findings inline so user consent is informed.
+	// folded into PlanHandoff.GuardianAttestation; the chat artifact and
+	// narrative carry findings so user consent is informed.
 	//
 	// On failure (timeout, transport error, blocking findings), fail
 	// the plan rather than ship un-vetted. Better to surface to the
@@ -717,6 +978,9 @@ func handlePlanSkillGenerateTasks(a *Architect, ctx context.Context, p *planInpu
 	}
 	if lm := a.planStore.LeaseManager(); lm != nil {
 		lm.GrantReadyLease(plan)
+	}
+	if !a.config.AutoApprove {
+		a.presentPlanApprovalDialogBestEffort(ctx, plan)
 	}
 	a.publishPlanSnapshot(ctx, plan)
 
@@ -885,8 +1149,8 @@ func planWorkflowSkill(a *Architect) *skills.Skill {
 		StringParam("plan_id", "Plan identifier to attach fix DAG to (for fix)", false).
 		StringParam("session_id", "Session identifier (for fix)", false).
 		ArrayParam("corrections", "Correction list from inspector/tester feedback (for fix)", "object", false).
-		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use route_plan_acceptance and let the Architect resume asynchronously when approval completes.").
-		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires route_plan_acceptance and an asynchronous handoff to the orchestrator.").
+		Usage("Use during plan formulation to organize atomic tasks into a dependency graph. This is a planning-phase tool that builds data structures — it does NOT submit the plan to the Orchestrator or trigger execution. To execute a plan after user approval, use plan_acceptance(action=route) and let the Architect resume asynchronously when approval completes.").
+		BestPractice("NEVER use this skill as a substitute for plan execution. Execution requires plan_acceptance(action=route) and an asynchronous handoff to the orchestrator.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params planWorkflowInput
 			if err := json.Unmarshal(input, &params); err != nil {

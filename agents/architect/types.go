@@ -616,7 +616,8 @@ type ConsultationEvidence struct {
 type EvidenceKind string
 
 const (
-	EvidenceKindConsult EvidenceKind = "consult"
+	EvidenceKindConsult    EvidenceKind = "consult"
+	EvidenceKindContinuity EvidenceKind = "continuity"
 )
 
 type PlanEvidence struct {

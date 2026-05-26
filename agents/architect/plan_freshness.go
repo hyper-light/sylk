@@ -4,15 +4,15 @@
 // resumed across architect demotion/restart) as a re-evaluation rather
 // than a re-dispatch. The audit composes cheap drift signals (workspace
 // fingerprint, plan age, file existence/modification) into a structured
-// PlanFreshnessAudit. The dialog (Phase 1) carries the audit's
-// FreshnessSummary + DriftSignals so the user clicks Approve / Modify /
-// Reject INFORMED about what changed since the plan was drafted.
+// PlanFreshnessAudit. The approval payload carries the audit's
+// FreshnessSummary + DriftSignals as structured decision context; user-visible
+// plan and audit text belongs in chat, not in the input-panel dialog.
 //
 // Cheap by design: no LLM calls, no consultations, no orchestrator
 // queries inline. Each signal is a stat() call or a string compare.
 // Phase 2.5 will add selective consultation triggers when drift
 // exceeds threshold; Phase 3 wires the audit into requestPlanApprovalDialog
-// so the dialog renders with audit context.
+// so the decision payload remains fresh.
 package architect
 
 import (

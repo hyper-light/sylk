@@ -254,6 +254,9 @@ func (m *AppModel) initializePipelineBridge(deps Deps) {
 	}
 	m.pipelineBridge = bridge.NewPipelineBridge("tui.pipeline", deps.GuideBus, deps.VariantRegistry, deps.Scope)
 	m.claimsBridge = bridge.NewClaimsBridge("tui.claims", claims.DefaultSessionBoardRegistry(), deps.Scope, deps.GuideBus)
+	if deps.GuideBus != nil {
+		m.proposalBridge = bridge.NewProposalBridge("tui.proposals", deps.GuideBus, deps.Scope)
+	}
 }
 
 var (

@@ -84,17 +84,17 @@ type Architect struct {
 	ownsControlStore bool
 	planModes        map[string]*PlanModeState
 
-	runMu         sync.RWMutex
-	runCtx        context.Context
-	runCancel     context.CancelFunc
-	knownAgentsMu sync.RWMutex
-	planModesMu   sync.RWMutex
-	pendingMu     sync.Mutex
-	pendingBus    map[string]*shared.PendingSyncWait
-	evidenceMu    sync.Mutex
+	runMu          sync.RWMutex
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	knownAgentsMu  sync.RWMutex
+	planModesMu    sync.RWMutex
+	pendingMu      sync.Mutex
+	pendingBus     map[string]*shared.PendingSyncWait
+	evidenceMu     sync.Mutex
 	stagedEvidence map[string][]*PlanEvidence
-	inFlightMu    sync.Mutex
-	inFlight      map[string]context.CancelFunc
+	inFlightMu     sync.Mutex
+	inFlight       map[string]context.CancelFunc
 
 	// Tracked goroutine scope for async claims dispatch and
 	// background operations (receipt resyncs, plan reaper).
@@ -269,9 +269,9 @@ type Config struct {
 
 // Default configuration values
 const (
-	DefaultMaxOutputTokens     = 16384
-	DefaultThinkingBudget      = 8192
-	DefaultArchitectModel      = "claude-opus-4-6"
+	DefaultMaxOutputTokens = 16384
+	DefaultThinkingBudget  = 8192
+	DefaultArchitectModel  = "claude-opus-4-6"
 	// DefaultLLMRequestTimeout is the per-chunk/beat idle tolerance
 	// for planner LLM streams. 15 minutes accommodates Claude Opus
 	// 4.7's adaptive-thinking silent windows — the model can think
@@ -279,7 +279,7 @@ const (
 	// stream chunks. The planner's watchdog resets this timer on
 	// every inbound chunk and on every heartbeat pulse, so the full
 	// 15 minutes is an idle threshold, not a total-call cap.
-	DefaultLLMRequestTimeout = 15 * time.Minute
+	DefaultLLMRequestTimeout   = 15 * time.Minute
 	DefaultLLMRetryMax         = 3
 	DefaultPromptCacheTTL      = 1 * time.Hour
 	DefaultCrossDomainTimeout  = 30 * time.Second
@@ -443,22 +443,22 @@ func New(ctx context.Context, cfg Config) (*Architect, error) {
 
 	guide.DebugFileLog().Info("DEBUG: architect_new_struct_init")
 	architect := &Architect{
-		id:                architectID,
-		config:            cfg,
-		logger:            cfg.Logger,
-		logWAL:            cfg.logWAL,
-		activityPub:       cfg.ActivityPub,
-		fileAccess:        authority.RestrictFileAccess("architect", cfg.FileAccess),
-		workspaceViews:    authority.RestrictWorkspaceViews("architect", cfg.WorkspaceViews),
-		planStore:         cfg.PlanStore,
-		ownsPlanStore:     ownedPlanStore,
-		controlStore:      cfg.ControlStore,
-		ownsControlStore:  ownedControlStore,
-		knownAgents:       make(map[string]*guide.AgentAnnouncement),
-		planModes:         make(map[string]*PlanModeState),
-		pendingBus:        make(map[string]*shared.PendingSyncWait),
-		stagedEvidence:    make(map[string][]*PlanEvidence),
-		inFlight:          make(map[string]context.CancelFunc),
+		id:                     architectID,
+		config:                 cfg,
+		logger:                 cfg.Logger,
+		logWAL:                 cfg.logWAL,
+		activityPub:            cfg.ActivityPub,
+		fileAccess:             authority.RestrictFileAccess("architect", cfg.FileAccess),
+		workspaceViews:         authority.RestrictWorkspaceViews("architect", cfg.WorkspaceViews),
+		planStore:              cfg.PlanStore,
+		ownsPlanStore:          ownedPlanStore,
+		controlStore:           cfg.ControlStore,
+		ownsControlStore:       ownedControlStore,
+		knownAgents:            make(map[string]*guide.AgentAnnouncement),
+		planModes:              make(map[string]*PlanModeState),
+		pendingBus:             make(map[string]*shared.PendingSyncWait),
+		stagedEvidence:         make(map[string][]*PlanEvidence),
+		inFlight:               make(map[string]context.CancelFunc),
 		forestTracker:          shared.NewMemoryForestTracker(),
 		steering:               shared.NewSteeringManager(),
 		requestSerializer:      shared.NewRequestSerializer(),
@@ -1201,6 +1201,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 		"elapsed", time.Since(startTime).String(),
 		"has_result", result != nil,
 		"err", err)
+	flushAccumulator()
 
 	if err != nil {
 		if a.isInterruptError(err) {
@@ -1262,7 +1263,7 @@ func (a *Architect) handleForwardBusRequest(ctx context.Context, msg *guide.Mess
 	// Always include the authoritative response text in the completion
 	// event. The bridge stores it as AuthoritativeText on StreamCompleteMsg
 	// so the chat model can correct dropped or reordered stream chunks.
-	directive := extractResponseDirective(result)
+	directive := a.responseDirectiveForResult(reqCtx, result)
 	completeText := extractUserResponse(result)
 	architectDebugLog().Info("handleForwardBusRequest: DIRECTIVE_EXTRACT",
 		"correlation_id", fwd.CorrelationID,
@@ -1330,6 +1331,13 @@ func (a *Architect) handleActionBusRequest(ctx context.Context, msg *guide.Messa
 	}
 	if req == nil {
 		return nil
+	}
+	if isCancelAction(req.Action) {
+		a.logInfo("INTERRUPT_DEBUG: architect_cancel_action_received",
+			"correlation_id", req.CorrelationID,
+			"target_agent", req.TargetAgentID,
+			"source_agent", req.SourceAgentID,
+		)
 	}
 	// Cancel must be checked BEFORE steering.HandleAction so the Architect's
 	// custom handleCancelAction runs (publishes interrupt response + supersedes plans).
@@ -1614,7 +1622,7 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	// acceptance loop. Ready plans recovered implicitly (same session or a
 	// unique recent restored plan) should remain conversational so the user can
 	// choose whether to resume, revise, or start fresh.
-	if plan := a.resolveReadyPlanFromMetadata(fwd.Metadata, now); hasPlanContinuationMetadata(fwd.Metadata) && plan != nil {
+	if plan := a.resolveReadyPlanFromMetadata(fwd.Metadata, now); shouldRoutePlanApprovalContinuation(fwd) && plan != nil {
 		a.recoverStalePendingWork(ctx, plan, now)
 		architectDebugLog().Info("handoff: READY_PLAN_FOUND",
 			"plan_id", plan.ID,
@@ -1649,28 +1657,32 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 		}
 		return result, nil
 	}
-	if pending := a.resolveActivePendingPlanForExecute(sessionID, fwd.Metadata, now); pending != nil {
-		return &ConversationResult{
-			Response: pendingPlanUserMessage(pending),
-			Intent:   IntentConverse,
-		}, nil
-	}
-	var existingReadyPlan *DesignPlan
-	if plan := a.resolveRecoverableReadyPlanForConversation(sessionID, now); plan != nil {
-		a.recoverStalePendingWork(ctx, plan, now)
-		if planHasActivePendingWork(plan, now) {
+	if shouldRecoverExistingPlanForConversation(fwd) {
+		if pending := a.resolveActivePendingPlanForExecute(sessionID, fwd.Metadata, now); pending != nil {
 			return &ConversationResult{
-				Response: pendingPlanUserMessage(plan),
+				Response: pendingPlanUserMessage(pending),
 				Intent:   IntentConverse,
 			}, nil
 		}
-		if isExplicitResumeReadyPlanSignal(fwd.Input) {
-			a.logInfo("handleConversation: explicit resume signal for recovered ready plan",
-				"plan_id", plan.ID,
-				"input", truncateString(fwd.Input, 120))
-			return a.handleExecute(ctx, fwd)
+	}
+	var existingReadyPlan *DesignPlan
+	if shouldRecoverExistingPlanForConversation(fwd) {
+		if plan := a.resolveRecoverableReadyPlanForConversation(sessionID, now); plan != nil {
+			a.recoverStalePendingWork(ctx, plan, now)
+			if planHasActivePendingWork(plan, now) {
+				return &ConversationResult{
+					Response: pendingPlanUserMessage(plan),
+					Intent:   IntentConverse,
+				}, nil
+			}
+			if isExplicitResumeReadyPlanSignal(fwd.Input) {
+				a.logInfo("handleConversation: explicit resume signal for recovered ready plan",
+					"plan_id", plan.ID,
+					"input", truncateString(fwd.Input, 120))
+				return a.handleExecute(ctx, fwd)
+			}
+			existingReadyPlan = plan
 		}
-		existingReadyPlan = plan
 	}
 
 	req := &ArchitectRequest{
@@ -1689,6 +1701,54 @@ func (a *Architect) handleConversation(ctx context.Context, fwd *guide.Forwarded
 	a.logInfo("handleConversation: ROUTE=conversation (no plan triggers matched)",
 		"mapped_intent", string(req.Intent))
 	return a.Handle(ctx, req)
+}
+
+func shouldRecoverExistingPlanForConversation(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil {
+		return false
+	}
+	switch fwd.Intent {
+	case guide.IntentPlan, guide.IntentDesign:
+		return false
+	default:
+		return true
+	}
+}
+
+func shouldRoutePlanApprovalContinuation(fwd *guide.ForwardedRequest) bool {
+	if fwd == nil || planIDFromMetadata(fwd.Metadata) == "" {
+		return false
+	}
+	switch fwd.Intent {
+	case guide.IntentExecute:
+		return true
+	case guide.IntentPlan, guide.IntentChat, guide.IntentUnknown:
+		return isPlanApprovalResponseLike(fwd.Input)
+	default:
+		return false
+	}
+}
+
+func isPlanApprovalResponseLike(input string) bool {
+	if isApprovalSignal(input) || isRejectSignal(input) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(input))
+	if lower == "" {
+		return false
+	}
+	for _, phrase := range planApprovalFeedbackPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
+}
+
+var planApprovalFeedbackPhrases = []string{
+	"change", "modify", "revise", "adjust", "instead", "swap",
+	"replace", "remove", "without", "use ", "make it", "make this",
+	"update the plan", "change the plan", "modify the plan",
 }
 
 var explicitResumeReadyPlanPhrases = []string{
@@ -2962,8 +3022,27 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		a.logInfo("executeConversation: LLM compose succeeded",
 			"response_len", len(response))
 
-		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
-			response = a.guardPlanReviewResponse(ctx, response, plan)
+		readyPlan := a.readyPlanForConversationDirective(req, requestCorrelationID)
+		stalledPlan := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID)
+		if shouldFallbackToPlanningProtocolAfterConversation(req, readyPlan, stalledPlan) {
+			if shouldDeferPlanningProtocolForUserConfirmation(response) {
+				a.logInfo("executeConversation: planning response requested user confirmation, deferring protocol fallback",
+					"intent", string(req.Intent),
+					"session_id", req.SessionID,
+					"request_correlation_id", requestCorrelationID,
+					"response_len", len(response))
+			} else {
+				a.logWarn("executeConversation: planning conversation completed without plan, using protocol fallback",
+					"intent", string(req.Intent),
+					"session_id", req.SessionID,
+					"request_correlation_id", requestCorrelationID,
+					"response_len", len(response))
+				return a.conversationFallback(ctx, req, fmt.Errorf("planning conversation completed without invoking plan"))
+			}
+		}
+
+		if readyPlan != nil {
+			response = a.guardPlanReviewResponse(ctx, response, readyPlan)
 		}
 
 		// Conversation response testament.
@@ -2991,24 +3070,24 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 		// path. The phase-gate directive remains as a fallback so
 		// users who type a response in chat instead of clicking the
 		// dialog still get classified routing.
-		if plan := a.latestReadyPlan(req.SessionID); plan != nil {
-			if directive := a.feedbackReadyDirectiveWithContext(ctx, plan); directive != nil {
+		if readyPlan != nil {
+			if directive := a.feedbackReadyDirectiveWithContext(ctx, readyPlan); directive != nil {
 				result.Directive = directive
 				architectDebugLog().Info("executeConversation: DIRECTIVE_SET",
-					"plan_id", plan.ID,
+					"plan_id", readyPlan.ID,
 					"session_id", req.SessionID,
 					"phase", string(directive.Phase))
 			} else {
 				architectDebugLog().Warn("executeConversation: DIRECTIVE_SKIPPED_REVIEW_ARTIFACT_UNAVAILABLE",
-					"plan_id", plan.ID,
+					"plan_id", readyPlan.ID,
 					"session_id", req.SessionID)
 			}
-		} else if stalled := a.latestStalledPlanForRequest(req.SessionID, requestCorrelationID); stalled != nil {
+		} else if stalledPlan != nil {
 			// The tool loop started a plan (via start_planning) but
 			// couldn't complete it — e.g. API overloaded mid-protocol.
 			// Recover via deterministic protocol so the plan reaches Ready.
-			a.recoverStalledPlan(ctx, stalled)
-			if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+			a.recoverStalledPlan(ctx, stalledPlan)
+			if plan := a.readyPlanForConversationDirective(req, requestCorrelationID); plan != nil {
 				result.Directive = a.feedbackReadyDirectiveWithContext(ctx, plan)
 			}
 		} else {
@@ -3022,7 +3101,7 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	// could compose a summary. Recover the plan's response and directive
 	// rather than falling through to conversationFallback (which would run
 	// a redundant planning protocol with a cancelled context).
-	if plan := a.latestReadyPlan(req.SessionID); plan != nil {
+	if plan := a.readyPlanForConversationDirective(req, requestCorrelationID); plan != nil {
 		a.logInfo("executeConversation: compose failed but ready plan exists, recovering",
 			"plan_id", plan.ID,
 			"plan_response_len", len(plan.UserResponse))
@@ -3051,6 +3130,66 @@ func (a *Architect) executeConversation(ctx context.Context, req *ArchitectReque
 	a.logWarn("executeConversation: compose failed, using domain fallback",
 		"intent", string(req.Intent), "error", composeErr)
 	return a.conversationFallback(ctx, req, composeErr)
+}
+
+func shouldFallbackToPlanningProtocolAfterConversation(req *ArchitectRequest, readyPlan *DesignPlan, stalledPlan *DesignPlan) bool {
+	if req == nil || readyPlan != nil || stalledPlan != nil {
+		return false
+	}
+	return isConversationFallbackPlanningIntent(req.Intent)
+}
+
+func shouldDeferPlanningProtocolForUserConfirmation(response string) bool {
+	normalized := normalizeArchitectDecisionText(response)
+	if normalized == "" {
+		return false
+	}
+	hasPlanMarker := false
+	for _, marker := range []string{
+		"plan",
+		"planning",
+		"formalize",
+		"formalise",
+	} {
+		if strings.Contains(normalized, marker) {
+			hasPlanMarker = true
+			break
+		}
+	}
+	if !hasPlanMarker {
+		return false
+	}
+	for _, marker := range []string{
+		"want me to",
+		"would you like me to",
+		"would you prefer",
+		"should i",
+		"shall i",
+		"let me know if you want",
+		"if you want me to",
+		"if youd like me to",
+		"if you would like me to",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Architect) readyPlanForConversationDirective(req *ArchitectRequest, requestCorrelationID string) *DesignPlan {
+	if a == nil || req == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	if strings.TrimSpace(requestCorrelationID) != "" {
+		plan := a.reusablePlanForRequest(req.SessionID, requestCorrelationID)
+		if isRecoverableReadyPlan(plan, now) {
+			return plan
+		}
+		return nil
+	}
+	return a.latestReadyPlan(req.SessionID)
 }
 
 // enrichConversationWithPlanContext adds plan continuity to conversation-mode
@@ -3097,6 +3236,9 @@ func (a *Architect) enrichConversationWithPlanContext(ctx context.Context, reque
 		))
 		return
 	}
+	if isFreshPlanningConversationIntent(req.Intent) {
+		return
+	}
 	plan := a.latestHistoricalPlanForSession(req.SessionID)
 	if plan == nil {
 		return
@@ -3109,6 +3251,15 @@ func (a *Architect) enrichConversationWithPlanContext(ctx context.Context, reque
 		return
 	}
 	populatePlannerConversationRequestFromPlan(request, plan)
+}
+
+func isFreshPlanningConversationIntent(intent ArchitectIntent) bool {
+	switch intent {
+	case IntentPlan, IntentDesign:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *Architect) enrichConversationWithRecentRecall(
@@ -3340,6 +3491,29 @@ func normalizeArchitectRecallQuery(query string) string {
 	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(query))), " ")
 }
 
+func normalizeArchitectDecisionText(text string) string {
+	replacer := strings.NewReplacer(
+		"'", "",
+		"`", "",
+		"?", " ",
+		"!", " ",
+		".", " ",
+		",", " ",
+		":", " ",
+		";", " ",
+		"(", " ",
+		")", " ",
+		"[", " ",
+		"]", " ",
+		"{", " ",
+		"}", " ",
+		"-", " ",
+		"_", " ",
+		"/", " ",
+	)
+	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(text)))), " ")
+}
+
 // conversationFallback runs the domain-specific execution path when the
 // conversational LLM is unavailable. Only starts the planning protocol
 // for plan/design intents — conversational intents (chat, help, etc.)
@@ -3363,9 +3537,6 @@ func (a *Architect) conversationFallback(ctx context.Context, req *ArchitectRequ
 			Response: "I'm having trouble processing that right now. Could you rephrase or try again?",
 			Intent:   req.Intent,
 		}, nil
-	}
-	if req.Intent == IntentDesign {
-		return a.executeDesignArchitecture(ctx, req)
 	}
 	plan, err := a.executePlanningProtocol(ctx, req)
 	if err != nil {

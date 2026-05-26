@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/steering"
+	"github.com/adalundhe/sylk/core/versioning"
 )
 
 // resumeContinuation is the architect's ResumeFn for the consult
@@ -32,6 +35,7 @@ func (a *Architect) resumeContinuation(
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("architect: nil consult-yield snapshot on resume")
 	}
+	ctx = a.stampConsultResumeContext(ctx, snapshot)
 
 	// Restore the in-flight accumulator so the resumed turn keeps
 	// producing into the same testament.
@@ -100,6 +104,51 @@ func (a *Architect) resumeContinuation(
 		return err
 	}
 	return nil
+}
+
+func (a *Architect) stampConsultResumeContext(ctx context.Context, snapshot *shared.TurnSnapshot) context.Context {
+	sessionID := strings.TrimSpace(a.config.SessionID)
+	if sessionID == "" && snapshot != nil {
+		sessionID = strings.TrimSpace(snapshot.SessionID)
+	}
+	if sessionID != "" {
+		ctx = versioning.WithSessionID(ctx, sessionID)
+	}
+	correlation := ""
+	if snapshot != nil {
+		correlation = strings.TrimSpace(snapshot.CorrelationID)
+	}
+	if correlation == "" {
+		correlation = "consult_resume_" + a.id
+	}
+	ctx = shared.WithLogMeta(ctx, shared.LogMeta{
+		EventLogger: a.steering.EventLogger(),
+		CorrID:      correlation,
+		AgentID:     a.id,
+		SessionID:   sessionID,
+	})
+	if a.identity != nil {
+		ctx = identity.WithIdentity(ctx, a.identity)
+	}
+	if a.factory != nil {
+		task, err := a.factory.NewTask(identity.TaskOptions{
+			DisplayID:   correlation,
+			Correlation: identity.CorrelationID(correlation),
+		})
+		if err != nil {
+			slog.Warn("architect_consult_resume_mint_task_failed",
+				"agent_id", a.id,
+				"correlation_id", correlation,
+				"error", err.Error(),
+			)
+			return ctx
+		}
+		ctx = identity.WithTask(ctx, task)
+	}
+	if snapshot != nil && strings.TrimSpace(snapshot.AccumulatorState.ClaimID) != "" {
+		ctx = claims.WithParentClaimID(ctx, strings.TrimSpace(snapshot.AccumulatorState.ClaimID))
+	}
+	return ctx
 }
 
 // ledgerCorrelationOrDefault extracts the steering ledger's

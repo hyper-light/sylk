@@ -680,6 +680,7 @@ func (d *Designer) handleBusRequest(msg *guide.Message) error {
 
 	result, err := d.handleDesign(ctx, fwd)
 	shared.LogResponse(d.steering.EventLogger(), fwd.CorrelationID, d.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if fwd.FireAndForget {
 		return nil

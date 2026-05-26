@@ -128,7 +128,7 @@ func consultSkill(a *Architect) *skills.Skill {
 				"consultations":           plan.Consultations,
 				"suggested_targets":       defaultDiscussionConsultationTargets(),
 				"stale_or_failed_targets": staleOrFailedConsultationTargets(plan.Consultations, a.config.ConsultationMaxAge),
-				"message":                 "Synthesize the discussion-time consultation evidence, refresh only the material gaps, then move into design.",
+				"message":                 "Synthesize the discussion-time continuity and consultation evidence, refresh only the material gaps, then move into design.",
 			}, nil
 		},
 		"knowledge": func(ctx context.Context, p *consultInput) (any, error) {
@@ -184,7 +184,7 @@ func consultSkill(a *Architect) *skills.Skill {
 		Description("Consult agents for evidence during live discussion and during planning synthesis.\n\n"+
 			"Modes:\n"+
 			"- single: Consult one execution or coordination agent directly (params: target [required], query, scope, session_id)\n"+
-			"- pre_planning: Consolidate and refresh discussion-time consultation evidence before design (params: query, scope, session_id)\n"+
+			"- pre_planning: Consolidate and refresh discussion-time continuity and consultation evidence before design (params: query, scope, session_id)\n"+
 			"- knowledge: Consult Librarian/Archivalist/Academic during discussion or planning for evidence (params: target [required], query, scope)").
 		Domain("consultation").
 		Keywords("consult", "before planning", "context", "evidence", "librarian",
@@ -625,6 +625,7 @@ func buildHandoffPayload(plan *DesignPlan, trigger string) string {
 //   - PlanHandoffPhasePrepare on plan-finalize
 //   - PlanHandoffPhaseExecutePrepared on user approval
 //   - PlanHandoffPhaseDiscardPrepared on user reject/modify
+//
 // Legacy callers still use buildHandoffPayload (Phase=Legacy).
 func buildPhasedHandoffPayload(plan *DesignPlan, trigger string, phase PlanHandoffPhase) string {
 	if plan == nil {
@@ -795,6 +796,14 @@ func (a *Architect) applyPlanRevision(plan *DesignPlan, reason string, updates m
 		a.logger.Warn("failed to rotate revised plan markdown", "plan_id", current.ID, "error", err)
 	}
 	current.Revision++
+	if current.sm == nil && current.Epoch > 0 {
+		current.sm = NewPlanStateMachineWithEpoch(current.ID, current.Status, current.Epoch)
+	}
+	current.Epoch = current.SM().BumpEpoch()
+	if minEpoch := uint64(current.Revision); current.Epoch < minEpoch {
+		current.Epoch = minEpoch
+		current.sm = NewPlanStateMachineWithEpoch(current.ID, current.Status, current.Epoch)
+	}
 	current.ArtifactVersion = nextVersion
 	current.PlanFile = nextPlanFile
 	current.UpdatedAt = time.Now()
@@ -1855,9 +1864,9 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 		TokenEstimate(300).
 		StringParam("query", "Synthesized planning query capturing all requirements, constraints, and scope gathered from the conversation", true).
 		StringParam("session_id", "Session identifier for plan tracking", false).
-		Usage("Invoke to create a new plan once the user discussion and consultation work have produced enough evidence to plan responsibly. Returns plan_id and protocol instructions. Then invoke the planning skills yourself using the returned plan_id: plan(analyze) → consult(pre_planning) → plan(design) → plan(generate_tasks). Do NOT wait — drive the protocol immediately after receiving the plan_id.").
-		BestPractice("Synthesize the full conversation context and the consultation evidence already gathered into the query — do not just repeat the user's last message.").
-		BestPractice("Do not treat start_planning as the first moment to gather obvious Librarian, Archivalist, or Academic evidence. Enter planning with a strong discussion-time evidence base, then use consult(pre_planning) to consolidate and refresh it.").
+		Usage("Invoke to create a new plan only after the user discussion, recall_forward continuity, and consultation work have produced enough evidence to plan responsibly. Returns plan_id and protocol instructions. Then invoke the planning skills yourself using the returned plan_id: evidence review/consult as needed → plan(analyze) → plan(design) → plan(generate_tasks). Do NOT wait — drive the protocol immediately after receiving the plan_id.").
+		BestPractice("Synthesize the full conversation context, carried-forward testaments/artifacts, and consultation evidence already gathered into the query — do not just repeat the user's last message.").
+		BestPractice("Do not treat start_planning as the first moment to gather obvious evidence. For fresh planning work, make the first targeted knowledge-agent consult before plan(action=start) unless recall_forward returned concrete fresh evidence for the same uncertainty.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			var params startPlanningInput
 			if err := json.Unmarshal(input, &params); err != nil {
@@ -1872,6 +1881,12 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 				sessionID = normalizeSessionID(params.SessionID)
 			}
 			requestCorrelationID := originalCIDFromContext(ctx)
+			if a.config.MandatoryConsultation &&
+				!planningStartHasFreshEvidence(a, &planInput{Query: query, SessionID: sessionID}, sessionID, requestCorrelationID) {
+				result := startRequiresConsultationResult(query)
+				result["session_id"] = sessionID
+				return result, nil
+			}
 			if reusable := a.reusablePlanForRequest(sessionID, requestCorrelationID); reusable != nil {
 				a.supersedeDuplicateRequestPlans(sessionID, requestCorrelationID, reusable.ID)
 				a.logInfo("start_planning: reusing request-scoped plan",
@@ -1928,8 +1943,9 @@ func startPlanningSkill(a *Architect) *skills.Skill {
 func startPlanningProtocolInstructions(autoApprove bool) string {
 	const base = "Drive the planning protocol using the plan_id above. " +
 		"Invoke these skills in order:\n" +
-		"1. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
-		"2. Review attached consultation evidence. Invoke consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap; do not repeat a fresh target/query just because the phase changed.\n" +
+		"1. Evidence review. Inspect the attached planning evidence from discussion-time consult_peer and recall_forward. For stable or resumed topics, call recall_forward(topic=...) before any repeat consult_peer. If no fresh planning evidence is attached for this request after recall, invoke one targeted consult_peer call to the most relevant knowledge agent before analysis. If fresh evidence already exists, invoke consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap; do not repeat a fresh target/query just because the phase changed.\n" +
+		"   If plan(action=analyze) or plan(action=design) returns requires_consultation=true, this is a normal phase gate: invoke the requested consult_peer call, wait for it to complete, then retry the same plan action. Do not treat it as a failure.\n" +
+		"2. plan(action=analyze, plan_id=<plan_id>, query=<the query>)\n" +
 		"3. If the request is still broadly vague or underspecified, invoke academic_research(action=request) and STOP. " +
 		"Use ask_user_clarification only for one or two narrow decisions. If the blocker is codebase or history evidence, " +
 		"consult_peer the Librarian or Archivalist instead. If the blocker is architectural quality, correctness, performance, testing, infrastructure, deployment, or tradeoffs, consult_peer the Academic instead of guessing.\n" +

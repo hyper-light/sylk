@@ -4082,9 +4082,11 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 
 	var cmds []tea.Cmd
 
-	chatComp, chatCmd := m.chat.Update(raw)
-	m.chat = chatComp.(*chat.Model)
-	cmds = appendCmd(cmds, chatCmd)
+	if m.shouldPropagateToChat(raw) {
+		chatComp, chatCmd := m.chat.Update(raw)
+		m.chat = chatComp.(*chat.Model)
+		cmds = appendCmd(cmds, chatCmd)
+	}
 
 	inputComp, inputCmd := m.input.Update(raw)
 	m.input = inputComp.(*inputpkg.Model)
@@ -4127,6 +4129,52 @@ func (m *AppModel) propagate(raw tea.Msg) tea.Cmd {
 	}
 
 	return tea.Batch(cmds...)
+}
+
+func (m *AppModel) shouldPropagateToChat(raw tea.Msg) bool {
+	sessionID := chatRoutedSessionID(raw)
+	if sessionID == "" {
+		return true
+	}
+	return sessionID == m.resolveRouteSessionID("")
+}
+
+func chatRoutedSessionID(raw tea.Msg) string {
+	switch typed := raw.(type) {
+	case msg.ClaimsAgentStatusMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.ClaimResponseTextMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.ClaimPresentationMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.ClaimContextMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.TestamentContextMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamStartMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamChunkMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamProgressMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamCompleteMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamErrorMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.AgentStateMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.StreamRerouteMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.RetryStatusMsg:
+		return strings.TrimSpace(typed.SessionID)
+	case msg.ActivityEventMsg:
+		if typed.Event != nil {
+			return strings.TrimSpace(typed.Event.SessionID)
+		}
+	case msg.ToolCallEventMsg:
+		return strings.TrimSpace(typed.SessionID)
+	}
+	return ""
 }
 
 func (m *AppModel) propagateWithoutChat(raw tea.Msg) tea.Cmd {

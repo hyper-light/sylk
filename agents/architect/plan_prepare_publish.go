@@ -58,18 +58,19 @@ func (a *Architect) publishPreparedHandoff(ctx context.Context, plan *DesignPlan
 	if !isPlanHandoffPayloadValid(payload) {
 		return fmt.Errorf("invalid plan handoff payload for plan %s", plan.ID)
 	}
-	if planHasCurrentMarkdownArtifact(plan) && strings.TrimSpace(plan.HandoffPayloadArtifactID) != "" {
+	hasCurrentPlanArtifact := a.planHasCurrentMarkdownArtifactOnBoard(plan)
+	if hasCurrentPlanArtifact && strings.TrimSpace(plan.HandoffPayloadArtifactID) != "" {
 		return nil
 	}
 	priorPlanArtifactID := ""
-	if strings.TrimSpace(plan.PlanMarkdownArtifactID) != "" && !planHasCurrentMarkdownArtifact(plan) {
+	if strings.TrimSpace(plan.PlanMarkdownArtifactID) != "" && !hasCurrentPlanArtifact {
 		priorPlanArtifactID = plan.PlanMarkdownArtifactID
 	}
 	var planArtifact *claims.Artifact
 	replaceKey := plan.PlanMarkdownReplaceKey
 	contentHash := plan.PlanMarkdownContentHash
 	artifactEpoch := plan.PlanMarkdownArtifactEpoch
-	if !planHasCurrentMarkdownArtifact(plan) {
+	if !hasCurrentPlanArtifact {
 		var err error
 		planArtifact, replaceKey, contentHash, artifactEpoch, err = a.buildPlanMarkdownArtifact(plan, priorPlanArtifactID)
 		if err != nil {

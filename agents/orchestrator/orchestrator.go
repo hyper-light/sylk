@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,8 +17,8 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/agents/identity"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/authority"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/dag"
@@ -95,10 +96,10 @@ type Orchestrator struct {
 	// not yet submitted to the scheduler. Populated by
 	// Phase=Prepare ingest, drained by Phase=ExecutePrepared.
 	// Initialised in newOrchestrator.
-	preparedDAGs *preparedDAGRegistry
-	coordination *CoordinationService
-	scope        *concurrency.GoroutineScope
-	claimsInbox      *claims.ClaimsInbox
+	preparedDAGs      *preparedDAGRegistry
+	coordination      *CoordinationService
+	scope             *concurrency.GoroutineScope
+	claimsInbox       *claims.ClaimsInbox
 	continuationStore *shared.ContinuationStore
 
 	// Pipeline subscriptions
@@ -126,9 +127,9 @@ type Orchestrator struct {
 	// SLATracker, and any other session-scoped audit-loop machinery
 	// — the orchestrator itself remains audit-loop-agnostic per
 	// docs/PARALLEL_GLOBAL_VFS.md §0.
-	sessionHooksMu      sync.RWMutex
-	sessionOpenHooks    []func(*versioning.SessionVFS)
-	sessionCloseHooks   []func(*versioning.SessionVFS)
+	sessionHooksMu    sync.RWMutex
+	sessionOpenHooks  []func(*versioning.SessionVFS)
+	sessionCloseHooks []func(*versioning.SessionVFS)
 
 	// Auth credential change subscription.
 	authSub guide.Subscription
@@ -148,9 +149,9 @@ type Orchestrator struct {
 
 	mu sync.RWMutex
 
-	pipelinePanelMu          sync.Mutex
-	pipelinePanelState       map[string]pipelinePanelSnapshot
-	pipelinePanelRegistered  map[string]struct{}
+	pipelinePanelMu         sync.Mutex
+	pipelinePanelState      map[string]pipelinePanelSnapshot
+	pipelinePanelRegistered map[string]struct{}
 
 	// Request lifecycle: runCtx is cancelled in Stop() and serves as parent
 	// for per-request contexts, enabling graceful cancellation.
@@ -227,21 +228,21 @@ func New(cfg Config, provider OrchestratorProvider, activityPub events.ActivityP
 	hookRegistry := skills.NewHookRegistry()
 
 	o := &Orchestrator{
-		config:                   cfg,
-		state:                    NewState(cfg.SessionID),
-		skills:                   skillsRegistry,
-		hooks:                    hookRegistry,
-		knownAgents:              make(map[string]*guide.AgentAnnouncement),
-		activityPub:              activityPub,
-		sessionVFS:               make(map[string]*versioning.SessionVFS),
-		logger:                   logger,
-		logWAL:                   logCloser,
-		steering:                 shared.NewSteeringManager(),
-		requestSerializer:        shared.NewRequestSerializer(),
-		pendingBus:               make(map[string]*shared.PendingSyncWait),
-		pipelinePanelState:       make(map[string]pipelinePanelSnapshot),
-		pipelinePanelRegistered:  make(map[string]struct{}),
-		preparedDAGs:             newPreparedDAGRegistry(),
+		config:                  cfg,
+		state:                   NewState(cfg.SessionID),
+		skills:                  skillsRegistry,
+		hooks:                   hookRegistry,
+		knownAgents:             make(map[string]*guide.AgentAnnouncement),
+		activityPub:             activityPub,
+		sessionVFS:              make(map[string]*versioning.SessionVFS),
+		logger:                  logger,
+		logWAL:                  logCloser,
+		steering:                shared.NewSteeringManager(),
+		requestSerializer:       shared.NewRequestSerializer(),
+		pendingBus:              make(map[string]*shared.PendingSyncWait),
+		pipelinePanelState:      make(map[string]pipelinePanelSnapshot),
+		pipelinePanelRegistered: make(map[string]struct{}),
+		preparedDAGs:            newPreparedDAGRegistry(),
 	}
 
 	if provider != nil {
@@ -331,6 +332,9 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 	sid := strings.TrimSpace(cfg.SessionID)
 	if sid == "" {
 		sid = "default"
+	}
+	if err := ensureSessionDataPlaneDirs(sd, sid); err != nil {
+		return err
 	}
 
 	// SQLite store
@@ -431,6 +435,30 @@ func (o *Orchestrator) initDataPlane(cfg Config, sd *sylkdir.SylkDir, activityPu
 		return o.dispatchGate.isHeld(sessionID, planID, dagID)
 	})
 
+	return nil
+}
+
+func ensureSessionDataPlaneDirs(sd *sylkdir.SylkDir, sessionID string) error {
+	if sd == nil {
+		return nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	dirs := []string{
+		sd.SessionPath(sessionID),
+		sd.SessionOrchestratorPath(sessionID),
+		sd.SessionOrchestratorWALPath(sessionID),
+		sd.SessionAgentWALPath(sessionID, "orchestrator"),
+		sd.SessionFabricPath(sessionID),
+		sd.SessionBusPath(sessionID),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("orchestrator: create session data dir %s: %w", dir, err)
+		}
+	}
 	return nil
 }
 
@@ -557,7 +585,6 @@ func (o *Orchestrator) SetScribeFactory(f shared.ScribeFactory) {
 		o.dagBridge.SetScribeFactory(f)
 	}
 }
-
 
 // SetTaskPodInfra wires the runtime/spec/session-VFS dependencies needed for
 // real task-scoped pipeline pods.
@@ -1369,6 +1396,7 @@ func (o *Orchestrator) handleBusRequest(msg *guide.Message) error {
 		"has_result", result != nil,
 		"has_error", err != nil,
 		"duration", time.Since(startTime))
+	flushAccumulator()
 
 	if err != nil {
 		acc.Record("error", err.Error())
@@ -2821,7 +2849,6 @@ func (o *Orchestrator) startWALGC() {
 		}
 	})
 }
-
 
 func extractPipelineUpdate(data map[string]any) *PipelineUpdate {
 	u := &PipelineUpdate{}

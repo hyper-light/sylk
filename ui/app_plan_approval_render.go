@@ -1,35 +1,10 @@
 // Plan acceptance dialog render.
 //
-// Matches the guardian command-approval dialog's layout pattern:
-//
-//  1. A short fixed prompt line ("Approve, modify, or reject this
-//     plan:") — never contains variable content, so never truncates.
-//  2. A markdown-rendered, height-budgeted, scrollable body showing
-//     the plan name (and, when space permits, the plan summary).
-//     Word-wrapping is handled by the same RenderMarkdown path
-//     command approval uses for its code block.
-//  3. The three Approve / Modify / Reject option buttons.
-//
-// Previously the dialog concatenated the plan name directly into the
-// prompt header and relied on hard truncation to fit a single line.
-// That failed for two cases the guardian dialog gets right:
-//
-//   - Multi-line PlanName values (the architect's derivePlanName
-//     pulls the user's original query, which routinely contains
-//     newlines). lipgloss.Width measures the widest line, not total
-//     length, so the truncation check would pass for a multi-line
-//     string whose widest line fit; the border then rendered the
-//     additional lines, the layout's line count underestimated the
-//     visual height, and subsequent rows (the ellipsis tail, a blank
-//     spacer, sometimes the start of the first option) clipped at
-//     the bottom of the panel — surfacing as the "Re..." fragment
-//     the user reported.
-//   - Long single-line PlanName values that wrap at render time.
-//     Same underlying bug: one layout line vs. multiple visual rows.
-//
-// Delegating body rendering to RenderMarkdown (with the same height
-// budgeting and scroll state the guardian dialog uses) eliminates
-// the mismatch — len(layout.lines) now equals the visible row count.
+// The dialog is only the decision control. The reviewable plan itself is a
+// claims-board plan_markdown artifact rendered in the chat panel through
+// ClaimPresentationMsg. Proposal.PlanText remains on the proposal as a
+// migration/integrity fallback, but this renderer deliberately does not put it
+// in the input panel.
 package ui
 
 import (
@@ -37,10 +12,7 @@ import (
 	"encoding/hex"
 	"strings"
 
-	"github.com/adalundhe/sylk/core/planapproval"
 	"github.com/adalundhe/sylk/ui/component"
-	markdownpkg "github.com/adalundhe/sylk/ui/markdown"
-	"github.com/adalundhe/sylk/ui/theme"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -53,7 +25,8 @@ func (m *AppModel) planApprovalHeight() int {
 	if maxH < inputBorderSize {
 		maxH = inputBorderSize
 	}
-	return min(bodyLines+inputBorderSize, max(maxH, inputBorderSize))
+	maxPlanH := planApprovalMaxInnerLines + inputBorderSize
+	return min(bodyLines+inputBorderSize, min(max(maxH, inputBorderSize), maxPlanH))
 }
 
 func (m *AppModel) renderPlanApprovalView() string {
@@ -70,15 +43,22 @@ func (m *AppModel) renderPlanApprovalView() string {
 	return enforceLineCountToHeight(style.Width(contentWidth).Render(body), m.planApprovalHeight())
 }
 
-// planApprovalMaxVisibleBodyLines mirrors commandApprovalMaxVisibleCodeLines:
-// caps the scrollable plan-body at a size that keeps the dialog from
-// dominating the chat panel. Agents summarize the full plan elsewhere;
-// the dialog is purely a verdict surface.
-const planApprovalMaxVisibleBodyLines = 8
+// planApprovalMaxInnerLines caps the entire plan approval dialog content,
+// excluding the border. The dialog is intentionally compact: prompt, status,
+// and the three decision options.
+const planApprovalMaxInnerLines = 5
 
-// planApprovalLayout composes: prompt + (height-budgeted, scrollable)
-// body + option buttons. Returns commandApprovalViewLayout so mouse
-// hit testing and scroll handling share the existing optionAt path.
+func (m *AppModel) planApprovalInnerLineBudget() int {
+	maxBodyLines := m.height - statusBarHeight - mainMinContentHeight - inputBorderSize
+	if maxBodyLines < 1 {
+		maxBodyLines = 1
+	}
+	return min(maxBodyLines, planApprovalMaxInnerLines)
+}
+
+// planApprovalLayout composes: prompt + status + option buttons. Returns
+// commandApprovalViewLayout so mouse hit testing shares the existing optionAt
+// path.
 func (m *AppModel) planApprovalLayout(width int) commandApprovalViewLayout {
 	if width <= 0 {
 		width = 1
@@ -94,36 +74,27 @@ func (m *AppModel) planApprovalLayout(width int) commandApprovalViewLayout {
 		codeStartY: -1,
 		codeEndY:   -1,
 	}
-	layout.lines = append(layout.lines,
-		promptStyle.Render(planApprovalPromptLine()),
-		"",
-	)
 
-	optionLines, optionHitboxes, optionLineCount := m.renderPlanApprovalOptions(width)
-	bodyLines := renderPlanApprovalBody(m.planApproval.proposal, width, th)
-	maxBodyLines := max(m.height-statusBarHeight-mainMinContentHeight-inputBorderSize, 1)
-	availableForBody := max(maxBodyLines-len(layout.lines)-optionLineCount, 0)
-	bodySpacerLines := 0
-	if availableForBody > 1 && len(bodyLines) > 0 {
-		bodySpacerLines = 1
+	innerBudget := m.planApprovalInnerLineBudget()
+	optionLines, optionHitboxes, _ := m.renderPlanApprovalOptions(width)
+	if innerBudget > 0 {
+		layout.lines = append(layout.lines, promptStyle.Render(planApprovalPromptLine()))
 	}
-	bodyBudget := min(max(availableForBody-bodySpacerLines, 0), planApprovalMaxVisibleBodyLines)
-	visibleBodyLines, appliedScroll := visibleCommandApprovalCodeLines(bodyLines, bodyBudget, m.planApproval.bodyScroll)
-	layout.codeTotalLines = len(bodyLines)
-	layout.codeVisibleLines = len(visibleBodyLines)
-	layout.codeScroll = appliedScroll
-	if len(visibleBodyLines) > 0 {
-		layout.codeStartY = len(layout.lines)
-		layout.lines = append(layout.lines, visibleBodyLines...)
-		layout.codeEndY = len(layout.lines)
-		if bodySpacerLines > 0 {
-			layout.lines = append(layout.lines, "")
-		}
+	if len(layout.lines) < innerBudget {
+		layout.lines = append(layout.lines, planApprovalStatusLine(m.planApproval.proposal.Metadata))
 	}
 	for idx := range planApprovalOptions {
 		baseY := len(layout.lines)
-		layout.lines = append(layout.lines, optionLines[idx]...)
+		for _, line := range optionLines[idx] {
+			if len(layout.lines) >= innerBudget {
+				break
+			}
+			layout.lines = append(layout.lines, line)
+		}
 		for _, hitbox := range optionHitboxes[idx] {
+			if baseY+hitbox.y >= len(layout.lines) {
+				continue
+			}
 			hitbox.y += baseY
 			layout.hitboxes = append(layout.hitboxes, hitbox)
 		}
@@ -151,68 +122,32 @@ func planApprovalPromptLine() string {
 	return "Approve, modify, or reject this plan:"
 }
 
-// renderPlanApprovalBody produces the scrollable body lines shown
-// between the prompt and the option buttons. Mirrors
-// renderCommandApprovalCodeBlock: uses the shared markdown renderer
-// so word wrapping is consistent with the rest of the chat UI, and
-// returns a proper []string whose length equals the visual row count.
-//
-// Body content comes from the canonical plan markdown carried by the
-// proposal (artifact-backed when PlanArtifactID is present). Plan name
-// and summary are only fallbacks for older proposals with no body.
-func renderPlanApprovalBody(proposal *planapproval.Proposal, width int, th *theme.Theme) []string {
-	markdown := buildPlanApprovalMarkdown(proposal)
-	if markdown == "" {
-		return nil
+func planApprovalStatusLine(metadata map[string]any) string {
+	status := planApprovalMetadataString(metadata, "plan_status", "status")
+	if status == "" {
+		status = "ready"
 	}
-	rendered := markdownpkg.RenderMarkdown(markdown, width, th)
-	return trimApprovalMarkdownBorders(rendered)
+	return "Status: " + status
 }
 
-func buildPlanApprovalMarkdown(proposal *planapproval.Proposal) string {
-	if proposal == nil {
-		return ""
-	}
-	planText := strings.TrimSpace(proposal.PlanText)
-	if planText != "" {
-		parts := []string{}
-		if warning := planApprovalArtifactWarning(proposal, planText); warning != "" {
-			parts = append(parts, warning)
+func planApprovalMetadataBool(metadata map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		if metadata == nil {
+			return false, false
 		}
-		parts = append(parts, planText)
-		return strings.Join(parts, "\n\n")
+		switch value := metadata[key].(type) {
+		case bool:
+			return value, true
+		case string:
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "true", "1", "yes":
+				return true, true
+			case "false", "0", "no":
+				return false, true
+			}
+		}
 	}
-	name := collapseWhitespace(proposal.PlanName)
-	summary := collapseWhitespace(proposal.PlanSummary)
-	parts := []string{}
-	if warning := planApprovalArtifactWarning(proposal, planText); warning != "" {
-		parts = append(parts, warning)
-	}
-	if name != "" {
-		parts = append(parts, "**"+name+"**")
-	}
-	if summary != "" && summary != name {
-		parts = append(parts, summary)
-	}
-	return strings.Join(parts, "\n\n")
-}
-
-func planApprovalArtifactWarning(proposal *planapproval.Proposal, body string) string {
-	if proposal == nil || strings.TrimSpace(proposal.PlanArtifactID) == "" {
-		return ""
-	}
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return "> Plan artifact is unavailable; showing fallback plan metadata."
-	}
-	expected := strings.TrimSpace(planApprovalMetadataString(proposal.Metadata, "plan_artifact_content_hash", "content_hash"))
-	if expected == "" {
-		return ""
-	}
-	if expected != planApprovalMarkdownHash(body) {
-		return "> Plan artifact hash mismatch; showing fallback plan text."
-	}
-	return ""
+	return false, false
 }
 
 func planApprovalMetadataString(metadata map[string]any, keys ...string) string {
@@ -234,28 +169,6 @@ func planApprovalMarkdownHash(body string) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-// collapseWhitespace replaces any run of whitespace (including
-// embedded newlines from multi-line queries) with a single space and
-// trims. Prevents newlines in the plan name from being interpreted as
-// markdown paragraph breaks the body block can't height-budget for.
-func collapseWhitespace(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-// trimApprovalMarkdownBorders strips leading/trailing empty lines the
-// markdown renderer sometimes emits around block content. Matches
-// the guardian dialog's renderCommandApprovalCodeBlock behavior so
-// the visual height matches the logical line count.
-func trimApprovalMarkdownBorders(lines []string) []string {
-	for len(lines) >= 2 && commandApprovalMarkdownLineEmpty(lines[0]) {
-		lines = lines[1:]
-	}
-	for len(lines) >= 2 && commandApprovalMarkdownLineEmpty(lines[len(lines)-1]) {
-		lines = lines[:len(lines)-1]
-	}
-	return lines
-}
-
 func (m *AppModel) renderPlanApprovalOption(index int, option commandApprovalOption, width int) ([]string, []commandApprovalHitbox) {
 	th := m.config.Theme()
 	selected := m.planApproval != nil && m.planApproval.selected == index
@@ -274,19 +187,8 @@ func (m *AppModel) renderPlanApprovalOption(index int, option commandApprovalOpt
 	return renderedLines, hitboxes
 }
 
-// scrollPlanApprovalBody adjusts the plan body scroll by delta.
-// Mirrors scrollCommandApprovalCode so mouse-wheel and keyboard
-// scroll events on the plan approval dialog work identically to the
-// command approval dialog.
+// scrollPlanApprovalBody is retained for shared mouse handling. Plan approval
+// no longer has a scrollable body; the plan body lives in the chat artifact.
 func (m *AppModel) scrollPlanApprovalBody(layout commandApprovalViewLayout, delta int) bool {
-	if m.planApproval == nil || delta == 0 || layout.codeVisibleLines <= 0 || layout.codeTotalLines <= layout.codeVisibleLines {
-		return false
-	}
-	maxScroll := layout.codeTotalLines - layout.codeVisibleLines
-	next := clampInt(layout.codeScroll+delta, 0, maxScroll)
-	if next == m.planApproval.bodyScroll {
-		return false
-	}
-	m.planApproval.bodyScroll = next
-	return true
+	return false
 }

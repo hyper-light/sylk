@@ -813,6 +813,7 @@ func (pi *PipelineInspector) handleBusRequest(msg *guide.Message) error {
 
 	result, err := pi.Handle(ctx, fwd)
 	agentShared.LogResponse(pi.steering.EventLogger(), fwd.CorrelationID, pi.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	if err != nil {
 		if lm := agentShared.LogMetaFromContext(ctx); lm.EventLogger != nil {

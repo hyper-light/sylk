@@ -13,7 +13,9 @@ import (
 // TestPlanApprovalGate_PublishesProposalToTUI pins the gate's
 // publication contract: plan_approval_gate publishes a
 // planapproval.Proposal as a MessageTypeProposal on the TUI's
-// response topic, with PlanID + CorrelationID + PlanText preserved.
+// response topic, with PlanID + CorrelationID + PlanText preserved as
+// fallback/integrity metadata. The TUI dialog itself must not render
+// PlanText; the plan_markdown artifact is the user-facing chat surface.
 // This is what triggers the UI dialog substitution; if the gate
 // stops publishing, the dialog never appears and the architect's
 // continuation hangs.

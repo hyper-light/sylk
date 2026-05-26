@@ -72,6 +72,11 @@ func (a *Architect) buildPlanMarkdownArtifact(plan *DesignPlan, priorArtifactID 
 		"content_hash": contentHash,
 		"role":         planReviewArtifactRole,
 	}
+	if correlationID := strings.TrimSpace(plan.RequestCorrelationID); correlationID != "" {
+		artifact.Metadata["request_correlation_id"] = correlationID
+		artifact.Metadata["stream_correlation_id"] = correlationID
+		artifact.Metadata["correlation_id"] = correlationID
+	}
 	if priorArtifactID = strings.TrimSpace(priorArtifactID); priorArtifactID != "" {
 		artifact.Relations = append(artifact.Relations, claims.Relation{
 			Related:      priorArtifactID,
@@ -96,8 +101,60 @@ func planHasCurrentMarkdownArtifact(plan *DesignPlan) bool {
 		plan.PlanMarkdownArtifactEpoch == planMarkdownArtifactEpoch(plan)
 }
 
+func (a *Architect) planHasCurrentMarkdownArtifactOnBoard(plan *DesignPlan) bool {
+	if a == nil || !planHasCurrentMarkdownArtifact(plan) {
+		return false
+	}
+	board := a.architectBoard()
+	if board == nil {
+		return false
+	}
+	artifact, ok := board.CloneArtifact(strings.TrimSpace(plan.PlanMarkdownArtifactID))
+	if !ok || artifact == nil {
+		return false
+	}
+	return planMarkdownArtifactMatchesPlan(artifact, plan)
+}
+
+func planMarkdownArtifactMatchesPlan(artifact *claims.Artifact, plan *DesignPlan) bool {
+	if artifact == nil || plan == nil {
+		return false
+	}
+	if strings.TrimSpace(artifact.ID) != strings.TrimSpace(plan.PlanMarkdownArtifactID) {
+		return false
+	}
+	if strings.TrimSpace(artifact.Kind) != claims.ArtifactKindPlanMarkdown {
+		return false
+	}
+	markdown := strings.TrimSpace(formatPlanForChat(plan))
+	if markdown == "" || strings.TrimSpace(artifact.Reference) != markdown {
+		return false
+	}
+	presentation := claims.NormalizePresentation(artifact.Presentation)
+	if !claims.PresentationMatches(presentation, string(claims.PresentationAudienceUser), string(claims.PresentationSurfaceChat)) {
+		return false
+	}
+	if strings.TrimSpace(presentation.ReplaceKey) != strings.TrimSpace(plan.PlanMarkdownReplaceKey) {
+		return false
+	}
+	hash := planReviewArtifactMetadataString(artifact.Metadata, "content_hash", "plan_artifact_content_hash")
+	return strings.TrimSpace(hash) == strings.TrimSpace(plan.PlanMarkdownContentHash)
+}
+
+func planReviewArtifactMetadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if metadata == nil {
+			return ""
+		}
+		if value := strings.TrimSpace(stringFromAny(metadata[key])); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (a *Architect) ensurePlanMarkdownArtifact(ctx context.Context, plan *DesignPlan) error {
-	if planHasCurrentMarkdownArtifact(plan) {
+	if a.planHasCurrentMarkdownArtifactOnBoard(plan) {
 		return nil
 	}
 	return a.publishPreparedHandoff(ctx, plan)

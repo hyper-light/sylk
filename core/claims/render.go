@@ -2,6 +2,7 @@ package claims
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -91,6 +92,11 @@ func RenderBoardPreamble(proj *ClaimsBoardProjection, agentType string) string {
 		b.WriteString("\n")
 	}
 
+	if continuity := renderCarryForwardContinuityPreamble(proj, agentType); continuity != "" {
+		b.WriteString(continuity)
+		b.WriteString("\n")
+	}
+
 	// Phase guidance.
 	switch proj.Phase {
 	case BoardPhaseImplementation:
@@ -106,6 +112,124 @@ func RenderBoardPreamble(proj *ClaimsBoardProjection, agentType string) string {
 	return b.String()
 }
 
+type continuityPreambleItem struct {
+	topic        string
+	testamentID  string
+	through      uint64
+	sourceCount  int
+	sequence     uint64
+	stale        bool
+	contradicted bool
+	superseded   bool
+}
+
+func renderCarryForwardContinuityPreamble(proj *ClaimsBoardProjection, agentType string) string {
+	if proj == nil {
+		return ""
+	}
+	superseded := make(map[string]struct{})
+	for _, t := range proj.Testaments {
+		for _, rel := range t.Relations {
+			if rel.RelatedType == RelatedTypeTestament && rel.Relationship == RelationshipSupersedes {
+				superseded[strings.TrimSpace(rel.Related)] = struct{}{}
+			}
+		}
+	}
+	latest := make(map[string]continuityPreambleItem)
+	for _, t := range proj.Testaments {
+		if !agentMatchesType(t.AgentID, agentType) {
+			continue
+		}
+		item, ok := continuityPreambleItemFromTestament(t)
+		if !ok {
+			continue
+		}
+		if _, ok := superseded[t.ID]; ok {
+			item.superseded = true
+		}
+		if item.superseded {
+			continue
+		}
+		prev, exists := latest[item.topic]
+		if !exists || item.sequence > prev.sequence {
+			latest[item.topic] = item
+		}
+	}
+	if len(latest) == 0 {
+		return ""
+	}
+	items := make([]continuityPreambleItem, 0, len(latest))
+	for _, item := range latest {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].sequence > items[j].sequence
+	})
+	if len(items) > 3 {
+		items = items[:3]
+	}
+	var b strings.Builder
+	b.WriteString("### My Carry-Forward Continuity\n")
+	b.WriteString("Before repeating consult/search/planning work on these topics, call `recall_forward(topic=...)` and reuse fresh carried testaments/artifacts when they answer the question.\n")
+	for _, item := range items {
+		status := "fresh"
+		switch {
+		case item.contradicted:
+			status = "contradicted"
+		case item.stale:
+			status = "stale"
+		}
+		fmt.Fprintf(&b, "- topic %q: testament %s through sequence %d (%s, %d source(s))\n", item.topic, item.testamentID, item.through, status, item.sourceCount)
+	}
+	return b.String()
+}
+
+func continuityPreambleItemFromTestament(t Testament) (continuityPreambleItem, bool) {
+	item := continuityPreambleItem{testamentID: t.ID, sequence: t.Sequence}
+	for _, artifact := range t.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		stale, contradicted := continuityArtifactStatus(artifact)
+		item.stale = item.stale || stale
+		item.contradicted = item.contradicted || contradicted
+		if artifact.Kind != ArtifactKindContinuityCursor {
+			continue
+		}
+		item.topic = normalizeContinuityTopic(metadataString(artifact.Metadata, "topic"))
+		item.through = metadataUint64(artifact.Metadata, "through_sequence")
+		item.sourceCount = len(metadataStringSlice(artifact.Metadata, "source_testament_ids")) +
+			len(metadataStringSlice(artifact.Metadata, "source_artifact_ids"))
+	}
+	return item, item.topic != "" && item.testamentID != ""
+}
+
+func metadataStringSlice(md map[string]any, key string) []string {
+	if len(md) == 0 {
+		return nil
+	}
+	switch v := md[key].(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func agentMatchesType(agentID, agentType string) bool {
+	agentID = strings.TrimSpace(agentID)
+	agentType = strings.TrimSpace(agentType)
+	return agentID == agentType || strings.HasPrefix(agentID, agentType+"-")
+}
+
 func hasAgentTypeRelation(relations []Relation, agentType, relationship string) bool {
 	for _, r := range relations {
 		if r.Relationship == relationship && r.RelatedType == RelatedTypeAgent {
@@ -113,7 +237,7 @@ func hasAgentTypeRelation(relations []Relation, agentType, relationship string) 
 			// type prefix (e.g., "engineer" matches "engineer",
 			// "engineer-pipeline-abc123"). The delimiter "-" prevents
 			// "engineer" from matching "chief-engineer".
-			if r.Related == agentType || strings.HasPrefix(r.Related, agentType+"-") {
+			if agentMatchesType(r.Related, agentType) {
 				return true
 			}
 		}

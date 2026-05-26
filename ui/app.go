@@ -488,6 +488,7 @@ type AppModel struct {
 	lspBridge        *bridge.LSPBridge
 	pipelineBridge   *bridge.PipelineBridge
 	claimsBridge     *bridge.ClaimsBridge
+	proposalBridge   *bridge.ProposalBridge
 
 	// LSP
 	lspManager    *lsp.Manager
@@ -1067,6 +1068,7 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	reflect.TypeFor[msg.FocusPanelMsg]():       appMsgCmdRoute((*AppModel).handleFocusPanel),
 	reflect.TypeFor[msg.PlanUpdateMsg]():       appMsgCmdRoute((*AppModel).handlePlanUpdate),
 	reflect.TypeFor[msg.ClaimPresentationMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.ClaimPresentationMsg) tea.Cmd {
+		m.refreshPlanApprovalArtifact(typed)
 		return m.propagate(typed)
 	}),
 	reflect.TypeFor[msg.PlanViewToggleMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.PlanViewToggleMsg) tea.Cmd {
@@ -1091,10 +1093,10 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 		return cmd
 	}),
 	reflect.TypeFor[msg.SessionEventMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.SessionEventMsg) tea.Cmd {
-		if m.claimsBridge != nil && typed.Event != nil {
-			m.claimsBridge.SwitchSession(typed.Event.SessionID)
-		}
 		return m.propagate(typed)
+	}),
+	reflect.TypeFor[msg.SessionSwitchedMsg](): appMsgCmdRoute(func(m *AppModel, typed msg.SessionSwitchedMsg) tea.Cmd {
+		return m.handleSessionSwitched(typed)
 	}),
 	reflect.TypeFor[msg.OpenEditorMsg]():  appMsgCmdRoute((*AppModel).handleOpenEditor),
 	reflect.TypeFor[msg.CloseEditorMsg](): appMsgCmdRoute(func(m *AppModel, _ msg.CloseEditorMsg) tea.Cmd { return m.handleCloseEditor() }),
@@ -2365,6 +2367,9 @@ func (m *AppModel) Shutdown() error {
 	if m.claimsBridge != nil {
 		m.claimsBridge.Stop()
 	}
+	if m.proposalBridge != nil {
+		m.proposalBridge.Stop()
+	}
 
 	var errs []error
 	if err := m.lspManager.Shutdown(); err != nil {
@@ -2449,6 +2454,16 @@ func (m *AppModel) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		_, escCmd := m.dispatchKey(m.escKey)
 		model, keyCmd := m.dispatchKey(key)
 		return model, tea.Batch(escCmd, keyCmd)
+	}
+
+	// Bubble Tea decodes two raw ESC bytes from the same terminal read as
+	// Alt+Esc. Treat that sequence as the two Esc presses the interrupt chord
+	// expects.
+	if key.Type == tea.KeyEscape && key.Alt {
+		uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_key_alt_escape_as_double_escape")
+		_, firstCmd := m.dispatchKey(tea.KeyMsg{Type: tea.KeyEscape})
+		model, secondCmd := m.dispatchKey(tea.KeyMsg{Type: tea.KeyEscape})
+		return model, tea.Batch(firstCmd, secondCmd)
 	}
 
 	// Buffer a standalone ESC for disambiguation.
@@ -2872,12 +2887,16 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 				return m, m.diffView.Update(key)
 			}
 			if m.focus.Current() == component.FocusAgentPanel && m.agentPanel.InSubView() {
+				uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_escape_routed_to_agent_subview",
+					"selected_agent", m.selectedInterruptDebugAgentID(),
+				)
 				comp, cmd := m.agentPanel.Update(key)
 				m.agentPanel = comp.(*agentpkg.Model)
 				m.syncManualTargetFromAgentSelection()
 				return m, cmd
 			}
 			if !m.input.IsEmpty() {
+				uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_escape_cleared_input_before_interrupt")
 				m.input.ClearInput()
 				return m, nil
 			}
@@ -2887,16 +2906,33 @@ var appKeyDispatchRoutes = []appKeyDispatchRoute{
 				m.escPressCount++
 				m.lastEscTime = now
 				if m.escPressCount == 2 {
+					uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_escape_chord_active",
+						"count", m.escPressCount,
+						"manual_target", m.manualTargetAgent,
+						"engaged_agent", m.engagedAgentID,
+						"selected_agent", m.selectedInterruptDebugAgentID(),
+					)
 					cmd := m.interruptActiveRoute("esc")
 					m.statusBar.SetFlash("Agent interrupted · Esc again to interrupt all")
 					return m, cmd
 				}
+				uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_escape_chord_all",
+					"count", m.escPressCount,
+					"manual_target", m.manualTargetAgent,
+					"engaged_agent", m.engagedAgentID,
+					"selected_agent", m.selectedInterruptDebugAgentID(),
+				)
 				m.lastEscTime = time.Time{}
 				m.escPressCount = 0
 				return m, m.interruptAllActiveRoutes("esc-all")
 			}
 			m.lastEscTime = now
 			m.escPressCount = 1
+			uiDebugFileLog().Info("INTERRUPT_DEBUG: ui_escape_chord_armed",
+				"manual_target", m.manualTargetAgent,
+				"engaged_agent", m.engagedAgentID,
+				"selected_agent", m.selectedInterruptDebugAgentID(),
+			)
 			m.statusBar.SetFlash("Press Esc again to interrupt agent")
 			return m, nil
 		},

@@ -30,13 +30,13 @@ If the envelope is absent, your scope is quiet. You may proceed normally.
 
 Use these whenever you need to dig deeper than the envelope shows:
 
-- **`query_peer_activity(scope, kinds, since_minutes)`** — broader than the envelope. Use BEFORE making a typed decision in any coordinable domain (`test_framework`, `build_backend`, `ui_framework`, `module_layout`, `linter_backend`, `code_style`, `accessibility_baseline`, `validation_strategy`, etc.). The envelope is bounded; this is unbounded within the lookback.
+- **`recall_forward(topic, lookback_sessions, include_sources)`** — your direct claims-board continuity spine. Use before repeating a consult, search, plan, design, test strategy, or analysis step for a stable topic. It recalls carried-forward testaments and artifacts written by you; it does not consult peers. Treat only `status=usable` and `usable=true` as evidence you can reuse; `miss`, `insufficient`, `partial`, `stale`, and `contradicted` results are explicit non-evidence.
+- **`carry_forward(topic, mode, max_sources)`** — write compact continuity after useful consult, discovery, research, testing, design, decision, or error/blocker evidence. It carries testaments and artifacts, not claims. Use `mode=preview` to inspect the deterministic source window; use `mode=advance` to write the continuity testament.
+- **`query_peer_activity(scope, kinds, since_minutes)`** — broader than the envelope. Use AFTER direct continuity recall when the question is about overlapping peer decisions or live coordination. Use BEFORE making a typed decision in any coordinable domain (`test_framework`, `build_backend`, `ui_framework`, `module_layout`, `linter_backend`, `code_style`, `accessibility_baseline`, `validation_strategy`, etc.). The envelope is bounded; this is unbounded within the lookback.
 - **`causal_trace(activity_id)`** — when an activity in your scope is unexpected, walk its ancestor chain to see why. Particularly useful when ambient_context surfaced an inbound dispute and you need to understand the dispute's full causal context before responding.
 - **`find_related_activity(query, scope)`** — full-text + semantic search across the activity stream. Use when you suspect related work has happened that might inform your current decision.
 - **`inspect_open_conflicts(scope)`** — narrower than `query_peer_activity`. Returns only what is currently contested in scope: open challenges, unanswered consults, stalled holds. Use when ambient_context showed a hotness advisory.
 - **`recall_my_history(scope, since_minutes, replica_generations)`** — your scribe is your authoritative biographer. Use when about to make a decision you may have made before, when revisiting a state you remember reasoning about earlier, or when you suspect you're repeating yourself. Pass `replica_generations=[0]` to include all your prior lives.
-- **`recall_forward(topic, lookback_sessions, include_sources)`** — your direct claims-board continuity spine. Use before repeating a consult, search, plan, design, test strategy, or analysis step for a stable topic. It recalls carried-forward testaments and artifacts written by you; it does not consult peers.
-- **`carry_forward(topic, mode, max_sources)`** — write compact continuity after useful consult, discovery, research, testing, design, decision, or error/blocker evidence. It carries testaments and artifacts, not claims. Use `mode=preview` to inspect the deterministic source window; use `mode=advance` to write the continuity testament.
 
 ## Cross-pipeline addressing — your peers are reachable
 
@@ -53,8 +53,8 @@ You will receive consults and challenges from other pipelines in your `inbound_c
 - **Adopt by default.** When peer activity in your scope is compatible with your task, adopt it. Adoption is cheap; divergence has integration cost.
 - **Challenge with evidence.** When you genuinely disagree with a peer's commitment, use `challenge_peer` against the activity's author. Carry the activity_id and your concrete evidence. Don't go silent and diverge.
 - **Answer your inbound.** Inbound disputes and consults in your envelope are addressed to YOU. The inspector will surface unanswered inbound at audit time as a quality issue.
-- **Recall before repeating.** If the topic is stable and you may have already gathered evidence, call `recall_forward(topic=…)` before asking Archivalist, Librarian, Academic, or a peer to repeat the same work.
-- **Carry after learning.** When a consult response, workspace discovery, research result, test result, design decision, or error artifact will matter in a later turn, call `carry_forward(topic=…)` before moving on.
+- **Recall before repeating.** If the topic is stable and you may have already gathered evidence, call `recall_forward(topic=…)` before asking Archivalist, Librarian, Academic, or a peer to repeat the same work. Fresh carried-forward testaments/artifacts outrank duplicate live consults for your own direct history only when recall returns `status=usable` and `usable=true`.
+- **Carry after learning.** When a consult response, workspace discovery, research result, test result, design decision, or error artifact will matter in a later turn, call `carry_forward(topic=…)` before moving on. Think of the published continuity as compact source indexes into durable evidence; keep it small, but make sure it points back to the useful testaments/artifacts.
 
 ## Auto-publish — your routine work feeds the fabric
 

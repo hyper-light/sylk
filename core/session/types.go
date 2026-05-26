@@ -149,10 +149,10 @@ func DefaultConfig() Config {
 	}
 }
 
-// BootstrapDefaultConfig returns the Config used to mint the system's
-// default session at startup. The ID "default" intentionally matches
-// the storage-layer default session created by SylkDir at
-// .sylk/sessions/default/ — runtime and disk converge on the same key.
+// BootstrapDefaultConfig returns a Config pinned to the storage-layer
+// default session. This is for legacy/backcompat paths that must
+// address .sylk/sessions/default/ explicitly; interactive TUI runs
+// should use DefaultConfig so each process mints an independent ID.
 func BootstrapDefaultConfig() Config {
 	cfg := DefaultConfig()
 	cfg.ID = "default"

@@ -98,6 +98,7 @@ type ClaimsBridge struct {
 
 	prevArtifactSink claims.ArtifactProgressSink
 	sinkRegistered   bool
+	boardDeltaUnsub  func()
 }
 
 type presentationEmissionState struct {
@@ -188,6 +189,7 @@ func (b *ClaimsBridge) drainFunc(program TeaProgram) concurrency.WorkFunc {
 
 func (b *ClaimsBridge) Stop() {
 	b.stopOnce.Do(func() {
+		b.stopBoardDeltaWatch()
 		b.mu.Lock()
 		if b.inbox != nil {
 			_ = b.inbox.Close()
@@ -209,6 +211,7 @@ func (b *ClaimsBridge) DroppedCount() int64 { return b.dropped.Load() }
 
 func (b *ClaimsBridge) SwitchSession(sessionID string) {
 	sessionID = strings.TrimSpace(sessionID)
+	b.stopBoardDeltaWatch()
 
 	var board *claims.ClaimsBoard
 	if b.registry != nil && sessionID != "" {
@@ -236,6 +239,7 @@ func (b *ClaimsBridge) SwitchSession(sessionID string) {
 
 	if board != nil {
 		b.startClaimsIntake(sessionID, board)
+		b.startBoardDeltaWatch(sessionID, board)
 		b.replayProjection(sessionID, board.Projection())
 	} else {
 		b.debug("switch_session_no_board", "session_id", sessionID)
@@ -322,6 +326,62 @@ func (b *ClaimsBridge) startClaimsIntake(sessionID string, board *claims.ClaimsB
 		return
 	}
 	b.debug("intake_started", "session_id", sessionID, "board_id", board.BoardID())
+}
+
+func (b *ClaimsBridge) stopBoardDeltaWatch() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	unsub := b.boardDeltaUnsub
+	b.boardDeltaUnsub = nil
+	b.mu.Unlock()
+	if unsub != nil {
+		unsub()
+	}
+}
+
+func (b *ClaimsBridge) startBoardDeltaWatch(sessionID string, board *claims.ClaimsBoard) {
+	if b == nil || board == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	unsub := board.SubscribeDelta(func(delta claims.BoardMutationDelta) error {
+		return b.processBoardMutationDelta(sessionID, board, delta)
+	})
+	b.mu.Lock()
+	if b.activeSession != sessionID || b.board != board {
+		b.mu.Unlock()
+		unsub()
+		return
+	}
+	b.boardDeltaUnsub = unsub
+	b.mu.Unlock()
+	b.debug("board_delta_watch_started", "session_id", sessionID, "board_id", board.BoardID())
+}
+
+func (b *ClaimsBridge) processBoardMutationDelta(sessionID string, board *claims.ClaimsBoard, delta claims.BoardMutationDelta) error {
+	if delta.Kind != "testament_submitted" || strings.TrimSpace(delta.TestamentID) == "" {
+		return nil
+	}
+	// Claim-scoped testaments also arrive via the claims bus as
+	// TestamentDelta. Free-floating presentation testaments do not, so
+	// this in-process board subscription closes that visibility gap
+	// without duplicating ordinary claim response rows.
+	if strings.TrimSpace(delta.ClaimID) != "" {
+		return nil
+	}
+	activeBoard, activeSession := b.currentBoard()
+	if activeBoard != board || activeSession != sessionID {
+		return nil
+	}
+	if t, ok := board.CloneTestament(strings.TrimSpace(delta.TestamentID)); ok {
+		b.handleTestamentSubmitted(sessionID, t)
+		return nil
+	}
+	if t := findTestament(board.Projection(), delta.TestamentID); t != nil {
+		b.handleTestamentSubmitted(sessionID, t)
+	}
+	return nil
 }
 
 func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.GraphEntryPoint) error {
@@ -450,9 +510,9 @@ func (b *ClaimsBridge) currentBoard() (*claims.ClaimsBoard, string) {
 }
 
 // ResolveArtifact returns a defensive copy of an artifact from the active
-// session's claims board. It first checks the bridge's live artifact index,
-// then falls back to the immutable board projection so callers do not depend
-// on presentation messages having drained before they resolve source content.
+// session's claims board. It first checks the canonical board storage so
+// projection truncation never leaks into user-visible hydration, then falls
+// back to the bridge's live artifact index and immutable projection.
 func (b *ClaimsBridge) ResolveArtifact(sessionID, artifactID string) (*claims.Artifact, bool) {
 	if b == nil {
 		return nil, false
@@ -470,12 +530,30 @@ func (b *ClaimsBridge) ResolveArtifact(sessionID, artifactID string) (*claims.Ar
 		b.mu.Unlock()
 		return nil, false
 	}
+	board := b.board
+	b.mu.Unlock()
+	if board != nil {
+		if art, ok := board.CloneArtifact(artifactID); ok {
+			b.mu.Lock()
+			stillActive := sessionID == b.activeSession && board == b.board
+			b.mu.Unlock()
+			if stillActive {
+				return art, true
+			}
+			return nil, false
+		}
+	}
+	b.mu.Lock()
+	if sessionID != b.activeSession {
+		b.mu.Unlock()
+		return nil, false
+	}
 	if art := b.artifactByID[artifactID]; art != nil {
 		cp := cloneArtifact(art)
 		b.mu.Unlock()
 		return cp, true
 	}
-	board := b.board
+	board = b.board
 	b.mu.Unlock()
 	if board == nil {
 		return nil, false
@@ -497,6 +575,12 @@ func (b *ClaimsBridge) handleEntryClaim(sessionID string, board *claims.ClaimsBo
 }
 
 func (b *ClaimsBridge) handleEntryTestament(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, testamentID string) {
+	if board != nil {
+		if t, ok := board.CloneTestament(strings.TrimSpace(testamentID)); ok {
+			b.handleTestamentSubmitted(sessionID, t)
+			return
+		}
+	}
 	if entry != nil && entry.Node.Testament != nil {
 		b.handleTestamentSubmitted(sessionID, entry.Node.Testament)
 		return
@@ -774,7 +858,7 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	claimID = strings.TrimSpace(claimID)
 	agentID = strings.TrimSpace(agentID)
 	sessionID = strings.TrimSpace(sessionID)
-	_, activeSession := b.currentBoard()
+	activeBoard, activeSession := b.currentBoard()
 	if sessionID == "" {
 		sessionID = activeSession
 	}
@@ -786,6 +870,11 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 		return
 	}
 	art := cloneArtifact(artifact)
+	if claimMetadataBool(art.Metadata, claims.ArtifactMetadataContentTruncated) && activeBoard != nil {
+		if full, ok := activeBoard.CloneArtifact(strings.TrimSpace(art.ID)); ok && full != nil {
+			art = full
+		}
+	}
 	if art.AgentID == "" {
 		art.AgentID = agentID
 	}
@@ -1190,7 +1279,7 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 		b.recordPresentationDropLocked("artifact", "", art.Presentation, "missing_source_id")
 		return nil, nil
 	}
-	content, truncated := presentationArtifactContent(art)
+	content, truncated := b.presentationArtifactContentLocked(art)
 	if strings.TrimSpace(content) == "" {
 		content = claimMetadataString(art.Metadata, "content", "text", "markdown", "body")
 	}
@@ -1209,7 +1298,7 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 		return nil, nil
 	}
 	p := claims.NormalizePresentation(art.Presentation)
-	cycleID := firstNonBlank(meta.CycleID, claimID)
+	cycleID := artifactPresentationCycleID(meta, claimID, art)
 	if cycleID == "" {
 		b.recordPresentationDropLocked("artifact", sourceID, p, "missing_cycle")
 		return nil, nil
@@ -1256,6 +1345,9 @@ func (b *ClaimsBridge) claimIDForArtifactLocked(art *claims.Artifact) string {
 	testamentID := strings.TrimSpace(art.TestamentID)
 	if testamentID == "" || b.board == nil {
 		return ""
+	}
+	if t, ok := b.board.CloneTestament(testamentID); ok {
+		return claims.ClaimIDFromRelations(t.Relations)
 	}
 	if t := findTestament(b.board.Projection(), testamentID); t != nil {
 		return claims.ClaimIDFromRelations(t.Relations)
@@ -1317,6 +1409,37 @@ func presentationArtifactContent(art *claims.Artifact) (string, bool) {
 	return art.Reference, false
 }
 
+func (b *ClaimsBridge) presentationArtifactContentLocked(art *claims.Artifact) (string, bool) {
+	if art == nil {
+		return "", false
+	}
+	if claimMetadataBool(art.Metadata, claims.ArtifactMetadataContentTruncated) {
+		if full, ok := b.fullArtifactCopyLocked(strings.TrimSpace(art.ID)); ok && full != nil {
+			if strings.TrimSpace(full.Reference) != "" {
+				return full.Reference, false
+			}
+		}
+		if strings.TrimSpace(art.Kind) == claims.ArtifactKindPlanMarkdown {
+			if strings.TrimSpace(art.Reference) != "" {
+				return art.Reference, false
+			}
+			return claimMetadataString(art.Metadata, "content", "text", "markdown", "body"), false
+		}
+	}
+	return presentationArtifactContent(art)
+}
+
+func (b *ClaimsBridge) fullArtifactCopyLocked(artifactID string) (*claims.Artifact, bool) {
+	if b == nil || b.board == nil {
+		return nil, false
+	}
+	artifactID = strings.TrimSpace(artifactID)
+	if artifactID == "" {
+		return nil, false
+	}
+	return b.board.CloneArtifact(artifactID)
+}
+
 func presentationTitle(p *claims.Presentation, fallback string) string {
 	if p != nil && strings.TrimSpace(p.Title) != "" {
 		return strings.TrimSpace(p.Title)
@@ -1343,6 +1466,29 @@ func presentationReplaceKey(p *claims.Presentation) string {
 		return ""
 	}
 	return strings.TrimSpace(p.ReplaceKey)
+}
+
+func artifactPresentationCycleID(meta claimMeta, claimID string, art *claims.Artifact) string {
+	if art != nil && strings.TrimSpace(art.Kind) == claims.ArtifactKindPlanMarkdown {
+		if cycleID := claimMetadataString(art.Metadata, "stream_correlation_id", "correlation_id", "request_correlation_id", "cycle_id"); cycleID != "" {
+			return cycleID
+		}
+	}
+	if cycleID := firstNonBlank(meta.CycleID, claimID); cycleID != "" {
+		return cycleID
+	}
+	if art == nil {
+		return ""
+	}
+	if cycleID := claimMetadataString(art.Metadata, "stream_correlation_id", "correlation_id", "request_correlation_id", "cycle_id"); cycleID != "" {
+		return cycleID
+	}
+	if strings.TrimSpace(art.Kind) == claims.ArtifactKindPlanMarkdown {
+		if planID := claimMetadataString(art.Metadata, "plan_id"); planID != "" {
+			return "plan:" + planID
+		}
+	}
+	return ""
 }
 
 func (b *ClaimsBridge) claimTestamentResponseMsg(sessionID, claimID string, t *claims.Testament) *msg.ClaimResponseTextMsg {
@@ -1537,7 +1683,16 @@ func (b *ClaimsBridge) syntheticLegacyPlanPresentationMsg(sessionID, claimID str
 			b.mu.Unlock()
 			return nil
 		}
-		cycleID := firstNonBlank(meta.CycleID, claimID)
+		cycleID := firstNonBlank(
+			meta.CycleID,
+			claimID,
+			claimMetadataString(metadata, "stream_correlation_id", "correlation_id", "request_correlation_id", "cycle_id"),
+		)
+		if cycleID == "" {
+			if planID := claimMetadataString(metadata, "plan_id"); planID != "" {
+				cycleID = "plan:" + planID
+			}
+		}
 		if cycleID == "" {
 			b.recordPresentationDropLocked("synthetic", sourceID, presentation, "missing_cycle")
 			b.mu.Unlock()

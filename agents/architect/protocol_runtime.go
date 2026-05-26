@@ -296,7 +296,14 @@ func (a *Architect) runDeterministicProtocol(
 	// invoking its legacy per-task RPC loop. Fire-and-forget — a
 	// publish failure degrades to single-phase ingest at approval
 	// time without blocking plan finalization.
-	a.publishPreparedHandoff(ctx, plan)
+	if err := a.publishPreparedHandoff(ctx, plan); err != nil {
+		a.logWarn("runDeterministicProtocol: publish ready plan artifacts failed",
+			"plan_id", plan.ID,
+			"error", err.Error())
+	}
+	if !a.config.AutoApprove {
+		a.presentPlanApprovalDialogBestEffort(ctx, plan)
+	}
 
 	elapsed := time.Since(protocolStart)
 	diag.log("deterministic protocol complete elapsed=%v tasks=%d", elapsed, len(tasks))
@@ -502,8 +509,8 @@ func (r *planningProtocolRunner) run() error {
 // planning protocol behavior within the tool loop.
 const protocolPhaseInstructions = `You drive the planning protocol by invoking skills. Execute these phases in order:
 
-1. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
-2. **Evidence review**: Inspect the plan(action=analyze) result and any consultation evidence already attached to the plan. Issue consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap that can materially change design. Do not repeat a fresh target/query just because the phase changed.
+1. **Evidence review**: Inspect the planning evidence already attached from discussion-time consult_peer and recall_forward. For stable or resumed topics, call recall_forward(topic=...) before any repeat consult_peer. If no fresh planning evidence is attached for this request after recall, issue one targeted consult_peer call to the most relevant knowledge agent before analysis. If fresh evidence already exists, issue consult_peer only for a concrete missing, stale, contradicted, or too-broad evidence gap that can materially change analysis or design. Do not repeat a fresh target/query just because the phase changed. If plan(action=analyze) or plan(action=design) returns requires_consultation=true, that is a normal phase gate, not a failed plan. Invoke the requested consult_peer call, wait for it to complete, then retry the same plan action.
+2. **Analyze**: Invoke plan with action=analyze, plan_id, and the user's query.
 3. **Clarify** (conditional): Review the analysis results. If the request is still
    broadly vague or underspecified and needs exploratory clarification or
    requirements-shaping before you can plan responsibly, invoke
@@ -532,8 +539,8 @@ const protocolPhaseInstructions = `You drive the planning protocol by invoking s
    "get started", or "ship it".
    Do NOT invoke plan_acceptance — wait for the user to respond.
 
-Always pass plan_id to plan skills. Do not skip phases 1, 4, or 5; phase 2 is a review step and only calls consult_peer when a material evidence gap remains.
-During conversation before this protocol begins, you should already have used consultation
+Always pass plan_id to plan skills. Do not skip phases 1, 2, 4, or 5; phase 1 must either consume fresh attached planning evidence from recall_forward/consultation or make one targeted consult_peer call before analysis.
+During conversation before this protocol begins, you should already have used recall_forward and consultation
 skills to gather evidence as the user revealed new material constraints or direction.
 
 Exception — auto-approve (when approval_required is false):

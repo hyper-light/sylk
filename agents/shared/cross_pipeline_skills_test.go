@@ -114,6 +114,108 @@ func TestConsultPeerSkill_RouteSyncSuccessReturnsResponse(t *testing.T) {
 	}
 }
 
+func TestConsultPeerSkill_RouteSyncStampsNestedClaimAndBranchMetadata(t *testing.T) {
+	sessionID := "sess-consult-nesting"
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.Remove(sessionID)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-consult-nesting",
+		SessionID: sessionID,
+		TaskID:    "task-consult-nesting",
+	})
+	if err := registry.Register(sessionID, board); err != nil {
+		t.Fatalf("register board: %v", err)
+	}
+	t.Cleanup(func() { registry.Remove(sessionID) })
+
+	const parentClaimID = "claim-parent"
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			ID:    parentClaimID,
+			Title: "parent planning turn",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction parent: %v", err)
+	}
+
+	var capturedReq *guide.RouteRequest
+	cfg := CrossPipelineSkillConfig{
+		SessionID:  func() string { return sessionID },
+		AgentID:    func() string { return "architect-1" },
+		AgentType:  func() string { return "architect" },
+		PipelineID: func() string { return "" },
+		RouteSync: func(_ context.Context, req *guide.RouteRequest) (*guide.Message, error) {
+			capturedReq = req
+			return guide.NewResponseMessage("resp-1", &guide.RouteResponse{
+				CorrelationID: req.CorrelationID,
+				Success:       true,
+				Data:          map[string]any{"answer": "ok"},
+			}), nil
+		},
+	}
+	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+	ctx := claims.WithParentClaimID(context.Background(), parentClaimID)
+	ctx = WithTurnContext(ctx, &TurnContext{
+		Request:       &providers.Request{},
+		CorrelationID: "corr-parent",
+		AgentID:       "architect-1",
+		SessionID:     sessionID,
+	})
+	ctx = context.WithValue(ctx, activeToolCallContextKey{}, ActiveToolCallContext{
+		ToolCallKey: "consult-peer-tool",
+		ToolName:    "consult_peer",
+		InterAgent:  &InterAgentToolEvent{Kind: InterAgentToolEventKindConsult},
+	})
+
+	result, err := skill.Handler(ctx, json.RawMessage(`{"target_agent_type":"librarian","query":"What exists?"}`))
+	if err != nil {
+		t.Fatalf("handler err = %v", err)
+	}
+	got, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("handler result type = %T", result)
+	}
+	consultID, _ := got["consult_id"].(string)
+	if consultID == "" {
+		t.Fatalf("consult_id missing: %#v", got)
+	}
+	if capturedReq == nil {
+		t.Fatal("route sync never called")
+	}
+	if capturedReq.Metadata[MetadataKeyParentClaimID] != consultID {
+		t.Fatalf("parent_claim_id = %#v, want consult claim %q", capturedReq.Metadata[MetadataKeyParentClaimID], consultID)
+	}
+	if capturedReq.Metadata["chat_nested_branch"] != true {
+		t.Fatalf("chat_nested_branch = %#v, want true", capturedReq.Metadata["chat_nested_branch"])
+	}
+	if capturedReq.Metadata["chat_parent_correlation_id"] != "corr-parent" {
+		t.Fatalf("chat_parent_correlation_id = %#v, want corr-parent", capturedReq.Metadata["chat_parent_correlation_id"])
+	}
+	if capturedReq.Metadata["chat_parent_tool_call_key"] != "consult-peer-tool" {
+		t.Fatalf("chat_parent_tool_call_key = %#v, want consult-peer-tool", capturedReq.Metadata["chat_parent_tool_call_key"])
+	}
+	if capturedReq.Metadata["chat_inter_agent_kind"] != InterAgentToolEventKindConsult {
+		t.Fatalf("chat_inter_agent_kind = %#v, want consult", capturedReq.Metadata["chat_inter_agent_kind"])
+	}
+
+	consultClaim, ok := board.CloneClaim(consultID)
+	if !ok {
+		t.Fatalf("consult claim %q not posted", consultID)
+	}
+	if !claims.HasRelation(consultClaim.Relations, claims.RelationshipCausedBy, parentClaimID) {
+		t.Fatalf("consult claim missing caused_by parent relation: %+v", consultClaim.Relations)
+	}
+	if !claims.HasRelation(consultClaim.Relations, claims.RelationshipSubject, "librarian") {
+		t.Fatalf("consult claim missing librarian subject relation: %+v", consultClaim.Relations)
+	}
+}
+
 func TestConsultPeerSkill_RouteSyncCrossPipelineMetadata(t *testing.T) {
 	// Cross-pipeline consults carry target_pipeline_id; the handler
 	// stamps it into request metadata so the routing layer can resolve

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/claims"
@@ -49,7 +48,9 @@ import (
 //  5. Creates a TestamentAccumulator stamped with that anchor,
 //     puts it on ctx via WithTestamentAccumulator (which inherits
 //     the parent claim ID automatically per accumulator.go).
-//  6. Returns the new ctx + a flush function the caller defers.
+//  6. Returns the new ctx + a flush function the caller invokes
+//     before publishing its final response and also defers as a
+//     safety net for early exits.
 //
 // The flush function is a no-op when no artifacts were recorded —
 // Flush already short-circuits an empty accumulator. So adding the
@@ -91,7 +92,7 @@ func BeginForwardedRequestAccumulator(
 	flush := func() {
 		// Flush is a no-op when nothing was recorded; safe to defer
 		// unconditionally even when the handler bails early.
-		acc.Flush(context.Background(), board, scopeAdapter(scope))
+		_ = acc.FlushBlocking(context.Background(), board)
 	}
 	return ctx, flush
 }
@@ -127,25 +128,6 @@ func lookupRouteClaimID(board *claims.ClaimsBoard, agentID, correlationID string
 		}
 	}
 	return ""
-}
-
-// scopeAdapter wraps a concurrency.GoroutineScope as a claims.ScopeProvider
-// so the accumulator's Flush can dispatch the testament submit on a
-// tracked goroutine. Returns nil when the scope is unset (Flush then
-// drops with a slog warning per its existing semantics).
-func scopeAdapter(scope *concurrency.GoroutineScope) claims.ScopeProvider {
-	if scope == nil {
-		return nil
-	}
-	return forwardedRequestScopeAdapter{scope: scope}
-}
-
-type forwardedRequestScopeAdapter struct {
-	scope *concurrency.GoroutineScope
-}
-
-func (a forwardedRequestScopeAdapter) Go(desc string, timeout time.Duration, fn func(context.Context) error) error {
-	return a.scope.Go(desc, timeout, concurrency.WorkFunc(fn))
 }
 
 // ─── Fabric envelope cycle-context propagation (UI_DESIGN.md §4.7.3) ──
@@ -377,7 +359,7 @@ func BeginForwardedRequestAccumulatorWithOpts(
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 
 	flush := func() {
-		acc.Flush(context.Background(), board, scopeAdapter(scope))
+		_ = acc.FlushBlocking(context.Background(), board)
 	}
 	return ctx, flush, nil
 }

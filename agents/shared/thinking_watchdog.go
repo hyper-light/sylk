@@ -60,6 +60,8 @@ func thinkingThreshold(d llmruntime.Deliberation) time.Duration {
 	}
 }
 
+const thinkingHeartbeatInterval = 30 * time.Second
+
 // ProgressPublisher publishes StreamEventProgress messages to the bus.
 type ProgressPublisher struct {
 	Bus           guide.EventBus
@@ -426,7 +428,11 @@ func startThinkingTimer(
 	displayName string,
 	deliberation string,
 ) func() {
-	timer := time.AfterFunc(threshold, func() {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	watchCtx, cancel := context.WithCancel(ctx)
+	emit := func() {
 		LogContextEvent(ctx, agentlog.EventThinkingDeeply,
 			agentlog.ThinkingDeeplyPayload{
 				AgentName:    displayName,
@@ -446,6 +452,27 @@ func startThinkingTimer(
 					detail, AgentStateReasoning, nil)
 			}
 		}
-	})
-	return func() { timer.Stop() }
+	}
+	go func() {
+		timer := time.NewTimer(threshold)
+		defer timer.Stop()
+		select {
+		case <-watchCtx.Done():
+			return
+		case <-timer.C:
+			emit()
+		}
+
+		ticker := time.NewTicker(thinkingHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+				emit()
+			}
+		}
+	}()
+	return cancel
 }

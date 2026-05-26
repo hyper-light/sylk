@@ -930,6 +930,7 @@ func (g *Guardian) handleForwardBusRequest(ctx context.Context, msg *guide.Messa
 		}
 	}
 	shared.LogResponse(g.steering.EventLogger(), fwd.CorrelationID, g.id, fwd.SessionID, time.Since(startTime), err)
+	flushAccumulator()
 
 	// Build response.
 	resp := &guide.RouteResponse{

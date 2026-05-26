@@ -198,8 +198,13 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			// authority.PermittedChallengeTargets list. When it's
 			// omitted we resolve it below from the target activity's
 			// author and re-check.
+			callerID := safeCallString(cfg.AgentID)
 			callerType := safeCallString(cfg.AgentType)
+			ownPipelineID := safeCallString(cfg.PipelineID)
 			if explicit := strings.TrimSpace(params.TargetAgentType); explicit != "" {
+				if peerTargetIsCaller(callerID, callerType, ownPipelineID, explicit, explicit, "") {
+					return nil, selfPeerTargetError("challenge_peer", callerID, callerType, explicit, explicit)
+				}
 				if !authority.CanChallenge(callerType, explicit) {
 					return nil, unauthorizedChallengeError(callerType, explicit, permittedTargets)
 				}
@@ -219,11 +224,16 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			// the surrounding fabric append still runs, and the caller
 			// gets the same challenge_id it would have gotten before.
 			targetActivityID := activity.ActivityID(strings.TrimSpace(params.TargetActivityID))
+			resolvedAgentID := ""
 			resolvedAgentType := ""
 			resolvedPipelineID := ""
 			if target := lookupTargetActivity(ctx, targetActivityID); target != nil {
+				resolvedAgentID = strings.TrimSpace(target.Actor.AgentID)
 				resolvedAgentType = strings.TrimSpace(target.Actor.AgentType)
 				resolvedPipelineID = strings.TrimSpace(target.Actor.PipelineID)
+			}
+			if peerTargetIsCaller(callerID, callerType, ownPipelineID, resolvedAgentID, resolvedAgentType, resolvedPipelineID) {
+				return nil, selfPeerTargetError("challenge_peer", callerID, callerType, resolvedAgentID, resolvedAgentType)
 			}
 			// Second authority gate: even if the caller didn't
 			// explicitly name target_agent_type, the resolved author
@@ -457,8 +467,14 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			// already constrains target_agent_type; this is defense-
 			// in-depth for cached schemas, manual JSON, or future
 			// bus-level injection.
+			callerID := safeCallString(cfg.AgentID)
 			callerType := safeCallString(cfg.AgentType)
+			ownPipelineID := safeCallString(cfg.PipelineID)
 			targetType := strings.TrimSpace(params.TargetAgentType)
+			targetPipelineID := strings.TrimSpace(params.TargetPipelineID)
+			if peerTargetIsCaller(callerID, callerType, ownPipelineID, targetType, targetType, targetPipelineID) {
+				return nil, selfPeerTargetError("consult_peer", callerID, callerType, targetType, targetType)
+			}
 			if !authority.CanConsult(callerType, targetType) {
 				return nil, unauthorizedConsultError(callerType, targetType, permittedTargets)
 			}
@@ -467,7 +483,6 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			// its role must allow cross-pipeline consults. Without
 			// this, a global agent could hop into per-task pipelines
 			// through the pipeline_id parameter.
-			targetPipelineID := strings.TrimSpace(params.TargetPipelineID)
 			if targetPipelineID != "" && !allowsCrossPipeline {
 				ownPipelineID := strings.TrimSpace(safeCallString(cfg.PipelineID))
 				if targetPipelineID != ownPipelineID {
@@ -584,7 +599,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
 			if store == nil || turn == nil || turn.Request == nil {
-				return runLegacyConsultWait(ctx, cfg, params, consultID)
+				return runLegacyConsultWait(ctx, cfg, params, consultID, consultationClaimID)
 			}
 			if consultationClaimID == "" {
 				return nil, fmt.Errorf("consult_peer: claims-native continuation requires a posted consultation claim")
@@ -687,6 +702,7 @@ func runLegacyConsultWait(
 		DeadlineSeconds  int    `json:"deadline_seconds"`
 	},
 	consultID string,
+	consultationClaimID string,
 ) (any, error) {
 	spec := InterAgentBranchSpec{
 		Kind:       InterAgentToolEventKindConsult,
@@ -710,6 +726,10 @@ func runLegacyConsultWait(
 			ExplicitTarget:  true,
 		}
 		req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
+		req.Metadata = consultRouteMetadata(ctx, req.Metadata, consultID)
+		req.Metadata = CycleOptsToAnyMetadata(req.Metadata, ForwardedRequestCycleOpts{
+			ParentClaimID: strings.TrimSpace(consultationClaimID),
+		})
 		if pipe := strings.TrimSpace(params.TargetPipelineID); pipe != "" {
 			if req.Metadata == nil {
 				req.Metadata = map[string]any{}
@@ -744,6 +764,37 @@ func runLegacyConsultWait(
 		}
 	}
 	return result, nil
+}
+
+func consultRouteMetadata(ctx context.Context, metadata map[string]any, consultID string) map[string]any {
+	if hasNestedInterAgentBranchMetadata(metadata) {
+		return metadata
+	}
+	parentCorrelationID := ""
+	if stream, ok := StreamMetadataFromContext(ctx); ok {
+		parentCorrelationID = strings.TrimSpace(stream.CorrelationID)
+	}
+	if parentCorrelationID == "" {
+		if turn := TurnFromContext(ctx); turn != nil {
+			parentCorrelationID = strings.TrimSpace(turn.CorrelationID)
+		}
+	}
+	if parentCorrelationID == "" {
+		return metadata
+	}
+	toolCallKey := ""
+	if active, ok := ActiveToolCallFromContext(ctx); ok {
+		toolCallKey = strings.TrimSpace(active.ToolCallKey)
+	}
+	if toolCallKey == "" {
+		toolCallKey = "consult_" + strings.TrimSpace(consultID)
+	}
+	return RouteMetadataWithExplicitInterAgentBranch(ctx, metadata, InterAgentBranchMetadata{
+		ParentCorrelationID: parentCorrelationID,
+		ParentToolCallKey:   toolCallKey,
+		ThreadKey:           strings.TrimSpace(consultID),
+		Kind:                InterAgentToolEventKindConsult,
+	})
 }
 
 // asString converts an arbitrary value into a string suitable for a
