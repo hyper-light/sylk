@@ -21,6 +21,32 @@ type ClaimPostOptions struct {
 	Reason              string
 }
 
+type ClaimPostPolicyRequest struct {
+	Claim      *Claim
+	ActorID    string
+	Subject    AgentRef
+	Evaluators []AgentRef
+}
+
+type ClaimPostPolicyDecision struct {
+	Allowed     bool
+	Reason      string
+	FailureKind string
+}
+
+type ClaimPostPolicy interface {
+	DecideClaimPost(ctx context.Context, req ClaimPostPolicyRequest) ClaimPostPolicyDecision
+}
+
+type ClaimPostPolicyFunc func(ctx context.Context, req ClaimPostPolicyRequest) ClaimPostPolicyDecision
+
+func (f ClaimPostPolicyFunc) DecideClaimPost(ctx context.Context, req ClaimPostPolicyRequest) ClaimPostPolicyDecision {
+	if f == nil {
+		return ClaimPostPolicyDecision{Allowed: true}
+	}
+	return f(ctx, req)
+}
+
 type GenerateTestamentActionOptions struct {
 	IdempotencyKey  string
 	AllowStandalone bool
@@ -29,6 +55,28 @@ type GenerateTestamentActionOptions struct {
 
 type TestamentPostOptions struct {
 	Reason string
+}
+
+type LifecycleFailureOptions struct {
+	Reason       string
+	ArtifactKind string
+	Metadata     map[string]any
+}
+
+const (
+	lifecycleFailureKindKey   = "lifecycle_failure_kind"
+	lifecycleFailureReasonKey = "lifecycle_failure_reason"
+	lifecycleFailureStatusKey = "lifecycle_failure_status"
+	lifecycleFailureClaimKey  = "claim_id"
+)
+
+type lifecyclePostError struct {
+	reason       string
+	artifactKind string
+}
+
+func (e lifecyclePostError) Error() string {
+	return e.reason
 }
 
 type GeneratedClaimAction struct {
@@ -83,18 +131,48 @@ func (b *ClaimsBoard) GenerateClaimAction(ctx context.Context, action Action, in
 }
 
 func (b *ClaimsBoard) GenerateClaim(ctx context.Context, actionID string, claim Claim, opts GenerateClaimActionOptions) (*Claim, error) {
-	action, ok := b.CloneAction(strings.TrimSpace(actionID))
-	if !ok {
-		return nil, fmt.Errorf("action %q not found", actionID)
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	result, err := b.GenerateClaimAction(ctx, *action, []Claim{claim}, opts)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(result.Claims) == 0 {
-		return nil, fmt.Errorf("generated claim missing from result")
+	b.mu.Lock()
+	if existing := b.generatedClaimByKeyLocked(opts.IdempotencyKey); existing != nil {
+		b.mu.Unlock()
+		return existing, nil
 	}
-	return &result.Claims[0], nil
+	action, ok := b.actions[strings.TrimSpace(actionID)]
+	if !ok {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("action %q not found", actionID)
+	}
+	now := time.Now().UTC()
+	if err := b.validateGeneratedClaimLocked(action.Type, &claim, opts); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
+	if err := b.ensureUniqueClaimIDInBatchLocked([]Claim{claim}, 0); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
+	prevSeq := b.seq.Load()
+	b.stampGeneratedClaimLocked(&claim, action, now, opts)
+	actionSnapshot := cloneActionEntity(action)
+	if err := b.appendDurableEventLocked(walEventClaimActionGenerated, action.AgentID, map[string]any{
+		"action": actionSnapshot, "claims": []Claim{claim},
+	}, nil); err != nil {
+		b.seq.Store(prevSeq)
+		b.mu.Unlock()
+		return nil, err
+	}
+	b.storeGeneratedClaimsLocked(action, []Claim{claim}, opts.IdempotencyKey)
+	result := CloneClaimEntity(&claim)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+	b.notifyLifecycleGenerated([]Claim{claim})
+	b.notifySubscribers()
+	return result, nil
 }
 
 func (b *ClaimsBoard) PostGeneratedClaim(ctx context.Context, claimID, actorID string, opts ClaimPostOptions) error {
@@ -118,8 +196,9 @@ func (b *ClaimsBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string
 		b.mu.Unlock()
 		return err
 	}
-	if err := b.validateClaimsPostableLocked(claims, opts); err != nil {
-		commitErr := b.failClaimsPostLocked(claims, actorID, err.Error(), now)
+	if err := b.validateClaimsPostableLocked(ctx, claims, actorID, opts); err != nil {
+		failureOpts := lifecycleFailureOptionsFromError(err)
+		commitErr := b.failClaimsLifecycleLocked(claims, actorID, ClaimLifecyclePostFailed, failureOpts, now)
 		b.mu.Unlock()
 		if commitErr != nil {
 			return commitErr
@@ -182,7 +261,7 @@ func (b *ClaimsBoard) GenerateTestamentAction(ctx context.Context, action Action
 		return existing, nil
 	}
 	now := time.Now().UTC()
-	if err := b.validateGenerateTestamentActionLocked(input, opts); err != nil {
+	if err := b.validateGenerateTestamentActionLocked(action, input, opts); err != nil {
 		b.mu.Unlock()
 		return nil, err
 	}
@@ -308,6 +387,107 @@ func (b *ClaimsBoard) AcknowledgeClaimTestament(ctx context.Context, claimID, te
 	return b.transitionClaimLifecycle(ctx, claimID, receiverID, ClaimLifecycleTestamentAcknowledged, "testament acknowledged")
 }
 
+func (b *ClaimsBoard) RecordClaimLifecycleFailure(ctx context.Context, claimID, actorID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !to.IsFailure() {
+		return fmt.Errorf("claim lifecycle target %q is not a failure status", to)
+	}
+	b.mu.Lock()
+	claim, ok := b.claims[strings.TrimSpace(claimID)]
+	if !ok {
+		b.mu.Unlock()
+		return fmt.Errorf("claim %q not found", claimID)
+	}
+	if claim.LifecycleStatus == to {
+		b.mu.Unlock()
+		return nil
+	}
+	if !CanTransitionClaimLifecycle(claim.LifecycleStatus, to) {
+		b.mu.Unlock()
+		return fmt.Errorf("cannot transition claim %q lifecycle from %q to %q", claim.ID, claim.LifecycleStatus, to)
+	}
+	now := time.Now().UTC()
+	if err := b.failClaimsLifecycleLocked([]*Claim{claim}, actorID, to, opts, now); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	b.mu.Unlock()
+	b.notifySubscribers()
+	return nil
+}
+
+func (b *ClaimsBoard) RecordClaimReceiptFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleReceiptFailed, opts)
+}
+
+func (b *ClaimsBoard) RecordClaimProgressFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleProgressFailed, opts)
+}
+
+func (b *ClaimsBoard) RecordClaimTestamentGenerationFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleTestamentGenerationFailed, opts)
+}
+
+func (b *ClaimsBoard) RecordClaimTestamentAcknowledgementFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleTestamentAcknowledgementFailed, opts)
+}
+
+func (b *ClaimsBoard) RecordClaimValidationError(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleValidationErrored, opts)
+}
+
+func (b *ClaimsBoard) BeginTestamentValidation(ctx context.Context, testamentID, actorID string) error {
+	return b.transitionTestamentValidation(ctx, testamentID, actorID, TestamentLifecycleValidating, "testament validation started")
+}
+
+func (b *ClaimsBoard) CompleteTestamentValidation(ctx context.Context, testamentID, actorID string, to TestamentLifecycleStatus, reason string) error {
+	if !isTerminalTestamentValidationStatus(to) {
+		return fmt.Errorf("testament lifecycle target %q is not a terminal validation status", to)
+	}
+	return b.transitionTestamentValidation(ctx, testamentID, actorID, to, lifecycleReason(reason, string(to)))
+}
+
+func (b *ClaimsBoard) transitionTestamentValidation(ctx context.Context, testamentID, actorID string, to TestamentLifecycleStatus, reason string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	testament, ok := b.testaments[strings.TrimSpace(testamentID)]
+	if !ok {
+		b.mu.Unlock()
+		return fmt.Errorf("testament %q not found", testamentID)
+	}
+	if testament.LifecycleStatus == to {
+		b.mu.Unlock()
+		return nil
+	}
+	if !CanTransitionTestamentLifecycle(testament.LifecycleStatus, to) {
+		b.mu.Unlock()
+		return fmt.Errorf("cannot transition testament %q lifecycle from %q to %q", testament.ID, testament.LifecycleStatus, to)
+	}
+	now := time.Now().UTC()
+	if err := b.appendDurableEventLocked(walEventTestamentLifecycleTransition, actorID, map[string]any{
+		"testament_ids": []string{testament.ID}, "to": to, "agent_id": actorID, "reason": reason, "changed": now,
+	}, nil); err != nil {
+		b.mu.Unlock()
+		return err
+	}
+	b.transitionTestamentLifecycleLocked(testament, to, actorID, reason, now)
+	b.syncClaimLifecycleForTestamentValidationLocked(testament, to, actorID, reason, now)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+	b.notifySubscribers()
+	return nil
+}
+
 func (b *ClaimsBoard) transitionClaimLifecycle(ctx context.Context, claimID, actorID string, to ClaimLifecycleStatus, reason string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -421,32 +601,123 @@ func (b *ClaimsBoard) ensureUniqueClaimIDInBatchLocked(claims []Claim, idx int) 
 	return nil
 }
 
-func (b *ClaimsBoard) validateClaimsPostableLocked(claims []*Claim, opts ClaimPostOptions) error {
+func (b *ClaimsBoard) validateClaimsPostableLocked(ctx context.Context, claims []*Claim, actorID string, opts ClaimPostOptions) error {
 	for _, claim := range claims {
-		if err := validateClaimPostable(claim, opts); err != nil {
+		if err := b.validateClaimPostableLocked(ctx, claim, actorID, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateClaimPostable(claim *Claim, opts ClaimPostOptions) error {
+func (b *ClaimsBoard) validateClaimPostableLocked(ctx context.Context, claim *Claim, actorID string, opts ClaimPostOptions) error {
 	if claim == nil {
-		return fmt.Errorf("nil claim")
+		return lifecyclePostError{reason: "nil claim", artifactKind: ArtifactKindErrorDiagnostic}
 	}
 	if claim.LifecycleStatus == ClaimLifecyclePosted {
 		return nil
 	}
 	if claim.LifecycleStatus != ClaimLifecycleGenerated {
-		return fmt.Errorf("claim %q lifecycle is %q, expected generated", claim.ID, claim.LifecycleStatus)
+		return lifecyclePostError{reason: fmt.Sprintf("claim %q lifecycle is %q, expected generated", claim.ID, claim.LifecycleStatus), artifactKind: ArtifactKindErrorDiagnostic}
 	}
 	if !opts.AllowMissingSubject && SubjectAgentID(claim.Relations) == "" {
-		return fmt.Errorf("claim %q subject relation is required before post", claim.ID)
+		return lifecyclePostError{reason: fmt.Sprintf("claim %q subject relation is required before post", claim.ID), artifactKind: ArtifactKindMissingDependency}
 	}
-	if !opts.AllowSelfTarget && isPeerDirectedActionType(claim.ActionType) && claimHasSelfIssuerSubject(claim.Relations) {
-		return fmt.Errorf("claim %q invalid self-target for peer-directed action %q", claim.ID, claim.ActionType)
+	identity, err := b.resolveClaimPostIdentity(ctx, claim, opts)
+	if err != nil {
+		return err
 	}
-	return nil
+	if !opts.AllowSelfTarget && isPeerDirectedActionType(claim.ActionType) && identity.selfTargeted() {
+		return lifecyclePostError{reason: fmt.Sprintf("claim %q invalid self-target for peer-directed action %q", claim.ID, claim.ActionType), artifactKind: ArtifactKindPolicyDenied}
+	}
+	return b.applyClaimPostPolicy(ctx, claim, actorID, identity)
+}
+
+type claimPostIdentity struct {
+	issuer     AgentRef
+	subject    AgentRef
+	evaluators []AgentRef
+}
+
+func (i claimPostIdentity) selfTargeted() bool {
+	issuerKey := i.issuer.RouteKey()
+	subjectKey := i.subject.RouteKey()
+	return issuerKey != "" && issuerKey == subjectKey
+}
+
+func (b *ClaimsBoard) resolveClaimPostIdentity(ctx context.Context, claim *Claim, opts ClaimPostOptions) (claimPostIdentity, error) {
+	issuerID := IssuerAgentID(claim.Relations)
+	subjectID := SubjectAgentID(claim.Relations)
+	issuer, err := b.resolveRequiredPostAgentRef(ctx, issuerID, "issuer", claim.ID)
+	if err != nil {
+		return claimPostIdentity{}, err
+	}
+	subject, err := b.resolveSubjectPostAgentRef(ctx, subjectID, claim.ID, opts)
+	if err != nil {
+		return claimPostIdentity{}, err
+	}
+	evaluators, err := b.resolveEvaluatorPostAgentRefs(ctx, claim.Relations, claim.ID)
+	if err != nil {
+		return claimPostIdentity{}, err
+	}
+	return claimPostIdentity{issuer: issuer, subject: subject, evaluators: evaluators}, nil
+}
+
+func (b *ClaimsBoard) resolveSubjectPostAgentRef(ctx context.Context, agentID, claimID string, opts ClaimPostOptions) (AgentRef, error) {
+	if strings.TrimSpace(agentID) == "" && opts.AllowMissingSubject {
+		return AgentRef{}, nil
+	}
+	return b.resolveRequiredPostAgentRef(ctx, agentID, "subject", claimID)
+}
+
+func (b *ClaimsBoard) resolveRequiredPostAgentRef(ctx context.Context, agentID, role, claimID string) (AgentRef, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return AgentRef{}, lifecyclePostError{reason: fmt.Sprintf("claim %q %s relation is required before post", claimID, role), artifactKind: ArtifactKindMissingDependency}
+	}
+	if b.agentRefResolver == nil {
+		return DegradedAgentRef(agentID, "canonical identity resolver unavailable"), nil
+	}
+	ref, ok := b.agentRefResolver.ResolveAgentRef(ctx, b.sessionID, agentID)
+	if !ok || ref.RouteKey() == "" || ref.Unresolved {
+		return AgentRef{}, lifecyclePostError{reason: fmt.Sprintf("claim %q %s identity %q could not be resolved", claimID, role, agentID), artifactKind: ArtifactKindMissingDependency}
+	}
+	return ref.Normalized(), nil
+}
+
+func (b *ClaimsBoard) resolveEvaluatorPostAgentRefs(ctx context.Context, relations []Relation, claimID string) ([]AgentRef, error) {
+	var refs []AgentRef
+	for _, relation := range relations {
+		if relation.RelatedType != RelatedTypeAgent || relation.Relationship != RelationshipEvaluator {
+			continue
+		}
+		ref, err := b.resolveRequiredPostAgentRef(ctx, relation.Related, "evaluator", claimID)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+func (b *ClaimsBoard) applyClaimPostPolicy(ctx context.Context, claim *Claim, actorID string, identity claimPostIdentity) error {
+	if b.claimPostPolicy == nil {
+		return nil
+	}
+	decision := b.claimPostPolicy.DecideClaimPost(ctx, ClaimPostPolicyRequest{
+		Claim:      CloneClaimEntity(claim),
+		ActorID:    actorID,
+		Subject:    identity.subject,
+		Evaluators: identity.evaluators,
+	})
+	if decision.Allowed {
+		return nil
+	}
+	reason := strings.TrimSpace(decision.Reason)
+	if reason == "" {
+		reason = fmt.Sprintf("claim %q post denied by policy", claim.ID)
+	}
+	return lifecyclePostError{reason: reason, artifactKind: normalizeLifecycleFailureArtifactKind(decision.FailureKind)}
 }
 
 func (b *ClaimsBoard) claimsForLifecyclePostLocked(ids []string) ([]*Claim, error) {
@@ -476,10 +747,14 @@ func (b *ClaimsBoard) testamentsForLifecyclePostLocked(ids []string) ([]*Testame
 	return testaments, nil
 }
 
-func (b *ClaimsBoard) failClaimsPostLocked(claims []*Claim, actorID, reason string, now time.Time) error {
-	action, testaments := b.lifecycleFailureTestamentsLocked(claims, actorID, reason, now)
+func (b *ClaimsBoard) failClaimsLifecycleLocked(claims []*Claim, actorID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions, now time.Time) error {
+	if !to.IsFailure() {
+		return fmt.Errorf("claim lifecycle failure target %q is not a failure status", to)
+	}
+	reason := lifecycleReason(opts.Reason, string(to))
+	action, testaments := b.lifecycleFailureTestamentsLocked(claims, actorID, to, opts, now)
 	if err := b.appendDurableEventLocked(walEventClaimLifecycleTransition, actorID, map[string]any{
-		"claim_ids": claimIDsFromPointers(claims), "to": ClaimLifecyclePostFailed, "agent_id": actorID, "reason": reason, "changed": now,
+		"claim_ids": claimIDsFromPointers(claims), "to": to, "agent_id": actorID, "reason": reason, "changed": now,
 		"failure_action": action, "failure_testaments": testaments,
 	}, nil); err != nil {
 		return err
@@ -499,7 +774,7 @@ func (b *ClaimsBoard) failClaimsPostLocked(claims []*Claim, actorID, reason stri
 		}
 	}
 	for _, claim := range claims {
-		b.transitionClaimLifecycleLocked(claim, ClaimLifecyclePostFailed, actorID, reason, now)
+		b.transitionClaimLifecycleLocked(claim, to, actorID, reason, now)
 		if !claim.Status.IsTerminal() {
 			b.adjustStatusCounter(claim.Status, ClaimStatusRejected)
 			claim.StatusHistory = append(claim.StatusHistory, StatusChange{From: string(claim.Status), To: string(ClaimStatusRejected), Reason: reason, AgentID: actorID, Changed: now})
@@ -510,21 +785,23 @@ func (b *ClaimsBoard) failClaimsPostLocked(claims []*Claim, actorID, reason stri
 	return nil
 }
 
-func (b *ClaimsBoard) lifecycleFailureTestamentsLocked(claims []*Claim, actorID, reason string, now time.Time) (*Action, []Testament) {
+func (b *ClaimsBoard) lifecycleFailureTestamentsLocked(claims []*Claim, actorID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions, now time.Time) (*Action, []Testament) {
 	if len(claims) == 0 {
 		return nil, nil
 	}
 	action := &Action{ID: uuid.NewString(), AgentID: actorID, Type: ActionTypeTestament, Status: ActionStatusComplete, Created: now, Accessed: now, SessionID: b.sessionID, PipelineID: b.pipelineID, TaskID: b.taskID, Sequence: b.nextSeq()}
 	testaments := make([]Testament, 0, len(claims))
 	for _, claim := range claims {
-		testaments = append(testaments, b.lifecycleFailureTestamentLocked(action.ID, claim, actorID, reason, now))
+		testaments = append(testaments, b.lifecycleFailureTestamentLocked(action.ID, claim, actorID, to, opts, now))
 	}
 	return action, testaments
 }
 
-func (b *ClaimsBoard) lifecycleFailureTestamentLocked(actionID string, claim *Claim, actorID, reason string, now time.Time) Testament {
+func (b *ClaimsBoard) lifecycleFailureTestamentLocked(actionID string, claim *Claim, actorID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions, now time.Time) Testament {
 	testamentID := uuid.NewString()
 	artifactID := uuid.NewString()
+	reason := lifecycleReason(opts.Reason, string(to))
+	metadata := lifecycleFailureMetadata(claim.ID, to, opts)
 	return Testament{
 		ID:               testamentID,
 		AgentID:          actorID,
@@ -552,14 +829,21 @@ func (b *ClaimsBoard) lifecycleFailureTestamentLocked(actionID string, claim *Cl
 			Sequence:    b.nextSeq(),
 			Created:     now,
 			Accessed:    now,
-			Kind:        ArtifactKindErrorDiagnostic,
+			Kind:        normalizeLifecycleFailureArtifactKind(opts.ArtifactKind),
 			Reference:   reason,
+			Metadata:    metadata,
 			Relations:   []Relation{{Related: claim.ID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim}},
 		}},
 	}
 }
 
-func (b *ClaimsBoard) validateGenerateTestamentActionLocked(testaments []Testament, opts GenerateTestamentActionOptions) error {
+func (b *ClaimsBoard) validateGenerateTestamentActionLocked(action Action, testaments []Testament, opts GenerateTestamentActionOptions) error {
+	if strings.TrimSpace(action.AgentID) == "" {
+		return fmt.Errorf("generated testament action agent_id is required")
+	}
+	if action.Type != ActionTypeTestament {
+		return fmt.Errorf("generated testament action type %q is invalid", action.Type)
+	}
 	for i := range testaments {
 		testament := &testaments[i]
 		if strings.TrimSpace(testament.Summary) == "" && strings.TrimSpace(testament.Context) == "" {
@@ -572,6 +856,32 @@ func (b *ClaimsBoard) validateGenerateTestamentActionLocked(testaments []Testame
 			if _, exists := b.testaments[testament.ID]; exists {
 				return fmt.Errorf("duplicate testament ID %q", testament.ID)
 			}
+			for j := 0; j < i; j++ {
+				if testaments[j].ID == testament.ID {
+					return fmt.Errorf("duplicate testament ID %q in batch", testament.ID)
+				}
+			}
+		}
+		if err := validateGeneratedTestamentArtifacts(testament); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGeneratedTestamentArtifacts(testament *Testament) error {
+	for _, artifact := range testament.Artifacts {
+		if artifact == nil {
+			return fmt.Errorf("generated testament %q has nil artifact", firstNonEmpty(testament.ID, testament.Summary))
+		}
+		if strings.TrimSpace(artifact.Kind) == "" {
+			return fmt.Errorf("generated testament %q artifact kind is required", firstNonEmpty(testament.ID, testament.Summary))
+		}
+		if strings.TrimSpace(artifact.Reference) == "" && strings.TrimSpace(artifact.ContentHash) == "" {
+			return fmt.Errorf("generated testament %q artifact %q requires reference or content hash", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(artifact.ID, artifact.Kind))
+		}
+		if artifact.Size < 0 {
+			return fmt.Errorf("generated testament %q artifact %q has negative size", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(artifact.ID, artifact.Kind))
 		}
 	}
 	return nil
@@ -649,14 +959,24 @@ func (b *ClaimsBoard) storeGeneratedClaimActionLocked(action *Action, claims []C
 	if action.IdempotencyKey != "" {
 		b.claimGenerationKeys[action.IdempotencyKey] = action.ID
 	}
+	b.storeGeneratedClaimsLocked(action, claims, "")
+}
+
+func (b *ClaimsBoard) storeGeneratedClaimsLocked(action *Action, claims []Claim, idempotencyKey string) {
 	for i := range claims {
 		claim := &claims[i]
+		if _, exists := b.claims[claim.ID]; exists {
+			continue
+		}
 		b.claims[claim.ID] = claim
 		b.claimOrder = append(b.claimOrder, claim.ID)
 		b.indexRelations(claim.ID, claim.Relations)
 		b.relationsIdx.addScope(claim.ID, claim.Scope)
 		b.countTotal.Add(1)
 		b.countPending.Add(1)
+		if strings.TrimSpace(idempotencyKey) != "" {
+			b.singleClaimGenerationKeys[strings.TrimSpace(idempotencyKey)] = claim.ID
+		}
 	}
 }
 
@@ -678,24 +998,32 @@ func (b *ClaimsBoard) storeGeneratedTestamentActionLocked(action *Action, testam
 	}
 }
 
-func (b *ClaimsBoard) transitionClaimLifecycleLocked(claim *Claim, to ClaimLifecycleStatus, agentID, reason string, now time.Time) {
+func (b *ClaimsBoard) transitionClaimLifecycleLocked(claim *Claim, to ClaimLifecycleStatus, agentID, reason string, now time.Time) bool {
 	if claim == nil || claim.LifecycleStatus == to {
-		return
+		return false
+	}
+	if !CanTransitionClaimLifecycle(claim.LifecycleStatus, to) {
+		return false
 	}
 	change := StatusChange{From: string(claim.LifecycleStatus), To: string(to), Reason: reason, AgentID: agentID, Changed: now}
 	claim.LifecycleHistory = append(claim.LifecycleHistory, change)
 	claim.LifecycleStatus = to
 	claim.Accessed = now
+	return true
 }
 
-func (b *ClaimsBoard) transitionTestamentLifecycleLocked(testament *Testament, to TestamentLifecycleStatus, agentID, reason string, now time.Time) {
+func (b *ClaimsBoard) transitionTestamentLifecycleLocked(testament *Testament, to TestamentLifecycleStatus, agentID, reason string, now time.Time) bool {
 	if testament == nil || testament.LifecycleStatus == to {
-		return
+		return false
+	}
+	if !CanTransitionTestamentLifecycle(testament.LifecycleStatus, to) {
+		return false
 	}
 	change := StatusChange{From: string(testament.LifecycleStatus), To: string(to), Reason: reason, AgentID: agentID, Changed: now}
 	testament.LifecycleHistory = append(testament.LifecycleHistory, change)
 	testament.LifecycleStatus = to
 	testament.Accessed = now
+	return true
 }
 
 func (b *ClaimsBoard) outboxRecordsForClaimPostLocked(claims []*Claim, now time.Time) []ClaimsOutboxRecord {
@@ -750,6 +1078,26 @@ func (b *ClaimsBoard) generatedClaimActionByKeyLocked(key string) *GeneratedClai
 		}
 	}
 	return &GeneratedClaimAction{Action: *action, Claims: claims}
+}
+
+func (b *ClaimsBoard) generatedClaimByKeyLocked(key string) *Claim {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	claimID := b.singleClaimGenerationKeys[key]
+	if claimID == "" {
+		return nil
+	}
+	return CloneClaimEntity(b.claims[claimID])
+}
+
+func (b *ClaimsBoard) claimKeyBelongsToActionGenerationLocked(claim *Claim) bool {
+	if claim == nil || claim.IdempotencyKey == "" {
+		return false
+	}
+	action := b.actions[ClaimActionID(claim.Relations)]
+	return action != nil && action.IdempotencyKey == claim.IdempotencyKey
 }
 
 func (b *ClaimsBoard) generatedTestamentActionByKeyLocked(key string) *GeneratedTestamentAction {
@@ -939,6 +1287,111 @@ func resolutionAt(resolutions []claimResolution, index int) claimResolution {
 		return claimResolution{}
 	}
 	return resolutions[index]
+}
+
+func cloneActionEntity(action *Action) Action {
+	if action == nil {
+		return Action{}
+	}
+	clone := *action
+	if len(action.Relations) > 0 {
+		clone.Relations = append([]Relation(nil), action.Relations...)
+	}
+	if len(action.StatusHistory) > 0 {
+		clone.StatusHistory = append([]StatusChange(nil), action.StatusHistory...)
+	}
+	return clone
+}
+
+func lifecycleFailureOptionsFromError(err error) LifecycleFailureOptions {
+	if err == nil {
+		return LifecycleFailureOptions{}
+	}
+	opts := LifecycleFailureOptions{Reason: err.Error(), ArtifactKind: ArtifactKindErrorDiagnostic}
+	if postErr, ok := err.(lifecyclePostError); ok {
+		opts.Reason = postErr.reason
+		opts.ArtifactKind = postErr.artifactKind
+	}
+	return opts
+}
+
+func normalizeLifecycleFailureArtifactKind(kind string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return ArtifactKindErrorDiagnostic
+	}
+	if isErrorArtifactKind(kind) {
+		return kind
+	}
+	return ArtifactKindErrorDiagnostic
+}
+
+func lifecycleFailureMetadata(claimID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions) map[string]any {
+	metadata := cloneAnyMap(opts.Metadata)
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	metadata[lifecycleFailureClaimKey] = claimID
+	metadata[lifecycleFailureStatusKey] = string(to)
+	metadata[lifecycleFailureKindKey] = normalizeLifecycleFailureArtifactKind(opts.ArtifactKind)
+	metadata[lifecycleFailureReasonKey] = lifecycleReason(opts.Reason, string(to))
+	return metadata
+}
+
+func isTerminalTestamentValidationStatus(status TestamentLifecycleStatus) bool {
+	return status == TestamentLifecycleValidated ||
+		status == TestamentLifecycleValidationIncomplete ||
+		status == TestamentLifecycleValidationFailed
+}
+
+func claimLifecycleForTestamentValidation(status TestamentLifecycleStatus) ClaimLifecycleStatus {
+	switch status {
+	case TestamentLifecycleValidating:
+		return ClaimLifecycleValidating
+	case TestamentLifecycleValidated:
+		return ClaimLifecycleSatisfied
+	case TestamentLifecycleValidationIncomplete:
+		return ClaimLifecycleValidationIncomplete
+	case TestamentLifecycleValidationFailed:
+		return ClaimLifecycleValidationFailed
+	default:
+		return ""
+	}
+}
+
+func (b *ClaimsBoard) syncClaimLifecycleForTestamentValidationLocked(testament *Testament, status TestamentLifecycleStatus, actorID, reason string, now time.Time) {
+	claimID := ClaimIDFromRelations(testament.Relations)
+	claim := b.claims[claimID]
+	to := claimLifecycleForTestamentValidation(status)
+	if claim == nil || to == "" {
+		return
+	}
+	if b.transitionClaimLifecycleLocked(claim, to, actorID, reason, now) {
+		b.setCoarseClaimStatusForLifecycleLocked(claim, to, actorID, reason, now)
+	}
+}
+
+func (b *ClaimsBoard) setCoarseClaimStatusForLifecycleLocked(claim *Claim, lifecycle ClaimLifecycleStatus, actorID, reason string, now time.Time) {
+	to, ok := coarseStatusForValidationLifecycle(lifecycle)
+	if !ok || claim.Status == to || claim.Status.IsTerminal() {
+		return
+	}
+	from := claim.Status
+	claim.StatusHistory = append(claim.StatusHistory, StatusChange{From: string(from), To: string(to), Reason: reason, AgentID: actorID, Changed: now})
+	claim.Status = to
+	claim.Accessed = now
+	b.adjustStatusCounter(from, to)
+}
+
+func coarseStatusForValidationLifecycle(lifecycle ClaimLifecycleStatus) (ClaimStatus, bool) {
+	switch lifecycle {
+	case ClaimLifecycleSatisfied:
+		return ClaimStatusAccepted, true
+	case ClaimLifecycleValidationIncomplete, ClaimLifecycleValidationFailed, ClaimLifecycleValidationErrored:
+		return ClaimStatusRejected, true
+	default:
+		return "", false
+	}
 }
 
 func lifecycleReason(value, fallback string) string {

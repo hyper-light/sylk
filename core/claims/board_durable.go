@@ -599,7 +599,7 @@ func (db *DurableBoard) applyClaimLifecycleTransition(event *walEvent) error {
 	for _, claimID := range payload.ClaimIDs {
 		if c, ok := db.board.claims[claimID]; ok {
 			db.board.transitionClaimLifecycleLocked(c, payload.To, payload.AgentID, payload.Reason, changed)
-			if payload.To == ClaimLifecyclePostFailed && !c.Status.IsTerminal() {
+			if payload.To.IsFailure() && !c.Status.IsTerminal() {
 				c.Status = ClaimStatusRejected
 			}
 		}
@@ -716,6 +716,7 @@ func (db *DurableBoard) applyTestamentLifecycleTransition(event *walEvent) error
 				}
 			}
 		}
+		db.board.syncClaimLifecycleForTestamentValidationLocked(t, payload.To, payload.AgentID, payload.Reason, changed)
 	}
 	return nil
 }

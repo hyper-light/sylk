@@ -367,6 +367,7 @@ const (
 	ArtifactKindPermissionDenied        = "permission_denied"
 	ArtifactKindPolicyDenied            = "policy_denied"
 	ArtifactKindMissingDependency       = "missing_dependency"
+	ArtifactKindInterrupted             = "interrupted"
 	ArtifactKindInvalidExpectedToolCall = "invalid_expected_tool_call"
 
 	ArtifactKindProjectionReceipt = "projection_receipt"
@@ -406,6 +407,7 @@ func isErrorArtifactKind(kind string) bool {
 		kind == ArtifactKindPermissionDenied ||
 		kind == ArtifactKindPolicyDenied ||
 		kind == ArtifactKindMissingDependency ||
+		kind == ArtifactKindInterrupted ||
 		kind == ArtifactKindInvalidExpectedToolCall
 }
 

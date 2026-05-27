@@ -9,10 +9,10 @@ import (
 // board-resolved adjacent context, and (3) an optional ambient lens
 // digest. The LLM's prompt is derived from this envelope alone.
 type TurnEnvelope struct {
-	AgentID    string    `json:"agent_id"`
-	SessionID  string    `json:"session_id"`
-	PipelineID string    `json:"pipeline_id,omitempty"`
-	TaskID     string    `json:"task_id,omitempty"`
+	AgentID    string `json:"agent_id"`
+	SessionID  string `json:"session_id"`
+	PipelineID string `json:"pipeline_id,omitempty"`
+	TaskID     string `json:"task_id,omitempty"`
 
 	Phase     BoardPhase `json:"phase"`
 	Iteration int        `json:"iteration"`
@@ -128,11 +128,25 @@ func populateDirectedClaims(env *TurnEnvelope, board *ClaimsBoard, agentID strin
 // in_progress = resume; rejected = remediation-required).
 // Superseded claims are no longer the subject's concern.
 func isDirectedClaimActive(c *Claim) bool {
+	if !isDirectedClaimLifecycleActive(c.LifecycleStatus) {
+		return false
+	}
 	switch c.Status {
 	case ClaimStatusPending, ClaimStatusInProgress, ClaimStatusRejected:
 		return true
 	}
 	return false
+}
+
+func isDirectedClaimLifecycleActive(status ClaimLifecycleStatus) bool {
+	switch status {
+	case "":
+		return true
+	case ClaimLifecyclePosted, ClaimLifecycleReceived, ClaimLifecycleProgressed:
+		return true
+	default:
+		return false
+	}
 }
 
 func populateEvaluationQueue(env *TurnEnvelope, board *ClaimsBoard, agentID string) {
@@ -187,6 +201,9 @@ func populateActionQueues(env *TurnEnvelope, board *ClaimsBoard, agentID string)
 		if a.Status == ActionStatusComplete {
 			continue
 		}
+		if len(claimSubjects[a.ID]) == 0 {
+			continue
+		}
 		if subjects := claimSubjects[a.ID]; contains(subjects, agentID) {
 			env.InboundAsks = append(env.InboundAsks, a)
 			continue
@@ -205,6 +222,9 @@ func indexClaimSubjectsByAction(claims []Claim) map[string][]string {
 	out := make(map[string][]string, len(claims))
 	for i := range claims {
 		c := claims[i]
+		if !isDirectedClaimLifecycleActive(c.LifecycleStatus) {
+			continue
+		}
 		actionID := ClaimActionID(c.Relations)
 		if actionID == "" {
 			continue

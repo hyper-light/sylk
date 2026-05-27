@@ -42,13 +42,14 @@ type ClaimsBoard struct {
 	iteration     int
 	maxIterations int
 
-	actions                 map[string]*Action
-	claims                  map[string]*Claim
-	testaments              map[string]*Testament
-	claimOrder              []string
-	phaseLog                []StatusChange
-	claimGenerationKeys     map[string]string
-	testamentGenerationKeys map[string]string
+	actions                   map[string]*Action
+	claims                    map[string]*Claim
+	testaments                map[string]*Testament
+	claimOrder                []string
+	phaseLog                  []StatusChange
+	claimGenerationKeys       map[string]string
+	singleClaimGenerationKeys map[string]string
+	testamentGenerationKeys   map[string]string
 
 	// relationsIdx is a secondary index over every Relation carried
 	// by every object. Serves the named board-context queries
@@ -61,6 +62,7 @@ type ClaimsBoard struct {
 	amplifier        *BoardAmplifier
 	scope            ScopeProvider // nil = synchronous (tests)
 	agentRefResolver AgentRefResolver
+	claimPostPolicy  ClaimPostPolicy
 
 	// Cached projection: recomputed only when projectionDirty is set.
 	// Multiple readers share the same immutable pointer.
@@ -117,25 +119,27 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		maxIter = defaultMaxIterations
 	}
 	b := &ClaimsBoard{
-		boardID:                 boardID,
-		pipelineID:              cfg.PipelineID,
-		taskID:                  cfg.TaskID,
-		sessionID:               cfg.SessionID,
-		sessionDir:              cfg.SessionDir,
-		parentBoardID:           cfg.ParentBoardID,
-		phase:                   BoardPhaseImplementation,
-		maxIterations:           maxIter,
-		actions:                 make(map[string]*Action),
-		claims:                  make(map[string]*Claim),
-		testaments:              make(map[string]*Testament),
-		claimGenerationKeys:     make(map[string]string),
-		testamentGenerationKeys: make(map[string]string),
-		relationsIdx:            newRelationsIndex(),
-		projectionErrors:        make(map[string]string),
-		scope:                   cfg.Scope,
-		agentRefResolver:        cfg.AgentRefResolver,
-		legacySessionNoWAL:      cfg.LegacySessionNoWAL,
-		rollout:                 boardRolloutConfig(cfg.Rollout),
+		boardID:                   boardID,
+		pipelineID:                cfg.PipelineID,
+		taskID:                    cfg.TaskID,
+		sessionID:                 cfg.SessionID,
+		sessionDir:                cfg.SessionDir,
+		parentBoardID:             cfg.ParentBoardID,
+		phase:                     BoardPhaseImplementation,
+		maxIterations:             maxIter,
+		actions:                   make(map[string]*Action),
+		claims:                    make(map[string]*Claim),
+		testaments:                make(map[string]*Testament),
+		claimGenerationKeys:       make(map[string]string),
+		singleClaimGenerationKeys: make(map[string]string),
+		testamentGenerationKeys:   make(map[string]string),
+		relationsIdx:              newRelationsIndex(),
+		projectionErrors:          make(map[string]string),
+		scope:                     cfg.Scope,
+		agentRefResolver:          cfg.AgentRefResolver,
+		claimPostPolicy:           cfg.ClaimPostPolicy,
+		legacySessionNoWAL:        cfg.LegacySessionNoWAL,
+		rollout:                   boardRolloutConfig(cfg.Rollout),
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
@@ -2292,6 +2296,7 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 	defer b.mu.Unlock()
 	b.relationsIdx = newRelationsIndex()
 	b.claimGenerationKeys = make(map[string]string)
+	b.singleClaimGenerationKeys = make(map[string]string)
 	b.testamentGenerationKeys = make(map[string]string)
 	b.countTotal.Store(0)
 	b.countPending.Store(0)
@@ -2325,6 +2330,9 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 		b.claimOrder = append(b.claimOrder, id)
 		b.indexRelations(c.ID, c.Relations)
 		b.relationsIdx.addScope(c.ID, c.Scope)
+		if c.IdempotencyKey != "" && !b.claimKeyBelongsToActionGenerationLocked(c) {
+			b.singleClaimGenerationKeys[c.IdempotencyKey] = c.ID
+		}
 		b.countTotal.Add(1)
 		b.incrementStatusCounter(c.Status)
 		if c.Sequence > high {

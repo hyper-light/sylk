@@ -825,6 +825,11 @@ type ClaimsBoardConfig struct {
 	// carry explicit degraded refs and route through agent_type topics.
 	AgentRefResolver AgentRefResolver
 
+	// ClaimPostPolicy is an optional policy gate for activating generated
+	// claims. It runs after lifecycle structure and identity checks, before
+	// claim.posted is committed.
+	ClaimPostPolicy ClaimPostPolicy
+
 	// Projectors are additional deterministic outbox projectors. The
 	// durable board always installs the Fabric projector; callers may
 	// add package-specific projectors such as a knowledge mirror without
