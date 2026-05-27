@@ -16,12 +16,12 @@ func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) 
 		SessionID: "sess-intake-consult",
 		TaskID:    "task-intake-consult",
 	})
-	var resumed map[string]*claims.ConsultResolvedDelta
+	var resumed map[string]*AwaitedClaimResult
 	store := NewContinuationStore(ContinuationStoreConfig{
 		AgentID:   "architect-1",
 		SessionID: "sess-intake-consult",
 		Board:     board,
-		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*claims.ConsultResolvedDelta) error {
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
 			resumed = results
 			return nil
 		},
@@ -76,7 +76,7 @@ func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) 
 			ExpectedDelta: claims.DeltaKindTestament,
 		},
 	}
-	if !deliverExpectedPeerTestamentToContinuation(ClaimsIntakeConfig{
+	if !deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
 		AgentID:           "architect-1",
 		SessionID:         "sess-intake-consult",
 		ContinuationStore: store,
@@ -108,8 +108,169 @@ func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) 
 	}
 }
 
+func TestClaimsIntakeExpectedCanonicalConsultTestamentDeliversContinuation(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-intake-canonical-consult",
+		SessionID: "sess-intake-canonical-consult",
+		TaskID:    "task-intake-canonical-consult",
+	})
+	var resumed map[string]*AwaitedClaimResult
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect-1",
+		SessionID: "sess-intake-canonical-consult",
+		Board:     board,
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
+			resumed = results
+			return nil
+		},
+	})
+	_, yielded, err := store.AwaitConsultsOrYield(context.Background(), AwaitOptions{
+		ConsultIDs:      []string{"consult-123"},
+		AwaitToolCallID: "tool-call-1",
+		AwaitToolName:   "consult_peer",
+		Deadline:        time.Now().Add(time.Hour),
+		Snapshot:        &TurnSnapshot{Request: &providers.Request{}},
+	})
+	if !yielded || !IsConsultYielded(err) {
+		t.Fatalf("AwaitConsultsOrYield yielded=%v err=%v, want ErrConsultYielded", yielded, err)
+	}
+
+	delta := claims.NewCanonicalDelta(
+		claims.DeltaActionTestamentSubmitted,
+		"sess-intake-canonical-consult",
+		"board-intake-canonical-consult",
+		2,
+		time.Now(),
+		claims.DegradedAgentRef("librarian", "test"),
+		[]claims.DeltaRef{
+			{Role: "claim", Type: claims.RelatedTypeClaim, ID: "consult-123"},
+			{Role: "testament", Type: claims.RelatedTypeTestament, ID: "testament-1"},
+		},
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":     "consult-123",
+				"action": string(claims.ActionTypeConsultation),
+				"status": string(claims.ClaimStatusTestified),
+			},
+			"testaments": []map[string]any{{
+				"id":      "testament-1",
+				"verdict": claims.TestamentVerdictWorkComplete,
+				"context": "No Python package metadata exists.",
+			}},
+		},
+	)
+	entry := &claims.GraphEntryPoint{
+		Delta: delta,
+		Expectation: &claims.Expectation{
+			ClaimID:       "consult-123",
+			ExpectedDelta: claims.DeltaKindTestament,
+		},
+	}
+	if !deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
+		AgentID:           "architect-1",
+		SessionID:         "sess-intake-canonical-consult",
+		ContinuationStore: store,
+	}, entry) {
+		t.Fatal("expected canonical testament to be consumed as a continuation resolution")
+	}
+	got := resumed["consult-123"]
+	if got == nil {
+		t.Fatalf("results = %#v, want consult-123", resumed)
+	}
+	if got.Status != claims.ConsultStatusCompleted {
+		t.Fatalf("status = %q", got.Status)
+	}
+	if got.ResponderAgentID != "librarian" {
+		t.Fatalf("responder = %q", got.ResponderAgentID)
+	}
+	if got.ResponseSummary != "No Python package metadata exists." {
+		t.Fatalf("summary = %q", got.ResponseSummary)
+	}
+}
+
+func TestClaimsIntakeExpectedTerminalClaimDeliversContinuation(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-intake-terminal-consult",
+		SessionID: "sess-intake-terminal-consult",
+		TaskID:    "task-intake-terminal-consult",
+	})
+	var resumed map[string]*AwaitedClaimResult
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect-1",
+		SessionID: "sess-intake-terminal-consult",
+		Board:     board,
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
+			resumed = results
+			return nil
+		},
+	})
+	_, yielded, err := store.AwaitConsultsOrYield(context.Background(), AwaitOptions{
+		ClaimRefs:       []string{"consult-terminal"},
+		AwaitToolCallID: "tool-call-1",
+		AwaitToolName:   "consult_peer",
+		Deadline:        time.Now().Add(time.Hour),
+		Snapshot:        &TurnSnapshot{Request: &providers.Request{}},
+	})
+	if !yielded || !IsConsultYielded(err) {
+		t.Fatalf("AwaitConsultsOrYield yielded=%v err=%v, want ErrConsultYielded", yielded, err)
+	}
+
+	delta := claims.NewCanonicalDelta(
+		claims.DeltaActionClaimTransitioned,
+		"sess-intake-terminal-consult",
+		"board-intake-terminal-consult",
+		3,
+		time.Now(),
+		claims.DegradedAgentRef("librarian", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "consult-terminal"}},
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":        "consult-terminal",
+				"action":    string(claims.ActionTypeConsultation),
+				"status":    string(claims.ClaimStatusAccepted),
+				"to_status": string(claims.ClaimStatusAccepted),
+				"context":   "receipt accepted",
+			},
+		},
+	)
+	entry := &claims.GraphEntryPoint{
+		Delta: delta,
+		Node: claims.GraphNode{
+			Claim: &claims.Claim{
+				ID:          "consult-terminal",
+				Title:       "Consult librarian",
+				Description: "Consult accepted",
+				ActionType:  claims.ActionTypeConsultation,
+			},
+		},
+		Expectation: &claims.Expectation{
+			ClaimID:       "consult-terminal",
+			ExpectedDelta: claims.DeltaKindTestament,
+		},
+	}
+	if !deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
+		AgentID:           "architect-1",
+		SessionID:         "sess-intake-terminal-consult",
+		ContinuationStore: store,
+	}, entry) {
+		t.Fatal("expected terminal claim transition to resolve the continuation")
+	}
+	got := resumed["consult-terminal"]
+	if got == nil {
+		t.Fatalf("results = %#v, want consult-terminal", resumed)
+	}
+	if got.Action != claims.DeltaActionClaimTransitioned || got.Status != claims.ConsultStatusCompleted {
+		t.Fatalf("result = %#v", got)
+	}
+	if got.ResponseSummary != "receipt accepted" {
+		t.Fatalf("summary = %q", got.ResponseSummary)
+	}
+}
+
 func TestClaimsIntakeExpectedConsultTestamentWithoutResolutionIDIsConsumed(t *testing.T) {
-	consumed := deliverExpectedPeerTestamentToContinuation(ClaimsIntakeConfig{
+	consumed := deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
 		AgentID:           "architect-1",
 		SessionID:         "sess-intake-consult-missing-id",
 		ContinuationStore: &ContinuationStore{},
@@ -157,6 +318,123 @@ func TestClaimsIntakeDoesNotSuppressNonPromptClaims(t *testing.T) {
 	entry.Node.Claim.ActionType = claims.ActionTypeConsultation
 	if shouldSuppressForwardedPromptEntry(claims.RoleSubject, entry) {
 		t.Fatal("consultation claim should not be suppressed")
+	}
+}
+
+type intakeExpectedToolExecutor struct {
+	calls []claims.ExpectedToolCall
+	err   error
+}
+
+func (e *intakeExpectedToolExecutor) ExecuteExpectedTool(_ context.Context, call claims.ExpectedToolCall) (claims.ExpectedToolExecutionOutput, error) {
+	e.calls = append(e.calls, call)
+	if e.err != nil {
+		return claims.ExpectedToolExecutionOutput{}, e.err
+	}
+	return claims.ExpectedToolExecutionOutput{Summary: "validation probe passed", Output: "ok"}, nil
+}
+
+func TestClaimsIntakeExecutesOwnedExpectedValidationToolsFromTestament(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "board-expected-tools", SessionID: "sess-expected-tools", TaskID: "task"})
+	claim := claims.Claim{
+		ID:         "claim-expected-tools",
+		Title:      "validate with tool",
+		ActionType: claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: []*claims.Validation{{
+			Description: "probe evidence",
+			Type:        claims.ValidationTypeInspection,
+			Required:    true,
+			ExpectedToolCalls: []claims.ExpectedToolCall{{
+				ID:       "probe-1",
+				Tool:     "workspace_read",
+				Required: true,
+			}},
+		}},
+	}
+	if err := board.PostAction(context.Background(), claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}, []claims.Claim{claim}); err != nil {
+		t.Fatal(err)
+	}
+	testaments := []claims.Testament{{
+		AgentID: "engineer",
+		Summary: "done",
+		Relations: []claims.Relation{{
+			Related:      claim.ID,
+			RelatedType:  claims.RelatedTypeClaim,
+			Relationship: claims.RelationshipClaim,
+		}},
+		Artifacts: []*claims.Artifact{{Kind: "workspace_observation", Reference: "done"}},
+	}}
+	if err := board.SubmitTestaments(context.Background(), claims.Action{AgentID: "engineer", Type: claims.ActionTypeTestament}, testaments); err != nil {
+		t.Fatal(err)
+	}
+	entry := claims.ResolveEntryPoint(board, claims.TestamentDelta{
+		SessionID:   "sess-expected-tools",
+		BoardID:     "board-expected-tools",
+		ClaimID:     claim.ID,
+		TestamentID: testaments[0].ID,
+		ActionKind:  claims.ActionTypeTask,
+		Verdict:     claims.TestamentVerdictWorkComplete,
+	}, claims.PriorityEvaluation, nil)
+	exec := &intakeExpectedToolExecutor{}
+	if !dispatchExpectedValidationTools(ClaimsIntakeConfig{
+		AgentID:              "architect",
+		SessionID:            "sess-expected-tools",
+		Board:                board,
+		ExpectedToolExecutor: exec,
+		ExpectedToolAllowlist: map[string]bool{
+			"workspace_read": true,
+		},
+	}, entry) {
+		t.Fatal("expected validation tools to dispatch")
+	}
+	if len(exec.calls) != 1 || exec.calls[0].Tool != "workspace_read" {
+		t.Fatalf("executor calls = %+v", exec.calls)
+	}
+	got, _ := board.CloneClaim(claim.ID)
+	if got.Validations[0].Status != claims.ValidationStatusPassed {
+		t.Fatalf("validation status = %s, want passed", got.Validations[0].Status)
+	}
+}
+
+func TestClaimsIntakeDoesNotExecuteIssuerOwnedExpectedValidationToolsForOtherAgents(t *testing.T) {
+	entry := &claims.GraphEntryPoint{
+		Delta: claims.TestamentDelta{ClaimID: "claim-1", TestamentID: "testament-1", ActionKind: claims.ActionTypeTask},
+		Node: claims.GraphNode{Claim: &claims.Claim{
+			ID:         "claim-1",
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{
+				ID:          "validation-1",
+				Description: "probe evidence",
+				Type:        claims.ValidationTypeInspection,
+				Status:      claims.ValidationStatusPending,
+				Required:    true,
+				ExpectedToolCalls: []claims.ExpectedToolCall{{
+					ID:       "probe-1",
+					Tool:     "workspace_read",
+					Required: true,
+				}},
+			}},
+		}},
+	}
+	exec := &intakeExpectedToolExecutor{}
+	if dispatchExpectedValidationTools(ClaimsIntakeConfig{
+		AgentID:              "inspector",
+		SessionID:            "sess-expected-tools",
+		Board:                claims.NewClaimsBoard(claims.ClaimsBoardConfig{SessionID: "sess-expected-tools"}),
+		ExpectedToolExecutor: exec,
+	}, entry) {
+		t.Fatal("non-owner should not dispatch issuer-owned expected validation tools")
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("executor calls = %+v", exec.calls)
 	}
 }
 

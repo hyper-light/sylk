@@ -4,25 +4,27 @@ package librarian
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/versioning"
 	"github.com/google/uuid"
 )
 
 // Default configuration values for search operations.
 const (
-	DefaultSearchLimit   = 20
-	MaxSearchLimit       = 100
-	DefaultContextLines  = 3
-	DefaultTokenLimit    = 4000
-	ApproxCharsPerToken  = 4
+	DefaultSearchLimit  = 20
+	MaxSearchLimit      = 100
+	DefaultContextLines = 3
+	DefaultTokenLimit   = 4000
+	ApproxCharsPerToken = 4
 )
 
 // Search handler errors.
 var (
-	ErrInvalidDomain   = errors.New("search handler only accepts 'code' domain")
-	ErrNilRequest      = errors.New("request cannot be nil")
-	ErrSearchFailed    = errors.New("search operation failed")
+	ErrInvalidDomain = errors.New("search handler only accepts 'code' domain")
+	ErrNilRequest    = errors.New("request cannot be nil")
+	ErrSearchFailed  = errors.New("search operation failed")
 )
 
 // SearchSystem defines the interface for the core search functionality.
@@ -36,6 +38,7 @@ type SearchOptions struct {
 	Types      []string `json:"types,omitempty"`
 	PathPrefix string   `json:"path_prefix,omitempty"`
 	Fuzzy      bool     `json:"fuzzy,omitempty"`
+	SessionID  string   `json:"session_id,omitempty"`
 }
 
 // CodeSearchResult contains the results of a code search operation.
@@ -83,6 +86,7 @@ func (h *SearchHandler) Handle(ctx context.Context, req *LibrarianRequest) (*Lib
 	}
 
 	opts := h.extractOptions(req)
+	opts.SessionID = searchRequestSessionID(ctx, req)
 	result, err := h.search.Search(ctx, req.Query, opts)
 	if err != nil {
 		return h.errorResponse(req, errors.Join(ErrSearchFailed, err), start), err
@@ -91,6 +95,15 @@ func (h *SearchHandler) Handle(ctx context.Context, req *LibrarianRequest) (*Lib
 	enriched := h.EnrichResults(result.Documents)
 
 	return h.successResponse(req, enriched, result.TotalHits, start), nil
+}
+
+func searchRequestSessionID(ctx context.Context, req *LibrarianRequest) string {
+	if req != nil {
+		if sessionID := strings.TrimSpace(req.SessionID); sessionID != "" {
+			return sessionID
+		}
+	}
+	return versioning.SessionIDFromContext(ctx)
 }
 
 // validateRequest checks that the request is valid for search handling.

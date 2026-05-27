@@ -10,10 +10,10 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -111,16 +111,7 @@ func (gi *GlobalInspector) registerCoreSkills() {
 		SessionID: func() string { return gi.config.SessionID },
 		AgentID:   func() string { return gi.id },
 		AgentType: func() string { return "inspector" },
-		RouteSync: agentShared.RouteSyncFromBus(
-			func() guide.EventBus { return gi.bus },
-			func() string {
-				if gi.channels == nil {
-					return ""
-				}
-				return gi.channels.Responses
-			},
-		),
-		Inbox: func() *claims.ClaimsInbox { return gi.claimsInbox },
+		Inbox:     func() *claims.ClaimsInbox { return gi.claimsInbox },
 	}) {
 		gi.skills.Register(skill)
 	}

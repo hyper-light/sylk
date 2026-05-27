@@ -12,9 +12,9 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/fabric"
-	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -63,16 +63,7 @@ func (d *Designer) registerCoreSkills() {
 		AgentID:    func() string { return d.id },
 		AgentType:  func() string { return "designer" },
 		PipelineID: func() string { return d.pipelineID },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return d.bus },
-			func() string {
-				if d.channels == nil {
-					return ""
-				}
-				return d.channels.Responses
-			},
-		),
-		Inbox: func() *claims.ClaimsInbox { return d.claimsInbox },
+		Inbox:      func() *claims.ClaimsInbox { return d.claimsInbox },
 	}) {
 		d.skills.Register(skill)
 	}
@@ -137,7 +128,6 @@ func (d *Designer) registerCoreSkills() {
 	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		d.skills.Register(skill)
 	}
-
 
 	// Collaboration skills (feedback.go).
 	// Phase 1 refactor: per-target peer skills (request_engineer_review,

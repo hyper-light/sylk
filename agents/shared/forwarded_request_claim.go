@@ -72,6 +72,7 @@ func BeginForwardedRequestAccumulator(
 
 	board := claims.DefaultSessionBoardRegistry().Lookup(sessionID)
 	claimID := lookupRouteClaimID(board, agentID, correlationID)
+	responseClaimID := claimID
 	if claimID == "" {
 		// Fallback: anchor on the correlation_id directly so the chat
 		// panel can still group artifacts under the same row even
@@ -86,6 +87,9 @@ func BeginForwardedRequestAccumulator(
 	acc := claims.NewTestamentAccumulator(agentID, sessionID)
 	if claimID != "" {
 		acc.WithClaimID(claimID)
+	}
+	if responseClaimID != "" {
+		acc.WithResponseClaimID(responseClaimID)
 	}
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 
@@ -263,6 +267,7 @@ func NewClaimsEntryAccumulator(agentID, sessionID string, entry *claims.GraphEnt
 	}
 	if id := strings.TrimSpace(entry.Node.Claim.ID); id != "" {
 		acc.WithClaimID(id)
+		acc.WithResponseClaimID(id)
 	}
 	return acc
 }
@@ -355,6 +360,7 @@ func BeginForwardedRequestAccumulatorWithOpts(
 	acc := claims.NewTestamentAccumulator(agentID, sessionID)
 	if claimID != "" {
 		acc.WithClaimID(claimID)
+		acc.WithResponseClaimID(claimID)
 	}
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 

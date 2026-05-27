@@ -114,6 +114,13 @@ func TestUnmarshalDelta_UnknownKind(t *testing.T) {
 	}
 }
 
+func TestUnmarshalDelta_RejectsLegacyConsultResolved(t *testing.T) {
+	data, _ := json.Marshal(DeltaEnvelope{Kind: "consult_resolved", Payload: json.RawMessage(`{"consult_id":"c1"}`)})
+	if _, err := UnmarshalDelta(data); err == nil {
+		t.Fatal("expected legacy consult_resolved delta to be rejected")
+	}
+}
+
 func TestDeriveTestamentVerdict(t *testing.T) {
 	cases := []struct {
 		name      string

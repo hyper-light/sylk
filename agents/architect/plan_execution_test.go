@@ -283,19 +283,31 @@ func TestLatestStalledPlanForRequest_FiltersByCorrelation(t *testing.T) {
 }
 
 func TestShouldFallbackToPlanningProtocolAfterConversation(t *testing.T) {
-	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, nil, nil) {
-		t.Fatal("plan intent without a current plan should fall back to protocol")
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan, Query: "Let's create a toy Python CLI."}, nil, nil) {
+		t.Fatal("initial planning intent should not fall back to protocol without explicit user confirmation")
 	}
-	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentDesign}, nil, nil) {
-		t.Fatal("design intent without a current plan should fall back to protocol")
+	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan, Query: "Plan it out!"}, nil, nil) {
+		t.Fatal("explicit plan command should fall back to protocol when no current plan exists")
+	}
+	if !shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{
+		Intent: IntentPlan,
+		Query:  "go ahead",
+		ConversationHistory: []guide.ConversationTurn{{
+			AgentReply: "Want me to put together a plan for it?",
+		}},
+	}, nil, nil) {
+		t.Fatal("affirmative response to a prior plan offer should fall back to protocol")
+	}
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentDesign, Query: "Use a simple CLI design."}, nil, nil) {
+		t.Fatal("design intent without explicit planning confirmation should not fall back to protocol")
 	}
 	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentChat}, nil, nil) {
 		t.Fatal("chat intent should not fall back to planning protocol")
 	}
-	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, &DesignPlan{}, nil) {
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan, Query: "Plan it out!"}, &DesignPlan{}, nil) {
 		t.Fatal("ready plan should satisfy the planning conversation")
 	}
-	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan}, nil, &DesignPlan{}) {
+	if shouldFallbackToPlanningProtocolAfterConversation(&ArchitectRequest{Intent: IntentPlan, Query: "Plan it out!"}, nil, &DesignPlan{}) {
 		t.Fatal("stalled current-request plan should be recovered instead of falling back")
 	}
 }

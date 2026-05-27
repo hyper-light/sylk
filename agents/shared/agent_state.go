@@ -181,7 +181,7 @@ func RecordResumeReceiving(
 	ctx context.Context,
 	board *claims.ClaimsBoard,
 	snapshot *TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*AwaitedClaimResult,
 ) {
 	if snapshot == nil || board == nil {
 		return
@@ -204,7 +204,7 @@ func RecordResumeReceiving(
 	RecordAgentState(ctx, board, claimID, detail, AgentStateReceiving, peer)
 }
 
-func summarizeResumeDetail(results map[string]*claims.ConsultResolvedDelta) string {
+func summarizeResumeDetail(results map[string]*AwaitedClaimResult) string {
 	if len(results) == 0 {
 		return "Resuming"
 	}

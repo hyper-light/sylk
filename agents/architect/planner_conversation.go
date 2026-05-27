@@ -205,18 +205,12 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	a.injectForestPreload(ctx, req, request.UserQuery, request.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
-	// User-facing turn: the caller (Handle / executeConversation) is
-	// synchronously awaiting the architect's response. Do NOT stamp
-	// WithContinuationStore here — yielding would return an empty
-	// answer to the user while the resume runs in the background and
-	// has nowhere to deliver its result. Consult_peer falls back to
-	// the legacy synchronous wait (runLegacyConsultWait) which blocks
-	// inline until the librarian's testament arrives, the loop
-	// continues, and the final response reaches the user.
-	//
-	// Yield-resume is reserved for claim-inbox-driven paths
-	// (processClaimsEntry) where no synchronous caller is waiting.
-	loopCtx := ctx
+	// User-facing Architect turns have a synchronous caller waiting for
+	// the final response. Stamp only the continuation store, not a turn
+	// snapshot, so consult_peer/challenge_peer block on canonical
+	// claim/testament deltas via AwaitClaimResults instead of returning
+	// an in-flight ticket or yielding to a background resume.
+	loopCtx := a.withSynchronousPeerWait(ctx)
 	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
 		return a.executeToolLoop(loopCtx, req, stage, request.OnChunk, ledger)
 	})
@@ -239,6 +233,13 @@ func (a *Architect) composeUserFacingResponseWithTools(
 		return "", fmt.Errorf("architect planner returned empty response")
 	}
 	return text, nil
+}
+
+func (a *Architect) withSynchronousPeerWait(ctx context.Context) context.Context {
+	if a == nil || a.continuationStore == nil {
+		return ctx
+	}
+	return shared.WithContinuationStore(ctx, a.continuationStore)
 }
 
 func (p *anthropicPlanner) ComposeUserResponse(

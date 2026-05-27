@@ -205,51 +205,9 @@ func buildInterAgentStartRecord(ev msg.ToolCallEventMsg) (ToolCallRecord, bool) 
 func buildInterAgentStartRecordFallback(ev msg.ToolCallEventMsg, args map[string]any) (ToolCallRecord, bool) {
 	switch {
 	case isConsultationTool(ev.ToolName, args):
-		targets := consultationTargets(ev.ToolName, args)
-		if len(targets) == 0 {
-			return ToolCallRecord{}, false
-		}
-		summary := firstNonEmptyString(
-			stringFromMap(args, "question"),
-			stringFromMap(args, "query"),
-			stringFromMap(args, "description"),
-			ev.ArgsSummary,
-		)
-		return ToolCallRecord{
-			ToolCallKey: ev.ToolCallKey,
-			ToolName:    ev.ToolName,
-			ArgsSummary: ev.ArgsSummary,
-			FullArgs:    ev.FullArgs,
-			StartedAt:   ev.StartedAt,
-			InterAgent: &InterAgentTool{
-				Kind:       InterAgentToolConsult,
-				AgentTypes: normalizeAgentTypes(targets),
-				Summary:    normalizeInlineText(summary),
-				Status:     InterAgentToolPending,
-			},
-		}, true
+		return ToolCallRecord{}, false
 	case isChallengeTool(ev.ToolName):
-		targets := challengeTargets(ev.ToolName, args, nil, ev.AgentType, ev.PipelineID)
-		if len(targets) == 0 {
-			return ToolCallRecord{}, false
-		}
-		return ToolCallRecord{
-			ToolCallKey: ev.ToolCallKey,
-			ToolName:    ev.ToolName,
-			ArgsSummary: ev.ArgsSummary,
-			FullArgs:    ev.FullArgs,
-			StartedAt:   ev.StartedAt,
-			InterAgent: &InterAgentTool{
-				Kind:       InterAgentToolChallenge,
-				AgentTypes: normalizeAgentTypes(targets),
-				Summary: normalizeInlineText(firstNonEmptyString(
-					stringFromMap(args, "request"),
-					stringFromMap(args, "reason"),
-					ev.ArgsSummary,
-				)),
-				Status: InterAgentToolPending,
-			},
-		}, true
+		return ToolCallRecord{}, false
 	default:
 		return ToolCallRecord{}, false
 	}
@@ -629,10 +587,10 @@ func interAgentRowFromMetadata(meta *msg.InterAgentToolEventMsg) (*InterAgentToo
 	if meta == nil || strings.TrimSpace(meta.Kind) == "" {
 		return nil, false
 	}
-	kind := InterAgentToolConsult
+	var kind InterAgentToolKind
 	switch strings.TrimSpace(meta.Kind) {
-	case "challenge":
-		kind = InterAgentToolChallenge
+	case "consult", "challenge":
+		return nil, false
 	case "approval":
 		kind = InterAgentToolApproval
 	case "store":
@@ -641,6 +599,8 @@ func interAgentRowFromMetadata(meta *msg.InterAgentToolEventMsg) (*InterAgentToo
 		kind = InterAgentToolClaim
 	case "testament":
 		kind = InterAgentToolTestament
+	default:
+		return nil, false
 	}
 	status := InterAgentToolPending
 	switch strings.TrimSpace(meta.Status) {

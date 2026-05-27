@@ -394,16 +394,17 @@ func (pi *PipelineInspector) Start(bus guide.EventBus) error {
 	// testament submitted in the session (CLAIMS.md §5.4 —
 	// inspector evaluates testaments).
 	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
-		AgentID:           pi.id,
-		SessionID:         pi.config.SessionID,
-		Role:              claims.RoleSubject | claims.RoleAuditor,
-		Bus:               bus,
-		Board:             pi.claimsBoard,
-		Scope:             pi.scope,
-		ProcessEntry:      pi.processClaimsEntry,
-		Identity:          pi.identity,
-		Factory:           pi.factory,
-		ContinuationStore: pi.continuationStore,
+		AgentID:             pi.id,
+		SessionID:           pi.config.SessionID,
+		Role:                claims.RoleSubject | claims.RoleAuditor,
+		Bus:                 bus,
+		Board:               pi.claimsBoard,
+		Scope:               pi.scope,
+		ProcessEntry:        pi.processClaimsEntry,
+		Identity:            pi.identity,
+		Factory:             pi.factory,
+		ContinuationStore:   pi.continuationStore,
+		ExpectedToolRuntime: pi.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("pipeline_inspector_claims_inbox_start_failed", "error", err.Error())

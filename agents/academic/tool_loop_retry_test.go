@@ -227,7 +227,7 @@ func (p *failedConsultThenAnswerProvider) Complete(_ context.Context, _ *provide
 	}, nil
 }
 
-func TestAcademicExecuteToolLoop_ConsultFailureReturnsStructuredToolResultAndContinues(t *testing.T) {
+func TestAcademicExecuteToolLoop_LegacyConsultToolIsRejected(t *testing.T) {
 	provider := &failedConsultThenAnswerProvider{}
 	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, provider)
 	if err != nil {
@@ -239,39 +239,12 @@ func TestAcademicExecuteToolLoop_ConsultFailureReturnsStructuredToolResultAndCon
 		Model:    "gpt-5.4-pro",
 	}
 
-	content, err := a.executeToolLoop(context.Background(), req, nil, nil)
-	if err != nil {
-		t.Fatalf("executeToolLoop: %v", err)
+	_, err = a.executeToolLoop(context.Background(), req, nil, nil)
+	if err == nil {
+		t.Fatal("expected legacy consult tool to be rejected")
 	}
-	if provider.calls != 2 {
-		t.Fatalf("provider calls = %d, want 2", provider.calls)
-	}
-	if !strings.Contains(content, "proceeding with direct research") {
-		t.Fatalf("content = %q, want final provider answer after consult failure", content)
-	}
-
-	var toolMsg *providers.Message
-	for i := range req.Messages {
-		msg := &req.Messages[i]
-		if msg.Role == providers.RoleTool && msg.ToolName == "consult" {
-			toolMsg = msg
-			break
-		}
-	}
-	if toolMsg == nil {
-		t.Fatal("expected consult tool message to be appended")
-	}
-	if toolMsg.IsError {
-		t.Fatalf("consult tool message should not be marked as error: %#v", toolMsg)
-	}
-	if !strings.Contains(toolMsg.Content, `"success":false`) {
-		t.Fatalf("consult tool message = %q, want structured failure payload", toolMsg.Content)
-	}
-	if !strings.Contains(toolMsg.Content, `"status":"failed"`) {
-		t.Fatalf("consult tool message = %q, want failed status", toolMsg.Content)
-	}
-	if !strings.Contains(toolMsg.Content, `"error":"academic bus is unavailable"`) {
-		t.Fatalf("consult tool message = %q, want bus-unavailable error", toolMsg.Content)
+	if !strings.Contains(err.Error(), `not permitted to execute tool "consult"`) {
+		t.Fatalf("error = %v, want consult permission rejection", err)
 	}
 }
 
@@ -429,12 +402,12 @@ type duplicateConsultProvider struct {
 func (p *duplicateConsultProvider) Complete(_ context.Context, _ *providers.Request) (*providers.Response, error) {
 	p.calls++
 	return &providers.Response{
-		Content: "Consulting Librarian for codebase patterns.",
+		Content: "Searching for codebase-independent packaging guidance.",
 		Model:   "gpt-5.4-pro",
 		ToolCalls: []providers.ToolCall{{
-			ID:        fmt.Sprintf("consult_%d", p.calls),
-			Name:      "consult",
-			Arguments: `{"target":"librarian","query":"What patterns exist for packaging configuration?"}`,
+			ID:        fmt.Sprintf("search_%d", p.calls),
+			Name:      "web_search",
+			Arguments: `{"query":"Python packaging configuration guidance"}`,
 		}},
 	}, nil
 }
@@ -452,7 +425,7 @@ func TestAcademicExecuteToolLoop_RepeatedToolBatchFailsFast(t *testing.T) {
 	}
 	surface := &scriptedAcademicSurface{
 		outputs: map[string]string{
-			"consult": `{"target":"librarian","success":true,"data":{"summary":"Prefer project-level packaging metadata."}}`,
+			"web_search": `{"summary":"Prefer project-level packaging metadata."}`,
 		},
 	}
 
@@ -460,8 +433,8 @@ func TestAcademicExecuteToolLoop_RepeatedToolBatchFailsFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected repeated tool batch to fail")
 	}
-	if !strings.Contains(err.Error(), "academic repeated tool call: consult") {
-		t.Fatalf("error = %v, want repeated consult failure", err)
+	if !strings.Contains(err.Error(), "academic repeated tool call: web_search") {
+		t.Fatalf("error = %v, want repeated web_search failure", err)
 	}
 }
 
@@ -486,9 +459,9 @@ func (p *researchPaperProvider) Complete(_ context.Context, _ *providers.Request
 				}`,
 				},
 				{
-					ID:        "consult_1",
-					Name:      "consult",
-					Arguments: `{"target_agent":"librarian","query":"This should never run."}`,
+					ID:        "search_1",
+					Name:      "web_search",
+					Arguments: `{"query":"This should never run."}`,
 				},
 			},
 		}, nil
@@ -513,7 +486,7 @@ func TestAcademicExecuteToolLoop_AuthorResearchPaperTerminatesRequiredConsultati
 	surface := &scriptedAcademicSurface{
 		outputs: map[string]string{
 			"author_research_paper": `{"paper_id":"paper_1","paper_path":"/tmp/python-packaging-guidance_v1.md","summary":"The research paper is ready for Architect consumption.","stored_in_archivalist":true}`,
-			"consult":               `{"summary":"unexpected consult"}`,
+			"web_search":            `{"summary":"unexpected search"}`,
 		},
 	}
 

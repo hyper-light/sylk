@@ -2,6 +2,7 @@ package claims
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +52,7 @@ func TestActionType_PartitionedByVisibility(t *testing.T) {
 		ActionTypeShutdown,
 		ActionTypeHandoff,
 		ActionTypeCheckpoint,
+		ActionTypeGuardianCheck,
 		ActionTypeConsultContinuation,
 	}
 	activationSet := make(map[ActionType]struct{}, len(AgentActivationActionTypes()))
@@ -143,6 +145,29 @@ func TestBoardAmplifier_SelfClaim_EmitsNoInboxDelta(t *testing.T) {
 	)
 	if len(deltas) != 0 {
 		t.Fatalf("self-claim produced %d InboxDeltas, want 0", len(deltas))
+	}
+}
+
+func TestClaimsBoard_RejectsSelfTargetPeerClaims(t *testing.T) {
+	for _, ty := range []ActionType{ActionTypeConsultation, ActionTypeChallenge, ActionTypeGuardianCheck} {
+		t.Run(string(ty), func(t *testing.T) {
+			b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
+			err := b.PostAction(context.Background(),
+				Action{AgentID: "architect", Type: ty},
+				[]Claim{{
+					Title:      "self peer claim",
+					ActionType: ty,
+					Relations: []Relation{
+						{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+						{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+					},
+					Validations: []*Validation{{Description: "v", QualityBar: "x", Type: ValidationTypeReceipt, Required: true}},
+				}},
+			)
+			if err == nil {
+				t.Fatalf("PostAction accepted self-targeted %q claim", ty)
+			}
+		})
 	}
 }
 
@@ -267,19 +292,21 @@ func TestBoardAmplifier_ActivationActionTypes_EmitInboxDeltas(t *testing.T) {
 	}
 }
 
-// Standing subscriptions are N specific activation patterns (one per
-// activation type) plus the agent's personal consult-resolved channel
-// — never the broad firehose. The consult-resolved pattern carries
-// ConsultResolvedDeltas back to the originator of a consult; it is
-// per-originator so it cannot fan out across the session.
+// Standing subscriptions are N legacy activation patterns (one per
+// activation type), plus two canonical directed-work patterns (UID and
+// legacy degraded agent-type) — never the broad firehose. Peer
+// responses are delivered through explicit expectation subscriptions on
+// canonical testament/claim deltas, not a standing consult-resolved
+// channel.
 func TestInboxPatternsFor_RoleSubject_NarrowedToActivationTypes(t *testing.T) {
 	patterns := InboxPatternsFor(RoleSubject, "sess", "architect")
 	activation := AgentActivationActionTypes()
-	want := len(activation) + 1 // +1 for ConsultResolvedPattern
+	want := len(activation) + 2 // +2 canonical directed
 	if len(patterns) != want {
-		t.Fatalf("RoleSubject patterns count = %d, want %d (one per activation type + 1 consult_resolved)", len(patterns), want)
+		t.Fatalf("RoleSubject patterns count = %d, want %d (activation + canonical)", len(patterns), want)
 	}
-	consultResolved := ConsultResolvedPattern("sess", "architect")
+	canonicalUID := CanonicalAgentActionPattern("sess", "architect", DeltaActionClaimDirected)
+	canonicalType := CanonicalAgentTypeActionPattern("sess", "architect", DeltaActionClaimDirected)
 	// Every activation type's pattern must be present.
 	for _, ty := range activation {
 		want := AgentInboxActionPattern("sess", "architect", RelationshipSubject, ty)
@@ -287,18 +314,18 @@ func TestInboxPatternsFor_RoleSubject_NarrowedToActivationTypes(t *testing.T) {
 			t.Fatalf("missing pattern for activation type %q: %q", ty, want)
 		}
 	}
-	// The consult-resolved pattern must be present and must be the
-	// only pattern with a trailing wildcard — every activation
-	// pattern terminates in a concrete action segment.
-	if !sliceContains(patterns, consultResolved) {
-		t.Fatalf("missing consult_resolved pattern %q in %v", consultResolved, patterns)
+	if !sliceContains(patterns, canonicalUID) {
+		t.Fatalf("missing canonical uid directed pattern %q in %v", canonicalUID, patterns)
+	}
+	if !sliceContains(patterns, canonicalType) {
+		t.Fatalf("missing canonical type directed pattern %q in %v", canonicalType, patterns)
 	}
 	for _, p := range patterns {
-		if p == consultResolved {
-			continue
-		}
 		if hasFinalSegment(p, "*") {
 			t.Fatalf("activation pattern %q has final wildcard (would match system types)", p)
+		}
+		if containsSegment(p, "consult_resolved") {
+			t.Fatalf("RoleSubject pattern %q reintroduced legacy consult_resolved channel", p)
 		}
 	}
 }
@@ -308,6 +335,15 @@ func hasFinalSegment(pattern, segment string) bool {
 		return false
 	}
 	return pattern[len(pattern)-len(segment):] == segment
+}
+
+func containsSegment(pattern, segment string) bool {
+	for _, part := range strings.Split(pattern, ".") {
+		if part == segment {
+			return true
+		}
+	}
+	return false
 }
 
 func sliceContains(haystack []string, needle string) bool {

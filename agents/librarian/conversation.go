@@ -205,7 +205,7 @@ func (l *Librarian) handleSearch(ctx context.Context, fwd *guide.ForwardedReques
 		Intent:    IntentRecall,
 		Domain:    DomainCode,
 		Query:     fwd.Input,
-		SessionID: "",
+		SessionID: fwd.SessionID,
 		Timestamp: time.Now(),
 	}
 
@@ -239,6 +239,7 @@ func (l *Librarian) handleCheck(ctx context.Context, fwd *guide.ForwardedRequest
 		Domain:    DomainCode,
 		Query:     fwd.Input,
 		Params:    map[string]any{"limit": 1},
+		SessionID: fwd.SessionID,
 		Timestamp: time.Now(),
 	}
 

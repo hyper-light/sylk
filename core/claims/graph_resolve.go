@@ -32,6 +32,13 @@ func resolveGraphNode(board *ClaimsBoard, d Delta) GraphNode {
 		return GraphNode{}
 	}
 	switch delta := d.(type) {
+	case *CanonicalDelta:
+		if delta == nil {
+			return GraphNode{}
+		}
+		return resolveCanonicalGraphNode(board, *delta)
+	case CanonicalDelta:
+		return resolveCanonicalGraphNode(board, delta)
 	case *InboxDelta:
 		return resolveClaimNode(board, delta.ClaimID)
 	case InboxDelta:
@@ -54,6 +61,19 @@ func resolveGraphNode(board *ClaimsBoard, d Delta) GraphNode {
 		return GraphNode{}
 	}
 	return GraphNode{}
+}
+
+func resolveCanonicalGraphNode(board *ClaimsBoard, delta CanonicalDelta) GraphNode {
+	switch delta.Action {
+	case DeltaActionClaimDirected, DeltaActionClaimProgressed, DeltaActionClaimTransitioned:
+		return resolveClaimNode(board, delta.ClaimID())
+	case DeltaActionTestamentSubmitted:
+		return resolveTestamentNode(board, delta.TestamentID())
+	case DeltaActionValidationEvaluated:
+		return resolveValidationNode(board, delta.ClaimID(), delta.ValidationID())
+	default:
+		return GraphNode{}
+	}
 }
 
 func resolveClaimNode(board *ClaimsBoard, claimID string) GraphNode {

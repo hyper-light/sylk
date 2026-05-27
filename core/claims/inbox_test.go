@@ -88,16 +88,16 @@ func TestInbox_StartSubscribesRolePatterns(t *testing.T) {
 	if err := inbox.Start(nil); err != nil {
 		t.Fatal(err)
 	}
-	// Default role (RoleSubject) → one narrow pattern per legitimate
-	// activation action type, plus the personal consult-resolved
-	// pattern. The broad AgentInboxPattern(*.*) is NOT used because
-	// it would match system-internal action types and trigger
-	// feedback loops.
+	// Default role (RoleSubject) → one narrow legacy pattern per
+	// legitimate activation action type, plus two canonical directed-work
+	// patterns. The broad
+	// AgentInboxPattern(*.*) is NOT used because it would match
+	// system-internal action types and trigger feedback loops.
 	patterns := InboxPatternsFor(RoleSubject, "sess", "eng")
 	activation := AgentActivationActionTypes()
-	wantCount := len(activation) + 1 // +1 for ConsultResolvedPattern
+	wantCount := len(activation) + 2 // +2 canonical directed
 	if len(patterns) != wantCount {
-		t.Fatalf("expected RoleSubject to derive %d patterns (activation + 1 consult_resolved), got %d (%v)", wantCount, len(patterns), patterns)
+		t.Fatalf("expected RoleSubject to derive %d patterns (activation + canonical), got %d (%v)", wantCount, len(patterns), patterns)
 	}
 	for _, p := range patterns {
 		if bus.SubscriptionCount(p) == 0 {
@@ -327,6 +327,180 @@ func TestInbox_ExpectAndMatch(t *testing.T) {
 	}
 }
 
+func TestInbox_ExpectMatchesCanonicalTestamentSubmitted(t *testing.T) {
+	var received atomic.Pointer[GraphEntryPoint]
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		OnResolved: func(entry *GraphEntryPoint) {
+			received.Store(entry)
+		},
+	})
+	inbox.Expect(&Expectation{
+		ClaimID:       "claim-42",
+		ExpectedDelta: DeltaKindTestament,
+		Priority:      PriorityResponse,
+	})
+
+	inbox.Ingest(NewCanonicalDelta(
+		DeltaActionTestamentSubmitted,
+		"sess",
+		"board",
+		2,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		[]DeltaRef{
+			{Role: "claim", Type: RelatedTypeClaim, ID: "claim-42"},
+			{Role: "testament", Type: RelatedTypeTestament, ID: "testament-1"},
+		},
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":     "claim-42",
+				"action": string(ActionTypeConsultation),
+				"status": string(ClaimStatusTestified),
+			},
+			"testaments": []map[string]any{{"id": "testament-1", "context": "done"}},
+		},
+	))
+
+	entry := received.Load()
+	if entry == nil || entry.Expectation == nil {
+		t.Fatalf("expected canonical testament to resolve expectation, got %#v", entry)
+	}
+	if entry.Delta.DeltaKind() != string(DeltaActionTestamentSubmitted) {
+		t.Fatalf("delta kind = %q", entry.Delta.DeltaKind())
+	}
+}
+
+func TestInbox_ExpectMatchesCanonicalClaimTransitioned(t *testing.T) {
+	var received atomic.Pointer[GraphEntryPoint]
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		OnResolved: func(entry *GraphEntryPoint) {
+			received.Store(entry)
+		},
+	})
+	inbox.Expect(&Expectation{
+		ClaimID:       "claim-42",
+		ExpectedDelta: DeltaKindClaimStatus,
+		Priority:      PriorityResponse,
+	})
+
+	inbox.Ingest(NewCanonicalDelta(
+		DeltaActionClaimTransitioned,
+		"sess",
+		"board",
+		3,
+		time.Now(),
+		DegradedAgentRef("system", "test"),
+		claimRefs("claim-42"),
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":        "claim-42",
+				"action":    string(ActionTypeConsultation),
+				"status":    string(ClaimStatusAccepted),
+				"to_status": string(ClaimStatusAccepted),
+			},
+		},
+	))
+
+	entry := received.Load()
+	if entry == nil || entry.Expectation == nil {
+		t.Fatalf("expected canonical transition to resolve expectation, got %#v", entry)
+	}
+}
+
+func TestInbox_CanonicalClaimProgressedDoesNotWakeSubject(t *testing.T) {
+	var called atomic.Bool
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "librarian",
+		SessionID: "sess",
+		Role:      RoleSubject,
+		OnResolved: func(_ *GraphEntryPoint) {
+			called.Store(true)
+		},
+	})
+	inbox.Ingest(NewCanonicalDelta(
+		DeltaActionClaimProgressed,
+		"sess",
+		"board",
+		4,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		claimRefs("claim-42"),
+		nil,
+		map[string]any{
+			"claim":    map[string]any{"id": "claim-42", "action": string(ActionTypeConsultation), "status": string(ClaimStatusInProgress)},
+			"progress": map[string]any{"state": "working", "message": "reading"},
+		},
+	))
+	if called.Load() {
+		t.Fatal("claim.progressed must not wake subject ProcessEntry by default")
+	}
+}
+
+func TestInbox_CanonicalClaimProgressedDoesNotResolveExpectation(t *testing.T) {
+	var called atomic.Bool
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		OnResolved: func(_ *GraphEntryPoint) {
+			called.Store(true)
+		},
+	})
+	inbox.Expect(&Expectation{
+		ClaimID:       "claim-42",
+		ExpectedDelta: DeltaKindTestament,
+		Priority:      PriorityResponse,
+	})
+	inbox.Ingest(NewCanonicalDelta(
+		DeltaActionClaimProgressed,
+		"sess",
+		"board",
+		5,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		claimRefs("claim-42"),
+		nil,
+		map[string]any{
+			"claim":    map[string]any{"id": "claim-42", "action": string(ActionTypeConsultation), "status": string(ClaimStatusInProgress)},
+			"progress": map[string]any{"state": "working", "message": "reading"},
+		},
+	))
+	if called.Load() {
+		t.Fatal("claim.progressed resolved a testament expectation")
+	}
+	if deltaMatchesExpectation(NewCanonicalDelta(
+		DeltaActionClaimProgressed,
+		"sess",
+		"board",
+		6,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		claimRefs("claim-42"),
+		nil,
+		nil,
+	), DeltaKindTestament) {
+		t.Fatal("claim.progressed matched testament expectation")
+	}
+	if canonicalDeltaMayResolveFutureExpectation(NewCanonicalDelta(
+		DeltaActionClaimProgressed,
+		"sess",
+		"board",
+		7,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		claimRefs("claim-42"),
+		nil,
+		nil,
+	)) {
+		t.Fatal("claim.progressed was stashed as future response")
+	}
+}
+
 func TestInbox_ExpectConsumesOnMatch(t *testing.T) {
 	var count atomic.Int32
 	inbox, _ := NewClaimsInbox(InboxConfig{
@@ -499,6 +673,61 @@ func TestInbox_ExpectSubscribesSpecificTestamentTopic(t *testing.T) {
 	}
 }
 
+func TestInbox_ExpectationReplaysEarlyCanonicalTestament(t *testing.T) {
+	var got *GraphEntryPoint
+	inbox, err := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		Role:      RoleSubject,
+		OnResolved: func(entry *GraphEntryPoint) {
+			got = entry
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID := "claim-consult-early"
+	delta := NewCanonicalDelta(
+		DeltaActionTestamentSubmitted,
+		"sess",
+		"board",
+		1,
+		time.Now(),
+		DegradedAgentRef("librarian", "test"),
+		[]DeltaRef{
+			{Role: "claim", Type: RelatedTypeClaim, ID: claimID},
+			{Role: "testament", Type: RelatedTypeTestament, ID: "testament-early"},
+		},
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef("architect", "test")}, Relationship: RelationshipIssuer},
+		map[string]any{
+			"claim": map[string]any{
+				"id":     claimID,
+				"action": string(ActionTypeConsultation),
+				"status": string(ClaimStatusTestified),
+			},
+		},
+	)
+
+	inbox.Ingest(delta)
+	if got != nil {
+		t.Fatal("response delta should not resolve before expectation registration")
+	}
+	inbox.Expect(&Expectation{
+		ClaimID:       claimID,
+		ExpectedDelta: DeltaKindTestament,
+		Priority:      PriorityResponse,
+	})
+	if got == nil {
+		t.Fatal("early canonical testament was not replayed into the expectation")
+	}
+	if got.Expectation == nil || got.Expectation.ClaimID != claimID {
+		t.Fatalf("expectation = %#v, want claim %q", got.Expectation, claimID)
+	}
+	if got.Delta.DeltaKind() != string(DeltaActionTestamentSubmitted) {
+		t.Fatalf("delta kind = %q", got.Delta.DeltaKind())
+	}
+}
+
 func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
 	// Subject-only inbox does not match claim status deltas via
 	// standing — issuer/subject identity flows are Expect()-driven.
@@ -635,6 +864,31 @@ func TestInbox_Len_DoesNotMatchDuplicates(t *testing.T) {
 	}
 	if inbox.Len() != 1 {
 		t.Fatalf("expected 1 match across 100 duplicate ingests, got %d", inbox.Len())
+	}
+}
+
+func TestInbox_Len_DoesNotMatchDuplicateCanonicalDelta(t *testing.T) {
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "librarian",
+		SessionID: "sess",
+		Role:      RoleSubject,
+	})
+	d := NewCanonicalDelta(
+		DeltaActionClaimDirected,
+		"sess",
+		"board",
+		1,
+		time.Now(),
+		DegradedAgentRef("architect", "test"),
+		claimRefs("claim-1"),
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef("librarian", "test")}, Relationship: RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": "claim-1", "action": string(ActionTypeConsultation)}},
+	)
+	for i := 0; i < 100; i++ {
+		inbox.Ingest(d)
+	}
+	if inbox.Len() != 1 {
+		t.Fatalf("expected 1 match across 100 duplicate canonical ingests, got %d", inbox.Len())
 	}
 }
 

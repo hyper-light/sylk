@@ -14,12 +14,12 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
-	"github.com/adalundhe/sylk/core/claims"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/commandapproval"
 	"github.com/adalundhe/sylk/core/detect"
 	"github.com/adalundhe/sylk/core/escalation"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/format"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/purevfs"
@@ -152,7 +152,6 @@ func (e *Engineer) registerCoreSkills() {
 		e.skills.Register(skill)
 	}
 
-
 	// Discovery
 	e.skills.Register(discoverProjectToolsSkill(e))
 	e.skills.Register(discoverCodePatternsSkill(e))
@@ -206,90 +205,6 @@ func (d *engineerDiag) AgentSpecificDiagnostics() map[string]any {
 		"in_flight_requests": inFlight,
 		"pipeline_id":        d.e.pipelineID,
 	}
-}
-
-// =============================================================================
-// Consolidated Consultation Skill
-// =============================================================================
-
-// consultTargets enumerates valid consultation targets.
-var consultTargets = map[string]string{
-	"librarian":   "Codebase patterns, existing implementations, and dependency information",
-	"archivalist": "Historical context on code decisions and past changes",
-	"academic":    "Theoretical guidance, alternative approaches, and research-backed solutions",
-}
-
-func consultSkill(e *Engineer) *skills.Skill {
-	return skills.NewSkill("consult").
-		Description("Consult a domain expert agent. Targets: librarian (codebase patterns), archivalist (historical context), academic (theoretical guidance).").
-		Domain("consultation").
-		Keywords("consult", "librarian", "archivalist", "academic", "knowledge", "patterns", "history", "research").
-		Priority(85).
-		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist", "academic"}, true).
-		StringParam("query", "Consultation question", true).
-		StringParam("scope", "Scope for consultation", false).
-		EnumParam("depth", "Research depth for Academic consultations", shared.ResearchDepthEnumValues(), false).
-		StringParam("session_id", "Session identifier", false).
-		Usage("Use to gather evidence from domain experts whenever the next implementation decision is blocked by missing repository, historical, or external context. Consultation is synchronous — you will receive the result before proceeding.").
-		Example(`{"target": "librarian", "query": "What patterns exist for error handling in this codebase?", "scope": "backend"}`).
-		BestPractice("Consult before implementing, and re-consult as implementation uncovers new uncertainty. Results are cached — do not repeat the same broad query, but do issue a follow-up consult when the unresolved question, evidence, or candidate approach materially changes.").
-		BestPractice("Prefer repeated targeted consults over one large review request. Ask one concrete blocking question at a time.").
-		BestPractice("When consulting Academic, re-evaluate depth each time: use `minimal` or `quick` for narrow validation, `standard` for ordinary tradeoff analysis, `deep` for decision-critical design or correctness work, and `comprehensive` for high-stakes or reusable research artifacts.").
-		BestPractice("Do not ask Academic for `comprehensive` depth on routine implementation questions; reserve it for questions where broader corroboration or a durable memo materially changes the outcome.").
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Target    string `json:"target"`
-				Query     string `json:"query"`
-				Scope     string `json:"scope"`
-				Depth     string `json:"depth"`
-				SessionID string `json:"session_id"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if _, ok := consultTargets[params.Target]; !ok {
-				return nil, fmt.Errorf("invalid target %q: must be librarian, archivalist, or academic", params.Target)
-			}
-			if params.Query == "" {
-				return nil, fmt.Errorf("query is required")
-			}
-			sessionID := params.SessionID
-			if sessionID == "" {
-				sessionID = e.config.SessionID
-			}
-			e.engineerPostClaim(ctx,
-				claims.Action{AgentID: "engineer", Type: claims.ActionTypeConsultation},
-				engineerConsultClaim(
-					"Consult "+params.Target+": "+truncateEngineer(params.Query, 60),
-					"Evidence gathering via consultation",
-					params.Target,
-					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
-					[]*claims.Validation{
-						engineerValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
-					},
-				),
-			)
-			evidence, err := e.requestConsultationWithMetadata(
-				ctx,
-				params.Target,
-				params.Query,
-				params.Scope,
-				sessionID,
-				shared.ConsultationMetadataWithResearchDepth(nil, params.Depth),
-			)
-			if err != nil {
-				if errors.Is(err, skills.ErrDelegatedRequested) {
-					return nil, err
-				}
-				return nil, err
-			}
-			return map[string]any{
-				"target":  params.Target,
-				"success": evidence.Success,
-				"data":    evidence.Data,
-			}, nil
-		}).
-		Build()
 }
 
 // =============================================================================
@@ -503,7 +418,6 @@ func (e *Engineer) publishRerouteRequest(reason, originalInput, suggestedTarget 
 	}
 	return e.bus.Publish(guide.TopicGuideRequests, guide.NewRerouteMessage("", reroute))
 }
-
 
 // Phase: run_command + run_shell_script merged into the unified bash
 // skill. Single skill, single script param, dynamic approval policy

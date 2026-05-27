@@ -3,7 +3,6 @@ package global
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +10,6 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	inspectorshared "github.com/adalundhe/sylk/agents/inspector/shared"
 	agentshared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/versioning"
 )
 
 func TestWaitForPendingResponse_UsesInactivityTimeout(t *testing.T) {
@@ -190,63 +188,5 @@ func TestDeliverPendingMessage_UsesNestedChildStreamActivityForParentWait(t *tes
 	case <-wait.activity:
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("expected parent wait activity from nested child stream")
-	}
-}
-
-func TestConsultAgent_PropagatesTaskScopeToChildConsult(t *testing.T) {
-	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
-	defer bus.Close()
-
-	gi := &GlobalInspector{
-		id:         "inspector-id",
-		bus:        bus,
-		channels:   guide.NewAgentChannels("inspector", "inspector-id"),
-		pendingBus: make(map[string]*pendingWait),
-		config:     inspectorshared.GlobalInspectorConfig{Factory: newTestFactory(t), SessionID: "sess-1"},
-	}
-
-	respSub, err := bus.SubscribeAsync(gi.channels.Responses, gi.handleBusResponse)
-	if err != nil {
-		t.Fatalf("subscribe inspector responses: %v", err)
-	}
-	defer respSub.Unsubscribe()
-
-	requests := make(chan *guide.RouteRequest, 1)
-	reqSub, err := bus.SubscribeAsync(guide.TopicGuideRequests, func(msg *guide.Message) error {
-		req, ok := msg.GetRouteRequest()
-		if !ok || req == nil {
-			return nil
-		}
-		select {
-		case requests <- req:
-		default:
-		}
-		return bus.Publish(gi.channels.Responses, guide.NewResponseMessage("resp", &guide.RouteResponse{
-			CorrelationID:     req.CorrelationID,
-			Success:           true,
-			RespondingAgentID: "academic",
-			Data:              "done",
-		}))
-	})
-	if err != nil {
-		t.Fatalf("subscribe guide requests: %v", err)
-	}
-	defer reqSub.Unsubscribe()
-
-	parentCorr := fmt.Sprintf("corr-parent-%d", time.Now().UnixNano())
-	ctx := versioning.WithTaskID(versioning.WithSessionID(context.Background(), "sess-1"), "task-1")
-	ctx = agentshared.WithStreamContext(ctx, parentCorr, "orchestrator")
-
-	if _, err := gi.consultAgent(ctx, "academic", "evaluate this design", nil); err != nil {
-		t.Fatalf("consultAgent: %v", err)
-	}
-
-	select {
-	case req := <-requests:
-		if got, _ := req.Metadata["task_id"].(string); got != "task-1" {
-			t.Fatalf("metadata task_id = %#v, want task-1", req.Metadata["task_id"])
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for child consult request")
 	}
 }

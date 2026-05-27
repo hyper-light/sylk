@@ -13,7 +13,6 @@ func librarianVisibleSkillNames() []string {
 		// find_symbol. The underlying builders stay registered for
 		// internal callers; the LLM picks `kind` to select the engine.
 		"search",
-		"consult",
 		// Layered reads only — workspace_read always requires an explicit
 		// `view` parameter (disk / global / pipeline), so layer attribution
 		// is captured at the tool boundary. The bare read_file / glob /

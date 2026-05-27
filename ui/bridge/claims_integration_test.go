@@ -35,6 +35,18 @@ func (p *integrationProgram) Snapshot() []any {
 	return out
 }
 
+func TestPeerCompletionOutcomeForErrorTestament(t *testing.T) {
+	got := peerCompletionOutcomeForTestament(&claims.Testament{
+		Artifacts: []*claims.Artifact{{
+			Kind:      claims.ArtifactKindToolTimeout,
+			Reference: "consult deadline elapsed",
+		}},
+	})
+	if got != "failure" {
+		t.Fatalf("outcome = %q, want failure", got)
+	}
+}
+
 type recordingPresentationMetricSink struct {
 	mu      sync.Mutex
 	metrics []PresentationMetric
@@ -1619,38 +1631,38 @@ func TestBridgeIntegration_CrossClaimNestingViaParentRowID(t *testing.T) {
 
 	drainBridge(t, prog, "cross-claim nesting")
 
-	var consultRow, toolRow *msg.ClaimArtifactAddedMsg
+	var peerRow *msg.ClaimPeerInteractionMsg
+	var toolRow *msg.ClaimArtifactAddedMsg
 	for _, m := range prog.Snapshot() {
-		if a, ok := m.(msg.ClaimArtifactAddedMsg); ok {
+		switch a := m.(type) {
+		case msg.ClaimPeerInteractionMsg:
+			if a.ClaimID == consultClaimID {
+				peerCopy := a
+				peerRow = &peerCopy
+			}
+		case msg.ClaimArtifactAddedMsg:
 			switch a.ArtifactID {
-			case consultStartedID:
-				consultCopy := a
-				consultRow = &consultCopy
 			case bToolStartedID:
 				toolCopy := a
 				toolRow = &toolCopy
 			}
 		}
 	}
-	if consultRow == nil {
+	if peerRow == nil {
 		debugSnapshot(t, prog, "cross-claim")
-		t.Fatal("expected ClaimArtifactAddedMsg for A's consult_started")
+		t.Fatal("expected ClaimPeerInteractionMsg for consultation claim")
 	}
 	if toolRow == nil {
 		debugSnapshot(t, prog, "cross-claim")
 		t.Fatal("expected ClaimArtifactAddedMsg for B's tool_started")
 	}
-	// A's consult_started is itself top-level in A's cycle.
-	if consultRow.ParentRowID != "" {
-		t.Fatalf("consult_started ParentRowID = %q, want empty (top-level in cycle)", consultRow.ParentRowID)
-	}
-	// B's tool_started must nest under A's consult_started.
-	if toolRow.ParentRowID != consultStartedID {
-		t.Fatalf("tool_started.ParentRowID = %q, want %q (cross-claim nest under consult)", toolRow.ParentRowID, consultStartedID)
+	wantParent := "claim-peer:" + consultClaimID
+	if toolRow.ParentRowID != wantParent {
+		t.Fatalf("tool_started.ParentRowID = %q, want %q (cross-claim nest under consultation claim)", toolRow.ParentRowID, wantParent)
 	}
 	// Both must share the same cycle.
-	if consultRow.CycleID != toolRow.CycleID {
-		t.Fatalf("CycleID mismatch: consult=%q tool=%q", consultRow.CycleID, toolRow.CycleID)
+	if peerRow.CycleID != toolRow.CycleID {
+		t.Fatalf("CycleID mismatch: peer=%q tool=%q", peerRow.CycleID, toolRow.CycleID)
 	}
 }
 
@@ -1688,8 +1700,9 @@ func TestBridgeIntegration_ChildArtifactFallbackActorIsClaimSubject(t *testing.T
 		debugSnapshot(t, prog, "child artifact actor fallback")
 		t.Fatal("expected child tool row")
 	}
-	if toolRow.ParentRowID != consultStartedID {
-		t.Fatalf("ParentRowID = %q, want %q", toolRow.ParentRowID, consultStartedID)
+	wantParent := "claim-peer:" + consultClaimID
+	if toolRow.ParentRowID != wantParent {
+		t.Fatalf("ParentRowID = %q, want %q", toolRow.ParentRowID, wantParent)
 	}
 	if toolRow.AgentID != "librarian" {
 		t.Fatalf("AgentID = %q, want librarian fallback from consultation subject", toolRow.AgentID)
@@ -1724,7 +1737,7 @@ func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T
 	drainBridge(t, prog, "testament child response")
 
 	var response *msg.ClaimResponseTextMsg
-	var completed *msg.ClaimArtifactCompletedMsg
+	var peerDone *msg.ClaimPeerInteractionMsg
 	for _, m := range prog.Snapshot() {
 		switch typed := m.(type) {
 		case msg.ClaimResponseTextMsg:
@@ -1732,10 +1745,10 @@ func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T
 				copy := typed
 				response = &copy
 			}
-		case msg.ClaimArtifactCompletedMsg:
-			if typed.StartArtifactID == consultStartedID {
+		case msg.ClaimPeerInteractionMsg:
+			if typed.ClaimID == consultClaimID && typed.Status == "success" {
 				copy := typed
-				completed = &copy
+				peerDone = &copy
 			}
 		}
 	}
@@ -1743,8 +1756,9 @@ func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T
 		debugSnapshot(t, prog, "testament child response")
 		t.Fatal("expected child ClaimResponseTextMsg from testament summary")
 	}
-	if response.ParentRowID != consultStartedID {
-		t.Fatalf("response.ParentRowID = %q, want %q", response.ParentRowID, consultStartedID)
+	wantParent := "claim-peer:" + consultClaimID
+	if response.ParentRowID != wantParent {
+		t.Fatalf("response.ParentRowID = %q, want %q", response.ParentRowID, wantParent)
 	}
 	if response.AgentID != "librarian" {
 		t.Fatalf("response.AgentID = %q, want librarian", response.AgentID)
@@ -1752,8 +1766,60 @@ func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T
 	if response.Content != "Workspace inventory complete." {
 		t.Fatalf("response.Content = %q", response.Content)
 	}
+	if peerDone == nil {
+		t.Fatal("expected consultation peer row completion from testament submission")
+	}
+}
+
+func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-terminal-peer")
+	defer cleanup()
+
+	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
+	consultStartedID := "consult-started-terminal"
+	br.OnArtifactAdded(parentClaimID, "architect", "ses-canonical-terminal-peer", &claims.Artifact{
+		ID:        consultStartedID,
+		AgentID:   "architect",
+		Kind:      "consult_started",
+		Reference: "librarian",
+		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
+		Created:   time.Now(),
+	})
+	drainBridge(t, prog, "canonical terminal setup")
+
+	delta := claims.NewCanonicalDelta(
+		claims.DeltaActionClaimTransitioned,
+		"ses-canonical-terminal-peer",
+		board.BoardID(),
+		board.HighWaterSequence()+1,
+		time.Now(),
+		claims.DegradedAgentRef("librarian", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: consultClaimID}},
+		nil,
+		map[string]any{"claim": map[string]any{
+			"id":          consultClaimID,
+			"action":      string(claims.ActionTypeConsultation),
+			"from_status": string(claims.ClaimStatusTestified),
+			"to_status":   string(claims.ClaimStatusAccepted),
+			"reason":      "canonical terminal",
+		}},
+	)
+	br.handleCanonicalClaimsEntry("ses-canonical-terminal-peer", board, nil, delta)
+	drainBridge(t, prog, "canonical terminal")
+
+	var completed *msg.ClaimPeerInteractionMsg
+	for _, m := range prog.Snapshot() {
+		if c, ok := m.(msg.ClaimPeerInteractionMsg); ok && c.ClaimID == consultClaimID && c.Status == "success" {
+			copy := c
+			completed = &copy
+		}
+	}
 	if completed == nil {
-		t.Fatal("expected consult_started completion from testament submission")
+		debugSnapshot(t, prog, "canonical terminal")
+		t.Fatal("canonical terminal claim delta did not close peer invocation")
+	}
+	if completed.Status != "success" {
+		t.Fatalf("completion status = %q, want success", completed.Status)
 	}
 }
 
@@ -2282,6 +2348,60 @@ func TestBridgeNegative_OrphanCompletionMessageEmitted(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("orphan completion should still emit ClaimArtifactCompletedMsg")
+	}
+}
+
+func TestBridgeIntegration_ErrorArtifactWithCompletesRelationClosesToolRow(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-error-completes")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title: "tool error row",
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+		}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	br.OnArtifactAdded(claimID, "engineer", "ses-error-completes", &claims.Artifact{
+		ID:        "tool-start-error",
+		AgentID:   "engineer",
+		Kind:      "tool_started",
+		Reference: "run_tests",
+		Created:   time.Now(),
+	})
+	br.OnArtifactAdded(claimID, "engineer", "ses-error-completes", &claims.Artifact{
+		ID:        "tool-error-artifact",
+		AgentID:   "engineer",
+		Kind:      claims.ArtifactKindError,
+		Reference: "run_tests failed",
+		Relations: []claims.Relation{
+			{Related: "tool-start-error", RelatedType: claims.RelatedTypeArtifact, Relationship: claims.RelationshipCompletes},
+		},
+		Created: time.Now(),
+	})
+	drainBridge(t, prog, "error completes")
+
+	var completed *msg.ClaimArtifactCompletedMsg
+	for _, m := range prog.Snapshot() {
+		if c, ok := m.(msg.ClaimArtifactCompletedMsg); ok && c.StartArtifactID == "tool-start-error" {
+			copy := c
+			completed = &copy
+			break
+		}
+	}
+	if completed == nil {
+		debugSnapshot(t, prog, "error completes")
+		t.Fatal("expected error artifact to close the started tool row")
+	}
+	if completed.Outcome != "failure" {
+		t.Fatalf("outcome = %q, want failure", completed.Outcome)
 	}
 }
 

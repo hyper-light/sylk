@@ -85,7 +85,7 @@ type ClaimsBridge struct {
 	presentationMetricSink    PresentationMetricSink
 	presentationDiagnostics   map[string]struct{}
 	completedStartedArtifacts map[string]struct{}
-	claimToInvocationArtifact map[string]string
+	claimToPeerRow            map[string]string
 	latestStateByClaim        map[string]string
 
 	lastAccepted int
@@ -131,7 +131,7 @@ func NewClaimsBridge(
 		presentationMetrics:       make(map[presentationMetricKey]int64),
 		presentationDiagnostics:   make(map[string]struct{}),
 		completedStartedArtifacts: make(map[string]struct{}),
-		claimToInvocationArtifact: make(map[string]string),
+		claimToPeerRow:            make(map[string]string),
 		latestStateByClaim:        make(map[string]string),
 		outbox:                    make(chan any, claimsBridgeBuffer),
 		done:                      make(chan struct{}),
@@ -257,7 +257,7 @@ func (b *ClaimsBridge) resetSessionStateLocked() {
 	b.presentationMetrics = make(map[presentationMetricKey]int64)
 	b.presentationDiagnostics = make(map[string]struct{})
 	b.completedStartedArtifacts = make(map[string]struct{})
-	b.claimToInvocationArtifact = make(map[string]string)
+	b.claimToPeerRow = make(map[string]string)
 	b.latestStateByClaim = make(map[string]string)
 	b.lastAccepted = 0
 	b.lastTotal = 0
@@ -417,6 +417,12 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 	b.emitCounterSnapshot(sessionID, board)
 
 	switch delta := entry.Delta.(type) {
+	case claims.CanonicalDelta:
+		b.handleCanonicalClaimsEntry(sessionID, board, entry, delta)
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			b.handleCanonicalClaimsEntry(sessionID, board, entry, *delta)
+		}
 	case claims.InboxDelta:
 		b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
 	case *claims.InboxDelta:
@@ -428,9 +434,11 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 			if !b.claimRegistered(delta.ClaimID) {
 				b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
 			}
+			b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, terminalOutcome(delta.ToStatus), delta.Reason, "", "", delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
 			b.handleClaimClosed(delta.ClaimID, terminalOutcome(delta.ToStatus))
 		} else if delta.ToStatus.IsActive() {
 			b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
+			b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, "pending", delta.Reason, "", "", delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
 		}
 	case *claims.ClaimStatusDelta:
 		if delta != nil {
@@ -438,9 +446,11 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 				if !b.claimRegistered(delta.ClaimID) {
 					b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
 				}
+				b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, terminalOutcome(delta.ToStatus), delta.Reason, "", "", delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
 				b.handleClaimClosed(delta.ClaimID, terminalOutcome(delta.ToStatus))
 			} else if delta.ToStatus.IsActive() {
 				b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
+				b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, "pending", delta.Reason, "", "", delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
 			}
 		}
 	case claims.TestamentDelta:
@@ -450,6 +460,7 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 			b.handleEntryTestament(sessionID, board, entry, delta.TestamentID)
 		}
 	case claims.ValidationDelta:
+		b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, validationDeltaPeerStatus(delta), delta.Reason, "", delta.ValidationID, delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
 		if delta.ClaimAutoAccepted {
 			if !b.claimRegistered(delta.ClaimID) {
 				b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
@@ -457,27 +468,20 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 			b.handleClaimClosed(delta.ClaimID, "success")
 		}
 	case *claims.ValidationDelta:
-		if delta != nil && delta.ClaimAutoAccepted {
-			if !b.claimRegistered(delta.ClaimID) {
-				b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
+		if delta != nil {
+			b.emitPeerInteractionForClaimID(sessionID, delta.ClaimID, validationDeltaPeerStatus(*delta), delta.Reason, "", delta.ValidationID, delta.Sequence, delta.DeltaKey(), delta.EmittedAt)
+			if delta.ClaimAutoAccepted {
+				if !b.claimRegistered(delta.ClaimID) {
+					b.handleEntryClaim(sessionID, board, entry, delta.ClaimID)
+				}
+				b.handleClaimClosed(delta.ClaimID, "success")
 			}
-			b.handleClaimClosed(delta.ClaimID, "success")
 		}
 	case claims.ClaimContextDelta:
-		b.handleClaimContext(sessionID, claimContextEvent{
-			ClaimID:           delta.ClaimID,
-			AgentID:           delta.OwnerAgentID,
-			Context:           delta.Context,
-			ContextTransition: delta.TransitionID,
-		})
+		b.debug("legacy_claim_context_delta_ignored", "session_id", sessionID, "claim_id", delta.ClaimID)
 	case *claims.ClaimContextDelta:
 		if delta != nil {
-			b.handleClaimContext(sessionID, claimContextEvent{
-				ClaimID:           delta.ClaimID,
-				AgentID:           delta.OwnerAgentID,
-				Context:           delta.Context,
-				ContextTransition: delta.TransitionID,
-			})
+			b.debug("legacy_claim_context_delta_ignored", "session_id", sessionID, "claim_id", delta.ClaimID)
 		}
 	case claims.TestamentContextDelta:
 		b.handleTestamentContext(sessionID, testamentContextEvent{
@@ -501,6 +505,148 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 		}
 	}
 	return nil
+}
+
+func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, delta claims.CanonicalDelta) {
+	claimID := strings.TrimSpace(delta.ClaimID())
+	switch delta.Action {
+	case claims.DeltaActionClaimDirected:
+		b.handleEntryClaim(sessionID, board, entry, claimID)
+		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", "", delta)
+	case claims.DeltaActionTestamentSubmitted:
+		b.handleEntryTestament(sessionID, board, entry, delta.TestamentID())
+		b.emitPeerInteractionForDelta(sessionID, claimID, "done", canonicalTestamentContext(delta), delta)
+	case claims.DeltaActionValidationEvaluated:
+		b.emitPeerInteractionForDelta(sessionID, claimID, canonicalValidationPeerStatus(delta), canonicalValidationReason(delta), delta)
+		if canonicalValidationAutoAccepted(delta) {
+			if !b.claimRegistered(claimID) {
+				b.handleEntryClaim(sessionID, board, entry, claimID)
+			}
+			b.handleClaimClosed(claimID, "success")
+		}
+	case claims.DeltaActionClaimTransitioned:
+		toStatus := delta.ClaimToStatus()
+		if toStatus.IsTerminal() {
+			if !b.claimRegistered(claimID) {
+				b.handleEntryClaim(sessionID, board, entry, claimID)
+			}
+			b.emitPeerInteractionForDelta(sessionID, claimID, terminalOutcome(toStatus), canonicalClaimTransitionReason(delta), delta)
+			b.handleClaimClosed(claimID, terminalOutcome(toStatus))
+		} else if toStatus.IsActive() {
+			b.handleEntryClaim(sessionID, board, entry, claimID)
+			b.emitPeerInteractionForDelta(sessionID, claimID, "pending", canonicalClaimTransitionReason(delta), delta)
+		}
+	case claims.DeltaActionClaimProgressed:
+		b.handleClaimContext(sessionID, claimContextEvent{
+			ClaimID:           claimID,
+			AgentID:           delta.Actor.RouteKey(),
+			Context:           canonicalProgressMessage(delta),
+			ContextTransition: canonicalProgressTransition(delta),
+		})
+	}
+}
+
+func canonicalValidationAutoAccepted(delta claims.CanonicalDelta) bool {
+	validation, ok := delta.Context["validation"].(map[string]any)
+	if !ok {
+		return false
+	}
+	accepted, _ := validation["claim_auto_accepted"].(bool)
+	return accepted
+}
+
+func canonicalValidationReason(delta claims.CanonicalDelta) string {
+	validation, ok := delta.Context["validation"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	reason, _ := validation["reason"].(string)
+	return strings.TrimSpace(reason)
+}
+
+func canonicalValidationPeerStatus(delta claims.CanonicalDelta) string {
+	validation, ok := delta.Context["validation"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	status, _ := validation["status"].(string)
+	switch strings.TrimSpace(status) {
+	case string(claims.ValidationStatusFailed):
+		return "failed"
+	case string(claims.ValidationStatusPassed):
+		return "done"
+	default:
+		return ""
+	}
+}
+
+func validationDeltaPeerStatus(delta claims.ValidationDelta) string {
+	switch strings.TrimSpace(delta.Verdict) {
+	case string(claims.ValidationStatusFailed):
+		return "failed"
+	case string(claims.ValidationStatusPassed), string(claims.ValidationStatusSkipped):
+		return "done"
+	default:
+		return ""
+	}
+}
+
+func canonicalTestamentContext(delta claims.CanonicalDelta) string {
+	raw, ok := delta.Context["testaments"].([]map[string]any)
+	if ok && len(raw) > 0 {
+		if contextValue, _ := raw[0]["context"].(string); strings.TrimSpace(contextValue) != "" {
+			return strings.TrimSpace(contextValue)
+		}
+	}
+	if generic, ok := delta.Context["testaments"].([]any); ok && len(generic) > 0 {
+		if item, ok := generic[0].(map[string]any); ok {
+			if contextValue, _ := item["context"].(string); strings.TrimSpace(contextValue) != "" {
+				return strings.TrimSpace(contextValue)
+			}
+		}
+	}
+	return ""
+}
+
+func canonicalClaimTransitionReason(delta claims.CanonicalDelta) string {
+	claim, ok := delta.Context["claim"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	reason, _ := claim["reason"].(string)
+	return strings.TrimSpace(reason)
+}
+
+func canonicalProgressMessage(delta claims.CanonicalDelta) string {
+	progress, ok := delta.Context["progress"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if message, _ := progress["message"].(string); strings.TrimSpace(message) != "" {
+		return strings.TrimSpace(message)
+	}
+	state, _ := progress["state"].(string)
+	return strings.TrimSpace(state)
+}
+
+func canonicalProgressTransition(delta claims.CanonicalDelta) int64 {
+	progress, ok := delta.Context["progress"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	switch value := progress["transition"].(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	case json.Number:
+		n, _ := value.Int64()
+		return n
+	default:
+		return 0
+	}
 }
 
 func (b *ClaimsBridge) currentBoard() (*claims.ClaimsBoard, string) {
@@ -625,7 +771,16 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	var toEmit []any
 	b.mu.Lock()
 	if existing := b.claimMeta[c.ID]; existing.ClaimID != "" && b.resolver.CycleForClaim(c.ID) != "" {
+		if isPeerActionType(existing.ActionType) && strings.TrimSpace(b.claimToPeerRow[c.ID]) == "" {
+			meta := b.metaForClaimLocked(c.ID)
+			if m := b.claimPeerInteractionMsgLocked(sessionID, c.ID, meta, "pending", "", "", "", c.Sequence, "", nonZeroTime(c.Created)); m != nil {
+				toEmit = append(toEmit, *m)
+			}
+		}
 		b.mu.Unlock()
+		for _, m := range toEmit {
+			b.enqueue(m)
+		}
 		b.debug("claim_created_duplicate",
 			"session_id", sessionID,
 			"claim_id", c.ID,
@@ -702,6 +857,9 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 			}
 		}
 	}
+	if m := b.claimPeerInteractionMsgLocked(sessionID, c.ID, meta, "pending", "", "", "", c.Sequence, "", nonZeroTime(c.Created)); m != nil {
+		toEmit = append(toEmit, *m)
+	}
 	b.mu.Unlock()
 
 	for _, m := range toEmit {
@@ -770,7 +928,126 @@ func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Test
 	if m := b.claimTestamentResponseMsg(sessionID, claimID, t); m != nil {
 		b.enqueue(*m)
 	}
-	b.completePeerInvocationForClaim(claimID, "success", strings.TrimSpace(t.Summary))
+	b.emitPeerInteractionForClaimID(sessionID, claimID, peerCompletionOutcomeForTestament(t), strings.TrimSpace(t.Summary), strings.TrimSpace(t.ID), "", t.Sequence, "", nonZeroTime(t.Created))
+}
+
+func peerCompletionOutcomeForTestament(t *claims.Testament) string {
+	if t == nil {
+		return "success"
+	}
+	switch claims.DeriveTestamentVerdict(t.Artifacts) {
+	case claims.TestamentVerdictError:
+		return "failure"
+	default:
+		return "success"
+	}
+}
+
+func (b *ClaimsBridge) emitPeerInteractionForDelta(sessionID, claimID, status, context string, delta claims.CanonicalDelta) {
+	b.emitPeerInteractionForClaimID(
+		sessionID,
+		claimID,
+		status,
+		context,
+		delta.TestamentID(),
+		delta.ValidationID(),
+		delta.Sequence,
+		delta.Key,
+		delta.OccurredAt,
+	)
+}
+
+func (b *ClaimsBridge) emitPeerInteractionForClaimID(sessionID, claimID, status, context, testamentID, validationID string, sequence uint64, deltaKey string, occurredAt time.Time) {
+	claimID = strings.TrimSpace(claimID)
+	if b == nil || claimID == "" {
+		return
+	}
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
+	var out *msg.ClaimPeerInteractionMsg
+	b.mu.Lock()
+	meta := b.metaForClaimLocked(claimID)
+	if m := b.claimPeerInteractionMsgLocked(sessionID, claimID, meta, status, context, testamentID, validationID, sequence, deltaKey, occurredAt); m != nil {
+		out = m
+	}
+	b.mu.Unlock()
+	if out != nil {
+		b.enqueue(*out)
+	}
+}
+
+func (b *ClaimsBridge) claimPeerInteractionMsgLocked(sessionID, claimID string, meta claimMeta, status, contextValue, testamentID, validationID string, sequence uint64, deltaKey string, occurredAt time.Time) *msg.ClaimPeerInteractionMsg {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" || !isPeerActionType(meta.ActionType) || meta.SuppressChat {
+		return nil
+	}
+	if meta.CycleID == "" || meta.CycleID == claimID {
+		return nil
+	}
+	subject := strings.TrimSpace(meta.TargetAgentID)
+	issuer := strings.TrimSpace(meta.IssuerAgentID)
+	if subject == "" {
+		return nil
+	}
+	if issuer != "" && issuer == subject {
+		return nil
+	}
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	rowID := bridgeClaimPeerInteractionRowID(claimID)
+	if rowID == "" {
+		return nil
+	}
+	b.claimToPeerRow[claimID] = rowID
+	return &msg.ClaimPeerInteractionMsg{
+		SessionID:      firstNonBlank(strings.TrimSpace(sessionID), meta.SessionID, b.activeSession),
+		CycleID:        meta.CycleID,
+		ClaimID:        claimID,
+		ActionType:     meta.ActionType,
+		IssuerAgentID:  issuer,
+		SubjectAgentID: subject,
+		Title:          meta.Title,
+		Context:        strings.TrimSpace(contextValue),
+		Status:         firstNonBlank(strings.TrimSpace(status), "pending"),
+		TestamentID:    strings.TrimSpace(testamentID),
+		ValidationID:   strings.TrimSpace(validationID),
+		Sequence:       sequence,
+		DeltaKey:       strings.TrimSpace(deltaKey),
+		OccurredAt:     occurredAt,
+		SuppressChat:   meta.SuppressChat,
+	}
+}
+
+func (b *ClaimsBridge) parentRowIDForClaimLocked(claimID string) string {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return ""
+	}
+	if rowID := strings.TrimSpace(b.claimToPeerRow[claimID]); rowID != "" {
+		return rowID
+	}
+	meta := b.metaForClaimLocked(claimID)
+	if b.claimPeerInteractionMsgLocked(meta.SessionID, claimID, meta, "pending", "", "", "", 0, "", time.Time{}) == nil {
+		return ""
+	}
+	return strings.TrimSpace(b.claimToPeerRow[claimID])
+}
+
+func bridgeClaimPeerInteractionRowID(claimID string) string {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return ""
+	}
+	return "claim-peer:" + claimID
+}
+
+func isPeerActionType(actionType string) bool {
+	switch strings.TrimSpace(actionType) {
+	case string(claims.ActionTypeConsultation), string(claims.ActionTypeChallenge), string(claims.ActionTypeGuardianCheck):
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEvent) {
@@ -785,7 +1062,7 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 	if meta.CycleID != "" {
 		state := firstNonBlank(b.latestStateByClaim[claimID], claimContextUIState(meta, event.Context))
 		actor := claimContextActor(meta, event.AgentID)
-		parentRowID := b.claimToInvocationArtifact[claimID]
+		parentRowID := b.parentRowIDForClaimLocked(claimID)
 		out = &msg.ClaimContextMsg{
 			SessionID:         sessionID,
 			ClaimID:           claimID,
@@ -839,7 +1116,7 @@ func (b *ClaimsBridge) handleTestamentContext(sessionID string, event testamentC
 			ClaimID:           claimID,
 			AgentID:           strings.TrimSpace(event.AgentID),
 			CycleID:           meta.CycleID,
-			ParentRowID:       b.claimToInvocationArtifact[claimID],
+			ParentRowID:       b.parentRowIDForClaimLocked(claimID),
 			Context:           event.Context,
 			ContextTransition: event.ContextTransition,
 		}
@@ -888,9 +1165,6 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	if claimID != "" {
 		b.artifactClaim[art.ID] = claimID
 	}
-	if isInvocationStartedArtifactKind(art.Kind) {
-		b.recordInvocationMappingLocked(art)
-	}
 	var presentationErr error
 	if art.Presentation != nil {
 		presentationErr = claims.ValidatePresentation(art.Presentation)
@@ -934,7 +1208,7 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 		if m := b.routeStartedArtifactLocked(sessionID, claimID, art); m != nil {
 			out = append(out, *m)
 		}
-	case isVisibleCompletedArtifactKind(art.Kind):
+	case isCompletionArtifact(art):
 		out = append(out, b.routeCompletedArtifactLocked(sessionID, art)...)
 	}
 	b.mu.Unlock()
@@ -1010,8 +1284,7 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		meta.OwnerAgentID = cycle.OwnerAgentID
 		meta.OwnerAgentType = agentTypeFromID(cycle.OwnerAgentID)
 	}
-	parentRowID := b.claimToInvocationArtifact[claimID]
-	b.recordInvocationMappingLocked(art)
+	parentRowID := b.parentRowIDForClaimLocked(claimID)
 	b.emittedStartedArtifacts[artifactID] = struct{}{}
 	return &msg.ClaimArtifactAddedMsg{
 		ArtifactID:     artifactID,
@@ -1028,24 +1301,6 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		CreatedAt:      art.Created,
 		SuppressChat:   meta.SuppressChat,
 	}
-}
-
-func (b *ClaimsBridge) recordInvocationMappingLocked(art *claims.Artifact) {
-	if b == nil || art == nil {
-		return
-	}
-	if !isInvocationStartedArtifactKind(art.Kind) {
-		return
-	}
-	artifactID := strings.TrimSpace(art.ID)
-	if artifactID == "" {
-		return
-	}
-	childClaimID := artifactChildClaimID(art)
-	if childClaimID == "" {
-		return
-	}
-	b.claimToInvocationArtifact[childClaimID] = artifactID
 }
 
 func (b *ClaimsBridge) routeCompletedArtifactLocked(sessionID string, art *claims.Artifact) []any {
@@ -1085,42 +1340,6 @@ func (b *ClaimsBridge) routeCompletedArtifactLocked(sessionID string, art *claim
 	return out
 }
 
-func (b *ClaimsBridge) completePeerInvocationForClaim(claimID, outcome, summary string) {
-	claimID = strings.TrimSpace(claimID)
-	if claimID == "" {
-		return
-	}
-	var out []any
-	b.mu.Lock()
-	startID := b.claimToInvocationArtifact[claimID]
-	if startID != "" {
-		if _, completed := b.completedStartedArtifacts[startID]; !completed {
-			b.completedStartedArtifacts[startID] = struct{}{}
-			cycle, drained := b.resolver.onArtifactCompleted(startID)
-			cycleID := ""
-			if cycle != nil {
-				cycleID = cycle.CycleID
-			}
-			suppressChat := b.metaForClaimLocked(claimID).SuppressChat
-			out = append(out, msg.ClaimArtifactCompletedMsg{
-				StartArtifactID: startID,
-				CycleID:         cycleID,
-				Outcome:         firstNonBlank(outcome, "success"),
-				Summary:         summary,
-				CompletedAt:     time.Now().UTC(),
-				SuppressChat:    suppressChat,
-			})
-			if drained && cycle != nil {
-				out = append(out, claimsAgentClosedMsg(b.activeSession, cycle, ""))
-			}
-		}
-	}
-	b.mu.Unlock()
-	for _, m := range out {
-		b.enqueue(m)
-	}
-}
-
 func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string, art *claims.Artifact) []any {
 	if artClaimID := claimMetadataString(art.Metadata, "claim_id"); artClaimID != "" {
 		claimID = artClaimID
@@ -1152,7 +1371,7 @@ func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string,
 		ClaimID:      claimID,
 		OwnerAgentID: claimContextActor(meta, agentID),
 		CycleID:      meta.CycleID,
-		ParentRowID:  b.claimToInvocationArtifact[claimID],
+		ParentRowID:  b.parentRowIDForClaimLocked(claimID),
 		Context:      detail,
 		State:        state,
 		SuppressChat: meta.SuppressChat,
@@ -1175,7 +1394,7 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 		SessionID:    sessionID,
 		CycleID:      meta.CycleID,
 		ClaimID:      claimID,
-		ParentRowID:  b.claimToInvocationArtifact[claimID],
+		ParentRowID:  b.parentRowIDForClaimLocked(claimID),
 		AgentID:      firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
 		Content:      content,
 		CreatedAt:    nonZeroTime(art.Created),
@@ -1503,7 +1722,7 @@ func (b *ClaimsBridge) claimTestamentResponseMsg(sessionID, claimID string, t *c
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	meta := b.metaForClaimLocked(claimID)
-	parentRowID := b.claimToInvocationArtifact[claimID]
+	parentRowID := b.parentRowIDForClaimLocked(claimID)
 	if meta.CycleID == "" || parentRowID == "" || meta.CycleID == claimID {
 		return nil
 	}
@@ -1529,6 +1748,9 @@ func (b *ClaimsBridge) metaForClaimLocked(claimID string) claimMeta {
 		if meta.CycleID == "" {
 			meta.CycleID = claimID
 		}
+	}
+	if resolvedCycle := b.resolver.CycleForClaim(claimID); resolvedCycle != "" && (meta.CycleID == "" || meta.CycleID == claimID) {
+		meta.CycleID = resolvedCycle
 	}
 	if meta.OwnerAgentID == "" {
 		meta.OwnerAgentID = b.resolver.OwnerForClaim(claimID)
@@ -2014,16 +2236,7 @@ func claimHasTag(c *claims.Claim, want string) bool {
 
 func isVisibleStartedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "tool_started", "consult_started", "challenge_started", "guardian_check_started":
-		return true
-	default:
-		return false
-	}
-}
-
-func isInvocationStartedArtifactKind(kind string) bool {
-	switch strings.TrimSpace(kind) {
-	case "consult_started", "challenge_started", "guardian_check_started":
+	case "tool_started":
 		return true
 	default:
 		return false
@@ -2032,7 +2245,33 @@ func isInvocationStartedArtifactKind(kind string) bool {
 
 func isVisibleCompletedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "tool_completed", "consult_completed", "challenge_completed", "guardian_check_completed":
+	case "tool_completed":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCompletionArtifact(art *claims.Artifact) bool {
+	if art == nil {
+		return false
+	}
+	kind := strings.TrimSpace(art.Kind)
+	return isVisibleCompletedArtifactKind(kind) ||
+		(isBridgeErrorArtifactKind(kind) && startedArtifactID(art) != "")
+}
+
+func isBridgeErrorArtifactKind(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case claims.ArtifactKindError,
+		claims.ArtifactKindErrorTrace,
+		claims.ArtifactKindErrorDiagnostic,
+		claims.ArtifactKindProjectionError,
+		claims.ArtifactKindToolTimeout,
+		claims.ArtifactKindPermissionDenied,
+		claims.ArtifactKindPolicyDenied,
+		claims.ArtifactKindMissingDependency,
+		claims.ArtifactKindInvalidExpectedToolCall:
 		return true
 	default:
 		return false
@@ -2054,6 +2293,9 @@ func artifactOutcome(art *claims.Artifact) string {
 		return outcome
 	}
 	if claimMetadataString(art.Metadata, "error") != "" {
+		return "failure"
+	}
+	if isBridgeErrorArtifactKind(art.Kind) {
 		return "failure"
 	}
 	return "success"

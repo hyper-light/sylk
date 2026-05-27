@@ -2,48 +2,20 @@ package academic
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-func TestConsultSkill_ExecuteResearchReturnsStructuredFailureForDuplicateQuestion(t *testing.T) {
+func TestAcademicDoesNotRegisterLegacyConsultSkill(t *testing.T) {
 	a, err := New(Config{Factory: newTestFactory(t), ID: "academic"}, nil)
 	if err != nil {
 		t.Fatalf("new academic: %v", err)
 	}
 
-	state := newAcademicResearchExecutionState("sess-exec")
-	if err := state.recordConsultAttempt("librarian", "How does Sylk already structure auth?", ""); err != nil {
-		t.Fatalf("recordConsultAttempt: %v", err)
-	}
-	ctx := WithAcademicResearchExecutionState(context.Background(), state)
-	skill := a.skills.Get("consult")
-	if skill == nil || skill.Handler == nil {
-		t.Fatal("consult skill not registered")
-	}
-
-	result, err := skill.Handler(ctx, json.RawMessage(`{"target":"librarian","query":"How does Sylk already structure auth?","scope":""}`))
-	if err != nil {
-		t.Fatalf("expected duplicate consultation to return structured failure, got %v", err)
-	}
-	payload, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("result type = %T, want map[string]any", result)
-	}
-	if got := payload["success"]; got != false {
-		t.Fatalf("success = %#v, want false", got)
-	}
-	if got := payload["status"]; got != "failed" {
-		t.Fatalf("status = %#v, want failed", got)
-	}
-	if got := payload["target"]; got != "librarian" {
-		t.Fatalf("target = %#v, want librarian", got)
-	}
-	if got := payload["error"]; !strings.Contains(stringValue(got), "forbids repeating") {
-		t.Fatalf("error = %#v, want duplicate consultation guidance", got)
+	if skill := a.skills.Get("consult"); skill != nil {
+		t.Fatal("academic must not register legacy synchronous consult skill")
 	}
 }
 

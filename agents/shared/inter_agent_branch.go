@@ -55,6 +55,9 @@ func BeginInterAgentBranch(ctx context.Context, spec InterAgentBranchSpec) (cont
 	if kind == "" {
 		return ctx, InterAgentBranchHandle{}
 	}
+	if claimsBackedInterAgentBranchKind(kind) {
+		return ctx, InterAgentBranchHandle{}
+	}
 
 	stream, ok := StreamMetadataFromContext(ctx)
 	if !ok || strings.TrimSpace(stream.CorrelationID) == "" {
@@ -357,6 +360,15 @@ func (h InterAgentBranchHandle) targets() []string {
 		return nil
 	}
 	return append([]string(nil), h.interAgent.AgentTypes...)
+}
+
+func claimsBackedInterAgentBranchKind(kind string) bool {
+	switch normalizeInterAgentBranchKind(kind) {
+	case InterAgentToolEventKindConsult, InterAgentToolEventKindChallenge:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeInterAgentBranchKind(kind string) string {

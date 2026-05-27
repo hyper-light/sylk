@@ -64,12 +64,9 @@ func renderToolCalls(calls []ToolCallRecord, width int, th *theme.Theme) ([]stri
 		grad = th.Palette.ToolCallGradient()
 	}
 
-	// Stamp orphan flags onto a per-frame copy of the call list so the
-	// formatter can swap the live spinner for a `?` indicator on rows the
-	// agent appears to have abandoned. Mutating the caller's slice would
-	// persist the visual hint across renders even if a late Complete
-	// eventually arrives, so we work on copies. See toolCallVisuallyOrphaned
-	// for the heuristic.
+	// Work on a per-frame copy. The legacy orphan hook now always returns
+	// false; pending rows close only when canonical completion/error
+	// evidence arrives.
 	now := time.Now()
 	render := make([]ToolCallRecord, len(calls))
 	for i := range calls {
@@ -611,24 +608,24 @@ const (
 )
 
 type interAgentNestedBlockItem struct {
-	kind             interAgentNestedBlockItemKind
-	root             bool
-	isLast           bool
-	ancestors        []bool
-	childIndex       int
-	childPath        []int
-	interAgentPath   []int
-	child            InterAgentChildActivity
-	toolCall         ToolCallRecord
-	childToolCallIdx int
+	kind               interAgentNestedBlockItemKind
+	root               bool
+	isLast             bool
+	ancestors          []bool
+	childIndex         int
+	childPath          []int
+	interAgentPath     []int
+	child              InterAgentChildActivity
+	toolCall           ToolCallRecord
+	childToolCallIdx   int
 	overflowCount      int
 	overflowExpanded   bool
 	overflowFailedHint int
-	rootSummary      string
-	anchorToolCall   bool
-	anchorChildPath  []int
-	anchorInterPath  []int
-	anchorToolIdx    int
+	rootSummary        string
+	anchorToolCall     bool
+	anchorChildPath    []int
+	anchorInterPath    []int
+	anchorToolIdx      int
 }
 
 func cloneBoolSlice(in []bool) []bool {
@@ -1227,16 +1224,10 @@ func wrapRenderedToolLine(line string, width int) []string {
 // Challenge rows deliberately stay Pending after dispatch until a response
 // arrives on the thread, so they keep ticking even when Completed=true.
 //
-// When OrphanedAtRender is set the live elapsed display is replaced with the
-// orphan glyph so the user is not misled by a still-spinning timer for a
-// row whose Complete event has very likely been lost. This does not assert
-// the call is dead — only that the agent has moved on enough that we should
-// stop pretending the row is actively in flight. The actual duration string
-// is still embedded so users can see how long the row has been outstanding.
+// Pending rows keep rendering as pending until a canonical completion,
+// error artifact, or terminal claim delta closes them. The renderer does
+// not infer completion from nearby activity.
 func formatToolCallDuration(tc ToolCallRecord) string {
-	if tc.OrphanedAtRender && !tc.Completed {
-		return orphanedToolCallDurationString(tc)
-	}
 	if tc.Completed && interAgentRowFreezesOnCompletion(tc.InterAgent) {
 		return formatToolDuration(tc.Duration)
 	}
@@ -1289,38 +1280,11 @@ const orphanRenderAgeThreshold = 30 * time.Second
 // long-running tool as orphaned the moment it crossed the age threshold.
 const orphanRenderSucceedingActivityCount = 3
 
-// toolCallVisuallyOrphaned reports whether the row at idx should render with
-// the orphan indicator. The signal combines (a) age greater than the threshold
-// and (b) at least N completed tool events appearing after this row in the
-// same call list. Inter-agent challenge rows are excluded because they are
-// designed to remain pending after dispatch until a peer response arrives —
-// a long-pending challenge is expected behavior, not an orphan.
+// toolCallVisuallyOrphaned is retained as a compatibility hook for the
+// render pipeline, but orphan status is no longer an authoritative UI
+// behavior. Pending rows are closed only by canonical completion/error
+// evidence.
 func toolCallVisuallyOrphaned(calls []ToolCallRecord, idx int, now time.Time) bool {
-	if idx < 0 || idx >= len(calls) {
-		return false
-	}
-	tc := calls[idx]
-	if tc.Completed {
-		return false
-	}
-	if tc.InterAgent != nil && tc.InterAgent.Kind == InterAgentToolChallenge {
-		return false
-	}
-	if tc.StartedAt.IsZero() {
-		return false
-	}
-	if now.Sub(tc.StartedAt) < orphanRenderAgeThreshold {
-		return false
-	}
-	completedAfter := 0
-	for j := idx + 1; j < len(calls); j++ {
-		if calls[j].Completed {
-			completedAfter++
-			if completedAfter >= orphanRenderSucceedingActivityCount {
-				return true
-			}
-		}
-	}
 	return false
 }
 

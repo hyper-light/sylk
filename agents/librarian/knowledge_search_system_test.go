@@ -2,20 +2,33 @@ package librarian
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/search"
 )
 
+const (
+	knowledgeSearchWaitDeadline = time.Second
+	knowledgeSearchSettleWindow = 20 * time.Millisecond
+)
+
 type fakeCommittedKnowledgeBackend struct {
+	mu      sync.Mutex
 	result  *knowledgeruntime.CommittedSearchResult
 	err     error
 	lastReq *search.SearchRequest
+	calls   int
 }
 
 func (f *fakeCommittedKnowledgeBackend) Search(_ context.Context, req *search.SearchRequest) (*knowledgeruntime.CommittedSearchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
 	if req != nil {
 		copied := *req
 		f.lastReq = &copied
@@ -24,6 +37,22 @@ func (f *fakeCommittedKnowledgeBackend) Search(_ context.Context, req *search.Se
 		return &knowledgeruntime.CommittedSearchResult{}, f.err
 	}
 	return f.result, f.err
+}
+
+func (f *fakeCommittedKnowledgeBackend) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeCommittedKnowledgeBackend) lastRequest() *search.SearchRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lastReq == nil {
+		return nil
+	}
+	copied := *f.lastReq
+	return &copied
 }
 
 func TestCommittedKnowledgeSearchSystem_SearchUsesCommittedBackend(t *testing.T) {
@@ -70,20 +99,21 @@ func TestCommittedKnowledgeSearchSystem_SearchUsesCommittedBackend(t *testing.T)
 	if err != nil {
 		t.Fatalf("Search returned error: %v", err)
 	}
-	if backend.lastReq == nil {
+	lastReq := backend.lastRequest()
+	if lastReq == nil {
 		t.Fatal("expected committed backend request to be recorded")
 	}
-	if backend.lastReq.Query != "needle" {
-		t.Fatalf("backend query = %q, want needle", backend.lastReq.Query)
+	if lastReq.Query != "needle" {
+		t.Fatalf("backend query = %q, want needle", lastReq.Query)
 	}
-	if backend.lastReq.PathFilter != "ui/theme" {
-		t.Fatalf("backend path filter = %q, want ui/theme", backend.lastReq.PathFilter)
+	if lastReq.PathFilter != "ui/theme" {
+		t.Fatalf("backend path filter = %q, want ui/theme", lastReq.PathFilter)
 	}
-	if backend.lastReq.Limit != 7 {
-		t.Fatalf("backend limit = %d, want 7", backend.lastReq.Limit)
+	if lastReq.Limit != 7 {
+		t.Fatalf("backend limit = %d, want 7", lastReq.Limit)
 	}
-	if backend.lastReq.FuzzyLevel != 1 {
-		t.Fatalf("backend fuzzy level = %d, want 1", backend.lastReq.FuzzyLevel)
+	if lastReq.FuzzyLevel != 1 {
+		t.Fatalf("backend fuzzy level = %d, want 1", lastReq.FuzzyLevel)
 	}
 	if len(result.Documents) != 1 {
 		t.Fatalf("document count = %d, want 1", len(result.Documents))
@@ -104,5 +134,104 @@ func TestCommittedKnowledgeSearchSystem_SearchRequiresBackend(t *testing.T) {
 	_, err := system.Search(context.Background(), "needle", SearchOptions{})
 	if err != knowledgeruntime.ErrCommittedBackendUnavailable {
 		t.Fatalf("Search error = %v, want %v", err, knowledgeruntime.ErrCommittedBackendUnavailable)
+	}
+}
+
+func TestCommittedKnowledgeSearchSystem_WaitsForReadinessTestament(t *testing.T) {
+	sessionID := "session-knowledge-wait"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{SessionID: sessionID, BoardID: "board-knowledge-wait"})
+	claims.DefaultSessionBoardRegistry().ReplaceForReason(sessionID, board, "knowledge search wait test")
+	t.Cleanup(func() { claims.DefaultSessionBoardRegistry().Remove(sessionID) })
+
+	backend := &fakeCommittedKnowledgeBackend{
+		result: &knowledgeruntime.CommittedSearchResult{
+			Query: "needle",
+			Hits: []knowledgeruntime.CommittedSearchHit{
+				{
+					ScoredDocument: search.ScoredDocument{
+						Document: search.Document{ID: "doc-1", Path: "README.md", Type: search.DocTypeMarkdown, Content: "needle"},
+						Score:    0.5,
+					},
+					NodeKinds: []string{"document"},
+				},
+			},
+		},
+	}
+	system := NewCommittedKnowledgeSearchSystem(backend)
+
+	var once sync.Once
+	claimCreated := make(chan struct{})
+	unsubscribe := board.SubscribeDelta(func(delta claims.BoardMutationDelta) error {
+		if delta.Kind == "claim_created" && delta.ClaimID == claims.KnowledgeBackendReadyClaimID {
+			once.Do(func() { close(claimCreated) })
+		}
+		return nil
+	})
+	defer unsubscribe()
+
+	ctx, cancel := context.WithTimeout(context.Background(), knowledgeSearchWaitDeadline)
+	defer cancel()
+
+	type searchResult struct {
+		result *CodeSearchResult
+		err    error
+	}
+	done := make(chan searchResult, 1)
+	go func() {
+		result, err := system.Search(ctx, "needle", SearchOptions{SessionID: sessionID, Limit: 1})
+		done <- searchResult{result: result, err: err}
+	}()
+
+	select {
+	case <-claimCreated:
+	case result := <-done:
+		t.Fatalf("search returned before posting readiness claim: result=%v err=%v", result.result, result.err)
+	case <-ctx.Done():
+		t.Fatalf("readiness claim was not created: %v", ctx.Err())
+	}
+
+	select {
+	case result := <-done:
+		t.Fatalf("search returned before readiness testament: result=%v err=%v", result.result, result.err)
+	case <-time.After(knowledgeSearchSettleWindow):
+	}
+	if calls := backend.callCount(); calls != 0 {
+		t.Fatalf("backend calls before readiness = %d, want 0", calls)
+	}
+
+	if _, err := claims.SubmitKnowledgeBackendReadyTestament(ctx, board, map[string]any{"level": "partial"}); err != nil {
+		t.Fatalf("SubmitKnowledgeBackendReadyTestament returned error: %v", err)
+	}
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("search returned error: %v", result.err)
+		}
+		if result.result.TotalHits != 1 {
+			t.Fatalf("total hits = %d, want 1", result.result.TotalHits)
+		}
+	case <-ctx.Done():
+		t.Fatalf("search did not resume after readiness testament: %v", ctx.Err())
+	}
+}
+
+func TestCommittedKnowledgeSearchSystem_ReadinessWaitHonorsContext(t *testing.T) {
+	sessionID := "session-knowledge-timeout"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{SessionID: sessionID, BoardID: "board-knowledge-timeout"})
+	claims.DefaultSessionBoardRegistry().ReplaceForReason(sessionID, board, "knowledge search timeout test")
+	t.Cleanup(func() { claims.DefaultSessionBoardRegistry().Remove(sessionID) })
+
+	backend := &fakeCommittedKnowledgeBackend{result: &knowledgeruntime.CommittedSearchResult{}}
+	system := NewCommittedKnowledgeSearchSystem(backend)
+	ctx, cancel := context.WithTimeout(context.Background(), knowledgeSearchSettleWindow)
+	defer cancel()
+
+	_, err := system.Search(ctx, "needle", SearchOptions{SessionID: sessionID})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("search error = %v, want context deadline", err)
+	}
+	if calls := backend.callCount(); calls != 0 {
+		t.Fatalf("backend calls after readiness wait timeout = %d, want 0", calls)
 	}
 }

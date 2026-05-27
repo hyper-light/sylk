@@ -435,16 +435,7 @@ func (gt *GlobalTester) registerCoreSkills() {
 		SessionID: func() string { return gt.config.SessionID },
 		AgentID:   func() string { return gt.id },
 		AgentType: func() string { return "tester" },
-		RouteSync: agentshared.RouteSyncFromBus(
-			func() guide.EventBus { return gt.bus },
-			func() string {
-				if gt.channels == nil {
-					return ""
-				}
-				return gt.channels.Responses
-			},
-		),
-		Inbox: func() *claims.ClaimsInbox { return gt.claimsInbox },
+		Inbox:     func() *claims.ClaimsInbox { return gt.claimsInbox },
 	}) {
 		gt.skills.Register(skill)
 	}
@@ -585,14 +576,15 @@ func (gt *GlobalTester) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := agentshared.WireClaimsIntake(agentshared.ClaimsIntakeConfig{
-		AgentID:      gt.id,
-		SessionID:    gt.config.SessionID,
-		Bus:          bus,
-		Board:        claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID),
-		Scope:        gt.scope,
-		ProcessEntry: gt.processClaimsEntry,
-		Identity:     gt.identity,
-		Factory:      gt.factory,
+		AgentID:             gt.id,
+		SessionID:           gt.config.SessionID,
+		Bus:                 bus,
+		Board:               claims.DefaultSessionBoardRegistry().Lookup(gt.config.SessionID),
+		Scope:               gt.scope,
+		ProcessEntry:        gt.processClaimsEntry,
+		Identity:            gt.identity,
+		Factory:             gt.factory,
+		ExpectedToolRuntime: gt.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("global_tester_claims_inbox_start_failed", "error", err.Error())

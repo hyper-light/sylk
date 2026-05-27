@@ -21,11 +21,10 @@ const (
 	// AuditToolMergesAfter returns merge descriptors with
 	// MergedVersion > since — mid-audit awareness per §3.9.
 	AuditToolMergesAfter = "merges_after"
-	// AuditToolConsultPeer dispatches a synchronous question to a
-	// peer agent (academic, librarian, other global agents) via the
-	// cross-pipeline consult primitive. Returned by the tool set
-	// only when the runtime has a configured ResponseTopic — without
-	// it the consult can't receive its terminal response.
+	// AuditToolConsultPeer is retained only so defensive dispatch can
+	// return a clear error for stale transcripts. It is no longer
+	// exposed in audit-replica tool schemas because synchronous peer
+	// routing bypasses the claims/deltas contract.
 	AuditToolConsultPeer = "consult_peer"
 	// AuditToolEmitDecision is the terminal tool. Calling it fires
 	// the ctx-scoped finalizer and ends the audit. No other tool
@@ -38,11 +37,13 @@ const (
 // tester) use the same set; the system prompt differentiates the
 // lens each role applies.
 //
-// includeConsult controls whether the consult_peer tool appears —
-// only when the runtime has a ResponseTopic (otherwise the LLM
-// would see a tool it can't successfully invoke).
+// includeConsult is ignored. It remains in the signature so older
+// construction sites compile while Phase 7 removes the legacy sync
+// peer route: audit replicas never expose consult_peer in their tool
+// schema.
 func buildAuditReplicaTools(agentType string, includeConsult bool) []providers.Tool {
 	_ = agentType // room for per-role customization if needed later.
+	_ = includeConsult
 	tools := []providers.Tool{
 		{
 			Name:        AuditToolWorkspaceRead,
@@ -131,38 +132,6 @@ func buildAuditReplicaTools(agentType string, includeConsult bool) []providers.T
 				"required": []string{"decision", "summary"},
 			},
 		},
-	}
-	if includeConsult {
-		tools = append(tools, providers.Tool{
-			Name:        AuditToolConsultPeer,
-			Description: "Ask a peer agent (academic, librarian, or other permitted targets) for evidence / context relevant to this audit. Synchronous: returns the peer's response inline. Use sparingly — only when ambient context is insufficient and the peer has genuinely relevant state. Authority is enforced by the cross-pipeline layer; unpermitted targets fail with an authority error.",
-			Parameters: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"target_agent_type": map[string]any{
-						"type":        "string",
-						"description": "Agent type of the peer to consult (e.g., 'academic', 'librarian', 'inspector', 'tester'). Must be in the caller's authority-permitted target set.",
-					},
-					"target_pipeline_id": map[string]any{
-						"type":        "string",
-						"description": "Specific pipeline id (cross-pipeline routing). Empty = natural same-scope peer.",
-					},
-					"scope": map[string]any{
-						"type":        "string",
-						"description": "Path or domain scope (e.g., 'services/billing/tests/'). Optional but helps the peer disambiguate.",
-					},
-					"query": map[string]any{
-						"type":        "string",
-						"description": "The concrete question to ask the peer.",
-					},
-					"deadline_seconds": map[string]any{
-						"type":        "integer",
-						"description": "Timeout before the consult is marked unanswered. Default 180.",
-					},
-				},
-				"required": []string{"target_agent_type", "query"},
-			},
-		})
 	}
 	return tools
 }

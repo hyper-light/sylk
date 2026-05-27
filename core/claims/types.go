@@ -98,6 +98,30 @@ type ClaimScopeEntry struct {
 	Key  string `json:"key"`  // path, symbol name, endpoint, surface ID, etc.
 }
 
+// ExpectedToolCall is a durable Sylk skill invocation specification.
+// It is not a provider tool-call message; it describes work the
+// receiving agent or evaluator should attempt, justify skipping, or
+// record as an error artifact.
+type ExpectedToolCall struct {
+	ID                string                 `json:"id,omitempty"`
+	Tool              string                 `json:"tool"`
+	Arguments         map[string]any         `json:"arguments,omitempty"`
+	Purpose           string                 `json:"purpose,omitempty"`
+	Required          bool                   `json:"required,omitempty"`
+	ProducesArtifacts []string               `json:"produces_artifacts,omitempty"`
+	TimeoutSeconds    int                    `json:"timeout_seconds,omitempty"`
+	Policy            ExpectedToolCallPolicy `json:"policy,omitempty"`
+}
+
+// ExpectedToolCallPolicy carries execution hints for an expected tool
+// call. These are policy inputs, not authority grants: the runtime still
+// validates tool availability, permissions, user approvals, and local
+// safety before executing anything.
+type ExpectedToolCallPolicy struct {
+	AllowAgentSubstitution bool `json:"allow_agent_substitution,omitempty"`
+	RequiresUserApproval   bool `json:"requires_user_approval,omitempty"`
+}
+
 // ScopeOverlaps returns true if any entry in a shares kind+key with
 // any entry in b.
 func ScopeOverlaps(a, b []ClaimScopeEntry) bool {
@@ -171,7 +195,7 @@ const (
 //
 // The split is deliberate and CLOSED:
 //   - Activation set (legitimate agent wakes): task, handoff,
-//     consultation, challenge, corrective, prompt.
+//     consultation, challenge, corrective, prompt, guardian_check.
 //   - System-internal (never agent wakes): boot, activation, shutdown,
 //     archival, testament, checkpoint.
 //
@@ -205,6 +229,7 @@ func AgentActivationActionTypes() []ActionType {
 		ActionTypeChallenge,
 		ActionTypeCorrective,
 		ActionTypePrompt,
+		ActionTypeGuardianCheck,
 	}
 }
 
@@ -334,6 +359,60 @@ const (
 	ValidationTypeRegression  ValidationType = "regression"  // no existing behavior broken
 	ValidationTypeReceipt     ValidationType = "receipt"     // proof of delivery/ingestion
 )
+
+// ValidationEvaluationMode classifies whether a validation is
+// evaluated mechanically by the board or agentically by an evaluator.
+type ValidationEvaluationMode string
+
+const (
+	ValidationEvaluationMechanical ValidationEvaluationMode = "mechanical"
+	ValidationEvaluationAgentic    ValidationEvaluationMode = "agentic"
+)
+
+// ValidationTypeSemantics documents the evaluation contract for one
+// ValidationType. Tests assert that every known validation type has an
+// entry here so new validation types cannot ship without specifying
+// who evaluates them and how.
+type ValidationTypeSemantics struct {
+	Mode        ValidationEvaluationMode
+	Description string
+}
+
+func KnownValidationTypes() []ValidationType {
+	return []ValidationType{
+		ValidationTypeTest,
+		ValidationTypeInspection,
+		ValidationTypeIntegration,
+		ValidationTypeContract,
+		ValidationTypeDesign,
+		ValidationTypeRegression,
+		ValidationTypeReceipt,
+	}
+}
+
+func ValidationTypeSemanticsFor(t ValidationType) (ValidationTypeSemantics, bool) {
+	switch t {
+	case ValidationTypeReceipt:
+		return ValidationTypeSemantics{
+			Mode:        ValidationEvaluationMechanical,
+			Description: "Board passes receipt when a non-error testament is linked to the claim; error testaments fail receipt.",
+		}, true
+	case ValidationTypeTest:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator inspects test artifacts or executes expected tools against the claim quality bar."}, true
+	case ValidationTypeInspection:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator reviews the submitted artifacts for correctness, completeness, and stated quality bar."}, true
+	case ValidationTypeIntegration:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator verifies cross-boundary behavior and integration evidence."}, true
+	case ValidationTypeContract:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator verifies API, interface, schema, or protocol contract adherence."}, true
+	case ValidationTypeDesign:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator reviews user-facing or architectural design quality against the claim's quality bar."}, true
+	case ValidationTypeRegression:
+		return ValidationTypeSemantics{Mode: ValidationEvaluationAgentic, Description: "Evaluator verifies the work did not break existing behavior."}, true
+	default:
+		return ValidationTypeSemantics{}, false
+	}
+}
 
 // BoardPhase tracks the overall claims board lifecycle.
 type BoardPhase string
@@ -484,6 +563,10 @@ type Claim struct {
 	// Validations are the quality gates for this claim. Structural
 	// ownership — each Validation belongs to exactly one Claim.
 	Validations []*Validation `json:"validations"`
+
+	// ExpectedToolCalls describes concrete tool work the subject should
+	// perform or explicitly account for while satisfying this claim.
+	ExpectedToolCalls []ExpectedToolCall `json:"expected_tool_calls,omitempty"`
 }
 
 // AllValidationsPassed reports whether every validation on this claim
@@ -640,6 +723,11 @@ type Validation struct {
 	Required      bool             `json:"required"`
 	Weight        int              `json:"weight,omitempty"`
 	Deadline      time.Time        `json:"deadline,omitempty"`
+
+	// ExpectedToolCalls describes concrete tool work the evaluator
+	// should perform or explicitly account for while verifying this
+	// validation.
+	ExpectedToolCalls []ExpectedToolCall `json:"expected_tool_calls,omitempty"`
 }
 
 // Passed reports whether this validation has a terminal passed status.
@@ -721,6 +809,11 @@ type ClaimsBoardConfig struct {
 	// NoopDeltaBus and bus publication is a silent no-op. Inboxes
 	// that want to subscribe need a real DeltaBus wired here.
 	DeltaBus DeltaBus
+
+	// AgentRefResolver resolves legacy agent relation strings into
+	// canonical identity refs for canonical deltas. When nil, deltas
+	// carry explicit degraded refs and route through agent_type topics.
+	AgentRefResolver AgentRefResolver
 
 	// Projectors are additional deterministic outbox projectors. The
 	// durable board always installs the Fabric projector; callers may
@@ -1054,6 +1147,50 @@ func CloneTestamentEntity(t *Testament) *Testament {
 		for i, artifact := range t.Artifacts {
 			cp.Artifacts[i] = CloneArtifact(artifact)
 		}
+	}
+	return &cp
+}
+
+// CloneClaimEntity returns a defensive copy of a claim, including
+// validation copies and expected tool specs.
+func CloneClaimEntity(c *Claim) *Claim {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	if len(c.Relations) > 0 {
+		cp.Relations = append([]Relation(nil), c.Relations...)
+	}
+	if len(c.Scope) > 0 {
+		cp.Scope = append([]ClaimScopeEntry(nil), c.Scope...)
+	}
+	if len(c.Tags) > 0 {
+		cp.Tags = append([]string(nil), c.Tags...)
+	}
+	if len(c.ExpectedToolCalls) > 0 {
+		cp.ExpectedToolCalls = append([]ExpectedToolCall(nil), c.ExpectedToolCalls...)
+	}
+	if len(c.Validations) > 0 {
+		cp.Validations = make([]*Validation, len(c.Validations))
+		for i, validation := range c.Validations {
+			if validation == nil {
+				continue
+			}
+			v := *validation
+			if len(validation.Relations) > 0 {
+				v.Relations = append([]Relation(nil), validation.Relations...)
+			}
+			if len(validation.StatusHistory) > 0 {
+				v.StatusHistory = append([]StatusChange(nil), validation.StatusHistory...)
+			}
+			if len(validation.ExpectedToolCalls) > 0 {
+				v.ExpectedToolCalls = append([]ExpectedToolCall(nil), validation.ExpectedToolCalls...)
+			}
+			cp.Validations[i] = &v
+		}
+	}
+	if len(c.StatusHistory) > 0 {
+		cp.StatusHistory = append([]StatusChange(nil), c.StatusHistory...)
 	}
 	return &cp
 }

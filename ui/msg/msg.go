@@ -910,6 +910,28 @@ type ClaimContextMsg struct {
 	State string
 }
 
+// ClaimPeerInteractionMsg projects a peer-interaction claim into the chat
+// tree. It is emitted from canonical claims deltas and keyed by ClaimID, so
+// consult/challenge/guardian rows are rendered from the claim graph rather
+// than inferred from tool-call arguments or streaming metadata.
+type ClaimPeerInteractionMsg struct {
+	SessionID      string
+	CycleID        string
+	ClaimID        string
+	ActionType     string // "consultation" | "challenge" | "guardian_check"
+	IssuerAgentID  string
+	SubjectAgentID string
+	Title          string
+	Context        string
+	Status         string // "pending" | "done" | "failed"
+	TestamentID    string
+	ValidationID   string
+	Sequence       uint64
+	DeltaKey       string
+	OccurredAt     time.Time
+	SuppressChat   bool
+}
+
 // TestamentContextMsg updates an in-flight testament's developing-
 // conclusion narrative. Emitted by the bridge whenever a
 // "testament_context_changed" delta lands. The chat panel keys by

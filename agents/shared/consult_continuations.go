@@ -14,7 +14,7 @@
 //
 //  2. ContinuationStore — per-agent registry of in-flight
 //     continuations. Keyed by continuation_id and indexed by awaited
-//     consult_id so a ConsultResolvedDelta arrival can locate its
+//     claim_ref so a AwaitedClaimResult arrival can locate its
 //     parent continuation in O(1). Survives process restart via
 //     restart-recovery scan of the board.
 //
@@ -76,15 +76,87 @@ var ErrConsultYielded = errors.New("shared: consult turn yielded — continuatio
 // Tolerant of wrapping (errors.Is).
 func IsConsultYielded(err error) bool { return errors.Is(err, ErrConsultYielded) }
 
+// AwaitedClaimResult is the continuation-store result for one awaited
+// directed claim. It is deliberately claim/testament shaped: canonical
+// testament.submitted and terminal claim.transitioned deltas populate
+// this directly.
+type AwaitedClaimResult struct {
+	SessionID string `json:"session_id,omitempty"`
+	BoardID   string `json:"board_id,omitempty"`
+
+	ClaimID      string `json:"claim_id"`
+	TestamentID  string `json:"testament_id,omitempty"`
+	ValidationID string `json:"validation_id,omitempty"`
+
+	Action  claims.DeltaAction `json:"action,omitempty"`
+	Verdict string             `json:"verdict,omitempty"`
+	Context string             `json:"context,omitempty"`
+
+	Status           string          `json:"status"`
+	ResponsePayload  json.RawMessage `json:"response,omitempty"`
+	ResponseSummary  string          `json:"summary,omitempty"`
+	ErrorMessage     string          `json:"error,omitempty"`
+	ResponderAgentID string          `json:"responder,omitempty"`
+
+	EmittedAt time.Time `json:"emitted_at,omitempty"`
+}
+
+func (r *AwaitedClaimResult) normalized() *AwaitedClaimResult {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	cp.ClaimID = strings.TrimSpace(cp.ClaimID)
+	cp.TestamentID = strings.TrimSpace(cp.TestamentID)
+	cp.ValidationID = strings.TrimSpace(cp.ValidationID)
+	cp.SessionID = strings.TrimSpace(cp.SessionID)
+	cp.BoardID = strings.TrimSpace(cp.BoardID)
+	cp.Status = strings.TrimSpace(cp.Status)
+	if cp.Status == "" {
+		cp.Status = claims.ConsultStatusCompleted
+	}
+	cp.ResponseSummary = strings.TrimSpace(cp.ResponseSummary)
+	cp.ErrorMessage = strings.TrimSpace(cp.ErrorMessage)
+	cp.ResponderAgentID = strings.TrimSpace(cp.ResponderAgentID)
+	cp.Context = strings.TrimSpace(cp.Context)
+	cp.Verdict = strings.TrimSpace(cp.Verdict)
+	if cp.EmittedAt.IsZero() {
+		cp.EmittedAt = time.Now().UTC()
+	}
+	return &cp
+}
+
 // AccumulatorSnapshot captures TestamentAccumulator state for
 // continuation persistence. Restore via claims.RestoreAccumulator.
 type AccumulatorSnapshot struct {
-	AgentID   string             `json:"agent_id"`
-	SessionID string             `json:"session_id"`
-	ClaimID   string             `json:"claim_id,omitempty"`
-	Started   time.Time          `json:"started"`
-	Artifacts []*claims.Artifact `json:"artifacts,omitempty"`
-	Notes     []string           `json:"notes,omitempty"`
+	AgentID         string             `json:"agent_id"`
+	SessionID       string             `json:"session_id"`
+	ClaimID         string             `json:"claim_id,omitempty"`
+	ResponseClaimID string             `json:"response_claim_id,omitempty"`
+	Started         time.Time          `json:"started"`
+	Artifacts       []*claims.Artifact `json:"artifacts,omitempty"`
+	Notes           []string           `json:"notes,omitempty"`
+}
+
+// RestoreAccumulatorFromSnapshot rebuilds an accumulator captured at
+// consult-yield time, including both its live artifact routing claim and
+// its durable response claim relation target.
+func RestoreAccumulatorFromSnapshot(snapshot AccumulatorSnapshot) *claims.TestamentAccumulator {
+	if strings.TrimSpace(snapshot.AgentID) == "" {
+		return nil
+	}
+	acc := claims.RestoreAccumulator(
+		snapshot.AgentID,
+		snapshot.SessionID,
+		snapshot.ClaimID,
+		snapshot.Started,
+		snapshot.Artifacts,
+		snapshot.Notes,
+	)
+	if responseClaimID := strings.TrimSpace(snapshot.ResponseClaimID); responseClaimID != "" {
+		acc.WithResponseClaimID(responseClaimID)
+	}
+	return acc
 }
 
 // TurnSnapshot is the durable continuation payload. JSON-serializable
@@ -119,10 +191,15 @@ type TurnSnapshot struct {
 	// same testament.
 	AccumulatorState AccumulatorSnapshot `json:"accumulator_state"`
 
-	// AwaitedConsultIDs are the consult_id values the LLM is
-	// waiting on. Each ID corresponds to one of the consult_peer
-	// tickets the LLM accumulated before the await_consults call.
-	AwaitedConsultIDs []string `json:"awaited_consult_ids"`
+	// AwaitedClaimRefs are the directed claim IDs the LLM is waiting
+	// on. Each ref corresponds to one consultation/challenge claim
+	// posted by the yielding tool call.
+	AwaitedClaimRefs []string `json:"awaited_claim_refs,omitempty"`
+
+	// AwaitedConsultIDs is retained for snapshot compatibility with
+	// pre-canonical continuations. New snapshots also stamp it during
+	// migration so older recovery code can still decode them.
+	AwaitedConsultIDs []string `json:"awaited_consult_ids,omitempty"`
 
 	// AwaitDeadline is the absolute time at which AwaitConsultsOrYield
 	// should give up and resume with whatever resolutions arrived
@@ -154,18 +231,19 @@ type TurnSnapshot struct {
 //
 // Implementations must be re-entrant — multiple continuations may
 // resume concurrently for the same agent.
-type ResumeFn func(ctx context.Context, snapshot *TurnSnapshot, results map[string]*claims.ConsultResolvedDelta) error
+type ResumeFn func(ctx context.Context, snapshot *TurnSnapshot, results map[string]*AwaitedClaimResult) error
 
 // pendingContinuation tracks one in-flight yielded turn.
 type pendingContinuation struct {
-	id         string                                  // ConsultContinuation claim ID
-	snapshot   *TurnSnapshot                           // serialized turn state
-	awaiting   map[string]struct{}                     // consult_ids still pending
-	resolved   map[string]*claims.ConsultResolvedDelta // consult_id → resolved delta
+	id         string                         // ConsultContinuation claim ID or in-memory wait ID
+	snapshot   *TurnSnapshot                  // serialized turn state; nil for synchronous waits
+	awaiting   map[string]struct{}            // claim refs still pending
+	resolved   map[string]*AwaitedClaimResult // claim ref → canonical result
 	deadline   time.Time
 	idleWindow time.Duration
-	activity   map[string]time.Time // consult_id -> most recent observed claim activity
+	activity   map[string]time.Time // claim ref -> most recent observed claim activity
 	deadlineFn context.CancelFunc   // cancels the deadline watcher
+	waitCh     chan map[string]*AwaitedClaimResult
 
 	// dispatched serializes resume invocation. Two concurrent
 	// completing consults (last-awaiting + last-awaiting due to
@@ -190,11 +268,11 @@ type ContinuationStore struct {
 	// pending maps continuation_id → state.
 	pending map[string]*pendingContinuation
 
-	// consultIndex maps consult_id → continuation_id, for O(1)
-	// lookup when ConsultResolvedDelta arrives at the inbox.
-	// A consult_id appears in at most one continuation (the one
+	// claimIndex maps awaited claim ref → continuation_id, for O(1)
+	// lookup when a canonical result arrives at the inbox.
+	// A claim ref appears in at most one continuation (the one
 	// that issued it).
-	consultIndex map[string]string
+	claimIndex map[string]string
 
 	// resumeFn is the agent-specific resume entry point. Invoked
 	// from a tracked goroutine when all awaiting consults for a
@@ -207,10 +285,10 @@ type ContinuationStore struct {
 	// goroutine (acceptable for tests, not production).
 	scope goroutineScopeProxy
 
-	// orphans buffers ConsultResolvedDeltas that arrived before
-	// their issuing AwaitConsultsOrYield call registered the
-	// continuation. Claimed by the next await call referencing the
-	// consult_id; expire after orphanResolutionsMaxAge.
+	// orphans buffers canonical claim results that arrived before
+	// their issuing AwaitConsultsOrYield/AwaitClaimResults call
+	// registered the continuation. Claimed by the next await call
+	// referencing the claim ref; expire after orphanResolutionsMaxAge.
 	orphans map[string]orphanedResolution
 }
 
@@ -243,21 +321,24 @@ func NewContinuationStore(cfg ContinuationStoreConfig) *ContinuationStore {
 		return nil
 	}
 	return &ContinuationStore{
-		agentID:      cfg.AgentID,
-		sessionID:    cfg.SessionID,
-		board:        cfg.Board,
-		pending:      make(map[string]*pendingContinuation),
-		consultIndex: make(map[string]string),
-		resumeFn:     cfg.ResumeFn,
-		scope:        cfg.Scope,
+		agentID:    cfg.AgentID,
+		sessionID:  cfg.SessionID,
+		board:      cfg.Board,
+		pending:    make(map[string]*pendingContinuation),
+		claimIndex: make(map[string]string),
+		resumeFn:   cfg.ResumeFn,
+		scope:      cfg.Scope,
 	}
 }
 
 // AwaitOptions configures a single AwaitConsultsOrYield invocation.
 type AwaitOptions struct {
-	// ConsultIDs are the consult_id values to await. Empty is a
-	// programming error and yields immediately with an empty
-	// results map.
+	// ClaimRefs are the directed claim IDs to await. Empty is a
+	// programming error unless legacy ConsultIDs is populated.
+	ClaimRefs []string
+
+	// ConsultIDs is the legacy name for ClaimRefs. It is accepted
+	// during migration but new callers should pass ClaimRefs.
 	ConsultIDs []string
 
 	// AwaitToolCallID is the tool_call_id of the await_consults
@@ -286,9 +367,30 @@ type AwaitOptions struct {
 	// await_consults tool handler) constructs this from the active
 	// LLM turn state — captured via WithTurnContext / TurnFromContext.
 	// The store stamps Version, YieldedAt, AwaitToolCallID,
-	// AwaitToolName, AwaitedConsultIDs, AwaitDeadline before
+	// AwaitToolName, AwaitedClaimRefs, AwaitDeadline before
 	// persisting.
 	Snapshot *TurnSnapshot
+}
+
+func normalizedAwaitClaimRefs(opts AwaitOptions) []string {
+	raw := opts.ClaimRefs
+	if len(raw) == 0 {
+		raw = opts.ConsultIDs
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 // AwaitConsultsOrYield is the central yield primitive. The
@@ -306,7 +408,7 @@ type AwaitOptions struct {
 //     returns normally — the LLM continues without a yield.
 //
 //  3. Slow path: persists the TurnSnapshot to the board as a
-//     ConsultContinuation claim, registers the awaited consult_ids
+//     ConsultContinuation claim, registers the awaited claim_refs
 //     in the index, starts a deadline watcher, and returns
 //     (nil, true, ErrConsultYielded). The handler converts this to
 //     ToolOutcome{Status: yielded}; the dispatch loop short-circuits
@@ -316,12 +418,13 @@ type AwaitOptions struct {
 func (s *ContinuationStore) AwaitConsultsOrYield(
 	ctx context.Context,
 	opts AwaitOptions,
-) (results map[string]*claims.ConsultResolvedDelta, yielded bool, err error) {
+) (results map[string]*AwaitedClaimResult, yielded bool, err error) {
 	if s == nil {
 		return nil, false, errors.New("await_consults: continuation store not configured")
 	}
-	if len(opts.ConsultIDs) == 0 {
-		return nil, false, errors.New("await_consults: no consult_ids supplied")
+	claimRefs := normalizedAwaitClaimRefs(opts)
+	if len(claimRefs) == 0 {
+		return nil, false, errors.New("await_consults: no claim_refs supplied")
 	}
 	if opts.Snapshot == nil {
 		return nil, false, errors.New("await_consults: snapshot is required")
@@ -351,10 +454,10 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 
 	// Fast path: collect already-resolved consults that arrived before
 	// this await call. If ALL are resolved, return inline.
-	preResolved := make(map[string]*claims.ConsultResolvedDelta, len(opts.ConsultIDs))
-	stillAwaiting := make(map[string]struct{}, len(opts.ConsultIDs))
-	for _, id := range opts.ConsultIDs {
-		// We pre-stage the index: ConsultResolvedDelta arrival
+	preResolved := make(map[string]*AwaitedClaimResult, len(claimRefs))
+	stillAwaiting := make(map[string]struct{}, len(claimRefs))
+	for _, id := range claimRefs {
+		// We pre-stage the index: AwaitedClaimResult arrival
 		// stores into pending[contID].resolved, but only after the
 		// continuation exists. Pre-await resolutions therefore have
 		// no continuation yet — they're captured into a separate
@@ -381,13 +484,14 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	snapshot.Version = turnSnapshotCodecVersion
 	snapshot.AgentID = s.agentID
 	snapshot.SessionID = s.sessionID
-	snapshot.AwaitedConsultIDs = opts.ConsultIDs
+	snapshot.AwaitedClaimRefs = claimRefs
+	snapshot.AwaitedConsultIDs = claimRefs
 	snapshot.AwaitToolCallID = opts.AwaitToolCallID
 	snapshot.AwaitToolName = opts.AwaitToolName
 	snapshot.AwaitDeadline = deadline
 	snapshot.YieldedAt = now
 
-	continuationID, err := s.persistContinuationLocked(ctx, snapshot, opts.ConsultIDs, deadline, idleWindow, preResolved)
+	continuationID, err := s.persistContinuationLocked(ctx, snapshot, claimRefs, deadline, idleWindow, preResolved)
 	if err != nil {
 		s.mu.Unlock()
 		// Persist failure: degrade to fast path with whatever
@@ -395,7 +499,7 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 		// partial results; LLM can re-call await if needed.
 		slog.Error("await_consults_persist_failed",
 			"agent_id", s.agentID, "session_id", s.sessionID,
-			"consult_ids", opts.ConsultIDs, "error", err.Error(),
+			"claim_refs", claimRefs, "error", err.Error(),
 		)
 		return preResolved, false, fmt.Errorf("await_consults: persist continuation: %w", err)
 	}
@@ -411,7 +515,7 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	}
 	s.pending[continuationID] = pending
 	for id := range stillAwaiting {
-		s.consultIndex[id] = continuationID
+		s.claimIndex[id] = continuationID
 	}
 	s.mu.Unlock()
 
@@ -423,26 +527,96 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	return nil, true, ErrConsultYielded
 }
 
-// DeliverResolution is the inbox-side entry: when a
-// ConsultResolvedDelta arrives at the issuing agent's inbox, the
-// dispatcher calls this with the delta. If the delta matches a
+// AwaitClaimResults is the synchronous counterpart used by callers that
+// need a blocking skill result but do not have a turn snapshot to park.
+// It waits on the same canonical claim-result index as yielded
+// continuations and never calls RouteSync.
+func (s *ContinuationStore) AwaitClaimResults(ctx context.Context, claimRefs []string, deadline time.Time) (map[string]*AwaitedClaimResult, error) {
+	if s == nil {
+		return nil, errors.New("await claim results: continuation store not configured")
+	}
+	claimRefs = normalizedAwaitClaimRefs(AwaitOptions{ClaimRefs: claimRefs})
+	if len(claimRefs) == 0 {
+		return nil, errors.New("await claim results: no claim refs supplied")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	now := time.Now().UTC()
+	if deadline.IsZero() {
+		deadline = now.Add(5 * time.Minute)
+	}
+	idleWindow := time.Until(deadline)
+	if idleWindow <= 0 {
+		idleWindow = 0
+	}
+	waitID := "wait_" + uuid.NewString()
+	waitCh := make(chan map[string]*AwaitedClaimResult, 1)
+
+	s.mu.Lock()
+	preResolved := make(map[string]*AwaitedClaimResult, len(claimRefs))
+	stillAwaiting := make(map[string]struct{}, len(claimRefs))
+	for _, id := range claimRefs {
+		if result := s.takeOrphanResolutionLocked(id); result != nil {
+			preResolved[id] = result
+			continue
+		}
+		stillAwaiting[id] = struct{}{}
+	}
+	if len(stillAwaiting) == 0 {
+		s.mu.Unlock()
+		return preResolved, nil
+	}
+	pending := &pendingContinuation{
+		id:         waitID,
+		awaiting:   stillAwaiting,
+		resolved:   preResolved,
+		deadline:   deadline,
+		idleWindow: idleWindow,
+		activity:   initialConsultActivity(stillAwaiting, now),
+		waitCh:     waitCh,
+	}
+	s.pending[waitID] = pending
+	for id := range stillAwaiting {
+		s.claimIndex[id] = waitID
+	}
+	s.mu.Unlock()
+
+	s.startDeadlineWatcher(waitID, idleWindow)
+	select {
+	case results := <-waitCh:
+		return results, nil
+	case <-ctx.Done():
+		s.CancelContinuation(waitID, ctx.Err().Error())
+		return nil, ctx.Err()
+	}
+}
+
+// DeliverClaimResult is the inbox-side entry: when canonical
+// testament.submitted or terminal claim.transitioned resolves an
+// awaited claim, the dispatcher calls this with the result. If the
+// result matches a
 // pending continuation, it's recorded; if all of that continuation's
-// awaited consults are now resolved, the resume is dispatched.
+// awaited claims are now resolved, the resume is dispatched.
 //
 // If the delta arrives BEFORE its continuation is registered (a race
 // where the peer responded faster than the issuer reached
 // AwaitConsultsOrYield), the resolution is held in an orphan map and
 // claimed by the next AwaitConsultsOrYield call referencing that
-// consult_id.
-func (s *ContinuationStore) DeliverResolution(ctx context.Context, delta *claims.ConsultResolvedDelta) {
-	if s == nil || delta == nil {
+// claim ref.
+func (s *ContinuationStore) DeliverClaimResult(ctx context.Context, result *AwaitedClaimResult) {
+	if s == nil || result == nil {
+		return
+	}
+	result = result.normalized()
+	if result == nil || result.ClaimID == "" {
 		return
 	}
 	s.mu.Lock()
-	contID, ok := s.consultIndex[delta.ConsultID]
+	contID, ok := s.claimIndex[result.ClaimID]
 	if !ok {
 		// Orphan: stash for the eventual await call.
-		s.stashOrphanResolutionLocked(delta)
+		s.stashOrphanResolutionLocked(result)
 		s.mu.Unlock()
 		return
 	}
@@ -451,17 +625,17 @@ func (s *ContinuationStore) DeliverResolution(ctx context.Context, delta *claims
 		// Index inconsistency — should not happen. Drop the
 		// resolution; the continuation's deadline watcher will
 		// handle the stranded await.
-		delete(s.consultIndex, delta.ConsultID)
+		delete(s.claimIndex, result.ClaimID)
 		s.mu.Unlock()
 		slog.Warn("consult_resolution_continuation_missing",
-			"agent_id", s.agentID, "consult_id", delta.ConsultID,
+			"agent_id", s.agentID, "claim_ref", result.ClaimID,
 			"continuation_id", contID,
 		)
 		return
 	}
-	pending.resolved[delta.ConsultID] = delta
-	delete(pending.awaiting, delta.ConsultID)
-	delete(s.consultIndex, delta.ConsultID)
+	pending.resolved[result.ClaimID] = result
+	delete(pending.awaiting, result.ClaimID)
+	delete(s.claimIndex, result.ClaimID)
 	complete := len(pending.awaiting) == 0
 	s.mu.Unlock()
 
@@ -476,6 +650,13 @@ func (s *ContinuationStore) DeliverResolution(ctx context.Context, delta *claims
 // per continuation, regardless of how many concurrent paths reach
 // "complete".
 func (s *ContinuationStore) dispatchResume(ctx context.Context, pending *pendingContinuation) {
+	if pending == nil {
+		return
+	}
+	if pending.waitCh != nil {
+		s.dispatchWaitResult(pending)
+		return
+	}
 	if s.resumeFn == nil {
 		slog.Warn("continuation_resume_skipped_no_resume_fn",
 			"agent_id", s.agentID, "continuation_id", pending.id,
@@ -492,7 +673,7 @@ func (s *ContinuationStore) dispatchResume(ctx context.Context, pending *pending
 		return
 	}
 	pending.dispatched = true
-	results := make(map[string]*claims.ConsultResolvedDelta, len(pending.resolved))
+	results := make(map[string]*AwaitedClaimResult, len(pending.resolved))
 	for id, delta := range pending.resolved {
 		results[id] = delta
 	}
@@ -526,6 +707,29 @@ func (s *ContinuationStore) dispatchResume(ctx context.Context, pending *pending
 	}
 	// Fall back to inline execution when no scope wired (tests).
 	_ = resume(ctx)
+}
+
+func (s *ContinuationStore) dispatchWaitResult(pending *pendingContinuation) {
+	s.mu.Lock()
+	if pending.dispatched {
+		s.mu.Unlock()
+		return
+	}
+	pending.dispatched = true
+	results := make(map[string]*AwaitedClaimResult, len(pending.resolved))
+	for id, result := range pending.resolved {
+		results[id] = result
+	}
+	delete(s.pending, pending.id)
+	if pending.deadlineFn != nil {
+		pending.deadlineFn()
+	}
+	waitCh := pending.waitCh
+	s.mu.Unlock()
+	select {
+	case waitCh <- results:
+	default:
+	}
 }
 
 // startDeadlineWatcher kicks off a tracked goroutine that fires
@@ -609,7 +813,7 @@ func (s *ContinuationStore) nextDeadlineWait(continuationID string) (time.Durati
 	for id := range pending.awaiting {
 		last := pending.activity[id]
 		if last.IsZero() {
-			last = pending.snapshot.YieldedAt
+			last = pendingYieldedAt(pending, time.Now().UTC())
 		}
 		due := last.Add(idleWindow)
 		if next.IsZero() || due.Before(next) {
@@ -622,9 +826,9 @@ func (s *ContinuationStore) nextDeadlineWait(continuationID string) (time.Durati
 	return time.Until(next), true
 }
 
-// fireDeadline materializes synthetic timeout resolutions for any
-// still-awaiting consults of the named continuation, then dispatches
-// resume.
+// fireDeadline materializes timeout results and submits an error
+// artifact testament for any still-awaiting directed claims of the
+// named continuation, then dispatches resume.
 func (s *ContinuationStore) fireDeadline(continuationID string) bool {
 	s.refreshContinuationActivity(continuationID)
 
@@ -639,31 +843,49 @@ func (s *ContinuationStore) fireDeadline(continuationID string) bool {
 	if idleWindow <= 0 {
 		idleWindow = time.Until(pending.deadline)
 	}
+	timedOut := make([]string, 0, len(pending.awaiting))
 	for id := range pending.awaiting {
 		last := pending.activity[id]
 		if last.IsZero() {
-			last = pending.snapshot.YieldedAt
+			last = pendingYieldedAt(pending, now)
 		}
 		if idleWindow > 0 && now.Sub(last) < idleWindow {
 			continue
 		}
-		pending.resolved[id] = &claims.ConsultResolvedDelta{
-			ConsultID:         id,
-			OriginatorAgentID: s.agentID,
-			Status:            claims.ConsultStatusTimeout,
-			ErrorMessage:      "consult deadline elapsed",
-			EmittedAt:         now,
-		}
-		delete(s.consultIndex, id)
+		pending.resolved[id] = (&AwaitedClaimResult{
+			ClaimID:      id,
+			Action:       claims.DeltaActionTestamentSubmitted,
+			Status:       claims.ConsultStatusTimeout,
+			ErrorMessage: "consult deadline elapsed",
+			EmittedAt:    now,
+		}).normalized()
+		timedOut = append(timedOut, id)
+		delete(s.claimIndex, id)
 		delete(pending.activity, id)
 		delete(pending.awaiting, id)
 	}
 	complete := len(pending.awaiting) == 0
 	s.mu.Unlock()
+	for _, id := range timedOut {
+		s.submitAwaitFailureTestament(context.Background(), id, claims.ConsultStatusTimeout, "consult deadline elapsed")
+	}
 	if complete {
 		s.dispatchResume(context.Background(), pending)
 	}
 	return complete
+}
+
+func pendingYieldedAt(pending *pendingContinuation, fallback time.Time) time.Time {
+	if pending != nil && pending.snapshot != nil && !pending.snapshot.YieldedAt.IsZero() {
+		return pending.snapshot.YieldedAt
+	}
+	if pending != nil && !pending.deadline.IsZero() && pending.idleWindow > 0 {
+		return pending.deadline.Add(-pending.idleWindow)
+	}
+	if fallback.IsZero() {
+		return time.Now().UTC()
+	}
+	return fallback
 }
 
 func (s *ContinuationStore) refreshContinuationActivity(continuationID string) {
@@ -778,7 +1000,7 @@ func continuationAwaitMatchesClaim(awaitID string, claim claims.Claim) bool {
 	}
 	for _, entry := range claim.Scope {
 		switch strings.TrimSpace(entry.Kind) {
-		case "consult_id", "challenge_id", "await_id":
+		case "claim_ref", "challenge_id", "await_id":
 			if strings.TrimSpace(entry.Key) == awaitID {
 				return true
 			}
@@ -841,7 +1063,7 @@ func (s *ContinuationStore) persistContinuationLocked(
 	consultIDs []string,
 	deadline time.Time,
 	idleWindow time.Duration,
-	alreadyResolved map[string]*claims.ConsultResolvedDelta,
+	alreadyResolved map[string]*AwaitedClaimResult,
 ) (string, error) {
 	if s.board == nil {
 		return "", errors.New("no board configured")
@@ -988,7 +1210,7 @@ func (s *ContinuationStore) Stop(reason string) {
 		pending = append(pending, p)
 	}
 	s.pending = make(map[string]*pendingContinuation)
-	s.consultIndex = make(map[string]string)
+	s.claimIndex = make(map[string]string)
 	s.mu.Unlock()
 
 	if reason == "" {
@@ -999,26 +1221,8 @@ func (s *ContinuationStore) Stop(reason string) {
 			p.deadlineFn()
 		}
 		s.markContinuationResolved(context.Background(), p.id)
-		// Best-effort: surface synthetic Cancelled resolutions on
-		// the bus so any other agents holding references to the
-		// awaited consult_ids see the cancellation. Uses the
-		// board's amplifier directly since the in-flight peer
-		// transport may have already been torn down.
-		if s.board == nil {
-			continue
-		}
-		amp := s.board.Amplifier()
-		if amp == nil {
-			continue
-		}
 		for id := range p.awaiting {
-			amp.PublishConsultResolvedDelta(context.Background(), claims.ConsultResolvedDelta{
-				ConsultID:         id,
-				OriginatorAgentID: s.agentID,
-				Status:            claims.ConsultStatusCancelled,
-				ErrorMessage:      reason,
-				EmittedAt:         time.Now().UTC(),
-			})
+			s.submitAwaitFailureTestament(context.Background(), id, claims.ConsultStatusCancelled, reason)
 		}
 	}
 }
@@ -1042,7 +1246,7 @@ func (s *ContinuationStore) CancelContinuation(continuationID, reason string) {
 	delete(s.pending, continuationID)
 	awaiting := make([]string, 0, len(p.awaiting))
 	for id := range p.awaiting {
-		delete(s.consultIndex, id)
+		delete(s.claimIndex, id)
 		awaiting = append(awaiting, id)
 	}
 	if p.deadlineFn != nil {
@@ -1054,21 +1258,69 @@ func (s *ContinuationStore) CancelContinuation(continuationID, reason string) {
 		reason = "continuation cancelled"
 	}
 	s.markContinuationResolved(context.Background(), continuationID)
-	if s.board == nil {
-		return
-	}
-	amp := s.board.Amplifier()
-	if amp == nil {
-		return
-	}
 	for _, id := range awaiting {
-		amp.PublishConsultResolvedDelta(context.Background(), claims.ConsultResolvedDelta{
-			ConsultID:         id,
-			OriginatorAgentID: s.agentID,
-			Status:            claims.ConsultStatusCancelled,
-			ErrorMessage:      reason,
-			EmittedAt:         time.Now().UTC(),
-		})
+		s.submitAwaitFailureTestament(context.Background(), id, claims.ConsultStatusCancelled, reason)
+	}
+}
+
+func (s *ContinuationStore) submitAwaitFailureTestament(ctx context.Context, claimID, status, message string) {
+	if s == nil || s.board == nil {
+		return
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = claims.ConsultStatusError
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "awaited claim failed"
+	}
+	kind := claims.ArtifactKindErrorDiagnostic
+	if status == claims.ConsultStatusTimeout {
+		kind = claims.ArtifactKindToolTimeout
+	}
+	action := claims.Action{AgentID: s.agentID, Type: claims.ActionTypeTestament}
+	testament := claims.Testament{
+		AgentID:    s.agentID,
+		SessionID:  s.sessionID,
+		Summary:    message,
+		Context:    message,
+		Confidence: "system",
+		Relations: []claims.Relation{{
+			Related:      claimID,
+			RelatedType:  claims.RelatedTypeClaim,
+			Relationship: claims.RelationshipClaim,
+		}},
+		Artifacts: []*claims.Artifact{{
+			ID:        uuid.NewString(),
+			AgentID:   s.agentID,
+			SessionID: s.sessionID,
+			Kind:      kind,
+			Reference: message,
+			Metadata: map[string]any{
+				"await_status": status,
+				"claim_id":     claimID,
+			},
+			Presentation: &claims.Presentation{
+				Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser, claims.PresentationAudienceOperator},
+				Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat, claims.PresentationSurfaceDiagnostics},
+				Format:    claims.PresentationFormatText,
+				Placement: claims.PresentationPlacementAfterResponse,
+			},
+		}},
+	}
+	if err := s.board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+		slog.Warn("await_failure_testament_submit_failed",
+			"agent_id", s.agentID,
+			"session_id", s.sessionID,
+			"claim_id", claimID,
+			"status", status,
+			"error", err.Error(),
+		)
 	}
 }
 
@@ -1077,7 +1329,7 @@ func (s *ContinuationStore) CancelContinuation(continuationID, reason string) {
 // the session board for ConsultContinuation claims subject=this
 // agent with pending validation, re-loads the TurnSnapshot from the
 // claim's continuation_context artifact, and re-registers each in
-// the pending map (with its consult_id index entries and deadline
+// the pending map (with its claim_ref index entries and deadline
 // watcher). Already-resolved consults that landed before this
 // recovery scan are matched against the board's existing testaments
 // and processed inline — if all awaited consults are already done,
@@ -1143,14 +1395,14 @@ func (s *ContinuationStore) RecoverPendingContinuations(ctx context.Context) int
 			id:         c.ID,
 			snapshot:   snapshot,
 			awaiting:   awaiting,
-			resolved:   make(map[string]*claims.ConsultResolvedDelta),
+			resolved:   make(map[string]*AwaitedClaimResult),
 			deadline:   deadline,
 			idleWindow: idleWindow,
 			activity:   s.recoveredConsultActivity(awaitedIDs, snapshot.YieldedAt),
 		}
 		s.pending[c.ID] = pending
 		for id := range awaiting {
-			s.consultIndex[id] = c.ID
+			s.claimIndex[id] = c.ID
 		}
 		s.mu.Unlock()
 		s.startDeadlineWatcher(c.ID, idleWindow)
@@ -1302,7 +1554,7 @@ func testamentRelatesToClaim(t claims.Testament, claimID string) bool {
 	return false
 }
 
-// orphanResolutions buffers ConsultResolvedDeltas that arrived
+// orphanResolutions buffers AwaitedClaimResults that arrived
 // before the originating AwaitConsultsOrYield call had a chance to
 // register the continuation. Cleaned up in
 // takeOrphanResolutionLocked when claimed, or by a periodic GC pass
@@ -1312,25 +1564,28 @@ func testamentRelatesToClaim(t claims.Testament, claimID string) bool {
 // expiry.
 const orphanResolutionsMaxAge = 10 * time.Minute
 
-func (s *ContinuationStore) stashOrphanResolutionLocked(delta *claims.ConsultResolvedDelta) {
+func (s *ContinuationStore) stashOrphanResolutionLocked(delta *AwaitedClaimResult) {
+	if delta == nil || strings.TrimSpace(delta.ClaimID) == "" {
+		return
+	}
 	if s.orphans == nil {
 		s.orphans = make(map[string]orphanedResolution)
 	}
-	s.orphans[delta.ConsultID] = orphanedResolution{
+	s.orphans[delta.ClaimID] = orphanedResolution{
 		delta:     delta,
 		stashedAt: time.Now(),
 	}
 }
 
-func (s *ContinuationStore) takeOrphanResolutionLocked(consultID string) *claims.ConsultResolvedDelta {
+func (s *ContinuationStore) takeOrphanResolutionLocked(claimID string) *AwaitedClaimResult {
 	if s.orphans == nil {
 		return nil
 	}
-	o, ok := s.orphans[consultID]
+	o, ok := s.orphans[claimID]
 	if !ok {
 		return nil
 	}
-	delete(s.orphans, consultID)
+	delete(s.orphans, claimID)
 	if time.Since(o.stashedAt) > orphanResolutionsMaxAge {
 		// Stale orphan; drop silently. The deadline watcher on
 		// the actual await will handle the timeout.
@@ -1340,6 +1595,6 @@ func (s *ContinuationStore) takeOrphanResolutionLocked(consultID string) *claims
 }
 
 type orphanedResolution struct {
-	delta     *claims.ConsultResolvedDelta
+	delta     *AwaitedClaimResult
 	stashedAt time.Time
 }

@@ -56,8 +56,9 @@ type ClaimsBoard struct {
 
 	seq atomic.Uint64
 
-	amplifier *BoardAmplifier
-	scope     ScopeProvider // nil = synchronous (tests)
+	amplifier        *BoardAmplifier
+	scope            ScopeProvider // nil = synchronous (tests)
+	agentRefResolver AgentRefResolver
 
 	// Cached projection: recomputed only when projectionDirty is set.
 	// Multiple readers share the same immutable pointer.
@@ -89,6 +90,7 @@ type ClaimsBoard struct {
 
 	legacySessionNoWAL bool
 	rollout            RolloutConfig
+	canonicalViaOutbox bool
 	durable            *DurableBoard
 }
 
@@ -127,12 +129,14 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		relationsIdx:       newRelationsIndex(),
 		projectionErrors:   make(map[string]string),
 		scope:              cfg.Scope,
+		agentRefResolver:   cfg.AgentRefResolver,
 		legacySessionNoWAL: cfg.LegacySessionNoWAL,
 		rollout:            boardRolloutConfig(cfg.Rollout),
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
 			WithDeltaBus(cfg.DeltaBus).
+			WithAgentRefResolver(cfg.AgentRefResolver).
 			WithScope(cfg.Scope).
 			WithErrorSink(b.RecordNotificationError)
 		b.amplifier = amp
@@ -246,7 +250,7 @@ func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims
 
 	now := time.Now().UTC()
 
-	if err := b.validatePostActionLocked(inputClaims); err != nil {
+	if err := b.validatePostActionLocked(action.Type, inputClaims); err != nil {
 		b.mu.Unlock()
 		return err
 	}
@@ -322,9 +326,27 @@ func (b *ClaimsBoard) PostAction(ctx context.Context, action Action, inputClaims
 	return nil
 }
 
-func (b *ClaimsBoard) validatePostActionLocked(inputClaims []Claim) error {
+func (b *ClaimsBoard) validatePostActionLocked(actionType ActionType, inputClaims []Claim) error {
 	for i := range inputClaims {
 		id := inputClaims[i].ID
+		claimActionType := inputClaims[i].ActionType
+		if claimActionType == "" {
+			claimActionType = actionType
+		}
+		if isPeerDirectedActionType(claimActionType) && claimHasSelfIssuerSubject(inputClaims[i].Relations) {
+			return fmt.Errorf("claim %q invalid self-target for peer-directed action %q", firstNonEmpty(id, inputClaims[i].Title), claimActionType)
+		}
+		if err := ValidateExpectedToolCalls(inputClaims[i].ExpectedToolCalls, nil); err != nil {
+			return fmt.Errorf("claim %q expected tool calls: %w", firstNonEmpty(id, inputClaims[i].Title), err)
+		}
+		for _, validation := range inputClaims[i].Validations {
+			if validation == nil {
+				continue
+			}
+			if err := ValidateExpectedToolCalls(validation.ExpectedToolCalls, nil); err != nil {
+				return fmt.Errorf("claim %q validation %q expected tool calls: %w", firstNonEmpty(id, inputClaims[i].Title), firstNonEmpty(validation.ID, validation.Description), err)
+			}
+		}
 		if id == "" {
 			continue // will be generated on stamp
 		}
@@ -338,6 +360,21 @@ func (b *ClaimsBoard) validatePostActionLocked(inputClaims []Claim) error {
 		}
 	}
 	return nil
+}
+
+func isPeerDirectedActionType(actionType ActionType) bool {
+	switch actionType {
+	case ActionTypeConsultation, ActionTypeChallenge, ActionTypeGuardianCheck:
+		return true
+	default:
+		return false
+	}
+}
+
+func claimHasSelfIssuerSubject(relations []Relation) bool {
+	issuer := strings.TrimSpace(IssuerAgentID(relations))
+	subject := strings.TrimSpace(SubjectAgentID(relations))
+	return issuer != "" && subject != "" && issuer == subject
 }
 
 func (b *ClaimsBoard) stampActionLocked(action *Action, now time.Time) {
@@ -373,6 +410,7 @@ func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) 
 	c.Accessed = now
 	c.Status = ClaimStatusPending
 	c.ActionType = action.Type
+	c.ExpectedToolCalls = stampExpectedToolCalls(c.ExpectedToolCalls)
 	c.StatusHistory = append(c.StatusHistory, StatusChange{
 		To:      string(ClaimStatusPending),
 		Reason:  "claim posted",
@@ -404,6 +442,7 @@ func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
 		if v.Status == "" {
 			v.Status = ValidationStatusPending
 		}
+		v.ExpectedToolCalls = stampExpectedToolCalls(v.ExpectedToolCalls)
 	}
 }
 
@@ -413,7 +452,7 @@ func (b *ClaimsBoard) indexRelations(objID string, relations []Relation) {
 
 // ── UpdateClaimProgress ─────────────────────────────────────────────
 
-func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _ ClaimProgressUpdate, agentID string) error {
+func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, update ClaimProgressUpdate, agentID string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -456,6 +495,7 @@ func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _
 		statusChanged = true
 		b.adjustStatusCounter(ClaimStatusPending, ClaimStatusInProgress)
 	}
+	claimSnapshot := CloneClaimEntity(c)
 
 	b.mu.Unlock()
 
@@ -476,10 +516,12 @@ func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, _
 			ToStatus:       c.Status,
 			Reason:         "work started",
 			AgentID:        agentID,
-			SubjectAgentID: SubjectAgentID(c.Relations),
-			IssuerAgentID:  IssuerAgentID(c.Relations),
+			SubjectAgentID: SubjectAgentID(claimSnapshot.Relations),
+			IssuerAgentID:  IssuerAgentID(claimSnapshot.Relations),
 		})
 	}
+	progressMessage := firstNonEmpty(update.WorkSummary, "work started")
+	b.amplifier.PublishCanonicalClaimProgressed(ctx, claimSnapshot, agentID, string(claimSnapshot.Status), progressMessage, claimSnapshot.ContextTransition, now)
 	b.notifySubscribers()
 	return nil
 }
@@ -664,7 +706,7 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 	// Capture post-stamp claim snapshots so the amplifier gets
 	// authoritative references once the lock is released. We resolve
 	// the claim referenced by each testament BEFORE unlocking.
-	claimRefs := make([]*Claim, len(testaments))
+	resolutions := make([]claimResolution, len(testaments))
 	for i := range testaments {
 		b.stampTestamentLocked(&testaments[i], &action, now)
 	}
@@ -688,7 +730,7 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 				b.indexRelations(artifact.ID, artifact.Relations)
 			}
 		}
-		claimRefs[i] = b.resolveClaimForTestamentLocked(&testaments[i], now)
+		resolutions[i] = b.resolveClaimForTestamentLocked(&testaments[i], now)
 	}
 
 	b.invalidateProjectionCache()
@@ -707,8 +749,34 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 				b.amplifier.EmitArtifactPublished(ctx, artifact)
 			}
 		}
-		if claimRefs[i] != nil {
-			b.amplifier.PublishTestamentDelta(ctx, &testaments[i], claimRefs[i])
+		if resolutions[i].claim != nil {
+			b.amplifier.PublishTestamentDelta(ctx, &testaments[i], resolutions[i].claim)
+			for _, validation := range resolutions[i].validations {
+				change := StatusChange{
+					From:    validation.from,
+					To:      validation.to,
+					Reason:  validation.reason,
+					AgentID: validation.agentID,
+					Changed: validation.changed,
+				}
+				b.amplifier.PublishCanonicalValidationEvaluated(ctx, resolutions[i].claim, validation.validation, change, resolutions[i].claim.Status == ClaimStatusAccepted, validation.changed)
+			}
+			for _, transition := range resolutions[i].transitions {
+				b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
+					SessionID:      b.sessionID,
+					BoardID:        b.boardID,
+					ClaimID:        resolutions[i].claim.ID,
+					Sequence:       resolutions[i].claim.Sequence,
+					EmittedAt:      transition.changed,
+					ActionKind:     resolutions[i].claim.ActionType,
+					FromStatus:     transition.from,
+					ToStatus:       transition.to,
+					Reason:         transition.reason,
+					AgentID:        transition.agentID,
+					SubjectAgentID: SubjectAgentID(resolutions[i].claim.Relations),
+					IssuerAgentID:  IssuerAgentID(resolutions[i].claim.Relations),
+				})
+			}
 		}
 		b.notifyDelta(BoardMutationDelta{
 			Kind:        "testament_submitted",
@@ -780,61 +848,129 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 	}
 }
 
+type claimResolution struct {
+	claim       *Claim
+	transitions []claimStatusTransition
+	validations []validationStatusTransition
+}
+
+type claimStatusTransition struct {
+	from    ClaimStatus
+	to      ClaimStatus
+	reason  string
+	agentID string
+	changed time.Time
+}
+
+type validationStatusTransition struct {
+	validation *Validation
+	from       string
+	to         string
+	reason     string
+	agentID    string
+	changed    time.Time
+}
+
 // resolveClaimForTestamentLocked returns the Claim referenced by the
-// testament's "claim" Relation and transitions it to Testified. Nil
+// testament's "claim" Relation and transitions it to Testified. Empty
 // when the relation is absent or the target claim no longer exists.
 // Caller holds b.mu (write-locked).
-func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time) *Claim {
+func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time) claimResolution {
 	claimRel := FindRelation(t.Relations, RelationshipClaim)
 	if claimRel == nil {
-		return nil
+		return claimResolution{}
 	}
 	c, ok := b.claims[claimRel.Related]
 	if !ok {
-		return nil
+		return claimResolution{}
 	}
+	var result claimResolution
 	if !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
 		prevStatus := c.Status
+		transition := claimStatusTransition{
+			from:    prevStatus,
+			to:      ClaimStatusTestified,
+			reason:  "testament submitted",
+			agentID: t.AgentID,
+			changed: now,
+		}
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
 			From:    string(c.Status),
 			To:      string(ClaimStatusTestified),
-			Reason:  "testament submitted",
+			Reason:  transition.reason,
 			AgentID: t.AgentID,
 			Changed: now,
 		})
 		c.Status = ClaimStatusTestified
 		c.Accessed = now
 		b.adjustStatusCounter(prevStatus, ClaimStatusTestified)
+		result.transitions = append(result.transitions, transition)
 	}
 
-	// Auto-pass receipt validations: the testament arriving IS the proof.
-	// This allows consultation and other receipt-gated claims to progress
-	// without an explicit EvaluateValidation call.
-	autoPassReceiptValidationsLocked(c, t.AgentID, now)
-	if c.AllValidationsPassed() && c.Status == ClaimStatusTestified {
-		c.StatusHistory = append(c.StatusHistory, StatusChange{
-			From:    string(c.Status),
-			To:      string(ClaimStatusAccepted),
-			Reason:  "all receipt validations auto-passed on testament",
-			AgentID: t.AgentID,
-			Changed: now,
-		})
-		b.adjustStatusCounter(ClaimStatusTestified, ClaimStatusAccepted)
-		c.Status = ClaimStatusAccepted
-		c.Accessed = now
+	if DeriveTestamentVerdict(t.Artifacts) == TestamentVerdictError {
+		result.validations = append(result.validations, failReceiptValidationsLocked(c, t.AgentID, now, "receipt failed: error testament submitted")...)
+		if claimHasRequiredFailedValidation(c) && !c.Status.IsTerminal() {
+			prevStatus := c.Status
+			transition := claimStatusTransition{
+				from:    prevStatus,
+				to:      ClaimStatusRejected,
+				reason:  "required receipt validation failed on error testament",
+				agentID: t.AgentID,
+				changed: now,
+			}
+			c.StatusHistory = append(c.StatusHistory, StatusChange{
+				From:    string(prevStatus),
+				To:      string(ClaimStatusRejected),
+				Reason:  transition.reason,
+				AgentID: t.AgentID,
+				Changed: now,
+			})
+			c.Status = ClaimStatusRejected
+			c.Accessed = now
+			b.adjustStatusCounter(prevStatus, ClaimStatusRejected)
+			result.transitions = append(result.transitions, transition)
+		}
+	} else {
+		// Auto-pass receipt validations: a non-error testament arriving
+		// IS the proof. Error testaments remain evidence, but they do not
+		// satisfy receipt gates.
+		result.validations = append(result.validations, autoPassReceiptValidationsLocked(c, t.AgentID, now)...)
+		if c.AllValidationsPassed() && c.Status == ClaimStatusTestified {
+			transition := claimStatusTransition{
+				from:    c.Status,
+				to:      ClaimStatusAccepted,
+				reason:  "all receipt validations auto-passed on testament",
+				agentID: t.AgentID,
+				changed: now,
+			}
+			c.StatusHistory = append(c.StatusHistory, StatusChange{
+				From:    string(c.Status),
+				To:      string(ClaimStatusAccepted),
+				Reason:  transition.reason,
+				AgentID: t.AgentID,
+				Changed: now,
+			})
+			b.adjustStatusCounter(ClaimStatusTestified, ClaimStatusAccepted)
+			c.Status = ClaimStatusAccepted
+			c.Accessed = now
+			result.transitions = append(result.transitions, transition)
+		}
 	}
 
-	return c
+	result.claim = CloneClaimEntity(c)
+	return result
 }
 
 // autoPassReceiptValidationsLocked passes all pending receipt-type
 // validations on a claim. Receipt validations assert "testimony was
 // delivered" — the testament existing is sufficient proof.
-func autoPassReceiptValidationsLocked(c *Claim, agentID string, now time.Time) {
+func autoPassReceiptValidationsLocked(c *Claim, agentID string, now time.Time) []validationStatusTransition {
+	var changed []validationStatusTransition
 	for _, v := range c.Validations {
 		if v == nil || v.Type != ValidationTypeReceipt || v.Status != ValidationStatusPending {
 			continue
 		}
+		from := v.Status
 		v.StatusHistory = append(v.StatusHistory, StatusChange{
 			From:    string(v.Status),
 			To:      string(ValidationStatusPassed),
@@ -844,7 +980,68 @@ func autoPassReceiptValidationsLocked(c *Claim, agentID string, now time.Time) {
 		})
 		v.Status = ValidationStatusPassed
 		v.Accessed = now
+		clone := *v
+		if len(v.ExpectedToolCalls) > 0 {
+			clone.ExpectedToolCalls = append([]ExpectedToolCall(nil), v.ExpectedToolCalls...)
+		}
+		changed = append(changed, validationStatusTransition{
+			validation: &clone,
+			from:       string(from),
+			to:         string(ValidationStatusPassed),
+			reason:     "receipt auto-passed: testament submitted",
+			agentID:    agentID,
+			changed:    now,
+		})
 	}
+	return changed
+}
+
+func failReceiptValidationsLocked(c *Claim, agentID string, now time.Time, reason string) []validationStatusTransition {
+	var changed []validationStatusTransition
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "receipt failed"
+	}
+	for _, v := range c.Validations {
+		if v == nil || v.Type != ValidationTypeReceipt || v.Status != ValidationStatusPending {
+			continue
+		}
+		from := v.Status
+		v.StatusHistory = append(v.StatusHistory, StatusChange{
+			From:    string(v.Status),
+			To:      string(ValidationStatusFailed),
+			Reason:  reason,
+			AgentID: agentID,
+			Changed: now,
+		})
+		v.Status = ValidationStatusFailed
+		v.Accessed = now
+		clone := *v
+		if len(v.ExpectedToolCalls) > 0 {
+			clone.ExpectedToolCalls = append([]ExpectedToolCall(nil), v.ExpectedToolCalls...)
+		}
+		changed = append(changed, validationStatusTransition{
+			validation: &clone,
+			from:       string(from),
+			to:         string(ValidationStatusFailed),
+			reason:     reason,
+			agentID:    agentID,
+			changed:    now,
+		})
+	}
+	return changed
+}
+
+func claimHasRequiredFailedValidation(c *Claim) bool {
+	if c == nil {
+		return false
+	}
+	for _, v := range c.Validations {
+		if v != nil && v.Required && v.Status == ValidationStatusFailed {
+			return true
+		}
+	}
+	return false
 }
 
 // ── EvaluateValidation ──────────────────────────────────────────────
@@ -878,7 +1075,16 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	change.Changed = now
 	change.From = string(v.Status)
 	toStatus := ValidationStatus(change.To)
+	if v.Status.IsTerminal() {
+		if v.Status == toStatus {
+			b.mu.Unlock()
+			return nil
+		}
+		b.mu.Unlock()
+		return fmt.Errorf("validation %q on claim %q is already terminal (%s)", validationID, claimID, v.Status)
+	}
 	accepted := claimAcceptedAfterValidation(c, validationID, toStatus)
+	acceptedFromStatus := c.Status
 	outboxRecords := []ClaimsOutboxRecord{
 		b.outboxRecordLocked(v.Sequence, "validation", v.ID, walEventValidationEvaluated, now),
 	}
@@ -910,6 +1116,21 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	}
 
 	validationDelta := b.buildValidationDeltaLocked(c, v, change, accepted, now)
+	claimSnapshot := CloneClaimEntity(c)
+	validationSnapshot := *v
+	if len(v.ExpectedToolCalls) > 0 {
+		validationSnapshot.ExpectedToolCalls = append([]ExpectedToolCall(nil), v.ExpectedToolCalls...)
+	}
+	var acceptedTransition *claimStatusTransition
+	if accepted {
+		acceptedTransition = &claimStatusTransition{
+			from:    acceptedFromStatus,
+			to:      ClaimStatusAccepted,
+			reason:  "all required validations passed",
+			agentID: change.AgentID,
+			changed: now,
+		}
+	}
 
 	b.mu.Unlock()
 
@@ -922,6 +1143,23 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		}
 	}
 	b.amplifier.PublishValidationDelta(ctx, validationDelta)
+	b.amplifier.PublishCanonicalValidationEvaluated(ctx, claimSnapshot, &validationSnapshot, change, accepted, now)
+	if acceptedTransition != nil {
+		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
+			SessionID:      b.sessionID,
+			BoardID:        b.boardID,
+			ClaimID:        claimID,
+			Sequence:       claimSnapshot.Sequence,
+			EmittedAt:      now,
+			ActionKind:     claimSnapshot.ActionType,
+			FromStatus:     acceptedTransition.from,
+			ToStatus:       acceptedTransition.to,
+			Reason:         acceptedTransition.reason,
+			AgentID:        acceptedTransition.agentID,
+			SubjectAgentID: SubjectAgentID(claimSnapshot.Relations),
+			IssuerAgentID:  IssuerAgentID(claimSnapshot.Relations),
+		})
+	}
 	claimToStatus := ClaimStatus(change.To)
 	if accepted {
 		claimToStatus = ClaimStatusAccepted
@@ -1003,6 +1241,12 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	change.From = string(c.Status)
 	change.To = string(ClaimStatusRejected)
 	change.Changed = now
+	if replacements != nil && len(replacementClaims) > 0 {
+		if err := b.validatePostActionLocked(ActionTypeCorrective, replacementClaims); err != nil {
+			b.mu.Unlock()
+			return err
+		}
+	}
 	prevSeq := b.seq.Load()
 	remediationIDs := b.prepareRemediationLocked(claimID, replacements, replacementClaims, change.AgentID, now)
 	outboxRecords := []ClaimsOutboxRecord{
@@ -1143,6 +1387,7 @@ func (b *ClaimsBoard) stampRemediationClaimLocked(rc *Claim, replacements *Actio
 	rc.Status = ClaimStatusPending
 	rc.Iteration = b.iteration + 1
 	rc.ActionType = replacements.Type
+	rc.ExpectedToolCalls = stampExpectedToolCalls(rc.ExpectedToolCalls)
 	rc.StatusHistory = append(rc.StatusHistory, StatusChange{
 		To:      string(ClaimStatusPending),
 		Reason:  "remediation for rejected claim " + rejectedID,
@@ -1584,8 +1829,7 @@ func (b *ClaimsBoard) ClaimByID(id string) (*Claim, bool) {
 	if !ok {
 		return nil, false
 	}
-	clone := *c
-	return &clone, true
+	return CloneClaimEntity(c), true
 }
 
 func (b *ClaimsBoard) ClaimsByRelation(relationship, relatedID string) []*Claim {
@@ -2151,6 +2395,13 @@ func (b *ClaimsBoard) shouldEmitFabricDirect() bool {
 		return true
 	}
 	return !b.durable.hasProjector(ProjectorFabric)
+}
+
+func (b *ClaimsBoard) shouldEmitCanonicalDirect() bool {
+	if b == nil || b.durable == nil {
+		return true
+	}
+	return !b.durable.hasProjector(ProjectorCanonicalDelta)
 }
 
 func (b *ClaimsBoard) outboxRecordLocked(sequence uint64, entityType, entityID, mutationKind string, createdAt time.Time) ClaimsOutboxRecord {

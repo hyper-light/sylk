@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	ProjectorFabric    = "fabric"
-	ProjectorKnowledge = "knowledge"
+	ProjectorFabric         = "fabric"
+	ProjectorCanonicalDelta = "canonical_delta"
+	ProjectorKnowledge      = "knowledge"
 )
 
 type ClaimsProjector interface {

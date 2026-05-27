@@ -19,21 +19,14 @@ import (
 func (pi *PipelineInspector) resumeContinuation(
 	ctx context.Context,
 	snapshot *agentShared.TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*agentShared.AwaitedClaimResult,
 ) error {
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("pipeline_inspector: nil consult-yield snapshot on resume")
 	}
 
 	if snapshot.AccumulatorState.AgentID != "" {
-		acc := claims.RestoreAccumulator(
-			snapshot.AccumulatorState.AgentID,
-			snapshot.AccumulatorState.SessionID,
-			snapshot.AccumulatorState.ClaimID,
-			snapshot.AccumulatorState.Started,
-			snapshot.AccumulatorState.Artifacts,
-			snapshot.AccumulatorState.Notes,
-		)
+		acc := agentShared.RestoreAccumulatorFromSnapshot(snapshot.AccumulatorState)
 		ctx = claims.WithTestamentAccumulator(ctx, acc)
 		defer acc.Flush(ctx, pi.claimsBoard, nil)
 	}
@@ -89,7 +82,7 @@ func pipelineLedgerCorrelation(ledger *steering.SteeringLedger, sessionID string
 	return "pipeline_inspector:turn"
 }
 
-func formatPipelineInspectorAwaitResults(results map[string]*claims.ConsultResolvedDelta) string {
+func formatPipelineInspectorAwaitResults(results map[string]*agentShared.AwaitedClaimResult) string {
 	formatted := agentShared.FormatConsultResults(results)
 	encoded, err := json.Marshal(formatted)
 	if err != nil {

@@ -2,8 +2,10 @@ package librarian
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/knowledgeruntime"
 	"github.com/adalundhe/sylk/core/search"
 )
@@ -25,6 +27,9 @@ func NewCommittedKnowledgeSearchSystem(backend committedKnowledgeSearcher) Searc
 func (s *committedKnowledgeSearchSystem) Search(ctx context.Context, queryText string, opts SearchOptions) (*CodeSearchResult, error) {
 	if s == nil || s.backend == nil {
 		return nil, knowledgeruntime.ErrCommittedBackendUnavailable
+	}
+	if err := waitForCommittedKnowledgeBackend(ctx, opts.SessionID); err != nil {
+		return nil, err
 	}
 
 	req := &search.SearchRequest{
@@ -61,6 +66,19 @@ func (s *committedKnowledgeSearchSystem) Search(ctx context.Context, queryText s
 		TotalHits: len(docs),
 		Took:      result.SearchTime,
 	}, nil
+}
+
+func waitForCommittedKnowledgeBackend(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(sessionID)
+	if board == nil {
+		return fmt.Errorf("knowledge backend readiness: session %q has no claims board", sessionID)
+	}
+	_, err := claims.WaitForKnowledgeBackendReady(ctx, board)
+	return err
 }
 
 func matchesRequestedNodeTypes(hit knowledgeruntime.CommittedSearchHit, requested []string) bool {

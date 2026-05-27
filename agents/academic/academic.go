@@ -518,14 +518,15 @@ func (a *Academic) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      a.id,
-		SessionID:    a.config.SessionID,
-		Bus:          bus,
-		Board:        a.academicBoard(),
-		Scope:        a.scope,
-		ProcessEntry: a.processClaimsEntry,
-		Identity:     a.identity,
-		Factory:      a.factory,
+		AgentID:             a.id,
+		SessionID:           a.config.SessionID,
+		Bus:                 bus,
+		Board:               a.academicBoard(),
+		Scope:               a.scope,
+		ProcessEntry:        a.processClaimsEntry,
+		Identity:            a.identity,
+		Factory:             a.factory,
+		ExpectedToolRuntime: a.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("academic_claims_inbox_start_failed", "error", err.Error())

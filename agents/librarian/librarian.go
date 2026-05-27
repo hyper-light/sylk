@@ -491,14 +491,15 @@ func (l *Librarian) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      l.id,
-		SessionID:    l.config.SessionID,
-		Bus:          bus,
-		Board:        l.librarianBoard(),
-		Scope:        l.scope,
-		ProcessEntry: l.processClaimsEntry,
-		Identity:     l.identity,
-		Factory:      l.factory,
+		AgentID:             l.id,
+		SessionID:           l.config.SessionID,
+		Bus:                 bus,
+		Board:               l.librarianBoard(),
+		Scope:               l.scope,
+		ProcessEntry:        l.processClaimsEntry,
+		Identity:            l.identity,
+		Factory:             l.factory,
+		ExpectedToolRuntime: l.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("librarian_claims_inbox_start_failed", "error", err.Error())

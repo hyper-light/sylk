@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrPeerSaturated is returned when a publisher's peer-side admission
@@ -55,9 +56,12 @@ const (
 	// caller. Highest non-response priority.
 	InboxClassConsultRequest
 
-	// InboxClassConsultResolved is a response/testimony delta the
-	// agent's loop is parked waiting on. Drop = caller's tool call
-	// times out. Highest priority — protected from any eviction.
+	// InboxClassConsultResolved is reserved for expectation-matched
+	// canonical response/testimony deltas once the inbox has
+	// subscriber-specific knowledge. Publisher-side classification
+	// defaults those canonical deltas to Observation; expectation
+	// subscriptions protect them from broad standing-subscription
+	// eviction.
 	InboxClassConsultResolved
 
 	numInboxClasses = int(InboxClassConsultResolved) + 1
@@ -76,7 +80,7 @@ func (c InboxClass) String() string {
 	case InboxClassConsultRequest:
 		return "consult_request"
 	case InboxClassConsultResolved:
-		return "consult_resolved"
+		return "consult_response"
 	}
 	return "unknown"
 }
@@ -89,9 +93,8 @@ func (c InboxClass) String() string {
 //   - InboxDelta with ActionTypeConsultation → ConsultRequest
 //   - InboxDelta with any other ActionType    → Directed
 //   - TestamentDelta / ValidationDelta with a directed claim_id the
-//     agent is awaiting → ConsultResolved (resolved at the inbox via
-//     expectations; defaults to Observation here for the publisher
-//     side, which has no per-subscriber knowledge)
+//     agent is awaiting → response handling is resolved by explicit
+//     expectations, not by an independent consult_resolved delta.
 //   - TestamentDelta / ValidationDelta otherwise → Observation
 //   - ClaimStatusDelta with rejected → Directed (remediator role
 //     responds); other statuses → Observation
@@ -101,6 +104,13 @@ func DeltaClass(d Delta) InboxClass {
 		return InboxClassObservation
 	}
 	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalDeltaClass(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return InboxClassObservation
+		}
+		return canonicalDeltaClass(*delta)
 	case InboxDelta:
 		return inboxDeltaClass(delta.ActionKind)
 	case *InboxDelta:
@@ -115,10 +125,21 @@ func DeltaClass(d Delta) InboxClass {
 		return claimStatusClass(delta.ToStatus)
 	case PhaseDelta, *PhaseDelta:
 		return InboxClassPhase
-	case ConsultResolvedDelta, *ConsultResolvedDelta:
-		return InboxClassConsultResolved
 	}
 	return InboxClassObservation
+}
+
+func canonicalDeltaClass(delta CanonicalDelta) InboxClass {
+	switch delta.Action {
+	case DeltaActionClaimDirected:
+		return inboxDeltaClass(delta.ClaimActionType())
+	case DeltaActionClaimTransitioned:
+		return claimStatusClass(delta.ClaimToStatus())
+	case DeltaActionTestamentSubmitted, DeltaActionValidationEvaluated, DeltaActionClaimProgressed:
+		return InboxClassObservation
+	default:
+		return InboxClassObservation
+	}
 }
 
 func inboxDeltaClass(kind ActionType) InboxClass {
@@ -215,6 +236,10 @@ func InboxPatternsFor(role ClaimsRole, sessionID, agentID string) []string {
 	// + auditor + phase + remediator + archivist.
 	out := make([]string, 0, len(activationTypes)+4)
 	if role.Has(RoleSubject) {
+		out = append(out,
+			CanonicalAgentActionPattern(sessionID, agentID, DeltaActionClaimDirected),
+			CanonicalAgentTypeActionPattern(sessionID, agentID, DeltaActionClaimDirected),
+		)
 		// RoleSubject subscribes to N narrow patterns — one per
 		// legitimate activation action type — instead of the broad
 		// AgentInboxPattern(*.*) firehose. System-internal action
@@ -227,26 +252,24 @@ func InboxPatternsFor(role ClaimsRole, sessionID, agentID string) []string {
 		for _, kind := range activationTypes {
 			out = append(out, AgentInboxActionPattern(sessionID, agentID, RelationshipSubject, kind))
 		}
-		// Personal consult-resolved channel: this agent receives
-		// resolutions only for consults it itself issued.
-		// ConsultResolvedDelta routing is per-originator, so the
-		// pattern is naturally narrow — no broadcast fan-out across
-		// the session.
-		out = append(out, ConsultResolvedPattern(sessionID, agentID))
 	}
 	if role.Has(RoleAuditor) {
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentSubmitted))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusTestified))
 	}
 	if role.Has(RolePhaseObserver) {
 		out = append(out, PhasePattern(sessionID))
 	}
 	if role.Has(RoleRemediator) {
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionClaimTransitioned))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusRejected))
 	}
 	if role.Has(RoleArchivist) {
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentSubmitted))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusTestified))
 	}
 	if role.Has(RoleObserver) {
+		out = append(out, CanonicalSessionPattern(sessionID))
 		// Wildcard set: every claim status, every context delta, every
 		// directed inbox delta in the session. The UI uses this to
 		// rebuild the chat tree + agent panel exclusively from claims
@@ -409,11 +432,16 @@ type ClaimsInbox struct {
 	// Expect(), consumed when a matching delta arrives via Ingest.
 	expectations map[string]*Expectation
 
+	// orphans buffers response-like deltas that arrived before the
+	// issuer registered the matching expectation. It is keyed by claim
+	// ID and reconciled synchronously in Expect().
+	orphans map[string][]orphanedInboxDelta
+
 	// expectationSubs holds one-shot, claim-specific bus subscriptions
 	// created by Expect(). RoleSubject deliberately does not subscribe to
 	// the claim.*.testified firehose, so issuer-side expectations need a
 	// narrow return channel for the specific claim they issued.
-	expectationSubs map[string]DeltaSubscription
+	expectationSubs map[string][]DeltaSubscription
 
 	board *ClaimsBoard
 
@@ -466,7 +494,8 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 		onResolved:      cfg.OnResolved,
 		seen:            newDedupLRU(queueCap),
 		expectations:    make(map[string]*Expectation),
-		expectationSubs: make(map[string]DeltaSubscription),
+		orphans:         make(map[string][]orphanedInboxDelta),
+		expectationSubs: make(map[string][]DeltaSubscription),
 		queueCap:        queueCap,
 	}, nil
 }
@@ -548,6 +577,7 @@ func (i *ClaimsInbox) Close() error {
 	i.subscriptions = nil
 	i.seen = nil
 	i.expectations = nil
+	i.orphans = nil
 	i.expectationSubs = nil
 	i.mu.Unlock()
 
@@ -576,66 +606,130 @@ func (i *ClaimsInbox) Expect(e *Expectation) {
 	}
 	copied := *e
 	copied.ClaimID = claimID
-	topic := expectationTopic(i.sessionID, &copied)
+	topics := expectationTopics(i.sessionID, &copied)
 
+	var entry *GraphEntryPoint
+	var releaseSubs []DeltaSubscription
 	i.mu.Lock()
 	if i.expectations != nil {
 		i.expectations[claimID] = &copied
 	}
-	needsSubscribe := topic != "" && i.expectationSubs[claimID] == nil
+	if orphan, ok := i.takeMatchingOrphanLocked(claimID, copied.ExpectedDelta); ok {
+		if i.expectations != nil {
+			delete(i.expectations, claimID)
+		}
+		releaseSubs = i.releaseExpectationSubscriptionsLocked(claimID)
+		i.matchCount.Add(1)
+		entry = ResolveEntryPoint(i.board, orphan.delta, copied.Priority, &copied)
+	}
+	needsSubscribe := entry == nil && len(topics) > 0 && len(i.expectationSubs[claimID]) == 0
 	i.mu.Unlock()
 
-	if needsSubscribe {
-		i.subscribeExpectationTopic(claimID, topic)
+	for _, sub := range releaseSubs {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
 	}
-}
-
-func expectationTopic(sessionID string, e *Expectation) string {
-	if e == nil {
-		return ""
-	}
-	switch strings.TrimSpace(e.ExpectedDelta) {
-	case DeltaKindTestament:
-		return ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified)
-	default:
-		return ""
-	}
-}
-
-func (i *ClaimsInbox) subscribeExpectationTopic(claimID, topic string) {
-	if i == nil || i.closed.Load() || strings.TrimSpace(claimID) == "" || strings.TrimSpace(topic) == "" {
-		return
-	}
-	handler := i.handler()
-	sub, err := i.subscriber.SubscribeDelta(topic, handler)
-	if err != nil {
-		slog.Error("claims_inbox_expectation_subscribe_failed",
+	if entry != nil {
+		slog.Info("claims_inbox_expectation_replayed_orphan",
 			"agent_id", i.agentID,
 			"session_id", i.sessionID,
 			"claim_id", claimID,
-			"topic", topic,
-			"error", err.Error(),
+			"delta_kind", entry.Delta.DeltaKind(),
+			"delta_key", entry.Delta.DeltaKey(),
 		)
+		if i.onResolved != nil {
+			i.onResolved(entry)
+		}
+		return
+	}
+	if needsSubscribe {
+		i.subscribeExpectationTopics(claimID, topics)
+	}
+}
+
+func expectationTopics(sessionID string, e *Expectation) []string {
+	if e == nil {
+		return nil
+	}
+	switch strings.TrimSpace(e.ExpectedDelta) {
+	case DeltaKindTestament:
+		return []string{
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionTestamentSubmitted),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimTransitioned),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusAccepted),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusRejected),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusSuperseded),
+		}
+	case DeltaKindValidation:
+		return []string{
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionValidationEvaluated),
+			ValidationVerdictPattern(sessionID, ValidationStatusPassed),
+			ValidationVerdictPattern(sessionID, ValidationStatusFailed),
+		}
+	case DeltaKindClaimStatus:
+		return []string{
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimTransitioned),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusAccepted),
+			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusRejected),
+		}
+	default:
+		return nil
+	}
+}
+
+func (i *ClaimsInbox) subscribeExpectationTopics(claimID string, topics []string) {
+	if i == nil || i.closed.Load() || strings.TrimSpace(claimID) == "" || len(topics) == 0 {
+		return
+	}
+	var subs []DeltaSubscription
+	for _, topic := range topics {
+		topic = strings.TrimSpace(topic)
+		if topic == "" {
+			continue
+		}
+		handler := i.handler()
+		sub, err := i.subscriber.SubscribeDelta(topic, handler)
+		if err != nil {
+			slog.Error("claims_inbox_expectation_subscribe_failed",
+				"agent_id", i.agentID,
+				"session_id", i.sessionID,
+				"claim_id", claimID,
+				"topic", topic,
+				"error", err.Error(),
+			)
+			for _, prior := range subs {
+				_ = prior.Unsubscribe()
+			}
+			return
+		}
+		subs = append(subs, sub)
+	}
+	if len(subs) == 0 {
 		return
 	}
 
 	keep := false
 	i.mu.Lock()
-	if !i.closed.Load() && i.expectations[claimID] != nil && i.expectationSubs[claimID] == nil {
-		i.expectationSubs[claimID] = sub
-		i.subscriptions = append(i.subscriptions, sub)
+	if !i.closed.Load() && i.expectations[claimID] != nil && len(i.expectationSubs[claimID]) == 0 {
+		i.expectationSubs[claimID] = subs
+		i.subscriptions = append(i.subscriptions, subs...)
 		keep = true
 	}
 	i.mu.Unlock()
 	if !keep {
-		_ = sub.Unsubscribe()
+		for _, sub := range subs {
+			_ = sub.Unsubscribe()
+		}
 		return
 	}
 	slog.Info("claims_inbox_expectation_subscribed",
 		"agent_id", i.agentID,
 		"session_id", i.sessionID,
 		"claim_id", claimID,
-		"topic", topic,
+		"topics", topics,
 	)
 }
 
@@ -682,6 +776,13 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 // lookups during diagnostics.
 func deltaDirectedAgentID(d Delta) string {
 	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalDirectedAgentID(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return ""
+		}
+		return canonicalDirectedAgentID(*delta)
 	case InboxDelta:
 		return delta.AgentID
 	case *InboxDelta:
@@ -702,9 +803,16 @@ func deltaDirectedAgentID(d Delta) string {
 	return ""
 }
 
+func canonicalDirectedAgentID(delta CanonicalDelta) string {
+	if delta.Delivery == nil || len(delta.Delivery.To) == 0 {
+		return ""
+	}
+	return delta.Delivery.To[0].RouteKey()
+}
+
 func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscription) {
 	// Dedup.
-	key := d.DeltaKey()
+	key := deltaDedupKey(d)
 	seq := d.DeltaSequence()
 	if i.seen == nil {
 		return nil, nil
@@ -716,7 +824,7 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 	// Match against expectations first (O(1) by claim_id).
 	claimID := deltaClaimID(d)
 	if claimID != "" && i.expectations != nil {
-		if exp, ok := i.expectations[claimID]; ok && exp.ExpectedDelta == d.DeltaKind() {
+		if exp, ok := i.expectations[claimID]; ok && deltaMatchesExpectation(d, exp.ExpectedDelta) {
 			delete(i.expectations, claimID)
 			releaseSubs := i.releaseExpectationSubscriptionsLocked(claimID)
 			i.matchCount.Add(1)
@@ -731,8 +839,222 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 		return ResolveEntryPoint(i.board, d, priority, nil), nil
 	}
 
-	// Unmatched — discard.
+	// Unmatched response-like deltas may have beaten expectation
+	// registration. Buffer briefly by claim ID so Expect can reconcile
+	// without polling the board or replaying the bus.
+	i.stashOrphanIfResponseLocked(d)
 	return nil, nil
+}
+
+func deltaDedupKey(d Delta) string {
+	if d == nil {
+		return ""
+	}
+	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalSemanticDedupKey(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return ""
+		}
+		return canonicalSemanticDedupKey(*delta)
+	default:
+		return d.DeltaKey()
+	}
+}
+
+func canonicalSemanticDedupKey(delta CanonicalDelta) string {
+	claimID := delta.ClaimID()
+	switch delta.Action {
+	case DeltaActionClaimDirected:
+		directed := ""
+		relationship := ""
+		if delta.Delivery != nil {
+			relationship = delta.Delivery.Relationship
+			if len(delta.Delivery.To) > 0 {
+				directed = delta.Delivery.To[0].RouteKey()
+			}
+		}
+		return inboxDeltaKey(claimID, directed, relationship)
+	case DeltaActionTestamentSubmitted:
+		return DeltaKindTestament + "|" + delta.TestamentID()
+	case DeltaActionValidationEvaluated:
+		return DeltaKindValidation + "|" + delta.ValidationID()
+	case DeltaActionClaimTransitioned:
+		return DeltaKindClaimStatus + "|" + claimID + "|" + string(delta.ClaimToStatus())
+	default:
+		if key := strings.TrimSpace(delta.Key); key != "" {
+			return key
+		}
+		return string(delta.Action) + "|" + claimID
+	}
+}
+
+func deltaMatchesExpectation(d Delta, expected string) bool {
+	expected = strings.TrimSpace(expected)
+	if d == nil || expected == "" {
+		return false
+	}
+	if d.DeltaKind() == expected {
+		return true
+	}
+	switch expected {
+	case DeltaKindTestament:
+		if d.DeltaKind() == string(DeltaActionTestamentSubmitted) {
+			return true
+		}
+		if d.DeltaKind() == string(DeltaActionClaimTransitioned) {
+			return claimTransitionDeltaResolvesExpectation(d)
+		}
+		if d.DeltaKind() == DeltaKindClaimStatus {
+			return claimStatusDeltaResolvesExpectation(d)
+		}
+		return false
+	case DeltaKindValidation:
+		return d.DeltaKind() == string(DeltaActionValidationEvaluated)
+	case DeltaKindClaimStatus:
+		return d.DeltaKind() == string(DeltaActionClaimTransitioned)
+	default:
+		return false
+	}
+}
+
+func claimTransitionDeltaResolvesExpectation(d Delta) bool {
+	switch delta := d.(type) {
+	case CanonicalDelta:
+		return claimStatusResolvesExpectation(delta.ClaimToStatus())
+	case *CanonicalDelta:
+		return delta != nil && claimStatusResolvesExpectation(delta.ClaimToStatus())
+	default:
+		return false
+	}
+}
+
+func claimStatusDeltaResolvesExpectation(d Delta) bool {
+	switch delta := d.(type) {
+	case ClaimStatusDelta:
+		return claimStatusResolvesExpectation(delta.ToStatus)
+	case *ClaimStatusDelta:
+		return delta != nil && claimStatusResolvesExpectation(delta.ToStatus)
+	default:
+		return false
+	}
+}
+
+func claimStatusResolvesExpectation(status ClaimStatus) bool {
+	return status == ClaimStatusTestified || status.IsTerminal()
+}
+
+const orphanInboxDeltaMaxAge = 10 * time.Minute
+
+type orphanedInboxDelta struct {
+	delta     Delta
+	stashedAt time.Time
+}
+
+func (i *ClaimsInbox) takeMatchingOrphanLocked(claimID, expected string) (orphanedInboxDelta, bool) {
+	if i == nil || i.orphans == nil {
+		return orphanedInboxDelta{}, false
+	}
+	list := i.orphans[claimID]
+	if len(list) == 0 {
+		return orphanedInboxDelta{}, false
+	}
+	now := time.Now()
+	kept := list[:0]
+	var found orphanedInboxDelta
+	matched := false
+	for _, orphan := range list {
+		if orphan.delta == nil || now.Sub(orphan.stashedAt) > orphanInboxDeltaMaxAge {
+			continue
+		}
+		if !matched && deltaMatchesExpectation(orphan.delta, expected) {
+			found = orphan
+			matched = true
+			continue
+		}
+		kept = append(kept, orphan)
+	}
+	if len(kept) == 0 {
+		delete(i.orphans, claimID)
+	} else {
+		i.orphans[claimID] = kept
+	}
+	return found, matched
+}
+
+func (i *ClaimsInbox) stashOrphanIfResponseLocked(d Delta) {
+	if i == nil || i.orphans == nil || d == nil {
+		return
+	}
+	claimID := deltaClaimID(d)
+	if claimID == "" || !deltaMayResolveFutureExpectation(d) {
+		return
+	}
+	now := time.Now()
+	list := i.orphans[claimID]
+	kept := list[:0]
+	for _, orphan := range list {
+		if orphan.delta == nil || now.Sub(orphan.stashedAt) > orphanInboxDeltaMaxAge {
+			continue
+		}
+		if orphan.delta.DeltaKey() == d.DeltaKey() && orphan.delta.DeltaSequence() == d.DeltaSequence() {
+			continue
+		}
+		kept = append(kept, orphan)
+	}
+	kept = append(kept, orphanedInboxDelta{delta: d, stashedAt: now})
+	if capLimit := i.orphanLimitLocked(); len(kept) > capLimit {
+		kept = kept[len(kept)-capLimit:]
+	}
+	i.orphans[claimID] = kept
+}
+
+func (i *ClaimsInbox) orphanLimitLocked() int {
+	limit := i.queueCap
+	if limit <= 0 {
+		limit = busSubscriptionQueueCapDefault
+	}
+	if limit < 16 {
+		limit = 16
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	return limit
+}
+
+func deltaMayResolveFutureExpectation(d Delta) bool {
+	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalDeltaMayResolveFutureExpectation(delta)
+	case *CanonicalDelta:
+		return delta != nil && canonicalDeltaMayResolveFutureExpectation(*delta)
+	case TestamentDelta, *TestamentDelta:
+		return true
+	case ValidationDelta, *ValidationDelta:
+		return true
+	case ClaimStatusDelta:
+		return claimStatusResolvesExpectation(delta.ToStatus)
+	case *ClaimStatusDelta:
+		return delta != nil && claimStatusResolvesExpectation(delta.ToStatus)
+	default:
+		return false
+	}
+}
+
+func canonicalDeltaMayResolveFutureExpectation(delta CanonicalDelta) bool {
+	if !DeltaActionMayCompleteExpectedWork(delta.Action) {
+		return false
+	}
+	switch delta.Action {
+	case DeltaActionTestamentSubmitted, DeltaActionValidationEvaluated:
+		return true
+	case DeltaActionClaimTransitioned:
+		return claimStatusResolvesExpectation(delta.ClaimToStatus())
+	default:
+		return false
+	}
 }
 
 func (i *ClaimsInbox) releaseExpectationSubscriptionsLocked(claimID string) []DeltaSubscription {
@@ -740,11 +1062,11 @@ func (i *ClaimsInbox) releaseExpectationSubscriptionsLocked(claimID string) []De
 		return nil
 	}
 	sub := i.expectationSubs[claimID]
-	if sub == nil {
+	if len(sub) == 0 {
 		return nil
 	}
 	delete(i.expectationSubs, claimID)
-	return []DeltaSubscription{sub}
+	return sub
 }
 
 // matchesStandingSubscription is a defense-in-depth guard that the
@@ -764,6 +1086,13 @@ func (i *ClaimsInbox) matchesStandingSubscription(d Delta) bool {
 		role = RoleSubject
 	}
 	switch delta := d.(type) {
+	case CanonicalDelta:
+		return i.matchesCanonicalStandingSubscription(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return false
+		}
+		return i.matchesCanonicalStandingSubscription(*delta)
 	case InboxDelta:
 		if IsSystemInternalAction(delta.ActionKind) {
 			return false
@@ -821,10 +1150,6 @@ func (i *ClaimsInbox) matchesStandingSubscription(d Delta) bool {
 		return role.Has(RoleObserver) && delta.ClaimAutoAccepted
 	case PhaseDelta, *PhaseDelta:
 		return role.Has(RolePhaseObserver) || role.Has(RoleObserver)
-	case ConsultResolvedDelta:
-		return role.Has(RoleSubject) && delta.OriginatorAgentID == i.agentID
-	case *ConsultResolvedDelta:
-		return role.Has(RoleSubject) && delta.OriginatorAgentID == i.agentID
 	case ClaimContextDelta:
 		if IsSystemInternalAction(delta.ActionKind) {
 			return false
@@ -841,6 +1166,37 @@ func (i *ClaimsInbox) matchesStandingSubscription(d Delta) bool {
 		return role.Has(RoleObserver)
 	}
 	return false
+}
+
+func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta) bool {
+	role := i.role
+	if role == 0 {
+		role = RoleSubject
+	}
+	switch delta.Action {
+	case DeltaActionClaimDirected:
+		if IsSystemInternalAction(delta.ClaimActionType()) {
+			return false
+		}
+		if role.Has(RoleObserver) {
+			return true
+		}
+		return role.Has(RoleSubject) && delta.DeliveredTo(i.agentID)
+	case DeltaActionTestamentSubmitted:
+		if IsSystemInternalAction(delta.ClaimActionType()) {
+			return false
+		}
+		return role.Has(RoleAuditor) || role.Has(RoleArchivist) || role.Has(RoleObserver)
+	case DeltaActionClaimTransitioned:
+		if IsSystemInternalAction(delta.ClaimActionType()) {
+			return false
+		}
+		return claimStatusMatchesRole(role, delta.ClaimToStatus()) || role.Has(RoleObserver)
+	case DeltaActionValidationEvaluated, DeltaActionClaimProgressed:
+		return role.Has(RoleObserver)
+	default:
+		return false
+	}
 }
 
 func claimStatusMatchesRole(role ClaimsRole, status ClaimStatus) bool {
@@ -999,6 +1355,13 @@ func (i *ClaimsInbox) handler() DeltaHandler {
 // one. Returns empty string for PhaseDelta.
 func deltaClaimID(d Delta) string {
 	switch delta := d.(type) {
+	case CanonicalDelta:
+		return delta.ClaimID()
+	case *CanonicalDelta:
+		if delta == nil {
+			return ""
+		}
+		return delta.ClaimID()
 	case InboxDelta:
 		return delta.ClaimID
 	case *InboxDelta:
@@ -1023,6 +1386,13 @@ func deltaClaimID(d Delta) string {
 // matched a standing subscription.
 func derivePriority(d Delta) WorkUnitPriority {
 	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalPriority(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return PriorityAdvisory
+		}
+		return canonicalPriority(*delta)
 	case InboxDelta:
 		return inboxDeltaPriority(delta.ActionKind)
 	case *InboxDelta:
@@ -1039,6 +1409,23 @@ func derivePriority(d Delta) WorkUnitPriority {
 		return PriorityPhase
 	}
 	return PriorityAdvisory
+}
+
+func canonicalPriority(delta CanonicalDelta) WorkUnitPriority {
+	switch delta.Action {
+	case DeltaActionClaimDirected:
+		return inboxDeltaPriority(delta.ClaimActionType())
+	case DeltaActionTestamentSubmitted:
+		return PriorityResponse
+	case DeltaActionValidationEvaluated:
+		return PriorityEvaluation
+	case DeltaActionClaimTransitioned:
+		return claimStatusPriority(delta.ClaimToStatus())
+	case DeltaActionClaimProgressed:
+		return PriorityAdvisory
+	default:
+		return PriorityAdvisory
+	}
 }
 
 func inboxDeltaPriority(kind ActionType) WorkUnitPriority {

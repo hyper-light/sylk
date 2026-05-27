@@ -1,0 +1,228 @@
+package claims
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+const (
+	KnowledgeBackendReadyClaimID  = "knowledge_backend.ready"
+	KnowledgeBackendAgentID       = "knowledge_backend"
+	KnowledgeBackendReadyQuality  = "knowledge_backend.ready"
+	KnowledgeBackendReadyScopeKey = "committed_search"
+)
+
+var (
+	ErrNilKnowledgeReadinessBoard = errors.New("claims: knowledge readiness requires a claims board")
+)
+
+// EnsureKnowledgeBackendReadyClaim posts the deterministic board-local claim
+// that knowledge searches wait on. The claim is intentionally system-internal:
+// it produces ordinary board mutation deltas for waiters without waking a
+// conversational agent.
+func EnsureKnowledgeBackendReadyClaim(ctx context.Context, board *ClaimsBoard) error {
+	if board == nil {
+		return ErrNilKnowledgeReadinessBoard
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); ok {
+		return nil
+	}
+	err := board.PostAction(ctx, knowledgeBackendReadyAction(), []Claim{knowledgeBackendReadyClaim()})
+	if isDuplicateKnowledgeReadyClaim(err) {
+		return nil
+	}
+	return err
+}
+
+// KnowledgeBackendReadyTestament returns the first readiness testament linked
+// to the deterministic knowledge-backend readiness claim.
+func KnowledgeBackendReadyTestament(board *ClaimsBoard) (*Testament, bool) {
+	if board == nil {
+		return nil, false
+	}
+	for _, testament := range board.TestamentsByClaim(KnowledgeBackendReadyClaimID) {
+		if knowledgeReadinessTestamentReady(testament) {
+			return testament, true
+		}
+	}
+	return nil, false
+}
+
+// SubmitKnowledgeBackendReadyTestament records that the committed knowledge
+// backend is searchable. Existing readiness testimony is reused so repeated
+// partial/full readiness events stay idempotent.
+func SubmitKnowledgeBackendReadyTestament(ctx context.Context, board *ClaimsBoard, metadata map[string]any) (*Testament, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if testament, ok := KnowledgeBackendReadyTestament(board); ok {
+		return testament, nil
+	}
+	if err := EnsureKnowledgeBackendReadyClaim(ctx, board); err != nil {
+		return nil, err
+	}
+	testament := knowledgeBackendReadyTestament(metadata)
+	if err := board.SubmitTestaments(ctx, knowledgeBackendReadyTestamentAction(), []Testament{testament}); err != nil {
+		return nil, err
+	}
+	if submitted, ok := KnowledgeBackendReadyTestament(board); ok {
+		return submitted, nil
+	}
+	return nil, fmt.Errorf("claims: knowledge readiness testament was submitted but is not queryable")
+}
+
+// WaitForKnowledgeBackendReady waits for a readiness testament using board
+// mutation deltas. It never polls; callers should pass a request-scoped context
+// so cancellation or tool timeout bounds the wait.
+func WaitForKnowledgeBackendReady(ctx context.Context, board *ClaimsBoard) (*Testament, error) {
+	if board == nil {
+		return nil, ErrNilKnowledgeReadinessBoard
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if testament, ok := KnowledgeBackendReadyTestament(board); ok {
+		return testament, nil
+	}
+
+	ready := make(chan struct{}, 1)
+	unsubscribe := board.SubscribeDelta(func(delta BoardMutationDelta) error {
+		if delta.Kind == "testament_submitted" && delta.ClaimID == KnowledgeBackendReadyClaimID {
+			select {
+			case ready <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	})
+	defer unsubscribe()
+
+	if err := EnsureKnowledgeBackendReadyClaim(ctx, board); err != nil {
+		return nil, err
+	}
+	if testament, ok := KnowledgeBackendReadyTestament(board); ok {
+		return testament, nil
+	}
+
+	for {
+		select {
+		case <-ready:
+			if testament, ok := KnowledgeBackendReadyTestament(board); ok {
+				return testament, nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func knowledgeBackendReadyAction() Action {
+	return Action{
+		ID:      KnowledgeBackendReadyClaimID + ".action",
+		AgentID: KnowledgeBackendAgentID,
+		Type:    ActionTypeBoot,
+		Relations: []Relation{
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+	}
+}
+
+func knowledgeBackendReadyClaim() Claim {
+	return Claim{
+		ID:          KnowledgeBackendReadyClaimID,
+		AgentID:     KnowledgeBackendAgentID,
+		Title:       "Committed knowledge backend ready",
+		Description: "Committed knowledge search must wait until the backend posts readiness testimony.",
+		ActionType:  ActionTypeBoot,
+		Context:     "Awaiting committed knowledge backend readiness testament",
+		Scope:       []ClaimScopeEntry{{Kind: "knowledge_backend", Key: KnowledgeBackendReadyScopeKey}},
+		Relations: []Relation{
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+		Validations: []*Validation{
+			{
+				ID:          KnowledgeBackendReadyClaimID + ".receipt",
+				Description: "Knowledge backend readiness testament received",
+				QualityBar:  KnowledgeBackendReadyQuality,
+				Type:        ValidationTypeReceipt,
+				Required:    true,
+			},
+		},
+	}
+}
+
+func knowledgeBackendReadyTestament(metadata map[string]any) Testament {
+	return Testament{
+		AgentID:    KnowledgeBackendAgentID,
+		Summary:    "Committed knowledge backend is ready.",
+		Confidence: "committed",
+		Relations: []Relation{
+			{Related: KnowledgeBackendReadyClaimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+		Artifacts: []*Artifact{
+			{
+				AgentID:   KnowledgeBackendAgentID,
+				Kind:      ArtifactKindReadiness,
+				Reference: "committed knowledge backend ready",
+				Metadata:  knowledgeBackendReadyMetadata(metadata),
+			},
+		},
+	}
+}
+
+func knowledgeBackendReadyTestamentAction() Action {
+	return Action{
+		AgentID: KnowledgeBackendAgentID,
+		Type:    ActionTypeTestament,
+		Relations: []Relation{
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+			{Related: KnowledgeBackendReadyClaimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+		},
+	}
+}
+
+func knowledgeBackendReadyMetadata(metadata map[string]any) map[string]any {
+	out := make(map[string]any, len(metadata)+2)
+	for key, value := range metadata {
+		if strings.TrimSpace(key) != "" {
+			out[key] = value
+		}
+	}
+	out["component"] = KnowledgeBackendAgentID
+	out["quality_bar"] = KnowledgeBackendReadyQuality
+	return out
+}
+
+func knowledgeReadinessTestamentReady(testament *Testament) bool {
+	if testament == nil || DeriveTestamentVerdict(testament.Artifacts) == TestamentVerdictError {
+		return false
+	}
+	for _, artifact := range testament.Artifacts {
+		if knowledgeReadinessArtifactReady(artifact) {
+			return true
+		}
+	}
+	return false
+}
+
+func knowledgeReadinessArtifactReady(artifact *Artifact) bool {
+	if artifact == nil || artifact.Kind != ArtifactKindReadiness {
+		return false
+	}
+	component, _ := artifact.Metadata["component"].(string)
+	return component == KnowledgeBackendAgentID
+}
+
+func isDuplicateKnowledgeReadyClaim(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "duplicate claim ID")
+}

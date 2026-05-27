@@ -49,9 +49,9 @@ func TestCompleteYieldedToolFromContinuationRecordsPairedCompletion(t *testing.T
 			}},
 		}}},
 	}
-	results := map[string]*claims.ConsultResolvedDelta{
+	results := map[string]*AwaitedClaimResult{
 		"consult-1": {
-			ConsultID:        "consult-1",
+			ClaimID:          "consult-1",
 			Status:           claims.ConsultStatusCompleted,
 			ResponseSummary:  "Found existing project structure.",
 			ResponderAgentID: "librarian",

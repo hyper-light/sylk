@@ -100,6 +100,10 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 			db.outbox = outbox
 		}
 		db.board.durable = db
+		db.board.canonicalViaOutbox = db.hasProjector(ProjectorCanonicalDelta)
+		if db.board.amplifier != nil {
+			db.board.amplifier.WithCanonicalDirectEnabled(!db.board.canonicalViaOutbox)
+		}
 		return db, nil
 	}
 
@@ -131,6 +135,10 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 	}
 	db.board = board
 	db.board.durable = db
+	db.board.canonicalViaOutbox = db.hasProjector(ProjectorCanonicalDelta)
+	if db.board.amplifier != nil {
+		db.board.amplifier.WithCanonicalDirectEnabled(!db.board.canonicalViaOutbox)
+	}
 	db.seq = snapshotSeq
 
 	if !cfg.DisableOutbox {
@@ -632,8 +640,15 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 		if claimRel != nil {
 			if c, ok := b.claims[claimRel.Related]; ok && !c.Status.IsTerminal() {
 				c.Status = ClaimStatusTestified
-				autoPassReceiptValidationsLocked(c, t.AgentID, event.CreatedAt)
-				if c.AllValidationsPassed() {
+				if DeriveTestamentVerdict(t.Artifacts) == TestamentVerdictError {
+					failReceiptValidationsLocked(c, t.AgentID, event.CreatedAt, "receipt failed: error testament submitted")
+					if claimHasRequiredFailedValidation(c) {
+						c.Status = ClaimStatusRejected
+					}
+				} else {
+					autoPassReceiptValidationsLocked(c, t.AgentID, event.CreatedAt)
+				}
+				if c.AllValidationsPassed() && !c.Status.IsTerminal() {
 					c.Status = ClaimStatusAccepted
 				}
 			}
@@ -781,6 +796,9 @@ func durableProjectors(cfg ClaimsBoardConfig) []ClaimsProjector {
 		return nil
 	}
 	projectors := []ClaimsProjector{NewFabricProjector()}
+	if cfg.DeltaBus != nil {
+		projectors = append(projectors, NewCanonicalDeltaProjector(cfg.DeltaBus, cfg.AgentRefResolver))
+	}
 	projectors = append(projectors, cfg.Projectors...)
 	return projectors
 }

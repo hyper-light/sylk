@@ -636,15 +636,16 @@ func (g *Guardian) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:           g.id,
-		SessionID:         g.activeSessionID,
-		Bus:               bus,
-		Board:             g.guardianBoard(),
-		Scope:             g.scope,
-		ProcessEntry:      g.processClaimsEntry,
-		Identity:          g.identity,
-		Factory:           g.factory,
-		ContinuationStore: g.continuationStore,
+		AgentID:             g.id,
+		SessionID:           g.activeSessionID,
+		Bus:                 bus,
+		Board:               g.guardianBoard(),
+		Scope:               g.scope,
+		ProcessEntry:        g.processClaimsEntry,
+		Identity:            g.identity,
+		Factory:             g.factory,
+		ContinuationStore:   g.continuationStore,
+		ExpectedToolRuntime: g.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("guardian_claims_inbox_start_failed", "error", err.Error())

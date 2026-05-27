@@ -96,23 +96,7 @@ func (a *Architect) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
-		// Architect already has a sync-route path via requestRouteSync,
-		// but the shared bus-based helper achieves the same thing and
-		// keeps the wiring uniform with every other caller. The architect's
-		// own requestConsultationWithMetadata continues to use its
-		// per-agent pending-bus-wait path for targeted consultations
-		// with admission/cache integration; consult_peer via this skill
-		// is the fabric-level primitive that any agent can call.
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return a.bus },
-			func() string {
-				if a.channels == nil {
-					return ""
-				}
-				return a.channels.Responses
-			},
-		),
-		Inbox: func() *claims.ClaimsInbox { return a.claimsInbox },
+		Inbox:      func() *claims.ClaimsInbox { return a.claimsInbox },
 	}) {
 		a.skills.Register(skill)
 	}

@@ -672,6 +672,9 @@ func (m *Model) Update(incoming tea.Msg) (component.Component, tea.Cmd) {
 	case msg.ClaimArtifactCompletedMsg:
 		m.viewDirty = true
 		return m, m.handleClaimArtifactCompleted(typed)
+	case msg.ClaimPeerInteractionMsg:
+		m.viewDirty = true
+		return m, m.handleClaimPeerInteraction(typed)
 	case msg.ClaimResponseTextMsg:
 		m.viewDirty = true
 		return m, m.handleClaimResponseText(typed)
@@ -1642,6 +1645,9 @@ func formatRetryDelay(d time.Duration) string {
 // correlationID first, then falls back to the thinking placeholder.
 func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 	m.clearExplicitTopLevelTransferState(ev.CorrelationID, ev.ParentCorrelationID, ev.BranchRef, ev.TopLevelTransfer)
+	if suppressClaimsBackedPeerToolEvent(ev) {
+		return nil
+	}
 	if ev.BranchRef != nil {
 		m.handleNestedToolCallEvent(ev)
 		return nil
@@ -1721,6 +1727,15 @@ func (m *Model) handleToolCallEvent(ev msg.ToolCallEventMsg) tea.Cmd {
 		m.reconcileToolDerivedThinkingProgress(idx)
 	}
 	return nil
+}
+
+func suppressClaimsBackedPeerToolEvent(ev msg.ToolCallEventMsg) bool {
+	switch strings.TrimSpace(ev.ToolName) {
+	case "consult_peer", "challenge_peer", "guardian_check":
+		return true
+	default:
+		return false
+	}
 }
 
 // toolCallRecordMatchesEvent pairs a stored start record with an incoming
@@ -6958,6 +6973,14 @@ func (m *Model) handleClaimArtifactCompleted(ev msg.ClaimArtifactCompletedMsg) t
 	if completed != nil {
 		m.completeClaimArtifactInHistory(completed)
 	}
+	return nil
+}
+
+func (m *Model) handleClaimPeerInteraction(ev msg.ClaimPeerInteractionMsg) tea.Cmd {
+	if ev.SuppressChat {
+		return nil
+	}
+	m.projectClaimPeerInteractionToHistory(ev)
 	return nil
 }
 

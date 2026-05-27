@@ -48,14 +48,9 @@ type ToolCallRecord struct {
 	// responses, and validations instead of the generic tool-call block.
 	InterAgent *InterAgentTool
 
-	// OrphanedAtRender is a transient flag the renderer sets on a per-frame
-	// copy when the row has been pending for more than the orphan threshold
-	// AND the agent has emitted enough subsequent tool events to suggest the
-	// agent has moved on without seeing this call's Complete. The duration
-	// formatter swaps the live spinner for a `?` glyph so the user is not
-	// misled into thinking the tool is still genuinely running. This does
-	// NOT mutate the persisted row — `renderToolCalls` makes a local copy
-	// before stuffing the flag, so toggling is purely cosmetic.
+	// OrphanedAtRender is a retained compatibility field. The renderer no
+	// longer infers orphan status from adjacent activity; pending rows stay
+	// pending until canonical completion/error evidence arrives.
 	OrphanedAtRender bool
 }
 
@@ -124,13 +119,20 @@ type InterAgentChildActivity struct {
 // row; values ≥2 suffix the headline with "×N" so the pattern is visible
 // without spawning duplicate rows.
 type InterAgentTool struct {
-	Kind        InterAgentToolKind
-	ThreadKey   string
-	AgentTypes  []string
-	Summary     string
-	Status      InterAgentToolStatus
-	Children    []InterAgentChildActivity
-	RepeatCount int
+	Kind           InterAgentToolKind
+	ThreadKey      string
+	ClaimID        string
+	IssuerAgentID  string
+	SubjectAgentID string
+	TestamentID    string
+	ValidationID   string
+	DeltaKey       string
+	Sequence       uint64
+	AgentTypes     []string
+	Summary        string
+	Status         InterAgentToolStatus
+	Children       []InterAgentChildActivity
+	RepeatCount    int
 }
 
 // ToolCallRegion describes a tool call block's position within rendered lines.

@@ -30,7 +30,7 @@ import (
 func (a *Architect) resumeContinuation(
 	ctx context.Context,
 	snapshot *shared.TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*shared.AwaitedClaimResult,
 ) error {
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("architect: nil consult-yield snapshot on resume")
@@ -40,14 +40,7 @@ func (a *Architect) resumeContinuation(
 	// Restore the in-flight accumulator so the resumed turn keeps
 	// producing into the same testament.
 	if snapshot.AccumulatorState.AgentID != "" {
-		acc := claims.RestoreAccumulator(
-			snapshot.AccumulatorState.AgentID,
-			snapshot.AccumulatorState.SessionID,
-			snapshot.AccumulatorState.ClaimID,
-			snapshot.AccumulatorState.Started,
-			snapshot.AccumulatorState.Artifacts,
-			snapshot.AccumulatorState.Notes,
-		)
+		acc := shared.RestoreAccumulatorFromSnapshot(snapshot.AccumulatorState)
 		ctx = claims.WithTestamentAccumulator(ctx, acc)
 		defer acc.Flush(ctx, a.architectBoard(), a.architectScope())
 	}
@@ -169,7 +162,7 @@ func ledgerCorrelationOrDefault(ledger *steering.SteeringLedger, sessionID strin
 // JSON payload the LLM expects from await_consults — same shape the
 // fast path returns, so the LLM cannot tell whether the await
 // resolved inline or after a yield.
-func formatAwaitResultsContent(results map[string]*claims.ConsultResolvedDelta) string {
+func formatAwaitResultsContent(results map[string]*shared.AwaitedClaimResult) string {
 	formatted := shared.FormatConsultResults(results)
 	encoded, err := json.Marshal(formatted)
 	if err != nil {

@@ -23,7 +23,7 @@ const yieldedToolArtifactOutputMax = 4096
 func CompleteYieldedToolFromContinuation(
 	ctx context.Context,
 	snapshot *TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*AwaitedClaimResult,
 	output string,
 ) bool {
 	if snapshot == nil {
@@ -214,7 +214,7 @@ func yieldedToolAgentID(snapshot *TurnSnapshot, started *claims.Artifact, acc *c
 	return strings.TrimSpace(snapshot.AccumulatorState.AgentID)
 }
 
-func yieldedToolCompletionOutcome(results map[string]*claims.ConsultResolvedDelta) (success bool, outcome, errorMsg string) {
+func yieldedToolCompletionOutcome(results map[string]*AwaitedClaimResult) (success bool, outcome, errorMsg string) {
 	if len(results) == 0 {
 		return false, "failure", "no consult results received"
 	}
@@ -257,7 +257,7 @@ func yieldedToolCompletionOutcome(results map[string]*claims.ConsultResolvedDelt
 
 func yieldedToolInterAgentCompletion(
 	toolName string,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*AwaitedClaimResult,
 	success bool,
 	errorMsg string,
 ) *InterAgentToolEvent {
@@ -282,7 +282,7 @@ func yieldedToolInterAgentCompletion(
 	}
 }
 
-func yieldedToolResponderAgentTypes(results map[string]*claims.ConsultResolvedDelta) []string {
+func yieldedToolResponderAgentTypes(results map[string]*AwaitedClaimResult) []string {
 	seen := make(map[string]struct{})
 	out := make([]string, 0, len(results))
 	for _, result := range results {
@@ -302,7 +302,7 @@ func yieldedToolResponderAgentTypes(results map[string]*claims.ConsultResolvedDe
 	return out
 }
 
-func yieldedToolResultSummary(results map[string]*claims.ConsultResolvedDelta, errorMsg string) string {
+func yieldedToolResultSummary(results map[string]*AwaitedClaimResult, errorMsg string) string {
 	if strings.TrimSpace(errorMsg) != "" {
 		return strings.TrimSpace(errorMsg)
 	}

@@ -109,23 +109,7 @@ func TestInterAgentBranchCompleteFromMessage_TreatsTerminalGuideErrorAsFailure(t
 	})
 	branch.CompleteFromMessage(branchCtx, guide.NewErrorMessage("err-1", "corr-parent", "academic", "academic consultation failed: provider unavailable"), nil)
 
-	if len(events) != 2 {
-		t.Fatalf("emitted events = %d, want 2", len(events))
-	}
-	complete := events[1]
-	if complete.Success {
-		t.Fatal("expected failed completion event")
-	}
-	if complete.ErrorMsg != "academic consultation failed: provider unavailable" {
-		t.Fatalf("error = %q", complete.ErrorMsg)
-	}
-	if complete.InterAgent == nil {
-		t.Fatal("expected inter-agent metadata on completion")
-	}
-	if complete.InterAgent.Status != InterAgentToolEventStatusFailed {
-		t.Fatalf("status = %q, want %q", complete.InterAgent.Status, InterAgentToolEventStatusFailed)
-	}
-	if complete.InterAgent.Summary != "academic consultation failed: provider unavailable" {
-		t.Fatalf("summary = %q", complete.InterAgent.Summary)
+	if len(events) != 0 {
+		t.Fatalf("consult branch emitted %d events; consult rows must be projected from claims deltas", len(events))
 	}
 }

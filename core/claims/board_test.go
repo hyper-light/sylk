@@ -197,6 +197,48 @@ func TestSubmitTestaments(t *testing.T) {
 	}
 }
 
+func TestSubmitErrorTestamentFailsReceiptAndRejectsClaim(t *testing.T) {
+	b := testBoard()
+	ctx := context.Background()
+	claim := testClaim("c1", "claim")
+	claim.Validations = []*Validation{{
+		Description: "response received",
+		Type:        ValidationTypeReceipt,
+		Required:    true,
+	}}
+	if err := b.PostAction(ctx, Action{AgentID: "architect", Type: ActionTypeConsultation}, []Claim{claim}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := b.SubmitTestaments(ctx, Action{AgentID: "system", Type: ActionTypeTestament}, []Testament{{
+		AgentID: "system",
+		Summary: "consult deadline elapsed",
+		Relations: []Relation{{
+			Related:      "c1",
+			RelatedType:  RelatedTypeClaim,
+			Relationship: RelationshipClaim,
+		}},
+		Artifacts: []*Artifact{{
+			Kind:      ArtifactKindToolTimeout,
+			Reference: "consult deadline elapsed",
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := b.CloneClaim("c1")
+	if !ok {
+		t.Fatal("claim not found")
+	}
+	if got.Status != ClaimStatusRejected {
+		t.Fatalf("claim status = %s, want %s", got.Status, ClaimStatusRejected)
+	}
+	if len(got.Validations) != 1 || got.Validations[0].Status != ValidationStatusFailed {
+		t.Fatalf("receipt validation not failed: %+v", got.Validations)
+	}
+}
+
 func TestEvaluateValidationAutoAccept(t *testing.T) {
 	b := testBoard()
 	ctx := context.Background()

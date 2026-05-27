@@ -2033,13 +2033,10 @@ func stripANSITest(s string) string {
 	return out.String()
 }
 
-// TestToolCallVisuallyOrphaned_FlagsLongPendingWithSubsequentActivity covers
-// the (E) heuristic: a tool call that has been pending for more than the
-// orphan threshold AND has at least N completed peers after it in the same
-// list is treated as visually abandoned. The renderer swaps the live spinner
-// for a `?` so users are not misled by a still-spinning timer for a row whose
-// Complete event has very likely been lost.
-func TestToolCallVisuallyOrphaned_FlagsLongPendingWithSubsequentActivity(t *testing.T) {
+// TestToolCallVisuallyOrphaned_DoesNotInferFromSubsequentActivity locks in
+// the canonical-delta model: the renderer must not infer completion merely
+// because newer rows completed after an older pending row.
+func TestToolCallVisuallyOrphaned_DoesNotInferFromSubsequentActivity(t *testing.T) {
 	now := time.Now()
 	calls := []ToolCallRecord{
 		{ToolCallKey: "stuck", ToolName: "summarize_workspace_state", StartedAt: now.Add(-2 * time.Minute)},
@@ -2047,8 +2044,8 @@ func TestToolCallVisuallyOrphaned_FlagsLongPendingWithSubsequentActivity(t *test
 		{ToolCallKey: "p2", ToolName: "coord_claim_scope", StartedAt: now.Add(-80 * time.Second), Completed: true, Success: true},
 		{ToolCallKey: "p3", ToolName: "prepare_pipeline_write_context", StartedAt: now.Add(-70 * time.Second), Completed: true, Success: true},
 	}
-	if !toolCallVisuallyOrphaned(calls, 0, now) {
-		t.Fatal("expected the long-pending call with 3 completed peers after it to be flagged orphaned")
+	if toolCallVisuallyOrphaned(calls, 0, now) {
+		t.Fatal("renderer must not flag pending rows orphaned from subsequent activity")
 	}
 }
 
@@ -2120,11 +2117,10 @@ func TestToolCallVisuallyOrphaned_SkipsPendingChallengeRows(t *testing.T) {
 	}
 }
 
-// TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph confirms the
-// formatter renders the orphan glyph alongside the elapsed string when the
-// transient OrphanedAtRender flag is set on a render-time copy. The persisted
-// row is unaffected — flag is render-only.
-func TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph(t *testing.T) {
+// TestFormatToolCallDuration_OrphanFlagDoesNotOverridePending confirms the
+// formatter ignores the legacy render-only orphan flag. Pending duration
+// remains live until canonical completion/error evidence arrives.
+func TestFormatToolCallDuration_OrphanFlagDoesNotOverridePending(t *testing.T) {
 	tc := ToolCallRecord{
 		ToolCallKey:      "stuck",
 		ToolName:         "summarize_workspace_state",
@@ -2132,8 +2128,8 @@ func TestFormatToolCallDuration_OrphanedSwapsLiveSpinnerForGlyph(t *testing.T) {
 		OrphanedAtRender: true,
 	}
 	got := formatToolCallDuration(tc)
-	if !strings.Contains(got, orphanGlyph) {
-		t.Fatalf("orphaned duration = %q, want it to contain the orphan glyph %q", got, orphanGlyph)
+	if strings.Contains(got, orphanGlyph) {
+		t.Fatalf("duration = %q, must not contain legacy orphan glyph %q", got, orphanGlyph)
 	}
 }
 

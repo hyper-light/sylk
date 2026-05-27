@@ -37,6 +37,36 @@ func TestPhaseTopic(t *testing.T) {
 	}
 }
 
+func TestCanonicalTopics(t *testing.T) {
+	if got, want := CanonicalAgentTopic("sess", "uid.1", DeltaActionClaimDirected), "claims.sess.agent.uid_1.claim_directed"; got != want {
+		t.Fatalf("agent topic got %q want %q", got, want)
+	}
+	if got, want := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimDirected), "claims.sess.agent_type.librarian.claim_directed"; got != want {
+		t.Fatalf("agent type topic got %q want %q", got, want)
+	}
+	if got, want := CanonicalClaimTopic("sess", "c1", DeltaActionTestamentSubmitted), "claims.sess.claim.c1.testament_submitted"; got != want {
+		t.Fatalf("claim topic got %q want %q", got, want)
+	}
+	if got, want := CanonicalValidationTopic("sess", "v1", DeltaActionValidationEvaluated), "claims.sess.validation.v1.validation_evaluated"; got != want {
+		t.Fatalf("validation topic got %q want %q", got, want)
+	}
+	if got, want := CanonicalBoardTopic("sess", "b1", DeltaActionClaimProgressed), "claims.sess.board.b1.claim_progressed"; got != want {
+		t.Fatalf("board topic got %q want %q", got, want)
+	}
+}
+
+func TestCanonicalPatterns(t *testing.T) {
+	if got, want := CanonicalAgentActionPattern("sess", "uid", DeltaActionClaimDirected), "claims.sess.agent.uid.claim_directed"; got != want {
+		t.Fatalf("agent pattern got %q want %q", got, want)
+	}
+	if got, want := CanonicalClaimActionPattern("sess", "*", DeltaActionTestamentSubmitted), "claims.sess.claim.*.testament_submitted"; got != want {
+		t.Fatalf("claim pattern got %q want %q", got, want)
+	}
+	if got, want := CanonicalSessionPattern("sess"), "claims.sess.*.*.*"; got != want {
+		t.Fatalf("session pattern got %q want %q", got, want)
+	}
+}
+
 func TestAgentInboxPattern(t *testing.T) {
 	got := AgentInboxPattern("", "eng-a3f2")
 	// Empty session should wildcard.

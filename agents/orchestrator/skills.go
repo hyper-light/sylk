@@ -11,10 +11,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -105,16 +105,7 @@ func (o *Orchestrator) registerFabricSkills() {
 		AgentID:    agentID,
 		AgentType:  agentType,
 		PipelineID: func() string { return "" },
-		RouteSync: shared.RouteSyncFromBus(
-			func() guide.EventBus { return o.bus },
-			func() string {
-				if o.channels == nil {
-					return ""
-				}
-				return o.channels.Responses
-			},
-		),
-		Inbox: func() *claims.ClaimsInbox { return o.claimsInbox },
+		Inbox:      func() *claims.ClaimsInbox { return o.claimsInbox },
 	}) {
 		o.skills.Register(skill)
 	}

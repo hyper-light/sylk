@@ -202,7 +202,8 @@ func TestBridgeIntegration_ConsultedAgentArtifactsRenderAsResponder(t *testing.T
 	if libRow.AgentID != "librarian" {
 		t.Fatalf("librarian tool row AgentID = %q, want librarian (the emitter)", libRow.AgentID)
 	}
-	if libRow.ParentRowID != "art-consult-started" {
-		t.Fatalf("ParentRowID = %q, want art-consult-started", libRow.ParentRowID)
+	wantParent := "claim-peer:" + consultClaimID
+	if libRow.ParentRowID != wantParent {
+		t.Fatalf("ParentRowID = %q, want %q", libRow.ParentRowID, wantParent)
 	}
 }

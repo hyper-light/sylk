@@ -12,6 +12,8 @@ import (
 	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/toolruntime"
 )
 
 // ClaimsIntakeConfig bundles everything needed to wire event-driven
@@ -63,33 +65,29 @@ type ClaimsIntakeConfig struct {
 	// RequireDispatch fails on the missing task.
 	Factory *identity.Factory
 
-	// ContinuationStore handles ConsultResolvedDelta deliveries for
-	// this agent. When set, deltas of kind consult_resolved are
-	// routed to store.DeliverResolution INSTEAD of ProcessEntry —
-	// resolutions feed pending continuations (waking yielded LLM
-	// turns) rather than firing fresh inference.
-	//
-	// When nil, ConsultResolvedDeltas fall through to ProcessEntry
-	// and would trigger LLM inference per resolution — almost
-	// certainly wrong; agents that use ticket-mode consult_peer
-	// MUST wire a store.
+	// ContinuationStore handles canonical response deltas for this
+	// agent. Expected testament.submitted and terminal claim.transitioned
+	// deltas are routed to the store INSTEAD of ProcessEntry —
+	// responses feed pending continuations (waking yielded LLM turns)
+	// rather than firing fresh inference.
 	ContinuationStore *ContinuationStore
-}
 
-// deltaConsultID extracts the ConsultID from a ConsultResolvedDelta
-// (value or pointer form) for diagnostic logging. Returns empty when
-// the delta is nil or not a ConsultResolvedDelta.
-func deltaConsultID(d claims.Delta) string {
-	switch v := d.(type) {
-	case claims.ConsultResolvedDelta:
-		return v.ConsultID
-	case *claims.ConsultResolvedDelta:
-		if v == nil {
-			return ""
-		}
-		return v.ConsultID
-	}
-	return ""
+	// ExpectedToolRuntime is the agent's ordinary Sylk skill runtime.
+	// When a testament lands on a claim with pending validation
+	// ExpectedToolCalls owned by this agent, the intake executes those
+	// tools through a transient request view and records the results as
+	// validation evidence artifacts.
+	ExpectedToolRuntime *toolruntime.Runtime
+
+	// ExpectedToolExecutor is an optional test seam or specialized
+	// executor. When set, it takes precedence over ExpectedToolRuntime.
+	ExpectedToolExecutor claims.ExpectedToolExecutor
+
+	ExpectedToolPolicy    claims.ExpectedToolPolicy
+	ExpectedToolRedactor  claims.ExpectedToolArgumentRedactor
+	ExpectedToolAllowlist map[string]bool
+	ExpectedToolApprovals map[string]bool
+	ExpectedToolRemediate claims.ValidationExpectedToolRemediationPoster
 }
 
 func shouldSuppressForwardedPromptEntry(role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {
@@ -119,11 +117,8 @@ func claimHasTag(tags []string, want string) bool {
 	return false
 }
 
-func deliverExpectedPeerTestamentToContinuation(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
+func deliverExpectedPeerResultToContinuation(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
 	if cfg.ContinuationStore == nil || entry == nil || entry.Expectation == nil || entry.Delta == nil {
-		return false
-	}
-	if entry.Delta.DeltaKind() != claims.DeltaKindTestament {
 		return false
 	}
 	actionKind := expectedPeerTestamentActionKind(entry)
@@ -142,46 +137,355 @@ func deliverExpectedPeerTestamentToContinuation(cfg ClaimsIntakeConfig, entry *c
 		return true
 	}
 
-	testamentDelta, _ := testamentDeltaFromEntry(entry)
+	result, ok := awaitedClaimResultFromEntry(entry, resolutionID, cfg)
+	if !ok {
+		return false
+	}
+	slog.Info("claims_intake_expected_peer_result_delivered",
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", entry.Expectation.ClaimID,
+		"testament_id", result.TestamentID,
+		"resolution_id", result.ClaimID,
+		"action_kind", actionKind,
+		"delta_action", result.Action,
+		"status", result.Status,
+	)
+	cfg.ContinuationStore.DeliverClaimResult(context.Background(), result)
+	return true
+}
+
+func dispatchExpectedValidationTools(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
+	if entry == nil || entry.Node.Claim == nil || !entryIsTestamentSubmitted(entry) {
+		return false
+	}
+	executor := expectedToolExecutorFromConfig(cfg)
+	if executor == nil {
+		return false
+	}
+	var validationIDs []string
+	for _, validation := range entry.Node.Claim.Validations {
+		if shouldExecuteExpectedValidationTools(cfg, entry.Node.Claim, validation) {
+			validationIDs = append(validationIDs, validation.ID)
+		}
+	}
+	if len(validationIDs) == 0 {
+		return false
+	}
+	run := func(ctx context.Context) error {
+		for _, validationID := range validationIDs {
+			result, err := claims.ExecuteValidationExpectedTools(ctx, cfg.Board, entry.Node.Claim.ID, validationID, claims.ExpectedToolExecutionOptions{
+				AgentID:           cfg.AgentID,
+				Executor:          executor,
+				Policy:            cfg.ExpectedToolPolicy,
+				Redactor:          cfg.ExpectedToolRedactor,
+				AllowedTools:      cfg.ExpectedToolAllowlist,
+				ApprovedToolIDs:   cfg.ExpectedToolApprovals,
+				RemediationPoster: cfg.ExpectedToolRemediate,
+			})
+			if err != nil {
+				slog.Error("claims_intake_expected_validation_tools_failed",
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"claim_id", entry.Node.Claim.ID,
+					"validation_id", validationID,
+					"error", err.Error(),
+				)
+				continue
+			}
+			slog.Info("claims_intake_expected_validation_tools_completed",
+				"agent_id", cfg.AgentID,
+				"session_id", cfg.SessionID,
+				"claim_id", result.ClaimID,
+				"validation_id", result.ValidationID,
+				"attempts", len(result.Attempts),
+				"status", result.ValidationStatus,
+				"already_terminal", result.AlreadyTerminal,
+			)
+		}
+		return nil
+	}
+	if cfg.Scope != nil {
+		if err := cfg.Scope.Go("expected_validation_tools", 0, run); err != nil {
+			slog.Error("claims_intake_expected_validation_tools_dispatch_failed",
+				"agent_id", cfg.AgentID,
+				"session_id", cfg.SessionID,
+				"claim_id", entry.Node.Claim.ID,
+				"error", err.Error(),
+			)
+			return false
+		}
+		return true
+	}
+	if err := run(context.Background()); err != nil {
+		slog.Error("claims_intake_expected_validation_tools_inline_failed",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", entry.Node.Claim.ID,
+			"error", err.Error(),
+		)
+	}
+	return true
+}
+
+func shouldExecuteExpectedValidationTools(cfg ClaimsIntakeConfig, claim *claims.Claim, validation *claims.Validation) bool {
+	if claim == nil || validation == nil || validation.Status != claims.ValidationStatusPending || len(validation.ExpectedToolCalls) == 0 {
+		return false
+	}
+	agentID := strings.TrimSpace(cfg.AgentID)
+	if agentID == "" {
+		return false
+	}
+	if validationAgent := strings.TrimSpace(validation.AgentID); validationAgent != "" {
+		return sameAgentID(agentID, validationAgent)
+	}
+	issuer := claims.IssuerAgentID(claim.Relations)
+	return issuer != "" && sameAgentID(agentID, issuer)
+}
+
+func sameAgentID(left, right string) bool {
+	return strings.EqualFold(strings.TrimSpace(left), strings.TrimSpace(right))
+}
+
+func entryIsTestamentSubmitted(entry *claims.GraphEntryPoint) bool {
+	if entry == nil || entry.Delta == nil {
+		return false
+	}
+	switch delta := entry.Delta.(type) {
+	case claims.CanonicalDelta:
+		return delta.Action == claims.DeltaActionTestamentSubmitted
+	case *claims.CanonicalDelta:
+		return delta != nil && delta.Action == claims.DeltaActionTestamentSubmitted
+	case claims.TestamentDelta, *claims.TestamentDelta:
+		return true
+	default:
+		return entry.Delta.DeltaKind() == claims.DeltaKindTestament
+	}
+}
+
+func expectedToolExecutorFromConfig(cfg ClaimsIntakeConfig) claims.ExpectedToolExecutor {
+	if cfg.ExpectedToolExecutor != nil {
+		return cfg.ExpectedToolExecutor
+	}
+	if cfg.ExpectedToolRuntime == nil {
+		return nil
+	}
+	return runtimeExpectedToolExecutor{
+		runtime: cfg.ExpectedToolRuntime,
+		agentID: cfg.AgentID,
+	}
+}
+
+type runtimeExpectedToolExecutor struct {
+	runtime *toolruntime.Runtime
+	agentID string
+}
+
+func (e runtimeExpectedToolExecutor) ExecuteExpectedTool(ctx context.Context, call claims.ExpectedToolCall) (claims.ExpectedToolExecutionOutput, error) {
+	if e.runtime == nil {
+		return claims.ExpectedToolExecutionOutput{}, fmt.Errorf("tool runtime is not configured")
+	}
+	toolName := strings.TrimSpace(call.Tool)
+	if toolName == "" {
+		return claims.ExpectedToolExecutionOutput{}, fmt.Errorf("expected tool name is required")
+	}
+	view, err := e.runtime.RequestView(toolName)
+	if err != nil {
+		return claims.ExpectedToolExecutionOutput{}, err
+	}
+	arguments := call.Arguments
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
+	rawArgs, err := json.Marshal(arguments)
+	if err != nil {
+		return claims.ExpectedToolExecutionOutput{}, fmt.Errorf("marshal expected tool arguments: %w", err)
+	}
+	toolID := strings.TrimSpace(call.ID)
+	if toolID == "" {
+		toolID = "expected_" + toolName
+	}
+	agentID := firstNonEmptyIntakeString(e.runtime.AgentID(), e.agentID)
+	result, err := view.Execute(ctx, toolruntime.Invocation{
+		ToolCall: providers.ToolCall{
+			ID:        toolID,
+			Name:      toolName,
+			Arguments: string(rawArgs),
+		},
+		AgentID:         agentID,
+		CorrelationID:   "expected_validation:" + toolID,
+		CapabilityScope: view.CapabilityScope(),
+	})
+	if err != nil {
+		return claims.ExpectedToolExecutionOutput{}, err
+	}
+	if result.Yielded() {
+		return claims.ExpectedToolExecutionOutput{}, fmt.Errorf("expected validation tool %q yielded; validation expected tools must complete synchronously", toolName)
+	}
+	return claims.ExpectedToolExecutionOutput{
+		Output:  result.Output,
+		Summary: truncatePromptString(result.Output, 240),
+		Metadata: map[string]any{
+			"tool_name":        result.ToolName,
+			"activated_skills": append([]string(nil), result.ActivatedSkills...),
+			"tool_defs_dirty":  result.ToolDefsDirty,
+		},
+	}, nil
+}
+
+func awaitedClaimResultFromEntry(entry *claims.GraphEntryPoint, resolutionID string, cfg ClaimsIntakeConfig) (*AwaitedClaimResult, bool) {
+	if entry == nil || entry.Delta == nil {
+		return nil, false
+	}
+	if signal, ok := peerTestamentSignalFromEntry(entry); ok {
+		return awaitedClaimResultFromPeerTestament(entry, signal, resolutionID, cfg), true
+	}
+	if signal, ok := terminalClaimSignalFromEntry(entry); ok {
+		return awaitedClaimResultFromTerminalClaim(entry, signal, resolutionID, cfg), true
+	}
+	return nil, false
+}
+
+func awaitedClaimResultFromPeerTestament(entry *claims.GraphEntryPoint, signal peerTestamentSignal, resolutionID string, cfg ClaimsIntakeConfig) *AwaitedClaimResult {
 	testament := entry.Node.Testament
-	summary := strings.TrimSpace(testamentDelta.Summary)
+	summary := strings.TrimSpace(signal.Context)
 	if summary == "" && testament != nil {
-		summary = strings.TrimSpace(testament.Summary)
+		summary = firstNonEmptyIntakeString(testament.Context, testament.Summary)
 	}
 	status := claims.ConsultStatusCompleted
 	errText := ""
-	if testamentDelta.Verdict == claims.TestamentVerdictError {
+	if signal.Verdict == claims.TestamentVerdictError {
 		status = claims.ConsultStatusError
 		errText = firstNonEmptyIntakeString(summary, "peer testament reported an error")
 	}
 	payload := peerTestamentResponsePayload(entry, summary)
-	responder := strings.TrimSpace(testamentDelta.SubjectAgentID)
+	responder := strings.TrimSpace(signal.ResponderAgentID)
 	if testament != nil && strings.TrimSpace(testament.AgentID) != "" {
 		responder = strings.TrimSpace(testament.AgentID)
 	}
-	delta := claims.ConsultResolvedDelta{
-		SessionID:         firstNonEmptyIntakeString(testamentDelta.SessionID, cfg.SessionID),
-		BoardID:           testamentDelta.BoardID,
-		ConsultID:         strings.TrimSpace(resolutionID),
-		OriginatorAgentID: strings.TrimSpace(cfg.AgentID),
-		ResponderAgentID:  responder,
-		Status:            status,
-		ResponsePayload:   payload,
-		ResponseSummary:   truncatePromptString(summary, 240),
-		ErrorMessage:      errText,
-		EmittedAt:         time.Now().UTC(),
+	return (&AwaitedClaimResult{
+		SessionID:        firstNonEmptyIntakeString(signal.SessionID, cfg.SessionID),
+		BoardID:          signal.BoardID,
+		ClaimID:          strings.TrimSpace(resolutionID),
+		TestamentID:      signal.TestamentID,
+		Action:           claims.DeltaActionTestamentSubmitted,
+		Verdict:          signal.Verdict,
+		Context:          summary,
+		ResponderAgentID: responder,
+		Status:           status,
+		ResponsePayload:  payload,
+		ResponseSummary:  truncatePromptString(summary, 240),
+		ErrorMessage:     errText,
+		EmittedAt:        time.Now().UTC(),
+	}).normalized()
+}
+
+type terminalClaimSignal struct {
+	SessionID string
+	BoardID   string
+	ClaimID   string
+	Status    claims.ClaimStatus
+	Context   string
+	ActorID   string
+}
+
+func terminalClaimSignalFromEntry(entry *claims.GraphEntryPoint) (terminalClaimSignal, bool) {
+	if entry == nil || entry.Delta == nil {
+		return terminalClaimSignal{}, false
 	}
-	slog.Info("claims_intake_expected_peer_testament_delivered",
-		"agent_id", cfg.AgentID,
-		"session_id", cfg.SessionID,
-		"claim_id", entry.Expectation.ClaimID,
-		"testament_id", testamentDelta.TestamentID,
-		"resolution_id", delta.ConsultID,
-		"action_kind", actionKind,
-		"status", status,
-	)
-	cfg.ContinuationStore.DeliverResolution(context.Background(), &delta)
-	return true
+	switch delta := entry.Delta.(type) {
+	case claims.CanonicalDelta:
+		return terminalClaimSignalFromCanonical(delta)
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			return terminalClaimSignalFromCanonical(*delta)
+		}
+	case claims.ClaimStatusDelta:
+		return terminalClaimSignalFromLegacyStatus(delta)
+	case *claims.ClaimStatusDelta:
+		if delta != nil {
+			return terminalClaimSignalFromLegacyStatus(*delta)
+		}
+	}
+	return terminalClaimSignal{}, false
+}
+
+func terminalClaimSignalFromCanonical(delta claims.CanonicalDelta) (terminalClaimSignal, bool) {
+	if delta.Action != claims.DeltaActionClaimTransitioned {
+		return terminalClaimSignal{}, false
+	}
+	status := delta.ClaimToStatus()
+	if !claimStatusResolvesAwait(status) {
+		return terminalClaimSignal{}, false
+	}
+	context := ""
+	if claim, ok := delta.Context["claim"].(map[string]any); ok {
+		context = firstNonEmptyIntakeString(stringFromAny(claim["context"]), stringFromAny(claim["reason"]))
+	}
+	return terminalClaimSignal{
+		SessionID: delta.SessionID,
+		BoardID:   delta.BoardID,
+		ClaimID:   delta.ClaimID(),
+		Status:    status,
+		Context:   context,
+		ActorID:   delta.Actor.RouteKey(),
+	}, true
+}
+
+func terminalClaimSignalFromLegacyStatus(delta claims.ClaimStatusDelta) (terminalClaimSignal, bool) {
+	if !claimStatusResolvesAwait(delta.ToStatus) {
+		return terminalClaimSignal{}, false
+	}
+	return terminalClaimSignal{
+		SessionID: delta.SessionID,
+		BoardID:   delta.BoardID,
+		ClaimID:   delta.ClaimID,
+		Status:    delta.ToStatus,
+		Context:   delta.Reason,
+		ActorID:   delta.AgentID,
+	}, true
+}
+
+func claimStatusResolvesAwait(status claims.ClaimStatus) bool {
+	switch status {
+	case claims.ClaimStatusTestified, claims.ClaimStatusAccepted:
+		return true
+	case claims.ClaimStatusRejected, claims.ClaimStatusSuperseded:
+		return true
+	default:
+		return status.IsTerminal()
+	}
+}
+
+func awaitedClaimResultFromTerminalClaim(entry *claims.GraphEntryPoint, signal terminalClaimSignal, resolutionID string, cfg ClaimsIntakeConfig) *AwaitedClaimResult {
+	summary := strings.TrimSpace(signal.Context)
+	if summary == "" && entry.Node.Claim != nil {
+		summary = firstNonEmptyIntakeString(entry.Node.Claim.Context, entry.Node.Claim.Description, entry.Node.Claim.Title)
+	}
+	status := claims.ConsultStatusCompleted
+	errText := ""
+	if signal.Status == claims.ClaimStatusRejected || signal.Status == claims.ClaimStatusSuperseded {
+		status = claims.ConsultStatusError
+		errText = firstNonEmptyIntakeString(summary, "peer claim transitioned to "+string(signal.Status))
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"claim_id":     firstNonEmptyIntakeString(signal.ClaimID, resolutionID),
+		"claim_status": string(signal.Status),
+		"summary":      summary,
+	})
+	return (&AwaitedClaimResult{
+		SessionID:        firstNonEmptyIntakeString(signal.SessionID, cfg.SessionID),
+		BoardID:          signal.BoardID,
+		ClaimID:          strings.TrimSpace(resolutionID),
+		Action:           claims.DeltaActionClaimTransitioned,
+		Context:          summary,
+		ResponderAgentID: signal.ActorID,
+		Status:           status,
+		ResponsePayload:  payload,
+		ResponseSummary:  truncatePromptString(summary, 240),
+		ErrorMessage:     errText,
+		EmittedAt:        time.Now().UTC(),
+	}).normalized()
 }
 
 func expectedPeerTestamentActionKind(entry *claims.GraphEntryPoint) claims.ActionType {
@@ -191,8 +495,8 @@ func expectedPeerTestamentActionKind(entry *claims.GraphEntryPoint) claims.Actio
 	if entry.Node.Claim != nil && entry.Node.Claim.ActionType != "" {
 		return entry.Node.Claim.ActionType
 	}
-	if delta, ok := testamentDeltaFromEntry(entry); ok {
-		return delta.ActionKind
+	if signal, ok := peerTestamentSignalFromEntry(entry); ok {
+		return signal.ActionKind
 	}
 	return ""
 }
@@ -235,19 +539,103 @@ func claimScopeValue(scope []claims.ClaimScopeEntry, kind string) string {
 	return ""
 }
 
-func testamentDeltaFromEntry(entry *claims.GraphEntryPoint) (claims.TestamentDelta, bool) {
+type peerTestamentSignal struct {
+	SessionID        string
+	BoardID          string
+	ClaimID          string
+	TestamentID      string
+	ActionKind       claims.ActionType
+	Verdict          string
+	ResponderAgentID string
+	Context          string
+}
+
+func peerTestamentSignalFromEntry(entry *claims.GraphEntryPoint) (peerTestamentSignal, bool) {
 	if entry == nil || entry.Delta == nil {
-		return claims.TestamentDelta{}, false
+		return peerTestamentSignal{}, false
 	}
 	switch delta := entry.Delta.(type) {
 	case claims.TestamentDelta:
-		return delta, true
+		return peerTestamentSignalFromLegacyDelta(delta), true
 	case *claims.TestamentDelta:
 		if delta != nil {
-			return *delta, true
+			return peerTestamentSignalFromLegacyDelta(*delta), true
+		}
+	case claims.CanonicalDelta:
+		return peerTestamentSignalFromCanonicalDelta(delta)
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			return peerTestamentSignalFromCanonicalDelta(*delta)
 		}
 	}
-	return claims.TestamentDelta{}, false
+	return peerTestamentSignal{}, false
+}
+
+func peerTestamentSignalFromLegacyDelta(delta claims.TestamentDelta) peerTestamentSignal {
+	return peerTestamentSignal{
+		SessionID:        delta.SessionID,
+		BoardID:          delta.BoardID,
+		ClaimID:          delta.ClaimID,
+		TestamentID:      delta.TestamentID,
+		ActionKind:       delta.ActionKind,
+		Verdict:          delta.Verdict,
+		ResponderAgentID: delta.SubjectAgentID,
+		Context:          delta.Summary,
+	}
+}
+
+func peerTestamentSignalFromCanonicalDelta(delta claims.CanonicalDelta) (peerTestamentSignal, bool) {
+	if delta.Action != claims.DeltaActionTestamentSubmitted {
+		return peerTestamentSignal{}, false
+	}
+	signal := peerTestamentSignal{
+		SessionID:        delta.SessionID,
+		BoardID:          delta.BoardID,
+		ClaimID:          delta.ClaimID(),
+		TestamentID:      delta.TestamentID(),
+		ActionKind:       delta.ClaimActionType(),
+		ResponderAgentID: delta.Actor.RouteKey(),
+	}
+	if testament := firstCanonicalTestamentContext(delta.Context); testament != nil {
+		signal.TestamentID = firstNonEmptyIntakeString(stringFromAny(testament["id"]), signal.TestamentID)
+		signal.Verdict = stringFromAny(testament["verdict"])
+		signal.Context = firstNonEmptyIntakeString(
+			stringFromAny(testament["context"]),
+			stringFromAny(testament["summary"]),
+		)
+	}
+	return signal, true
+}
+
+func firstCanonicalTestamentContext(context map[string]any) map[string]any {
+	raw, ok := context["testaments"]
+	if !ok {
+		return nil
+	}
+	switch testaments := raw.(type) {
+	case []map[string]any:
+		if len(testaments) > 0 {
+			return testaments[0]
+		}
+	case []any:
+		for _, item := range testaments {
+			if m, ok := item.(map[string]any); ok {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func stringFromAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case fmt.Stringer:
+		return strings.TrimSpace(v.String())
+	default:
+		return ""
+	}
 }
 
 func peerTestamentResponsePayload(entry *claims.GraphEntryPoint, summary string) json.RawMessage {
@@ -381,40 +769,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			if entry == nil {
 				return
 			}
-			// Pre-empt: ConsultResolvedDelta entries route to the
-			// ContinuationStore (waking pending continuations or
-			// stashing as orphans) and MUST NOT fall through to
-			// ProcessEntry. The ProcessEntry path triggers LLM
-			// inference; firing inference on every resolution
-			// would loop the agent's own consults back into its
-			// own loop.
-			if delta := entry.Delta; delta != nil && delta.DeltaKind() == claims.DeltaKindConsultResolved {
-				if cfg.ContinuationStore == nil {
-					slog.Warn("consult_resolved_dropped_no_continuation_store",
-						"agent_id", cfg.AgentID,
-						"session_id", cfg.SessionID,
-						"consult_id", deltaConsultID(delta),
-					)
-					return
-				}
-				resolved, ok := delta.(claims.ConsultResolvedDelta)
-				if !ok {
-					if ptr, ok2 := delta.(*claims.ConsultResolvedDelta); ok2 && ptr != nil {
-						resolved = *ptr
-						ok = true
-					}
-				}
-				if !ok {
-					slog.Warn("consult_resolved_unexpected_payload_type",
-						"agent_id", cfg.AgentID,
-						"delta_kind", delta.DeltaKind(),
-					)
-					return
-				}
-				cfg.ContinuationStore.DeliverResolution(context.Background(), &resolved)
+			expectedValidationToolsScheduled := dispatchExpectedValidationTools(cfg, entry)
+			if deliverExpectedPeerResultToContinuation(cfg, entry) {
 				return
 			}
-			if deliverExpectedPeerTestamentToContinuation(cfg, entry) {
+			if expectedValidationToolsScheduled {
 				return
 			}
 			if shouldSuppressForwardedPromptEntry(role, entry) {
@@ -682,6 +1041,24 @@ func composeValidationInstructions(b *strings.Builder, claim *claims.Claim) {
 			b.WriteString("  Quality bar: " + v.QualityBar + "\n")
 		}
 		b.WriteString("  Validation ID: `" + v.ID + "` | Claim ID: `" + claim.ID + "` | Type: " + string(v.Type) + "\n")
+		if len(v.ExpectedToolCalls) > 0 {
+			b.WriteString("  Expected validation tools:\n")
+			for _, call := range v.ExpectedToolCalls {
+				b.WriteString("  - `" + strings.TrimSpace(call.Tool) + "`")
+				if call.Required {
+					b.WriteString(" required")
+				}
+				if purpose := strings.TrimSpace(call.Purpose); purpose != "" {
+					b.WriteString(" - " + purpose)
+				}
+				if len(call.Arguments) > 0 {
+					if raw, err := json.Marshal(call.Arguments); err == nil {
+						b.WriteString(" args=" + truncatePromptString(string(raw), 240))
+					}
+				}
+				b.WriteString("\n")
+			}
+		}
 	}
 
 	b.WriteString("\nFor each validation: use your skills to assess whether the artifacts satisfy the quality bar. ")

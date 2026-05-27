@@ -13,16 +13,18 @@ import "strings"
 // literal prefixes.
 
 const (
-	TopicNamespace             = "claims"
+	TopicNamespace               = "claims"
 	TopicSegmentInbox            = "inbox"
+	TopicSegmentAgent            = "agent"
+	TopicSegmentAgentType        = "agent_type"
 	TopicSegmentClaim            = "claim"
 	TopicSegmentValidation       = "validation"
+	TopicSegmentBoard            = "board"
 	TopicSegmentPhase            = "phase"
-	TopicSegmentConsultResolved  = "consult_resolved"
 	TopicSegmentClaimContext     = "claim_context"
 	TopicSegmentTestamentContext = "testament_context"
-	TopicWildcard              = "*"
-	topicSeparator             = "."
+	TopicWildcard                = "*"
+	topicSeparator               = "."
 )
 
 // InboxTopic builds the canonical topic for an InboxDelta.
@@ -102,19 +104,66 @@ func TestamentContextTopic(sessionID, testamentID, accumulatorID string) string 
 	)
 }
 
-// ConsultResolvedTopic builds the canonical topic for a
-// ConsultResolvedDelta. Routed to the originating agent's personal
-// consult-resolved channel so only the awaiter receives the
-// resolution; broadcast fan-out is avoided. The trailing consult_id
-// segment makes individual resolutions independently addressable for
-// targeted dedup and replay.
-func ConsultResolvedTopic(sessionID, originatorAgentID, consultID string) string {
+// CanonicalAgentTopic builds the canonical UID-addressed topic for
+// directed work. agentUID must be a canonical UID; degraded type-only
+// delivery uses CanonicalAgentTypeTopic so it cannot spoof UID routes.
+func CanonicalAgentTopic(sessionID, agentUID string, action DeltaAction) string {
 	return joinTopic(
 		TopicNamespace,
 		normalizeTopicSegment(sessionID),
-		TopicSegmentConsultResolved,
-		normalizeTopicSegment(originatorAgentID),
-		normalizeTopicSegment(consultID),
+		TopicSegmentAgent,
+		normalizeTopicSegment(agentUID),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+// CanonicalAgentTypeTopic builds the degraded legacy route for type-only
+// references. This is intentionally distinct from TopicSegmentAgent.
+func CanonicalAgentTypeTopic(sessionID, agentType string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentAgentType,
+		normalizeTopicSegment(agentType),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalAgentRefTopic(sessionID string, ref AgentRef, action DeltaAction) string {
+	ref = ref.Normalized()
+	if ref.UID != "" {
+		return CanonicalAgentTopic(sessionID, ref.UID, action)
+	}
+	return CanonicalAgentTypeTopic(sessionID, ref.RouteKey(), action)
+}
+
+func CanonicalClaimTopic(sessionID, claimID string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentClaim,
+		normalizeTopicSegment(claimID),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalValidationTopic(sessionID, validationID string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentValidation,
+		normalizeTopicSegment(validationID),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalBoardTopic(sessionID, boardID string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentBoard,
+		normalizeTopicSegment(boardID),
+		normalizeTopicSegment(string(action)),
 	)
 }
 
@@ -202,16 +251,65 @@ func PhasePattern(sessionFilter string) string {
 	)
 }
 
-// ConsultResolvedPattern matches every ConsultResolvedDelta routed to
-// agentID in the given session. Each issuing agent subscribes to its
-// own pattern so only it sees the resolutions of consults it issued —
-// no broadcast fan-out across the session.
-func ConsultResolvedPattern(sessionFilter, agentID string) string {
+func CanonicalAgentActionPattern(sessionFilter, agentUID string, action DeltaAction) string {
 	return joinTopic(
 		TopicNamespace,
 		wildcardOrSegment(sessionFilter),
-		TopicSegmentConsultResolved,
-		normalizeTopicSegment(agentID),
+		TopicSegmentAgent,
+		normalizeTopicSegment(agentUID),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalAgentTypeActionPattern(sessionFilter, agentType string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentAgentType,
+		normalizeTopicSegment(agentType),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalClaimActionPattern(sessionFilter, claimFilter string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentClaim,
+		wildcardOrSegment(claimFilter),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalValidationActionPattern(sessionFilter, validationFilter string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentValidation,
+		wildcardOrSegment(validationFilter),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalBoardActionPattern(sessionFilter, boardFilter string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentBoard,
+		wildcardOrSegment(boardFilter),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+// CanonicalSessionPattern matches all canonical delta topics in a
+// session because canonical topics share the five-segment grammar
+// claims.<session>.<dimension>.<id>.<action>.
+func CanonicalSessionPattern(sessionFilter string) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicWildcard,
+		TopicWildcard,
 		TopicWildcard,
 	)
 }

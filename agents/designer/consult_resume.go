@@ -19,21 +19,14 @@ import (
 func (d *Designer) resumeContinuation(
 	ctx context.Context,
 	snapshot *shared.TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*shared.AwaitedClaimResult,
 ) error {
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("designer: nil consult-yield snapshot on resume")
 	}
 
 	if snapshot.AccumulatorState.AgentID != "" {
-		acc := claims.RestoreAccumulator(
-			snapshot.AccumulatorState.AgentID,
-			snapshot.AccumulatorState.SessionID,
-			snapshot.AccumulatorState.ClaimID,
-			snapshot.AccumulatorState.Started,
-			snapshot.AccumulatorState.Artifacts,
-			snapshot.AccumulatorState.Notes,
-		)
+		acc := shared.RestoreAccumulatorFromSnapshot(snapshot.AccumulatorState)
 		ctx = claims.WithTestamentAccumulator(ctx, acc)
 		defer acc.Flush(ctx, d.designerBoard(), d.designerScope())
 	}
@@ -89,7 +82,7 @@ func designerLedgerCorrelation(ledger *steering.SteeringLedger, sessionID string
 	return "designer:turn"
 }
 
-func formatDesignerAwaitResults(results map[string]*claims.ConsultResolvedDelta) string {
+func formatDesignerAwaitResults(results map[string]*shared.AwaitedClaimResult) string {
 	formatted := shared.FormatConsultResults(results)
 	encoded, err := json.Marshal(formatted)
 	if err != nil {

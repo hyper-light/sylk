@@ -3,12 +3,9 @@ package shared
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/providers"
@@ -36,7 +33,6 @@ func TestConsultPeerSkill_NilRouteSyncReturnsConsultID(t *testing.T) {
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipe-1" },
-		RouteSync:  nil,
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
@@ -57,27 +53,31 @@ func TestConsultPeerSkill_NilRouteSyncReturnsConsultID(t *testing.T) {
 	}
 }
 
-func TestConsultPeerSkill_RouteSyncSuccessReturnsResponse(t *testing.T) {
-	// When RouteSync returns a successful RouteResponse, the handler
-	// surfaces the payload as the consult response and emits completed
-	// status. The target's stream events are expected to stitch as
-	// children upstream via the branch metadata the handler stamps on
-	// the outgoing RouteRequest — we verify the request shape here,
-	// since the stitching is observed in UI integration tests.
-	var capturedReq *guide.RouteRequest
+func TestConsultPeerSkill_RejectsSelfConsult(t *testing.T) {
+	cfg := CrossPipelineSkillConfig{
+		SessionID:  func() string { return "sess-self-consult" },
+		AgentID:    func() string { return "architect-1" },
+		AgentType:  func() string { return "architect" },
+		PipelineID: func() string { return "pipe-1" },
+	}
+	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+
+	_, err := skill.Handler(context.Background(), json.RawMessage(`{"target_agent_type":"architect","query":"What should I do?"}`))
+	if err == nil {
+		t.Fatal("expected self-consult to be rejected")
+	}
+}
+
+func TestConsultPeerSkill_ReturnsTicketWithoutSynchronousPeerRoute(t *testing.T) {
+	// Without continuation context, consult_peer returns a claim ticket
+	// and lets claim.directed/testament.submitted drive the work. There
+	// is no RouteSync hook in the config: the test fails at compile time
+	// if the old synchronous route authority returns.
 	cfg := CrossPipelineSkillConfig{
 		SessionID:  func() string { return "sess-1" },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "" },
-		RouteSync: func(_ context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-			capturedReq = req
-			return guide.NewResponseMessage("resp-1", &guide.RouteResponse{
-				CorrelationID: req.CorrelationID,
-				Success:       true,
-				Data:          map[string]any{"user_message": "Found two related modules."},
-			}), nil
-		},
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
@@ -90,31 +90,12 @@ func TestConsultPeerSkill_RouteSyncSuccessReturnsResponse(t *testing.T) {
 	if !ok {
 		t.Fatalf("handler result type = %T", result)
 	}
-	if got["status"] != "completed" {
-		t.Fatalf("status = %v, want completed", got["status"])
-	}
-	resp, ok := got["response"].(map[string]any)
-	if !ok {
-		t.Fatalf("response missing or wrong type: %#v", got)
-	}
-	if resp["user_message"] != "Found two related modules." {
-		t.Fatalf("response.user_message = %v", resp["user_message"])
-	}
-	if capturedReq == nil {
-		t.Fatal("route sync never called")
-	}
-	if capturedReq.TargetAgentID != "librarian" {
-		t.Fatalf("target agent = %q", capturedReq.TargetAgentID)
-	}
-	if capturedReq.Input != "Any prior art?" {
-		t.Fatalf("input = %q", capturedReq.Input)
-	}
-	if !capturedReq.ExplicitTarget {
-		t.Fatal("expected ExplicitTarget=true")
+	if got["status"] != "in_flight" {
+		t.Fatalf("status = %v, want in_flight", got["status"])
 	}
 }
 
-func TestConsultPeerSkill_RouteSyncStampsNestedClaimAndBranchMetadata(t *testing.T) {
+func TestConsultPeerSkill_StampsNestedClaimAndBranchMetadata(t *testing.T) {
 	sessionID := "sess-consult-nesting"
 	registry := claims.DefaultSessionBoardRegistry()
 	registry.Remove(sessionID)
@@ -144,20 +125,11 @@ func TestConsultPeerSkill_RouteSyncStampsNestedClaimAndBranchMetadata(t *testing
 		t.Fatalf("PostAction parent: %v", err)
 	}
 
-	var capturedReq *guide.RouteRequest
 	cfg := CrossPipelineSkillConfig{
 		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "architect-1" },
 		AgentType:  func() string { return "architect" },
 		PipelineID: func() string { return "" },
-		RouteSync: func(_ context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-			capturedReq = req
-			return guide.NewResponseMessage("resp-1", &guide.RouteResponse{
-				CorrelationID: req.CorrelationID,
-				Success:       true,
-				Data:          map[string]any{"answer": "ok"},
-			}), nil
-		},
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 	ctx := claims.WithParentClaimID(context.Background(), parentClaimID)
@@ -185,25 +157,6 @@ func TestConsultPeerSkill_RouteSyncStampsNestedClaimAndBranchMetadata(t *testing
 	if consultID == "" {
 		t.Fatalf("consult_id missing: %#v", got)
 	}
-	if capturedReq == nil {
-		t.Fatal("route sync never called")
-	}
-	if capturedReq.Metadata[MetadataKeyParentClaimID] != consultID {
-		t.Fatalf("parent_claim_id = %#v, want consult claim %q", capturedReq.Metadata[MetadataKeyParentClaimID], consultID)
-	}
-	if capturedReq.Metadata["chat_nested_branch"] != true {
-		t.Fatalf("chat_nested_branch = %#v, want true", capturedReq.Metadata["chat_nested_branch"])
-	}
-	if capturedReq.Metadata["chat_parent_correlation_id"] != "corr-parent" {
-		t.Fatalf("chat_parent_correlation_id = %#v, want corr-parent", capturedReq.Metadata["chat_parent_correlation_id"])
-	}
-	if capturedReq.Metadata["chat_parent_tool_call_key"] != "consult-peer-tool" {
-		t.Fatalf("chat_parent_tool_call_key = %#v, want consult-peer-tool", capturedReq.Metadata["chat_parent_tool_call_key"])
-	}
-	if capturedReq.Metadata["chat_inter_agent_kind"] != InterAgentToolEventKindConsult {
-		t.Fatalf("chat_inter_agent_kind = %#v, want consult", capturedReq.Metadata["chat_inter_agent_kind"])
-	}
-
 	consultClaim, ok := board.CloneClaim(consultID)
 	if !ok {
 		t.Fatalf("consult claim %q not posted", consultID)
@@ -216,25 +169,15 @@ func TestConsultPeerSkill_RouteSyncStampsNestedClaimAndBranchMetadata(t *testing
 	}
 }
 
-func TestConsultPeerSkill_RouteSyncCrossPipelineMetadata(t *testing.T) {
-	// Cross-pipeline consults carry target_pipeline_id; the handler
-	// stamps it into request metadata so the routing layer can resolve
-	// a specific pipeline's peer rather than the nearest same-pipeline
-	// or knowledge peer.
-	var capturedReq *guide.RouteRequest
+func TestConsultPeerSkill_CrossPipelineMetadataStaysOnClaimTicket(t *testing.T) {
+	// Cross-pipeline consults carry target_pipeline_id in the claim
+	// ticket/activity. The config has no synchronous route hook, so no
+	// side-channel metadata path can run.
 	cfg := CrossPipelineSkillConfig{
 		SessionID:  func() string { return "sess-1" },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipe-origin" },
-		RouteSync: func(_ context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-			capturedReq = req
-			return guide.NewResponseMessage("resp-1", &guide.RouteResponse{
-				CorrelationID: req.CorrelationID,
-				Success:       true,
-				Data:          map[string]any{"note": "ok"},
-			}), nil
-		},
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
@@ -243,72 +186,42 @@ func TestConsultPeerSkill_RouteSyncCrossPipelineMetadata(t *testing.T) {
 	// authority matrix (see docs/COMMS_MATRIX.md), engineer may
 	// consult tester-pipeline and holds AllowsCrossPipelineConsult.
 	input := json.RawMessage(`{"target_agent_type":"tester-pipeline","target_pipeline_id":"pipe-42","query":"How are you handling retries?"}`)
-	if _, err := skill.Handler(context.Background(), input); err != nil {
+	result, err := skill.Handler(context.Background(), input)
+	if err != nil {
 		t.Fatalf("handler err = %v", err)
 	}
-	if capturedReq == nil {
-		t.Fatal("route sync never called")
+	got, ok := result.(map[string]any)
+	if !ok {
+		t.Fatalf("handler result type = %T", result)
 	}
-	if got, _ := capturedReq.Metadata["target_pipeline_id"].(string); got != "pipe-42" {
-		t.Fatalf("metadata.target_pipeline_id = %v", capturedReq.Metadata["target_pipeline_id"])
+	if got["target"] != "tester-pipeline/pipe-42" {
+		t.Fatalf("target = %#v, want tester-pipeline/pipe-42", got["target"])
 	}
 }
 
-func TestConsultPeerSkill_RouteSyncFailureReturnsError(t *testing.T) {
-	// A failed RouteResponse.Success=false is propagated as a handler
-	// error so the tool-loop's Phase 1 event marks the consult_peer row
-	// as Failed. This avoids the silent-success case where a peer
-	// rejected the consult but the UI still showed a green checkmark.
+func TestConsultPeerSkill_ReturnsTicketWhenPeerMayLaterFailWithArtifact(t *testing.T) {
+	// Peer errors are returned as artifacts in the eventual testament.
+	// consult_peer itself only posts the claim and returns/yields.
 	cfg := CrossPipelineSkillConfig{
 		SessionID:  func() string { return "sess-1" },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "" },
-		RouteSync: func(_ context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-			return guide.NewResponseMessage("resp-1", &guide.RouteResponse{
-				CorrelationID: req.CorrelationID,
-				Success:       false,
-				Error:         "peer refused consultation: out of scope",
-			}), nil
-		},
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
 	input := json.RawMessage(`{"target_agent_type":"librarian","query":"Q"}`)
-	_, err := skill.Handler(context.Background(), input)
-	if err == nil {
-		t.Fatal("expected handler error on failed route response")
+	result, err := skill.Handler(context.Background(), input)
+	if err != nil {
+		t.Fatalf("handler err = %v", err)
 	}
-	if !strings.Contains(err.Error(), "out of scope") {
-		t.Fatalf("error does not mention peer reason: %v", err)
-	}
-}
-
-func TestConsultPeerSkill_RouteSyncTransportErrorReturnsError(t *testing.T) {
-	// Transport-level failures (bus unavailable, timeout, cancellation)
-	// propagate as handler errors so the tool row renders as Failed.
-	cfg := CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
-		AgentID:    func() string { return "agent-1" },
-		AgentType:  func() string { return "engineer" },
-		PipelineID: func() string { return "" },
-		RouteSync: func(_ context.Context, _ *guide.RouteRequest) (*guide.Message, error) {
-			return nil, errors.New("bus unavailable")
-		},
-	}
-	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
-
-	input := json.RawMessage(`{"target_agent_type":"librarian","query":"Q"}`)
-	_, err := skill.Handler(context.Background(), input)
-	if err == nil {
-		t.Fatal("expected handler error on transport failure")
-	}
-	if !strings.Contains(err.Error(), "bus unavailable") {
-		t.Fatalf("error does not mention transport failure: %v", err)
+	got := result.(map[string]any)
+	if got["status"] != "in_flight" {
+		t.Fatalf("status = %#v, want in_flight", got["status"])
 	}
 }
 
-func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
+func TestConsultPeerSkill_TicketModeUsesClaimContinuation(t *testing.T) {
 	sessionID := "sess-ticket-mode-claim"
 	registry := claims.DefaultSessionBoardRegistry()
 	registry.Remove(sessionID)
@@ -322,12 +235,11 @@ func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
 	}
 	t.Cleanup(func() { registry.Remove(sessionID) })
 
-	routeCalled := false
 	store := NewContinuationStore(ContinuationStoreConfig{
 		AgentID:   "agent-1",
 		SessionID: sessionID,
 		Board:     board,
-		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*claims.ConsultResolvedDelta) error {
+		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*AwaitedClaimResult) error {
 			return nil
 		},
 	})
@@ -336,10 +248,6 @@ func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "" },
-		RouteSync: func(context.Context, *guide.RouteRequest) (*guide.Message, error) {
-			routeCalled = true
-			return nil, errors.New("legacy route should not run in claims ticket mode")
-		},
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 	ctx := WithContinuationStore(context.Background(), store)
@@ -358,13 +266,9 @@ func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
 	if !ok || outcome.Status != skills.ToolStatusYielded {
 		t.Fatalf("result = %#v, want yielded ToolOutcome", result)
 	}
-	if routeCalled {
-		t.Fatal("RouteSync was called; claims ticket mode must let the posted claim drive peer work")
-	}
-
 	store.mu.Lock()
 	var consultID string
-	for id := range store.consultIndex {
+	for id := range store.claimIndex {
 		consultID = id
 		break
 	}
@@ -372,13 +276,13 @@ func TestConsultPeerSkill_TicketModeUsesClaimInsteadOfRouteSync(t *testing.T) {
 	if consultID == "" {
 		t.Fatal("consult_id was not registered with the continuation store")
 	}
-	store.DeliverResolution(context.Background(), &claims.ConsultResolvedDelta{
-		SessionID:         sessionID,
-		ConsultID:         consultID,
-		OriginatorAgentID: "agent-1",
-		ResponderAgentID:  "librarian",
-		Status:            claims.ConsultStatusCompleted,
-		EmittedAt:         time.Now().UTC(),
+	store.DeliverClaimResult(context.Background(), &AwaitedClaimResult{
+		SessionID:        sessionID,
+		ClaimID:          consultID,
+		Action:           claims.DeltaActionTestamentSubmitted,
+		Status:           claims.ConsultStatusCompleted,
+		ResponderAgentID: "librarian",
+		EmittedAt:        time.Now().UTC(),
 	})
 }
 
@@ -397,7 +301,6 @@ func TestConsultPeerSkill_EmitsConsultEmittedActivity(t *testing.T) {
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipe-1" },
-		RouteSync:  nil, // fire-and-forget exercises just the activity write
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 

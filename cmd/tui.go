@@ -479,7 +479,8 @@ type bootstrapPhase4 struct {
 
 // busReadinessPublisher adapts knowledge.ReadinessPublisher to the guide EventBus.
 type busReadinessPublisher struct {
-	bus guide.EventBus
+	bus       guide.EventBus
+	sessionID func() string
 }
 
 func (p *busReadinessPublisher) PublishKnowledgeReady(event knowledge.ReadinessEvent) {
@@ -493,6 +494,57 @@ func (p *busReadinessPublisher) PublishKnowledgeReady(event knowledge.ReadinessE
 			"searchers", event.Searchers,
 			"error", err.Error(),
 		)
+	}
+	p.publishKnowledgeBackendReadyTestament(event)
+}
+
+const knowledgeReadinessTestamentPublishTimeout = 5 * time.Second
+
+func (p *busReadinessPublisher) publishKnowledgeBackendReadyTestament(event knowledge.ReadinessEvent) {
+	if p == nil || !knowledgeReadinessEventHasTextSearch(event) || p.sessionID == nil {
+		return
+	}
+	sessionID := strings.TrimSpace(p.sessionID())
+	if sessionID == "" {
+		return
+	}
+	board := claims.DefaultSessionBoardRegistry().Lookup(sessionID)
+	if board == nil {
+		slog.Warn("tui_knowledge_ready_board_missing", "session_id", sessionID)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), knowledgeReadinessTestamentPublishTimeout)
+	defer cancel()
+	if _, err := claims.SubmitKnowledgeBackendReadyTestament(ctx, board, map[string]any{
+		"level":     knowledgeReadinessLevelLabel(event.Level),
+		"searchers": append([]string(nil), event.Searchers...),
+	}); err != nil {
+		slog.Warn("tui_knowledge_ready_testament_failed",
+			"session_id", sessionID,
+			"level", int(event.Level),
+			"searchers", event.Searchers,
+			"error", err.Error(),
+		)
+	}
+}
+
+func knowledgeReadinessEventHasTextSearch(event knowledge.ReadinessEvent) bool {
+	for _, searcher := range event.Searchers {
+		if searcher == "text" {
+			return true
+		}
+	}
+	return false
+}
+
+func knowledgeReadinessLevelLabel(level knowledge.ReadinessLevel) string {
+	switch level {
+	case knowledge.ReadinessPartial:
+		return "partial"
+	case knowledge.ReadinessFull:
+		return "full"
+	default:
+		return "none"
 	}
 }
 
@@ -850,7 +902,15 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	planLeaseManager := architect.NewPlanLeaseManager(architect.DefaultLLMRequestTimeout, architect.ReadyPlanMaxAge)
 	phase1.planStore = architect.NewPlanStore(projectRoot, planLeaseManager, slog.Default())
 	phase1.knowledgeStore = knowledge.NewKnowledgeStore(
-		&busReadinessPublisher{bus: phase1.guideBus},
+		&busReadinessPublisher{
+			bus: phase1.guideBus,
+			sessionID: func() string {
+				if phase1.defaultSession == nil {
+					return ""
+				}
+				return phase1.defaultSession.ID()
+			},
+		},
 		slog.Default(),
 	)
 	forest, forestContent, forestVectorDB, err := buildMemoryForestForSession(projectRoot, phase1.defaultSession.ID(), phase1.budget)

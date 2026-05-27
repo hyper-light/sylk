@@ -927,16 +927,17 @@ func (o *Orchestrator) Start(bus guide.EventBus) error {
 	// transitions (CLAIMS.md §5.4 — orchestrator's pattern) on top of
 	// the directly-addressed inbox baseline.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:           o.config.AgentID,
-		SessionID:         o.SessionID(),
-		Role:              claims.RoleSubject | claims.RolePhaseObserver,
-		Bus:               o.bus,
-		Board:             o.orchestratorBoardOrNil(),
-		Scope:             o.scope,
-		ProcessEntry:      o.processClaimsEntry,
-		Identity:          o.identity,
-		Factory:           o.factory,
-		ContinuationStore: o.continuationStore,
+		AgentID:             o.config.AgentID,
+		SessionID:           o.SessionID(),
+		Role:                claims.RoleSubject | claims.RolePhaseObserver,
+		Bus:                 o.bus,
+		Board:               o.orchestratorBoardOrNil(),
+		Scope:               o.scope,
+		ProcessEntry:        o.processClaimsEntry,
+		Identity:            o.identity,
+		Factory:             o.factory,
+		ContinuationStore:   o.continuationStore,
+		ExpectedToolRuntime: o.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("orchestrator_claims_inbox_start_failed", "error", err.Error())

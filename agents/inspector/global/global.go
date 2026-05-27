@@ -439,16 +439,17 @@ func (gi *GlobalInspector) Start(bus guide.EventBus) error {
 	// submitted in the session (CLAIMS.md §5.4 — inspector evaluates
 	// testaments).
 	if inbox := agentShared.WireClaimsIntake(agentShared.ClaimsIntakeConfig{
-		AgentID:           gi.id,
-		SessionID:         gi.config.SessionID,
-		Role:              claims.RoleSubject | claims.RoleAuditor,
-		Bus:               bus,
-		Board:             gi.globalInspectorBoardOrNil(),
-		Scope:             gi.scope,
-		ProcessEntry:      gi.processClaimsEntry,
-		Identity:          gi.identity,
-		Factory:           gi.factory,
-		ContinuationStore: gi.continuationStore,
+		AgentID:             gi.id,
+		SessionID:           gi.config.SessionID,
+		Role:                claims.RoleSubject | claims.RoleAuditor,
+		Bus:                 bus,
+		Board:               gi.globalInspectorBoardOrNil(),
+		Scope:               gi.scope,
+		ProcessEntry:        gi.processClaimsEntry,
+		Identity:            gi.identity,
+		Factory:             gi.factory,
+		ContinuationStore:   gi.continuationStore,
+		ExpectedToolRuntime: gi.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("global_inspector_claims_inbox_start_failed", "error", err.Error())

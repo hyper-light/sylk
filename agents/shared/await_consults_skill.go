@@ -92,17 +92,17 @@ type AwaitConsultsResult struct {
 
 // ConsultResolutionResult is one entry in the results map.
 type ConsultResolutionResult struct {
-	Status   string          `json:"status"`
-	Response json.RawMessage `json:"response,omitempty"`
-	Summary  string          `json:"summary,omitempty"`
-	Error    string          `json:"error,omitempty"`
-	Responder string         `json:"responder,omitempty"`
+	Status    string          `json:"status"`
+	Response  json.RawMessage `json:"response,omitempty"`
+	Summary   string          `json:"summary,omitempty"`
+	Error     string          `json:"error,omitempty"`
+	Responder string          `json:"responder,omitempty"`
 }
 
 // FormatConsultResults is the canonical converter from a results map
 // to the LLM-facing AwaitConsultsResult. Exported because the resume
 // path also calls it when constructing the post-resume tool result.
-func FormatConsultResults(results map[string]*claims.ConsultResolvedDelta) AwaitConsultsResult {
+func FormatConsultResults(results map[string]*AwaitedClaimResult) AwaitConsultsResult {
 	out := AwaitConsultsResult{
 		Results: make(map[string]ConsultResolutionResult, len(results)),
 	}
@@ -133,12 +133,13 @@ func snapshotAccumulator(ctx context.Context) AccumulatorSnapshot {
 		return AccumulatorSnapshot{}
 	}
 	return AccumulatorSnapshot{
-		AgentID:   acc.AgentID(),
-		SessionID: acc.SessionID(),
-		ClaimID:   acc.ClaimID(),
-		Started:   acc.Started(),
-		Artifacts: acc.Artifacts(),
-		Notes:     acc.Notes(),
+		AgentID:         acc.AgentID(),
+		SessionID:       acc.SessionID(),
+		ClaimID:         acc.ClaimID(),
+		ResponseClaimID: acc.ResponseClaimID(),
+		Started:         acc.Started(),
+		Artifacts:       acc.Artifacts(),
+		Notes:           acc.Notes(),
 	}
 }
 

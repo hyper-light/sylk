@@ -311,6 +311,28 @@ func TestPlanningProtocolInstructions_GateEvidenceBeforeAnalyze(t *testing.T) {
 	}
 }
 
+func TestPlanningProtocolPromptStartsWithEvidenceReview(t *testing.T) {
+	runner := &planningProtocolRunner{
+		architect: &Architect{},
+		request:   &ArchitectRequest{Query: "Create a toy Python CLI."},
+		plan:      &DesignPlan{ID: "plan-1", SessionID: "session-1"},
+	}
+	text := compactPromptWhitespace(runner.buildProtocolPrompt())
+	if strings.Contains(text, "Begin by invoking plan with action=analyze") {
+		t.Fatalf("protocol prompt still starts at analyze:\n%s", text)
+	}
+	for _, want := range []string{
+		"Begin with evidence review.",
+		"Call recall_forward",
+		"issue one targeted consult_peer and wait for it to complete",
+		"Only after fresh evidence is attached should you invoke plan(action=analyze).",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("protocol prompt missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func containsToolName(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

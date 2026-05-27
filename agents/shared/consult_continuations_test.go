@@ -13,12 +13,12 @@ func TestContinuationDeadlineUsesConsultInactivity(t *testing.T) {
 	board := testContinuationBoard("board-cont-idle")
 	postContinuationConsultClaim(t, board, "consult-idle")
 
-	resumed := make(chan map[string]*claims.ConsultResolvedDelta, 1)
+	resumed := make(chan map[string]*AwaitedClaimResult, 1)
 	store := NewContinuationStore(ContinuationStoreConfig{
 		AgentID:   "architect",
 		SessionID: "sess-cont-idle",
 		Board:     board,
-		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*claims.ConsultResolvedDelta) error {
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
 			resumed <- results
 			return nil
 		},
@@ -67,12 +67,12 @@ func TestContinuationDeadlineTimesOutWithoutActivity(t *testing.T) {
 	board := testContinuationBoard("board-cont-timeout")
 	postContinuationConsultClaim(t, board, "consult-timeout")
 
-	resumed := make(chan map[string]*claims.ConsultResolvedDelta, 1)
+	resumed := make(chan map[string]*AwaitedClaimResult, 1)
 	store := NewContinuationStore(ContinuationStoreConfig{
 		AgentID:   "architect",
 		SessionID: "sess-cont-timeout",
 		Board:     board,
-		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*claims.ConsultResolvedDelta) error {
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
 			resumed <- results
 			return nil
 		},
@@ -95,8 +95,64 @@ func TestContinuationDeadlineTimesOutWithoutActivity(t *testing.T) {
 		if got == nil || got.Status != claims.ConsultStatusTimeout {
 			t.Fatalf("results = %#v, want timeout", results)
 		}
+		testaments := board.TestamentsByClaim("consult-timeout")
+		if len(testaments) == 0 {
+			t.Fatal("timeout did not submit an error testament against the awaited claim")
+		}
+		found := false
+		for _, testament := range testaments {
+			for _, artifact := range testament.Artifacts {
+				if artifact != nil && artifact.Kind == claims.ArtifactKindToolTimeout {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("timeout testaments = %#v, want %q artifact", testaments, claims.ArtifactKindToolTimeout)
+		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("expected timeout without consult activity")
+	}
+}
+
+func TestAwaitClaimResultsSynchronouslyResolvesCanonicalResult(t *testing.T) {
+	board := testContinuationBoard("board-cont-sync")
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-sync",
+		Board:     board,
+	})
+	if store == nil {
+		t.Fatal("expected continuation store")
+	}
+	done := make(chan map[string]*AwaitedClaimResult, 1)
+	errs := make(chan error, 1)
+	go func() {
+		results, err := store.AwaitClaimResults(context.Background(), []string{"claim-sync"}, time.Now().Add(time.Second))
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- results
+	}()
+
+	store.DeliverClaimResult(context.Background(), &AwaitedClaimResult{
+		ClaimID:          "claim-sync",
+		Status:           claims.ConsultStatusCompleted,
+		ResponseSummary:  "peer answered",
+		ResponderAgentID: "librarian",
+	})
+
+	select {
+	case err := <-errs:
+		t.Fatalf("AwaitClaimResults returned error: %v", err)
+	case results := <-done:
+		got := results["claim-sync"]
+		if got == nil || got.ResponseSummary != "peer answered" {
+			t.Fatalf("results = %#v", results)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("AwaitClaimResults did not return")
 	}
 }
 

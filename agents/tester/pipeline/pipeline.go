@@ -532,14 +532,15 @@ func (pt *PipelineTester) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := agentshared.WireClaimsIntake(agentshared.ClaimsIntakeConfig{
-		AgentID:      pt.id,
-		SessionID:    pt.config.SessionID,
-		Bus:          bus,
-		Board:        pt.claimsBoard,
-		Scope:        pt.scope,
-		ProcessEntry: pt.processClaimsEntry,
-		Identity:     pt.identity,
-		Factory:      pt.factory,
+		AgentID:             pt.id,
+		SessionID:           pt.config.SessionID,
+		Bus:                 bus,
+		Board:               pt.claimsBoard,
+		Scope:               pt.scope,
+		ProcessEntry:        pt.processClaimsEntry,
+		Identity:            pt.identity,
+		Factory:             pt.factory,
+		ExpectedToolRuntime: pt.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("pipeline_tester_claims_inbox_start_failed", "error", err.Error())

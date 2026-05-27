@@ -82,7 +82,7 @@ func TestConsultationResponseSummary_AcademicPayloadUsesContent(t *testing.T) {
 
 func TestBuildInterAgentStartRecord_MergesMetadataWithFallbackTargets(t *testing.T) {
 	startedAt := time.Now()
-	record, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
+	_, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
 		CorrelationID: "corr-1",
 		ToolCallKey:   "consult-1",
 		ToolName:      "consult",
@@ -95,25 +95,13 @@ func TestBuildInterAgentStartRecord_MergesMetadataWithFallbackTargets(t *testing
 			Summary: "",
 		},
 	})
-	if !ok {
-		t.Fatal("expected metadata-driven consult start record")
-	}
-	if record.InterAgent == nil {
-		t.Fatal("expected inter-agent row")
-	}
-	if got := record.InterAgent.AgentTypes; len(got) != 1 || got[0] != "librarian" {
-		t.Fatalf("agent types = %#v, want [librarian]", got)
-	}
-	if got := record.InterAgent.Summary; got != "Find relevant in-repo patterns." {
-		t.Fatalf("summary = %q, want fallback query", got)
-	}
-	if got := record.ToolCallKey; got != "consult-1" {
-		t.Fatalf("tool call key = %q, want consult-1", got)
+	if ok {
+		t.Fatal("consult rows must be claims-projected, not inferred from tool metadata")
 	}
 }
 
 func TestBuildInterAgentStartRecord_MergesMetadataWithFallbackChallengeTargets(t *testing.T) {
-	record, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
+	_, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
 		CorrelationID: "corr-2",
 		ToolCallKey:   "challenge-1",
 		ToolName:      "challenge_architect",
@@ -125,17 +113,8 @@ func TestBuildInterAgentStartRecord_MergesMetadataWithFallbackChallengeTargets(t
 			Status: "pending",
 		},
 	})
-	if !ok {
-		t.Fatal("expected metadata-driven challenge start record")
-	}
-	if record.InterAgent == nil {
-		t.Fatal("expected inter-agent row")
-	}
-	if got := record.InterAgent.AgentTypes; len(got) != 1 || got[0] != "architect" {
-		t.Fatalf("agent types = %#v, want [architect]", got)
-	}
-	if got := record.InterAgent.Summary; got != "Reassess the plan." {
-		t.Fatalf("summary = %q, want fallback request", got)
+	if ok {
+		t.Fatal("challenge rows must be claims-projected, not inferred from tool metadata")
 	}
 }
 
@@ -168,7 +147,7 @@ func TestBuildInterAgentStartRecord_UsesApprovalMetadata(t *testing.T) {
 }
 
 func TestBuildInterAgentStartRecord_PipelineChallengeNormalizesTesterLabel(t *testing.T) {
-	record, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
+	_, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
 		CorrelationID: "corr-pipeline",
 		ToolCallKey:   "challenge-pipeline-1",
 		ToolName:      "challenge_agent",
@@ -182,14 +161,8 @@ func TestBuildInterAgentStartRecord_PipelineChallengeNormalizesTesterLabel(t *te
 			Status: "pending",
 		},
 	})
-	if !ok {
-		t.Fatal("expected pipeline challenge start record")
-	}
-	if record.InterAgent == nil {
-		t.Fatal("expected inter-agent row")
-	}
-	if got := record.InterAgent.AgentTypes; len(got) != 1 || got[0] != "tester-pipeline" {
-		t.Fatalf("agent types = %#v, want [tester-pipeline]", got)
+	if ok {
+		t.Fatal("pipeline challenge rows must be claims-projected, not inferred from tool metadata")
 	}
 }
 
@@ -543,27 +516,15 @@ func TestHandleInterAgentToolCallInList_ChallengePeerPromotesRegularRow(t *testi
 			Status:     "pending",
 		},
 	}
-	if !handleInterAgentToolCallInList(&calls, "librarian", complete, interAgentDispatchCallbacks{}) {
-		t.Fatal("expected Complete event to be consumed by the inter-agent handler")
+	if handleInterAgentToolCallInList(&calls, "librarian", complete, interAgentDispatchCallbacks{}) {
+		t.Fatal("challenge_peer completion must not promote a metadata-inferred inter-agent row")
 	}
 	if len(calls) != 1 {
-		t.Fatalf("calls len = %d, want 1 (the regular row must be promoted in-place, not duplicated): %#v", len(calls), calls)
+		t.Fatalf("calls len = %d, want 1: %#v", len(calls), calls)
 	}
 	record := calls[0]
-	if record.InterAgent == nil {
-		t.Fatal("regular row was not promoted — InterAgent is nil after Complete")
-	}
-	if record.InterAgent.Kind != InterAgentToolChallenge {
-		t.Fatalf("InterAgent.Kind = %q, want %q", record.InterAgent.Kind, InterAgentToolChallenge)
-	}
-	if len(record.InterAgent.AgentTypes) != 1 || record.InterAgent.AgentTypes[0] != "tester-pipeline" {
-		t.Fatalf("InterAgent.AgentTypes = %#v, want [tester-pipeline]", record.InterAgent.AgentTypes)
-	}
-	if !record.Completed {
-		t.Fatal("promoted row must be Completed after a Complete event")
-	}
-	if !record.Success {
-		t.Fatal("promoted row must be Success=true for a successful Complete")
+	if record.InterAgent != nil {
+		t.Fatalf("regular row was promoted from metadata; InterAgent = %#v", record.InterAgent)
 	}
 }
 

@@ -19,21 +19,14 @@ import (
 func (gi *GlobalInspector) resumeContinuation(
 	ctx context.Context,
 	snapshot *agentShared.TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*agentShared.AwaitedClaimResult,
 ) error {
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("global_inspector: nil consult-yield snapshot on resume")
 	}
 
 	if snapshot.AccumulatorState.AgentID != "" {
-		acc := claims.RestoreAccumulator(
-			snapshot.AccumulatorState.AgentID,
-			snapshot.AccumulatorState.SessionID,
-			snapshot.AccumulatorState.ClaimID,
-			snapshot.AccumulatorState.Started,
-			snapshot.AccumulatorState.Artifacts,
-			snapshot.AccumulatorState.Notes,
-		)
+		acc := agentShared.RestoreAccumulatorFromSnapshot(snapshot.AccumulatorState)
 		ctx = claims.WithTestamentAccumulator(ctx, acc)
 		defer acc.Flush(ctx, gi.globalInspectorBoardOrNil(), nil)
 	}
@@ -79,7 +72,7 @@ func (gi *GlobalInspector) resumeContinuation(
 	return nil
 }
 
-func formatGlobalInspectorAwaitResults(results map[string]*claims.ConsultResolvedDelta) string {
+func formatGlobalInspectorAwaitResults(results map[string]*agentShared.AwaitedClaimResult) string {
 	formatted := agentShared.FormatConsultResults(results)
 	encoded, err := json.Marshal(formatted)
 	if err != nil {

@@ -9,7 +9,6 @@ import (
 
 	"log/slog"
 
-	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/authority"
 	"github.com/adalundhe/sylk/core/claims"
@@ -23,19 +22,11 @@ import (
 // activity and returns. Delivery is handled by the fabric via ambient
 // context envelopes.
 //
-// consult_peer has two modes governed by RouteSync:
-//   - When RouteSync is non-nil, the skill dispatches the consult
-//     synchronously via the provided transport, waits for the
-//     terminal response, and renders the target's stream events as
-//     nested children of the caller's consult_peer row. This is the
-//     primary mode for interactive agents that need the answer to
-//     proceed.
-//   - When RouteSync is nil, the skill degrades to fire-and-forget:
-//     it writes a consult_emitted activity and returns the consult_id
-//     without waiting. The addressee is expected to observe the
-//     emitted activity via ambient context and respond on its own
-//     cadence. This preserves audit flow for agents that either lack
-//     a route transport or explicitly want the async semantics.
+// consult_peer and challenge_peer are claim-backed. They post directed
+// claims to the session board and then either yield the current LLM
+// turn on canonical testament/claim deltas or return an in-flight
+// ticket when no continuation context is available. They do not
+// synchronously RouteSync peer execution after posting the claim.
 //
 // See docs/FABRIC.md Part 3: cross-pipeline collaboration.
 type CrossPipelineSkillConfig struct {
@@ -43,11 +34,6 @@ type CrossPipelineSkillConfig struct {
 	AgentID    func() string
 	AgentType  func() string
 	PipelineID func() string
-
-	// RouteSync dispatches a RouteRequest to the target peer agent and
-	// waits for the terminal response. Nil ⇒ consult_peer runs in
-	// fire-and-forget mode (see type doc).
-	RouteSync func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error)
 
 	// Inbox returns the calling agent's ClaimsInbox so the consult /
 	// challenge dispatchers can register a just-in-time response
@@ -58,39 +44,11 @@ type CrossPipelineSkillConfig struct {
 	// callers.
 	Inbox func() *claims.ClaimsInbox
 
-	// Scope is the calling agent's tracked goroutine scope. In
-	// claims-native ticket mode the peer runs from the posted claim;
-	// the issuer's claims inbox converts the peer testament into a
-	// continuation resolution. Nil degrades to legacy synchronous mode
-	// if RouteSync is set, or fire-and-forget if not.
+	// Scope is the calling agent's tracked goroutine scope. The peer
+	// runs from the posted claim; the issuer's claims inbox converts
+	// the peer testament into a continuation resolution. Nil returns an
+	// in-flight ticket instead of yielding the current turn.
 	Scope GoroutineScopeProxy
-}
-
-// RouteSyncFromBus builds a RouteSync using the caller-provided bus
-// and response topic. Pass the agent's live bus and Responses topic
-// (typically accessed via closures so nil-at-registration-time is
-// tolerated). Returns a RouteSync that errors early when the bus or
-// topic is unavailable, so the consult surfaces a real failure
-// instead of silently blocking.
-func RouteSyncFromBus(busFn func() guide.EventBus, topicFn func() string) func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-	return func(ctx context.Context, req *guide.RouteRequest) (*guide.Message, error) {
-		if busFn == nil || topicFn == nil {
-			return nil, fmt.Errorf("consult_peer: route transport is not configured")
-		}
-		bus := busFn()
-		topic := strings.TrimSpace(topicFn())
-		if bus == nil {
-			return nil, fmt.Errorf("consult_peer: bus is not ready")
-		}
-		if topic == "" {
-			return nil, fmt.Errorf("consult_peer: response topic is not configured")
-		}
-		return RequestGuideRouteSync(ctx, GuideRouteSyncRequest{
-			Bus:           bus,
-			ResponseTopic: topic,
-			Request:       req,
-		})
-	}
 }
 
 // CrossPipelineSkills returns challenge_peer and consult_peer,
@@ -202,7 +160,7 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			callerType := safeCallString(cfg.AgentType)
 			ownPipelineID := safeCallString(cfg.PipelineID)
 			if explicit := strings.TrimSpace(params.TargetAgentType); explicit != "" {
-				if peerTargetIsCaller(callerID, callerType, ownPipelineID, explicit, explicit, "") {
+				if peerTargetIsCaller(callerID, callerType, ownPipelineID, "", explicit, "") {
 					return nil, selfPeerTargetError("challenge_peer", callerID, callerType, explicit, explicit)
 				}
 				if !authority.CanChallenge(callerType, explicit) {
@@ -232,9 +190,6 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 				resolvedAgentType = strings.TrimSpace(target.Actor.AgentType)
 				resolvedPipelineID = strings.TrimSpace(target.Actor.PipelineID)
 			}
-			if peerTargetIsCaller(callerID, callerType, ownPipelineID, resolvedAgentID, resolvedAgentType, resolvedPipelineID) {
-				return nil, selfPeerTargetError("challenge_peer", callerID, callerType, resolvedAgentID, resolvedAgentType)
-			}
 			// Second authority gate: even if the caller didn't
 			// explicitly name target_agent_type, the resolved author
 			// of the challenged activity must still be a permitted
@@ -242,6 +197,9 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			// via an opaque target_activity_id.
 			if resolvedAgentType != "" && !authority.CanChallenge(callerType, resolvedAgentType) {
 				return nil, unauthorizedChallengeError(callerType, resolvedAgentType, permittedTargets)
+			}
+			if peerTargetIsCaller(callerID, callerType, ownPipelineID, resolvedAgentID, resolvedAgentType, resolvedPipelineID) {
+				return nil, selfPeerTargetError("challenge_peer", callerID, callerType, resolvedAgentID, resolvedAgentType)
 			}
 
 			payload, _ := json.Marshal(map[string]any{
@@ -335,19 +293,24 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 				"Challenging "+challengeTarget,
 				AgentStateChallengingPeer, peerRef)
 
-			// Yield path: per spec §5.2 step 4, treat the challenge_id
-			// as a consult_id and use the existing
-			// AwaitConsultsOrYield framework. The challenged peer's
-			// response (defend/yield/scope-split/escalate) publishes a
-			// ConsultResolvedDelta with the challenge_id; resume
-			// injects the verdict as the challenge_peer tool's
-			// result. Falls through to the legacy fire-and-forget
-			// ticket return when no continuation store / turn context
-			// is wired (user-facing turns) — matches consult_peer's
-			// dual-path shape.
+			// Yield path: await the challenge claim's canonical response
+			// deltas. The challenged peer answers by submitting a
+			// testament against challengeClaimID; the continuation
+			// resumes from testament.submitted or terminal
+			// claim.transitioned.
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
-			if store != nil && turn != nil && turn.Request != nil {
+			if store != nil {
+				if challengeClaimID == "" {
+					return nil, fmt.Errorf("challenge_peer: claims-native continuation requires a posted challenge claim")
+				}
+				if turn == nil || turn.Request == nil {
+					results, waitErr := store.AwaitClaimResults(ctx, []string{challengeClaimID}, time.Now().Add(deadline))
+					if waitErr != nil {
+						return nil, waitErr
+					}
+					return FormatConsultResults(results), nil
+				}
 				toolCallID, toolName := activeToolCallFromContext(ctx)
 				if toolCallID == "" {
 					toolCallID = "challenge_" + string(act.ID)
@@ -361,7 +324,7 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 					AccumulatorState: snapshotAccumulator(ctx),
 				}
 				_, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
-					ConsultIDs:      []string{string(act.ID)},
+					ClaimRefs:       []string{challengeClaimID},
 					AwaitToolCallID: toolCallID,
 					AwaitToolName:   toolName,
 					Deadline:        time.Now().Add(deadline),
@@ -376,7 +339,7 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 					}
 					return skills.YieldToolOutcome(&skills.YieldContinuation{
 						Kind:        "challenge",
-						AwaitedIDs:  []string{string(act.ID)},
+						AwaitedIDs:  []string{challengeClaimID},
 						ToolCallID:  toolCallID,
 						ToolName:    toolName,
 						Deadline:    time.Now().Add(deadline),
@@ -429,13 +392,13 @@ func lookupTargetActivity(ctx context.Context, id activity.ActivityID) *activity
 
 func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, allowsCrossPipeline bool) *skills.Skill {
 	return skills.NewSkill("consult_peer").
-		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. When a route transport is configured for the calling agent, this blocks on the peer's terminal response and renders their work as nested children of this tool call — the normal mode for interactive consultation. Without a transport, it degrades to fire-and-forget: an activity is emitted, the addressee responds via their own ambient_context envelope, and the caller gets a consult_id to causal_trace later. PREFER THIS over guessing when peer state matters.").
+		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. This posts a directed consultation claim; the peer receives the claim through the Guide bus and answers by submitting a testament with artifacts. When the current turn can be parked, the tool yields and resumes from canonical deltas. Otherwise it returns an in-flight ticket. PREFER THIS over guessing when peer state matters.").
 		Domain("fabric").
 		Keywords("consult", "fabric", "cross-pipeline", "peer", "knowledge-agent", "ask", "question").
 		Priority(91).
 		Usage("Use when ambient context shows a peer working in adjacent or overlapping scope and you'd benefit from their live state — e.g., 'how are you handling fixtures for shared models?' Pass target_agent_type and (optional) target_pipeline_id; without pipeline_id the consult routes to the natural same-pipeline peer or knowledge agent.").
 		Requirement("Frame the question concretely. Vague consults waste both parties' attention budget.").
-		Satisfies("Records a consult_emitted activity addressed to the target; returns the peer's response inline when the route transport is available.").
+		Satisfies("Posts a consultation claim addressed to the target and waits/yields on the peer's testament when continuation context is available.").
 		// target_agent_type is an authority-gated enum: each agent
 		// only sees targets its authority.Profile permits it to
 		// consult. Self-targeting is already excluded by
@@ -469,10 +432,9 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			// bus-level injection.
 			callerID := safeCallString(cfg.AgentID)
 			callerType := safeCallString(cfg.AgentType)
-			ownPipelineID := safeCallString(cfg.PipelineID)
 			targetType := strings.TrimSpace(params.TargetAgentType)
 			targetPipelineID := strings.TrimSpace(params.TargetPipelineID)
-			if peerTargetIsCaller(callerID, callerType, ownPipelineID, targetType, targetType, targetPipelineID) {
+			if peerTargetIsCaller(callerID, callerType, safeCallString(cfg.PipelineID), "", targetType, targetPipelineID) {
 				return nil, selfPeerTargetError("consult_peer", callerID, callerType, targetType, targetType)
 			}
 			if !authority.CanConsult(callerType, targetType) {
@@ -569,40 +531,27 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				}
 			}
 
-			// Fire-and-forget transport: caller has no route-sync, so
-			// there is no peer response to wait for. Return the
-			// activity envelope as the tool result so the LLM sees it
-			// dispatched.
 			ticket := map[string]any{
 				"consult_id":  consultID,
 				"deadline_at": time.Now().Add(deadline),
 				"status":      "in_flight",
 				"target":      targetAddress,
 			}
-			if cfg.RouteSync == nil {
-				return ticket, nil
-			}
 
-			// Two paths:
-			//   - WithContinuationStore + WithTurnContext stamped on
-			//     ctx → ticket-mode yield/resume (claim-inbox-driven
-			//     flows where no synchronous caller is waiting).
-			//   - Otherwise → legacy synchronous wait (user-facing
-			//     turns where the caller is blocked on the response;
-			//     this is what sylk-clone has always done).
-			//
-			// The synchronous path posts the same consultation claim,
-			// dispatches via cfg.RouteSync, and blocks inline until the
-			// peer's testament arrives. The LLM continues with the
-			// real response in the same tool-loop turn — no half-empty
-			// answer reaches the user.
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
-			if store == nil || turn == nil || turn.Request == nil {
-				return runLegacyConsultWait(ctx, cfg, params, consultID, consultationClaimID)
+			if store == nil {
+				return ticket, nil
 			}
 			if consultationClaimID == "" {
 				return nil, fmt.Errorf("consult_peer: claims-native continuation requires a posted consultation claim")
+			}
+			if turn == nil || turn.Request == nil {
+				results, waitErr := store.AwaitClaimResults(ctx, []string{consultationClaimID}, time.Now().Add(deadline))
+				if waitErr != nil {
+					return nil, waitErr
+				}
+				return FormatConsultResults(results), nil
 			}
 
 			board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID))
@@ -646,7 +595,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				AccumulatorState: snapshotAccumulator(ctx),
 			}
 			_, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
-				ConsultIDs:      []string{consultID},
+				ClaimRefs:       []string{consultationClaimID},
 				AwaitToolCallID: toolCallID,
 				AwaitToolName:   toolName,
 				Deadline:        time.Now().Add(deadline),
@@ -671,7 +620,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				}
 				return skills.YieldToolOutcome(&skills.YieldContinuation{
 					Kind:        "consult",
-					AwaitedIDs:  []string{consultID},
+					AwaitedIDs:  []string{consultationClaimID},
 					ToolCallID:  toolCallID,
 					ToolName:    toolName,
 					Deadline:    time.Now().Add(deadline),
@@ -684,117 +633,6 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			return ticket, nil
 		}).
 		Build()
-}
-
-// runLegacyConsultWait is the synchronous behavior of consult_peer.
-// The LLM blocks on the peer's response and the tool result IS the
-// response payload. Used when no ContinuationStore + TurnContext is
-// stamped on ctx (i.e. user-facing turns where a caller is awaiting
-// the response synchronously). Same shape as sylk-clone.
-func runLegacyConsultWait(
-	ctx context.Context,
-	cfg CrossPipelineSkillConfig,
-	params struct {
-		TargetAgentType  string `json:"target_agent_type"`
-		TargetPipelineID string `json:"target_pipeline_id"`
-		Scope            string `json:"scope"`
-		Query            string `json:"query"`
-		DeadlineSeconds  int    `json:"deadline_seconds"`
-	},
-	consultID string,
-	consultationClaimID string,
-) (any, error) {
-	spec := InterAgentBranchSpec{
-		Kind:       InterAgentToolEventKindConsult,
-		ToolName:   "consult_peer",
-		AgentTypes: []string{strings.TrimSpace(params.TargetAgentType)},
-		Summary:    params.Query,
-		Args: map[string]any{
-			"target_agent_type":  params.TargetAgentType,
-			"target_pipeline_id": params.TargetPipelineID,
-			"scope":              params.Scope,
-			"query":              params.Query,
-		},
-	}
-	response, err := WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch InterAgentBranchHandle) (*guide.Message, error) {
-		req := &guide.RouteRequest{
-			Input:           params.Query,
-			TargetAgentID:   strings.TrimSpace(params.TargetAgentType),
-			SessionID:       safeCallString(cfg.SessionID),
-			SourceAgentID:   safeCallString(cfg.AgentID),
-			SourceAgentName: safeCallString(cfg.AgentType),
-			ExplicitTarget:  true,
-		}
-		req.Metadata = branch.ApplyMetadata(branchCtx, req.Metadata)
-		req.Metadata = consultRouteMetadata(ctx, req.Metadata, consultID)
-		req.Metadata = CycleOptsToAnyMetadata(req.Metadata, ForwardedRequestCycleOpts{
-			ParentClaimID: strings.TrimSpace(consultationClaimID),
-		})
-		if pipe := strings.TrimSpace(params.TargetPipelineID); pipe != "" {
-			if req.Metadata == nil {
-				req.Metadata = map[string]any{}
-			}
-			req.Metadata["target_pipeline_id"] = pipe
-		}
-		return cfg.RouteSync(branchCtx, req)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("consult_peer: %w", err)
-	}
-	result := map[string]any{
-		"consult_id": consultID,
-		"status":     "completed",
-	}
-	if response != nil {
-		if resp, ok := response.GetRouteResponse(); ok && resp != nil {
-			if !resp.Success {
-				errText := strings.TrimSpace(resp.Error)
-				if errText == "" {
-					errText = "peer consultation failed"
-				}
-				return nil, fmt.Errorf("consult_peer: %s", errText)
-			}
-			result["response"] = resp.Data
-		} else if errText, ok := response.GetError(); ok {
-			trimmed := strings.TrimSpace(errText)
-			if trimmed == "" {
-				trimmed = "peer consultation failed"
-			}
-			return nil, fmt.Errorf("consult_peer: %s", trimmed)
-		}
-	}
-	return result, nil
-}
-
-func consultRouteMetadata(ctx context.Context, metadata map[string]any, consultID string) map[string]any {
-	if hasNestedInterAgentBranchMetadata(metadata) {
-		return metadata
-	}
-	parentCorrelationID := ""
-	if stream, ok := StreamMetadataFromContext(ctx); ok {
-		parentCorrelationID = strings.TrimSpace(stream.CorrelationID)
-	}
-	if parentCorrelationID == "" {
-		if turn := TurnFromContext(ctx); turn != nil {
-			parentCorrelationID = strings.TrimSpace(turn.CorrelationID)
-		}
-	}
-	if parentCorrelationID == "" {
-		return metadata
-	}
-	toolCallKey := ""
-	if active, ok := ActiveToolCallFromContext(ctx); ok {
-		toolCallKey = strings.TrimSpace(active.ToolCallKey)
-	}
-	if toolCallKey == "" {
-		toolCallKey = "consult_" + strings.TrimSpace(consultID)
-	}
-	return RouteMetadataWithExplicitInterAgentBranch(ctx, metadata, InterAgentBranchMetadata{
-		ParentCorrelationID: parentCorrelationID,
-		ParentToolCallKey:   toolCallKey,
-		ThreadKey:           strings.TrimSpace(consultID),
-		Kind:                InterAgentToolEventKindConsult,
-	})
 }
 
 // asString converts an arbitrary value into a string suitable for a
@@ -904,6 +742,38 @@ func RespondToConsult(ctx context.Context, cfg CrossPipelineSkillConfig, consult
 	}
 	activity.Append(ctx, act)
 	return act.ID, nil
+}
+
+func peerTargetIsCaller(callerID, callerType, callerPipelineID, targetAgentID, targetAgentType, targetPipelineID string) bool {
+	callerID = strings.TrimSpace(callerID)
+	callerType = strings.TrimSpace(callerType)
+	callerPipelineID = strings.TrimSpace(callerPipelineID)
+	targetAgentID = strings.TrimSpace(targetAgentID)
+	targetAgentType = strings.TrimSpace(targetAgentType)
+	targetPipelineID = strings.TrimSpace(targetPipelineID)
+	if callerID != "" && targetAgentID != "" && strings.EqualFold(callerID, targetAgentID) {
+		return true
+	}
+	if callerType == "" || targetAgentType == "" || !strings.EqualFold(callerType, targetAgentType) {
+		return false
+	}
+	// A type-only target with no target pipeline resolves to the
+	// caller's natural same-pipeline peer. For same-type calls that is
+	// the caller itself; different target_pipeline_id is the explicit
+	// cross-pipeline case and may be legitimate.
+	return targetPipelineID == "" || strings.EqualFold(callerPipelineID, targetPipelineID)
+}
+
+func selfPeerTargetError(toolName, callerID, callerType, targetAgentID, targetAgentType string) error {
+	caller := strings.TrimSpace(callerID)
+	if caller == "" {
+		caller = strings.TrimSpace(callerType)
+	}
+	target := strings.TrimSpace(targetAgentID)
+	if target == "" {
+		target = strings.TrimSpace(targetAgentType)
+	}
+	return fmt.Errorf("%s: target %q resolves to caller %q; use local claims/testaments instead of consulting or challenging yourself", toolName, target, caller)
 }
 
 // unauthorizedConsultError formats a role-aware rejection message for

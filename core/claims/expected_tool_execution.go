@@ -1,0 +1,642 @@
+package claims
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"runtime/debug"
+	"strings"
+	"time"
+
+	"github.com/adalundhe/sylk/core/security"
+	"github.com/google/uuid"
+)
+
+const (
+	ArtifactKindExpectedToolInvocation = "expected_tool_invocation"
+	ArtifactKindExpectedToolOutput     = "expected_tool_output"
+	ArtifactKindExpectedToolSkipped    = "expected_tool_skipped"
+
+	ExpectedToolMetadataValidationID         = "expected_tool_validation_id"
+	ExpectedToolMetadataInvocationArtifactID = "expected_tool_invocation_artifact_id"
+	ExpectedToolMetadataArguments            = "expected_tool_arguments"
+	ExpectedToolMetadataOutput               = "expected_tool_output"
+	ExpectedToolMetadataStatus               = "expected_tool_status"
+	ExpectedToolMetadataPolicyDecision       = "expected_tool_policy_decision"
+)
+
+type ExpectedToolExecutionStatus string
+
+const (
+	ExpectedToolExecutionSucceeded    ExpectedToolExecutionStatus = "succeeded"
+	ExpectedToolExecutionFailed       ExpectedToolExecutionStatus = "failed"
+	ExpectedToolExecutionSkipped      ExpectedToolExecutionStatus = "skipped"
+	ExpectedToolExecutionPolicyDenied ExpectedToolExecutionStatus = "policy_denied"
+)
+
+// ExpectedToolExecutionOutput is the deterministic result returned by a
+// validation expected-tool executor. Output is captured into an audit
+// artifact when Artifacts is empty; Artifacts can be used when the tool
+// already produces structured board evidence.
+type ExpectedToolExecutionOutput struct {
+	Output    any            `json:"output,omitempty"`
+	Summary   string         `json:"summary,omitempty"`
+	Artifacts []*Artifact    `json:"artifacts,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+// ExpectedToolExecutor executes one expected Sylk skill invocation.
+// Callers usually adapt the active tool runtime so ordinary tool policy
+// and permission checks remain authoritative.
+type ExpectedToolExecutor interface {
+	ExecuteExpectedTool(ctx context.Context, call ExpectedToolCall) (ExpectedToolExecutionOutput, error)
+}
+
+type ExpectedToolPolicyRequest struct {
+	Claim      *Claim
+	Validation *Validation
+	Call       ExpectedToolCall
+	AgentID    string
+}
+
+type ExpectedToolPolicyDecision struct {
+	Allowed     bool
+	Reason      string
+	FailureKind string
+}
+
+type ExpectedToolPolicy interface {
+	DecideExpectedTool(ctx context.Context, req ExpectedToolPolicyRequest) ExpectedToolPolicyDecision
+}
+
+type ExpectedToolArgumentRedactor interface {
+	RedactExpectedToolArguments(ctx context.Context, tool string, args map[string]any) (map[string]any, error)
+}
+
+type ValidationExpectedToolRemediationPoster interface {
+	PostValidationExpectedToolRemediation(ctx context.Context, board *ClaimsBoard, claim *Claim, validation *Validation, result *ValidationExpectedToolExecutionResult) ([]string, error)
+}
+
+type ExpectedToolExecutionOptions struct {
+	AgentID string
+
+	Executor ExpectedToolExecutor
+	Policy   ExpectedToolPolicy
+	Redactor ExpectedToolArgumentRedactor
+
+	// AllowedTools, when non-empty, is an allowlist applied before
+	// Policy. It is deliberately simple so tests and constrained
+	// validators can make denial deterministic without inventing a
+	// second policy subsystem.
+	AllowedTools map[string]bool
+
+	// ApprovedToolIDs contains expected-tool call IDs that have already
+	// received any required user approval.
+	ApprovedToolIDs map[string]bool
+
+	RemediationPoster ValidationExpectedToolRemediationPoster
+}
+
+type ExpectedToolAttemptResult struct {
+	ExpectedToolCallID   string                      `json:"expected_tool_call_id"`
+	Tool                 string                      `json:"tool"`
+	Required             bool                        `json:"required"`
+	Status               ExpectedToolExecutionStatus `json:"status"`
+	InvocationArtifactID string                      `json:"invocation_artifact_id,omitempty"`
+	OutputArtifactIDs    []string                    `json:"output_artifact_ids,omitempty"`
+	ErrorArtifactID      string                      `json:"error_artifact_id,omitempty"`
+	ErrorKind            string                      `json:"error_kind,omitempty"`
+	Error                string                      `json:"error,omitempty"`
+	PolicyReason         string                      `json:"policy_reason,omitempty"`
+}
+
+type ValidationExpectedToolExecutionResult struct {
+	ClaimID              string                      `json:"claim_id"`
+	ValidationID         string                      `json:"validation_id"`
+	AgentID              string                      `json:"agent_id"`
+	AlreadyTerminal      bool                        `json:"already_terminal,omitempty"`
+	Attempts             []ExpectedToolAttemptResult `json:"attempts,omitempty"`
+	TestamentID          string                      `json:"testament_id,omitempty"`
+	ArtifactIDs          []string                    `json:"artifact_ids,omitempty"`
+	ValidationEvaluated  bool                        `json:"validation_evaluated,omitempty"`
+	ValidationStatus     ValidationStatus            `json:"validation_status,omitempty"`
+	ValidationReason     string                      `json:"validation_reason,omitempty"`
+	RemediationClaimIDs  []string                    `json:"remediation_claim_ids,omitempty"`
+	RemediationErrorText string                      `json:"remediation_error,omitempty"`
+}
+
+// ExecuteValidationExpectedTools executes the ExpectedToolCalls attached
+// to one pending validation, records a testament containing audit
+// artifacts for every attempted/skipped/denied tool, then evaluates the
+// validation with a verdict that cites those artifacts.
+func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, claimID, validationID string, opts ExpectedToolExecutionOptions) (*ValidationExpectedToolExecutionResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if board == nil {
+		return nil, fmt.Errorf("claims board not available")
+	}
+	claimID = strings.TrimSpace(claimID)
+	validationID = strings.TrimSpace(validationID)
+	if claimID == "" {
+		return nil, fmt.Errorf("claim_id is required")
+	}
+	if validationID == "" {
+		return nil, fmt.Errorf("validation_id is required")
+	}
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		return nil, fmt.Errorf("claim %q not found", claimID)
+	}
+	validation := findValidationOnClaim(claim, validationID)
+	if validation == nil {
+		return nil, fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
+	}
+	result := &ValidationExpectedToolExecutionResult{
+		ClaimID:      claimID,
+		ValidationID: validationID,
+		AgentID:      firstNonEmpty(strings.TrimSpace(opts.AgentID), validation.AgentID, IssuerAgentID(claim.Relations), claim.AgentID),
+	}
+	if validation.Status.IsTerminal() {
+		result.AlreadyTerminal = true
+		result.ValidationStatus = validation.Status
+		return result, nil
+	}
+	if len(validation.ExpectedToolCalls) == 0 {
+		return result, nil
+	}
+	if err := ValidateExpectedToolCalls(validation.ExpectedToolCalls, nil); err != nil {
+		return nil, fmt.Errorf("validation %q expected tool calls: %w", validationID, err)
+	}
+
+	var artifacts []*Artifact
+	for _, call := range validation.ExpectedToolCalls {
+		attempt, attemptArtifacts := executeExpectedToolAttempt(ctx, claim, validation, call, opts, result.AgentID)
+		result.Attempts = append(result.Attempts, attempt)
+		artifacts = append(artifacts, attemptArtifacts...)
+	}
+	if len(artifacts) == 0 {
+		return result, nil
+	}
+
+	for _, artifact := range artifacts {
+		if artifact == nil {
+			continue
+		}
+		if artifact.ID == "" {
+			artifact.ID = uuid.NewString()
+		}
+		if artifact.AgentID == "" {
+			artifact.AgentID = result.AgentID
+		}
+		result.ArtifactIDs = append(result.ArtifactIDs, artifact.ID)
+	}
+
+	testaments := []Testament{{
+		AgentID:      result.AgentID,
+		Summary:      validationExpectedToolSummary(result.Attempts),
+		Confidence:   "deterministic",
+		Relations:    validationExpectedToolRelations(claimID, validationID),
+		Artifacts:    artifacts,
+		Presentation: nil,
+	}}
+	if err := board.SubmitTestaments(contextWithoutCancellation(ctx), Action{AgentID: result.AgentID, Type: ActionTypeTestament}, testaments); err != nil {
+		return nil, fmt.Errorf("submit validation expected-tool audit testament: %w", err)
+	}
+	result.TestamentID = testaments[0].ID
+
+	status := ValidationStatusPassed
+	if validationExpectedToolHasRequiredFailure(result.Attempts) {
+		status = ValidationStatusFailed
+	}
+	reason := validationExpectedToolValidationReason(status, result)
+	latestClaim, ok := board.CloneClaim(claimID)
+	if !ok {
+		return nil, fmt.Errorf("claim %q disappeared before validation evaluation", claimID)
+	}
+	latestValidation := findValidationOnClaim(latestClaim, validationID)
+	if latestValidation == nil {
+		return nil, fmt.Errorf("validation %q disappeared before validation evaluation", validationID)
+	}
+	if latestValidation.Status.IsTerminal() {
+		result.AlreadyTerminal = true
+		result.ValidationStatus = latestValidation.Status
+		return result, nil
+	}
+	if err := board.EvaluateValidation(contextWithoutCancellation(ctx), claimID, validationID, StatusChange{
+		To:      string(status),
+		Reason:  reason,
+		AgentID: result.AgentID,
+	}); err != nil {
+		return nil, fmt.Errorf("evaluate validation after expected-tool audit: %w", err)
+	}
+	result.ValidationEvaluated = true
+	result.ValidationStatus = status
+	result.ValidationReason = reason
+
+	if status == ValidationStatusFailed && opts.RemediationPoster != nil {
+		ids, err := opts.RemediationPoster.PostValidationExpectedToolRemediation(contextWithoutCancellation(ctx), board, claim, validation, result)
+		result.RemediationClaimIDs = append([]string(nil), ids...)
+		if err != nil {
+			result.RemediationErrorText = err.Error()
+		}
+	}
+	return result, nil
+}
+
+func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *Validation, call ExpectedToolCall, opts ExpectedToolExecutionOptions, agentID string) (ExpectedToolAttemptResult, []*Artifact) {
+	attempt := ExpectedToolAttemptResult{
+		ExpectedToolCallID: strings.TrimSpace(call.ID),
+		Tool:               strings.TrimSpace(call.Tool),
+		Required:           call.Required,
+	}
+	var artifacts []*Artifact
+	redactedArgs, err := redactExpectedToolArguments(ctx, opts.Redactor, call)
+	if err != nil {
+		artifact := expectedToolSafeFailureArtifact(call, agentID, validation.ID, ArtifactKindErrorDiagnostic, "expected tool argument redaction failed")
+		artifact.Metadata["redaction_error"] = err.Error()
+		attempt.Status = ExpectedToolExecutionFailed
+		attempt.ErrorKind = artifact.Kind
+		attempt.Error = artifact.Reference
+		attempt.ErrorArtifactID = artifact.ID
+		return attempt, []*Artifact{artifact}
+	}
+
+	decision := expectedToolPolicyDecision(ctx, claim, validation, call, opts, agentID)
+	if !decision.Allowed {
+		kind := firstNonEmpty(strings.TrimSpace(decision.FailureKind), ArtifactKindPolicyDenied)
+		reason := firstNonEmpty(strings.TrimSpace(decision.Reason), "expected tool execution denied by policy")
+		artifact := expectedToolSafeFailureArtifact(call, agentID, validation.ID, kind, reason)
+		artifact.Metadata[ExpectedToolMetadataPolicyDecision] = reason
+		artifact.Metadata[ExpectedToolMetadataArguments] = redactedArgs
+		attempt.Status = ExpectedToolExecutionPolicyDenied
+		attempt.PolicyReason = reason
+		attempt.ErrorKind = artifact.Kind
+		attempt.Error = artifact.Reference
+		attempt.ErrorArtifactID = artifact.ID
+		return attempt, []*Artifact{artifact}
+	}
+
+	invocation := expectedToolInvocationArtifact(call, agentID, validation.ID, redactedArgs)
+	attempt.InvocationArtifactID = invocation.ID
+	artifacts = append(artifacts, invocation)
+	if opts.Executor == nil {
+		kind := ArtifactKindExpectedToolSkipped
+		if call.Required {
+			kind = ArtifactKindErrorDiagnostic
+		}
+		artifact := expectedToolSafeFailureArtifact(call, agentID, validation.ID, kind, "expected tool executor is not configured")
+		artifact.Metadata[ExpectedToolMetadataInvocationArtifactID] = invocation.ID
+		artifact.Metadata[ExpectedToolMetadataArguments] = redactedArgs
+		linkExpectedToolArtifactToInvocation(artifact, invocation.ID)
+		attempt.Status = ExpectedToolExecutionSkipped
+		if call.Required {
+			attempt.Status = ExpectedToolExecutionFailed
+		}
+		attempt.ErrorKind = artifact.Kind
+		attempt.Error = artifact.Reference
+		attempt.ErrorArtifactID = artifact.ID
+		return attempt, append(artifacts, artifact)
+	}
+
+	execCtx := ctx
+	var cancel context.CancelFunc
+	if call.TimeoutSeconds > 0 {
+		execCtx, cancel = context.WithTimeout(ctx, time.Duration(call.TimeoutSeconds)*time.Second)
+		defer cancel()
+	}
+	output, execErr := invokeExpectedToolSafely(execCtx, opts.Executor, call)
+	if execErr != nil {
+		kind := expectedToolFailureKind(execErr)
+		artifact := ExpectedToolFailureArtifact(call, agentID, kind, execErr.Error())
+		artifact.ID = uuid.NewString()
+		artifact.Metadata[ExpectedToolMetadataValidationID] = validation.ID
+		artifact.Metadata[ExpectedToolMetadataInvocationArtifactID] = invocation.ID
+		artifact.Metadata[ExpectedToolMetadataArguments] = redactedArgs
+		linkExpectedToolArtifactToInvocation(artifact, invocation.ID)
+		attempt.Status = ExpectedToolExecutionFailed
+		attempt.ErrorKind = artifact.Kind
+		attempt.Error = artifact.Reference
+		attempt.ErrorArtifactID = artifact.ID
+		return attempt, append(artifacts, artifact)
+	}
+
+	outArtifacts := expectedToolOutputArtifacts(call, agentID, validation.ID, invocation.ID, output)
+	for _, artifact := range outArtifacts {
+		if artifact == nil {
+			continue
+		}
+		attempt.OutputArtifactIDs = append(attempt.OutputArtifactIDs, artifact.ID)
+	}
+	attempt.Status = ExpectedToolExecutionSucceeded
+	return attempt, append(artifacts, outArtifacts...)
+}
+
+func redactExpectedToolArguments(ctx context.Context, redactor ExpectedToolArgumentRedactor, call ExpectedToolCall) (map[string]any, error) {
+	args := cloneAnyMap(call.Arguments)
+	if len(args) == 0 {
+		return nil, nil
+	}
+	if redactor != nil {
+		return redactor.RedactExpectedToolArguments(ctx, call.Tool, args)
+	}
+	redacted, ok := redactExpectedToolValue(args).(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	return redacted, nil
+}
+
+func expectedToolPolicyDecision(ctx context.Context, claim *Claim, validation *Validation, call ExpectedToolCall, opts ExpectedToolExecutionOptions, agentID string) ExpectedToolPolicyDecision {
+	tool := strings.TrimSpace(call.Tool)
+	if len(opts.AllowedTools) > 0 && !opts.AllowedTools[tool] {
+		return ExpectedToolPolicyDecision{Allowed: false, FailureKind: ArtifactKindPolicyDenied, Reason: "expected tool is not allowed for this validation"}
+	}
+	if call.Policy.RequiresUserApproval && !opts.ApprovedToolIDs[strings.TrimSpace(call.ID)] {
+		return ExpectedToolPolicyDecision{Allowed: false, FailureKind: ArtifactKindPolicyDenied, Reason: "expected tool requires user approval"}
+	}
+	if expectedToolIsPeerRouting(tool) && !call.Policy.AllowAgentSubstitution {
+		return ExpectedToolPolicyDecision{Allowed: false, FailureKind: ArtifactKindPolicyDenied, Reason: "expected validation tools may not route peer work unless delegation is explicitly authorized"}
+	}
+	if opts.Policy != nil {
+		decision := opts.Policy.DecideExpectedTool(ctx, ExpectedToolPolicyRequest{Claim: claim, Validation: validation, Call: call, AgentID: agentID})
+		if !decision.Allowed {
+			if strings.TrimSpace(decision.FailureKind) == "" {
+				decision.FailureKind = ArtifactKindPolicyDenied
+			}
+			return decision
+		}
+	}
+	return ExpectedToolPolicyDecision{Allowed: true}
+}
+
+func expectedToolIsPeerRouting(tool string) bool {
+	switch strings.TrimSpace(tool) {
+	case "consult_peer", "challenge_peer", "guardian_check", "post_action":
+		return true
+	default:
+		return false
+	}
+}
+
+func expectedToolInvocationArtifact(call ExpectedToolCall, agentID, validationID string, redactedArgs map[string]any) *Artifact {
+	return &Artifact{
+		ID:        uuid.NewString(),
+		AgentID:   agentID,
+		Kind:      ArtifactKindExpectedToolInvocation,
+		Reference: strings.TrimSpace(call.Tool),
+		Metadata: map[string]any{
+			ExpectedToolMetadataID:           strings.TrimSpace(call.ID),
+			ExpectedToolMetadataTool:         strings.TrimSpace(call.Tool),
+			ExpectedToolMetadataPurpose:      strings.TrimSpace(call.Purpose),
+			ExpectedToolMetadataRequired:     call.Required,
+			ExpectedToolMetadataValidationID: validationID,
+			ExpectedToolMetadataArguments:    redactedArgs,
+			ExpectedToolMetadataStatus:       "started",
+		},
+	}
+}
+
+func expectedToolOutputArtifacts(call ExpectedToolCall, agentID, validationID, invocationArtifactID string, output ExpectedToolExecutionOutput) []*Artifact {
+	metadataBase := map[string]any{
+		ExpectedToolMetadataID:                   strings.TrimSpace(call.ID),
+		ExpectedToolMetadataTool:                 strings.TrimSpace(call.Tool),
+		ExpectedToolMetadataRequired:             call.Required,
+		ExpectedToolMetadataValidationID:         validationID,
+		ExpectedToolMetadataInvocationArtifactID: invocationArtifactID,
+		ExpectedToolMetadataStatus:               string(ExpectedToolExecutionSucceeded),
+	}
+	if len(output.Metadata) > 0 {
+		metadataBase["executor_metadata"] = sortedAnyMap(output.Metadata)
+	}
+	out := make([]*Artifact, 0, len(output.Artifacts)+1)
+	for _, artifact := range output.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		cp := CloneArtifact(artifact)
+		if cp.ID == "" {
+			cp.ID = uuid.NewString()
+		}
+		if cp.AgentID == "" {
+			cp.AgentID = agentID
+		}
+		if cp.Kind == "" {
+			cp.Kind = ArtifactKindExpectedToolOutput
+		}
+		if cp.Metadata == nil {
+			cp.Metadata = make(map[string]any, len(metadataBase))
+		}
+		for key, value := range metadataBase {
+			cp.Metadata[key] = value
+		}
+		linkExpectedToolArtifactToInvocation(cp, invocationArtifactID)
+		out = append(out, cp)
+	}
+	if len(out) == 0 {
+		artifact := &Artifact{
+			ID:        uuid.NewString(),
+			AgentID:   agentID,
+			Kind:      ArtifactKindExpectedToolOutput,
+			Reference: expectedToolOutputReference(output),
+			Metadata:  cloneAnyMap(metadataBase),
+		}
+		linkExpectedToolArtifactToInvocation(artifact, invocationArtifactID)
+		out = append(out, artifact)
+	}
+	return out
+}
+
+func expectedToolOutputReference(output ExpectedToolExecutionOutput) string {
+	if summary := strings.TrimSpace(output.Summary); summary != "" {
+		return summary
+	}
+	if output.Output == nil {
+		return "expected tool completed"
+	}
+	switch value := output.Output.(type) {
+	case string:
+		return truncateExpectedToolReference(value)
+	default:
+		blob, err := json.Marshal(value)
+		if err != nil {
+			return "expected tool completed"
+		}
+		return truncateExpectedToolReference(string(blob))
+	}
+}
+
+func expectedToolSafeFailureArtifact(call ExpectedToolCall, agentID, validationID, failureKind, message string) *Artifact {
+	if strings.TrimSpace(failureKind) == ArtifactKindExpectedToolSkipped {
+		return &Artifact{
+			ID:        uuid.NewString(),
+			AgentID:   strings.TrimSpace(agentID),
+			Kind:      ArtifactKindExpectedToolSkipped,
+			Reference: firstNonEmpty(strings.TrimSpace(message), "expected tool call skipped"),
+			Metadata: map[string]any{
+				ExpectedToolMetadataID:           strings.TrimSpace(call.ID),
+				ExpectedToolMetadataTool:         strings.TrimSpace(call.Tool),
+				ExpectedToolMetadataRequired:     call.Required,
+				ExpectedToolMetadataValidationID: validationID,
+				ExpectedToolMetadataStatus:       string(ExpectedToolExecutionSkipped),
+			},
+		}
+	}
+	artifact := ExpectedToolFailureArtifact(call, agentID, failureKind, message)
+	artifact.ID = uuid.NewString()
+	if artifact.Metadata == nil {
+		artifact.Metadata = map[string]any{}
+	}
+	artifact.Metadata[ExpectedToolMetadataValidationID] = validationID
+	artifact.Metadata[ExpectedToolMetadataStatus] = string(ExpectedToolExecutionFailed)
+	return artifact
+}
+
+func linkExpectedToolArtifactToInvocation(artifact *Artifact, invocationArtifactID string) {
+	if artifact == nil {
+		return
+	}
+	invocationArtifactID = strings.TrimSpace(invocationArtifactID)
+	if invocationArtifactID == "" {
+		return
+	}
+	if artifact.Metadata == nil {
+		artifact.Metadata = map[string]any{}
+	}
+	artifact.Metadata[ExpectedToolMetadataInvocationArtifactID] = invocationArtifactID
+	if !HasRelation(artifact.Relations, RelationshipCompletes, invocationArtifactID) {
+		artifact.Relations = append(artifact.Relations, Relation{
+			Related:      invocationArtifactID,
+			RelatedType:  RelatedTypeArtifact,
+			Relationship: RelationshipCompletes,
+		})
+	}
+}
+
+func invokeExpectedToolSafely(ctx context.Context, executor ExpectedToolExecutor, call ExpectedToolCall) (out ExpectedToolExecutionOutput, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("expected tool %q panicked: %v\n%s", strings.TrimSpace(call.Tool), recovered, debug.Stack())
+		}
+	}()
+	return executor.ExecuteExpectedTool(ctx, call)
+}
+
+func expectedToolFailureKind(err error) string {
+	if err == nil {
+		return ArtifactKindError
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ArtifactKindToolTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return ArtifactKindErrorDiagnostic
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "permission denied"), strings.Contains(msg, "access denied"):
+		return ArtifactKindPermissionDenied
+	case strings.Contains(msg, "policy"):
+		return ArtifactKindPolicyDenied
+	case strings.Contains(msg, "missing dependency"), strings.Contains(msg, "not found"):
+		return ArtifactKindMissingDependency
+	default:
+		return ArtifactKindError
+	}
+}
+
+func validationExpectedToolRelations(claimID, validationID string) []Relation {
+	return []Relation{
+		{Related: claimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+		{Related: validationID, RelatedType: RelatedTypeValidation, Relationship: RelationshipReviews},
+	}
+}
+
+func validationExpectedToolSummary(attempts []ExpectedToolAttemptResult) string {
+	if len(attempts) == 0 {
+		return "No validation expected tools were attempted."
+	}
+	failed := 0
+	for _, attempt := range attempts {
+		if attempt.Required && attempt.Status != ExpectedToolExecutionSucceeded {
+			failed++
+		}
+	}
+	if failed > 0 {
+		return fmt.Sprintf("Validation expected tools completed with %d required failure(s).", failed)
+	}
+	return "Validation expected tools completed successfully."
+}
+
+func validationExpectedToolHasRequiredFailure(attempts []ExpectedToolAttemptResult) bool {
+	for _, attempt := range attempts {
+		if attempt.Required && attempt.Status != ExpectedToolExecutionSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
+func validationExpectedToolValidationReason(status ValidationStatus, result *ValidationExpectedToolExecutionResult) string {
+	evidence := strings.Join(result.ArtifactIDs, ",")
+	if evidence == "" {
+		evidence = "none"
+	}
+	if status == ValidationStatusPassed {
+		return "expected validation tools passed; evidence_artifacts=" + evidence
+	}
+	return "expected validation tools failed; evidence_artifacts=" + evidence
+}
+
+func redactExpectedToolValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, val := range typed {
+			if expectedToolSensitiveKey(key) {
+				out[key] = "[REDACTED]"
+				continue
+			}
+			out[key] = redactExpectedToolValue(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i := range typed {
+			out[i] = redactExpectedToolValue(typed[i])
+		}
+		return out
+	case string:
+		sanitized, _ := security.NewSecretSanitizer().SanitizeString(typed)
+		return sanitized
+	default:
+		return typed
+	}
+}
+
+func expectedToolSensitiveKey(key string) bool {
+	key = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(key), "-", "_"))
+	for _, needle := range []string{"secret", "token", "password", "passwd", "api_key", "apikey", "credential", "private_key", "authorization", "auth_header"} {
+		if strings.Contains(key, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func truncateExpectedToolReference(value string) string {
+	value = strings.TrimSpace(value)
+	const max = 4096
+	if len(value) <= max {
+		return value
+	}
+	return value[:max] + "...(truncated)"
+}
+
+func contextWithoutCancellation(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
+}

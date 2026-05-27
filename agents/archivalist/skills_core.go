@@ -59,7 +59,8 @@ func (a *Archivalist) registerCoreSkills() {
 	a.skills.Register(archivalistIntentFacadeSkill(a))
 	a.skills.Register(routeToSkill(a))
 	a.skills.Register(replyToSkill(a))
-	a.skills.Register(consultSkill(a))
+	// Archivalist is reactive for peer work; callers consult it by posting
+	// directed claims and receiving testaments over canonical deltas.
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&archivalistDiag{a: a}))
 	if a.logIngest != nil {
 		a.skills.Register(queryAgentLogsSkill(a.logIngest))

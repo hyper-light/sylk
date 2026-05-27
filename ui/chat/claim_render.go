@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/google/uuid"
 )
 
@@ -71,6 +72,222 @@ func (m *Model) projectClaimArtifactToHistory(art *ArtifactRow) {
 	})
 	m.syncPendingInterAgentEntry(idx)
 	m.viewDirty = true
+}
+
+func (m *Model) projectClaimPeerInteractionToHistory(ev msg.ClaimPeerInteractionMsg) {
+	if m == nil {
+		return
+	}
+	cycleID := strings.TrimSpace(ev.CycleID)
+	claimID := strings.TrimSpace(ev.ClaimID)
+	subject := strings.TrimSpace(ev.SubjectAgentID)
+	issuer := strings.TrimSpace(ev.IssuerAgentID)
+	if cycleID == "" || claimID == "" || subject == "" {
+		return
+	}
+	if issuer != "" && issuer == subject {
+		return
+	}
+	kind := interAgentKindForClaimAction(ev.ActionType)
+	if kind == "" {
+		return
+	}
+	rowID := claimPeerInteractionRowID(claimID)
+	occurredAt := ev.OccurredAt
+	if occurredAt.IsZero() {
+		occurredAt = time.Now()
+	}
+	idx := m.historyIndexForCorrelation(cycleID)
+	if idx < 0 {
+		entry := &ChatEntry{
+			ID:            uuid.NewString(),
+			Timestamp:     occurredAt,
+			CorrelationID: cycleID,
+			Source:        SourceAgent,
+			AgentID:       issuer,
+			AgentType:     issuer,
+			Streaming:     true,
+			Height:        -1,
+		}
+		m.history.Push(entry)
+		idx = m.historyIndexForCorrelation(cycleID)
+	}
+	if idx < 0 {
+		return
+	}
+	m.history.UpdateAt(idx, func(e *ChatEntry) {
+		if e.AgentID == "" && issuer != "" {
+			e.AgentID = issuer
+		}
+		if e.AgentType == "" && issuer != "" {
+			e.AgentType = issuer
+		}
+		record := buildClaimPeerInteractionRecord(ev, kind, rowID, occurredAt)
+		if upsertClaimPeerInteractionRecord(e, record) {
+			invalidateChatEntryRender(e)
+		}
+	})
+	m.syncPendingInterAgentEntry(idx)
+	m.viewDirty = true
+}
+
+func buildClaimPeerInteractionRecord(ev msg.ClaimPeerInteractionMsg, kind InterAgentToolKind, rowID string, occurredAt time.Time) ToolCallRecord {
+	status := interAgentStatusFromPeerEvent(ev.Status)
+	summary := firstNonEmptyString(ev.Context, ev.Title)
+	if summary == "" {
+		summary = strings.TrimSpace(ev.SubjectAgentID)
+	}
+	rec := ToolCallRecord{
+		ToolCallKey: rowID,
+		ToolName:    claimPeerToolName(ev.ActionType),
+		ArgsSummary: summary,
+		StartedAt:   occurredAt,
+		Completed:   status != InterAgentToolPending,
+		Success:     status != InterAgentToolFailed,
+		InterAgent: &InterAgentTool{
+			Kind:           kind,
+			ThreadKey:      rowID,
+			ClaimID:        strings.TrimSpace(ev.ClaimID),
+			IssuerAgentID:  strings.TrimSpace(ev.IssuerAgentID),
+			SubjectAgentID: strings.TrimSpace(ev.SubjectAgentID),
+			TestamentID:    strings.TrimSpace(ev.TestamentID),
+			ValidationID:   strings.TrimSpace(ev.ValidationID),
+			DeltaKey:       strings.TrimSpace(ev.DeltaKey),
+			Sequence:       ev.Sequence,
+			AgentTypes:     normalizeAgentTypes([]string{ev.SubjectAgentID}),
+			Summary:        summary,
+			Status:         status,
+		},
+	}
+	if rec.Completed {
+		rec.Duration = occurredAt.Sub(rec.StartedAt)
+		if rec.Duration < 0 {
+			rec.Duration = 0
+		}
+	}
+	return rec
+}
+
+func upsertClaimPeerInteractionRecord(e *ChatEntry, next ToolCallRecord) bool {
+	if e == nil || next.InterAgent == nil || strings.TrimSpace(next.ToolCallKey) == "" {
+		return false
+	}
+	for i := range e.ToolCalls {
+		if strings.TrimSpace(e.ToolCalls[i].ToolCallKey) != next.ToolCallKey {
+			continue
+		}
+		current := &e.ToolCalls[i]
+		if current.InterAgent != nil && next.InterAgent.Sequence > 0 && current.InterAgent.Sequence > next.InterAgent.Sequence {
+			return false
+		}
+		mergeClaimPeerInteractionRecord(current, next)
+		return true
+	}
+	e.ToolCalls = append(e.ToolCalls, next)
+	return true
+}
+
+func mergeClaimPeerInteractionRecord(current *ToolCallRecord, next ToolCallRecord) {
+	if current == nil {
+		return
+	}
+	children := []InterAgentChildActivity(nil)
+	if current.InterAgent != nil {
+		children = current.InterAgent.Children
+	}
+	if current.StartedAt.IsZero() || (!next.StartedAt.IsZero() && next.StartedAt.Before(current.StartedAt)) {
+		current.StartedAt = next.StartedAt
+	}
+	if current.ToolName == "" {
+		current.ToolName = next.ToolName
+	}
+	if strings.TrimSpace(next.ArgsSummary) != "" {
+		current.ArgsSummary = next.ArgsSummary
+	}
+	if next.Completed {
+		current.Completed = true
+		current.Success = next.Success
+		if !next.StartedAt.IsZero() {
+			current.Duration = next.StartedAt.Sub(current.StartedAt)
+			if current.Duration < 0 {
+				current.Duration = 0
+			}
+		}
+	}
+	if current.InterAgent == nil {
+		current.InterAgent = next.InterAgent
+	} else if next.InterAgent != nil {
+		current.InterAgent.Kind = next.InterAgent.Kind
+		current.InterAgent.ThreadKey = next.InterAgent.ThreadKey
+		current.InterAgent.ClaimID = next.InterAgent.ClaimID
+		current.InterAgent.IssuerAgentID = next.InterAgent.IssuerAgentID
+		current.InterAgent.SubjectAgentID = next.InterAgent.SubjectAgentID
+		if next.InterAgent.TestamentID != "" {
+			current.InterAgent.TestamentID = next.InterAgent.TestamentID
+		}
+		if next.InterAgent.ValidationID != "" {
+			current.InterAgent.ValidationID = next.InterAgent.ValidationID
+		}
+		if next.InterAgent.DeltaKey != "" {
+			current.InterAgent.DeltaKey = next.InterAgent.DeltaKey
+		}
+		if next.InterAgent.Sequence > 0 {
+			current.InterAgent.Sequence = next.InterAgent.Sequence
+		}
+		current.InterAgent.AgentTypes = next.InterAgent.AgentTypes
+		if strings.TrimSpace(next.InterAgent.Summary) != "" {
+			current.InterAgent.Summary = next.InterAgent.Summary
+		}
+		current.InterAgent.Status = next.InterAgent.Status
+	}
+	if current.InterAgent != nil {
+		current.InterAgent.Children = children
+	}
+}
+
+func claimPeerInteractionRowID(claimID string) string {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return ""
+	}
+	return "claim-peer:" + claimID
+}
+
+func interAgentKindForClaimAction(action string) InterAgentToolKind {
+	switch strings.TrimSpace(action) {
+	case "consultation":
+		return InterAgentToolConsult
+	case "challenge":
+		return InterAgentToolChallenge
+	case "guardian_check":
+		return InterAgentToolApproval
+	default:
+		return ""
+	}
+}
+
+func claimPeerToolName(action string) string {
+	switch strings.TrimSpace(action) {
+	case "consultation":
+		return "consult_peer"
+	case "challenge":
+		return "challenge_peer"
+	case "guardian_check":
+		return "guardian_check"
+	default:
+		return "peer_interaction"
+	}
+}
+
+func interAgentStatusFromPeerEvent(status string) InterAgentToolStatus {
+	switch strings.TrimSpace(status) {
+	case "failed", "failure", "error", "timeout", "cancelled", "canceled", "rejected":
+		return InterAgentToolFailed
+	case "done", "success", "complete", "completed", "accepted", "responded", "received":
+		return InterAgentToolDone
+	default:
+		return InterAgentToolPending
+	}
 }
 
 // completeClaimArtifactInHistory finds the existing ToolCallRecord

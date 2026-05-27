@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/activity"
@@ -37,8 +38,10 @@ type BoardAmplifier struct {
 	taskID    string
 	boardID   string
 
-	deltaBus DeltaPublisher
-	scope    ScopeProvider
+	deltaBus               DeltaPublisher
+	scope                  ScopeProvider
+	agentRefResolver       AgentRefResolver
+	canonicalDirectEnabled bool
 
 	// errorSink receives emission failures. When nil, errors are
 	// dropped silently (tests). Wired by the board so agents see
@@ -50,10 +53,11 @@ type BoardAmplifier struct {
 // (Noop) DeltaPublisher. Callers wire a real bus via WithDeltaBus.
 func NewBoardAmplifier(sessionID, taskID, boardID string) *BoardAmplifier {
 	return &BoardAmplifier{
-		sessionID: sessionID,
-		taskID:    taskID,
-		boardID:   boardID,
-		deltaBus:  NoopDeltaBus{},
+		sessionID:              sessionID,
+		taskID:                 taskID,
+		boardID:                boardID,
+		deltaBus:               NoopDeltaBus{},
+		canonicalDirectEnabled: true,
 	}
 }
 
@@ -75,6 +79,27 @@ func (a *BoardAmplifier) WithScope(scope ScopeProvider) *BoardAmplifier {
 		return nil
 	}
 	a.scope = scope
+	return a
+}
+
+// WithAgentRefResolver wires optional canonical identity resolution for
+// actor and delivery refs.
+func (a *BoardAmplifier) WithAgentRefResolver(resolver AgentRefResolver) *BoardAmplifier {
+	if a == nil {
+		return nil
+	}
+	a.agentRefResolver = resolver
+	return a
+}
+
+// WithCanonicalDirectEnabled controls direct canonical bus emission.
+// Durable boards with the canonical projector disable direct canonical
+// emission so the outbox owns replayable delivery.
+func (a *BoardAmplifier) WithCanonicalDirectEnabled(enabled bool) *BoardAmplifier {
+	if a == nil {
+		return nil
+	}
+	a.canonicalDirectEnabled = enabled
 	return a
 }
 
@@ -258,6 +283,7 @@ func (a *BoardAmplifier) PublishInboxDeltas(ctx context.Context, action *Action,
 	if a == nil || action == nil || claim == nil {
 		return
 	}
+	a.dispatchCanonical(ctx, a.buildClaimDirectedDeltas(ctx, action, claim, time.Now().UTC()))
 	deltas := a.buildInboxDeltas(action, claim)
 	if len(deltas) == 0 {
 		return
@@ -278,6 +304,10 @@ func (a *BoardAmplifier) PublishTestamentDelta(ctx context.Context, testament *T
 		return
 	}
 	delta := a.buildTestamentDelta(testament, claim)
+	a.dispatchCanonical(ctx, []canonicalDispatch{{
+		topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionTestamentSubmitted),
+		delta: a.buildCanonicalTestamentSubmitted(ctx, testament, claim, time.Now().UTC()),
+	}})
 	topic := ClaimStatusTopic(a.sessionID, claim.ID, ClaimStatusTestified)
 	a.dispatchSingle(ctx, topic, delta)
 }
@@ -301,6 +331,64 @@ func (a *BoardAmplifier) PublishValidationDelta(ctx context.Context, delta Valid
 	}
 }
 
+// PublishCanonicalValidationEvaluated emits the canonical validation
+// fact with full validation context. The legacy ValidationDelta path
+// remains separate during migration.
+func (a *BoardAmplifier) PublishCanonicalValidationEvaluated(ctx context.Context, claim *Claim, validation *Validation, change StatusChange, accepted bool, now time.Time) {
+	if a == nil || claim == nil || validation == nil {
+		return
+	}
+	if IsSystemInternalAction(claim.ActionType) {
+		return
+	}
+	delta := a.buildCanonicalValidationEvaluated(ctx, claim, validation, change, accepted, now)
+	a.dispatchCanonical(ctx, []canonicalDispatch{
+		{
+			topic: CanonicalValidationTopic(a.sessionID, validation.ID, DeltaActionValidationEvaluated),
+			delta: delta,
+		},
+		{
+			topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionValidationEvaluated),
+			delta: delta,
+		},
+	})
+}
+
+func (a *BoardAmplifier) PublishCanonicalClaimProgressed(ctx context.Context, claim *Claim, agentID, state, message string, transitionID int64, now time.Time) {
+	if a == nil || claim == nil {
+		return
+	}
+	if IsSystemInternalAction(claim.ActionType) {
+		return
+	}
+	delta := NewCanonicalDelta(
+		DeltaActionClaimProgressed,
+		a.sessionID,
+		a.boardID,
+		claim.Sequence,
+		now,
+		a.resolveAgentRef(ctx, agentID, "legacy claim progress actor"),
+		claimRefs(claim.ID),
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":     claim.ID,
+				"action": string(claim.ActionType),
+				"status": string(claim.Status),
+			},
+			"progress": map[string]any{
+				"state":      strings.TrimSpace(state),
+				"message":    strings.TrimSpace(message),
+				"transition": transitionID,
+			},
+		},
+	)
+	a.dispatchCanonical(ctx, []canonicalDispatch{{
+		topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionClaimProgressed),
+		delta: delta,
+	}})
+}
+
 // PublishClaimStatusDelta emits a ClaimStatusDelta on the
 // claim-status topic for the target status. System-internal action
 // types short-circuit — Remediator / Auditor / Archivist roles
@@ -313,6 +401,10 @@ func (a *BoardAmplifier) PublishClaimStatusDelta(ctx context.Context, delta Clai
 	if IsSystemInternalAction(delta.ActionKind) {
 		return
 	}
+	a.dispatchCanonical(ctx, []canonicalDispatch{{
+		topic: CanonicalClaimTopic(a.sessionID, delta.ClaimID, DeltaActionClaimTransitioned),
+		delta: a.buildCanonicalClaimTransitioned(ctx, delta),
+	}})
 	topic := ClaimStatusTopic(a.sessionID, delta.ClaimID, delta.ToStatus)
 	a.dispatchSingle(ctx, topic, delta)
 }
@@ -323,20 +415,6 @@ func (a *BoardAmplifier) PublishPhaseDelta(ctx context.Context, delta PhaseDelta
 		return
 	}
 	topic := PhaseTopic(a.sessionID, delta.ToPhase)
-	a.dispatchSingle(ctx, topic, delta)
-}
-
-// PublishConsultResolvedDelta emits a ConsultResolvedDelta on the
-// originator's personal consult-resolved topic. The pattern is per-
-// agent so only the agent that issued the consult sees the
-// resolution; no broadcast fan-out across the session. Used by the
-// responding agent's tool loop (or by deadline / cancellation
-// emitters) to wake the originator's pending ConsultContinuation.
-func (a *BoardAmplifier) PublishConsultResolvedDelta(ctx context.Context, delta ConsultResolvedDelta) {
-	if a == nil {
-		return
-	}
-	topic := ConsultResolvedTopic(a.sessionID, delta.OriginatorAgentID, delta.ConsultID)
 	a.dispatchSingle(ctx, topic, delta)
 }
 
@@ -352,6 +430,31 @@ func (a *BoardAmplifier) PublishClaimContextDelta(ctx context.Context, delta Cla
 	if IsSystemInternalAction(delta.ActionKind) {
 		return
 	}
+	a.dispatchCanonical(ctx, []canonicalDispatch{{
+		topic: CanonicalClaimTopic(a.sessionID, delta.ClaimID, DeltaActionClaimProgressed),
+		delta: NewCanonicalDelta(
+			DeltaActionClaimProgressed,
+			delta.SessionID,
+			delta.BoardID,
+			delta.Sequence,
+			delta.EmittedAt,
+			a.resolveAgentRef(ctx, delta.OwnerAgentID, "legacy claim progress actor"),
+			append(claimRefs(delta.ClaimID), DeltaRef{Role: "progress", Type: "claim_progress", ID: fmt.Sprintf("%d", delta.TransitionID)}),
+			nil,
+			map[string]any{
+				"claim": map[string]any{
+					"id":     delta.ClaimID,
+					"action": string(delta.ActionKind),
+					"status": "",
+				},
+				"progress": map[string]any{
+					"state":      "context",
+					"message":    delta.Context,
+					"transition": delta.TransitionID,
+				},
+			},
+		),
+	}})
 	topic := ClaimContextTopic(a.sessionID, delta.ClaimID)
 	a.dispatchSingle(ctx, topic, delta)
 }
@@ -454,6 +557,69 @@ type inboxDispatch struct {
 	delta InboxDelta
 }
 
+type canonicalDispatch struct {
+	topic string
+	delta CanonicalDelta
+}
+
+func (a *BoardAmplifier) buildClaimDirectedDeltas(ctx context.Context, action *Action, claim *Claim, occurredAt time.Time) []canonicalDispatch {
+	if action != nil && IsSystemInternalAction(action.Type) {
+		return nil
+	}
+	if claim != nil && IsSystemInternalAction(claim.ActionType) {
+		return nil
+	}
+	issuerID := action.AgentID
+	if issuerID == "" {
+		issuerID = IssuerAgentID(claim.Relations)
+	}
+	actor := a.resolveAgentRef(ctx, issuerID, "legacy action agent id")
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	var out []canonicalDispatch
+	for _, r := range claim.Relations {
+		if r.RelatedType != RelatedTypeAgent || !isDirectedAgentRelationship(r.Relationship) {
+			continue
+		}
+		if r.Related == issuerID && HandoffFromClaimID(claim.Relations) == "" {
+			continue
+		}
+		target := a.resolveAgentRef(ctx, r.Related, "legacy directed relation")
+		delivery := &DeltaDelivery{
+			To:           []AgentRef{target},
+			Relationship: r.Relationship,
+		}
+		delta := NewCanonicalDelta(
+			DeltaActionClaimDirected,
+			a.sessionID,
+			a.boardID,
+			claim.Sequence,
+			occurredAt,
+			actor,
+			append(actionRefs(action.ID), DeltaRef{Role: "claim", Type: RelatedTypeClaim, ID: claim.ID}),
+			delivery,
+			map[string]any{
+				"claim": map[string]any{
+					"id":                  claim.ID,
+					"action":              string(claim.ActionType),
+					"title":               claim.Title,
+					"description":         claim.Description,
+					"status":              string(claim.Status),
+					"scope":               claimScopeContext(claim.Scope),
+					"validations":         validationContext(claim.Validations),
+					"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
+				},
+			},
+		)
+		out = append(out, canonicalDispatch{
+			topic: CanonicalAgentRefTopic(a.sessionID, target, DeltaActionClaimDirected),
+			delta: delta,
+		})
+	}
+	return out
+}
+
 func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim) TestamentDelta {
 	verdict := DeriveTestamentVerdict(testament.Artifacts)
 	kinds := CollectArtifactKinds(testament.Artifacts)
@@ -473,8 +639,112 @@ func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim)
 		IssuerAgentID:  issuer,
 		Summary:        testament.Summary,
 		Confidence:     testament.Confidence,
-		AutoAccepted:   false,
+		AutoAccepted:   claim.Status == ClaimStatusAccepted,
 	}
+}
+
+func (a *BoardAmplifier) buildCanonicalTestamentSubmitted(ctx context.Context, testament *Testament, claim *Claim, occurredAt time.Time) CanonicalDelta {
+	actor := a.resolveAgentRef(ctx, testament.AgentID, "legacy testament agent id")
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	refs := claimRefs(claim.ID)
+	refs = append(refs, DeltaRef{Role: "testament", Type: RelatedTypeTestament, ID: testament.ID})
+	for _, artifact := range testament.Artifacts {
+		if artifact == nil || strings.TrimSpace(artifact.ID) == "" {
+			continue
+		}
+		refs = append(refs, DeltaRef{Role: "artifact", Type: RelatedTypeArtifact, ID: artifact.ID})
+	}
+	testamentContext := compactTestamentDeltaContext(testament)
+	testamentEntry := map[string]any{
+		"id":         testament.ID,
+		"verdict":    DeriveTestamentVerdict(testament.Artifacts),
+		"confidence": testament.Confidence,
+		"context":    testamentContext.Value,
+		"artifacts":  artifactHeadersContext(testament.Artifacts),
+	}
+	if testamentContext.Truncated {
+		testamentEntry["context_truncated"] = true
+		if testamentContext.ArtifactID != "" {
+			testamentEntry["context_artifact_id"] = testamentContext.ArtifactID
+			testamentEntry["context_artifact_kind"] = testamentContext.ArtifactKind
+		}
+	}
+	return NewCanonicalDelta(
+		DeltaActionTestamentSubmitted,
+		a.sessionID,
+		a.boardID,
+		testament.Sequence,
+		occurredAt,
+		actor,
+		refs,
+		&DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "legacy claim issuer")}, Relationship: RelationshipIssuer},
+		map[string]any{
+			"claim": map[string]any{
+				"id":                  claim.ID,
+				"action":              string(claim.ActionType),
+				"status":              string(claim.Status),
+				"validations":         validationContext(claim.Validations),
+				"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
+			},
+			"testaments": []map[string]any{testamentEntry},
+		},
+	)
+}
+
+func (a *BoardAmplifier) buildCanonicalValidationEvaluated(ctx context.Context, claim *Claim, validation *Validation, change StatusChange, accepted bool, now time.Time) CanonicalDelta {
+	status := ValidationStatus(change.To)
+	remaining := claim.PendingValidationCount()
+	return NewCanonicalDelta(
+		DeltaActionValidationEvaluated,
+		a.sessionID,
+		a.boardID,
+		validation.Sequence,
+		now,
+		a.resolveAgentRef(ctx, change.AgentID, "legacy validation evaluator"),
+		append(claimRefs(claim.ID), DeltaRef{Role: "validation", Type: RelatedTypeValidation, ID: validation.ID}),
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":     claim.ID,
+				"action": string(claim.ActionType),
+				"status": string(claim.Status),
+			},
+			"validation": map[string]any{
+				"id":                  validation.ID,
+				"type":                string(validation.Type),
+				"status":              string(status),
+				"required":            validation.Required,
+				"reason":              change.Reason,
+				"remaining_required":  remaining,
+				"claim_auto_accepted": accepted,
+				"expected_tool_calls": expectedToolCallContext(validation.ExpectedToolCalls),
+			},
+		},
+	)
+}
+
+func (a *BoardAmplifier) buildCanonicalClaimTransitioned(ctx context.Context, delta ClaimStatusDelta) CanonicalDelta {
+	return NewCanonicalDelta(
+		DeltaActionClaimTransitioned,
+		delta.SessionID,
+		delta.BoardID,
+		delta.Sequence,
+		delta.EmittedAt,
+		a.resolveAgentRef(ctx, delta.AgentID, "legacy claim status actor"),
+		claimRefs(delta.ClaimID),
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":          delta.ClaimID,
+				"action":      string(delta.ActionKind),
+				"from_status": string(delta.FromStatus),
+				"to_status":   string(delta.ToStatus),
+				"reason":      delta.Reason,
+			},
+		},
+	)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -516,6 +786,58 @@ func (a *BoardAmplifier) dispatchSingle(ctx context.Context, topic string, delta
 		return nil
 	}
 	a.runTracked(ctx, "claims_amplifier_delta", emit)
+}
+
+func (a *BoardAmplifier) dispatchCanonical(ctx context.Context, deltas []canonicalDispatch) {
+	if a == nil || !a.canonicalDirectEnabled {
+		return
+	}
+	if len(deltas) == 0 {
+		return
+	}
+	deltas = a.canonicalDispatchesWithBoardTopic(deltas)
+	publisher := a.deltaBus
+	emit := func(runCtx context.Context) error {
+		return a.publishCanonicalBatch(runCtx, publisher, deltas)
+	}
+	a.runTracked(ctx, "claims_amplifier_canonical_delta", emit)
+}
+
+func (a *BoardAmplifier) publishCanonicalBatch(ctx context.Context, publisher DeltaPublisher, deltas []canonicalDispatch) error {
+	var firstErr error
+	for _, d := range deltas {
+		if err := publisher.PublishDelta(ctx, d.topic, d.delta); err != nil {
+			a.reportEmitError("canonical_delta_publish_failed", d.topic, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+func (a *BoardAmplifier) canonicalDispatchesWithBoardTopic(deltas []canonicalDispatch) []canonicalDispatch {
+	if a == nil || len(deltas) == 0 || strings.TrimSpace(a.boardID) == "" {
+		return deltas
+	}
+	out := make([]canonicalDispatch, 0, len(deltas)*2)
+	seen := make(map[string]struct{}, len(deltas)*2)
+	add := func(d canonicalDispatch) {
+		key := d.topic + "\x00" + d.delta.DeltaKey()
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, d)
+	}
+	for _, d := range deltas {
+		add(d)
+		boardTopic := CanonicalBoardTopic(a.sessionID, a.boardID, d.delta.Action)
+		if boardTopic != d.topic {
+			add(canonicalDispatch{topic: boardTopic, delta: d.delta})
+		}
+	}
+	return out
 }
 
 // runTracked dispatches fn under scope as a tracked async goroutine.
@@ -568,12 +890,197 @@ func collectRelatedIDs(relations []Relation, relationship string) []string {
 	return out
 }
 
+func (a *BoardAmplifier) resolveAgentRef(ctx context.Context, agentID, degradedReason string) AgentRef {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return DegradedAgentRef("unknown", firstNonEmpty(degradedReason, "missing agent reference"))
+	}
+	if a != nil && a.agentRefResolver != nil {
+		if ref, ok := a.agentRefResolver.ResolveAgentRef(ctx, a.sessionID, agentID); ok {
+			ref = ref.Normalized()
+			if err := ref.Validate(); err == nil && ref.MatchesAgentID(agentID) {
+				return ref
+			}
+			reason := "identity resolver returned invalid or mismatched ref"
+			if degradedReason != "" {
+				reason = degradedReason + ": " + reason
+			}
+			return DegradedAgentRef(agentID, reason)
+		}
+	}
+	return DegradedAgentRef(agentID, degradedReason)
+}
+
 func copyScope(src []ClaimScopeEntry) []ClaimScopeEntry {
 	if len(src) == 0 {
 		return nil
 	}
 	out := make([]ClaimScopeEntry, len(src))
 	copy(out, src)
+	return out
+}
+
+func actionRefs(actionID string) []DeltaRef {
+	actionID = strings.TrimSpace(actionID)
+	if actionID == "" {
+		return nil
+	}
+	return []DeltaRef{{Role: "action", Type: RelatedTypeAction, ID: actionID}}
+}
+
+func claimRefs(claimID string) []DeltaRef {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return nil
+	}
+	return []DeltaRef{{Role: "claim", Type: RelatedTypeClaim, ID: claimID}}
+}
+
+func claimScopeContext(scope []ClaimScopeEntry) []map[string]string {
+	if len(scope) == 0 {
+		return nil
+	}
+	out := make([]map[string]string, 0, len(scope))
+	for _, entry := range scope {
+		kind := strings.TrimSpace(entry.Kind)
+		key := strings.TrimSpace(entry.Key)
+		if kind == "" && key == "" {
+			continue
+		}
+		out = append(out, map[string]string{"kind": kind, "key": key})
+	}
+	return out
+}
+
+func validationContext(validations []*Validation) []map[string]any {
+	if len(validations) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(validations))
+	for _, validation := range validations {
+		if validation == nil {
+			continue
+		}
+		entry := map[string]any{
+			"id":          validation.ID,
+			"type":        string(validation.Type),
+			"required":    validation.Required,
+			"description": validation.Description,
+			"quality_bar": validation.QualityBar,
+			"status":      string(validation.Status),
+		}
+		if tools := expectedToolCallContext(validation.ExpectedToolCalls); len(tools) > 0 {
+			entry["expected_tool_calls"] = tools
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func artifactHeadersContext(artifacts []*Artifact) []map[string]any {
+	if len(artifacts) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact == nil {
+			continue
+		}
+		header := map[string]any{
+			"id":        artifact.ID,
+			"kind":      artifact.Kind,
+			"ephemeral": artifact.Ephemeral,
+		}
+		if artifact.ContentHash != "" {
+			header["content_hash"] = artifact.ContentHash
+		}
+		if artifact.Size > 0 {
+			header["size"] = artifact.Size
+		}
+		if presentation := presentationHeaderContext(artifact.Presentation); len(presentation) > 0 {
+			header["presentation"] = presentation
+		}
+		out = append(out, header)
+	}
+	return out
+}
+
+const canonicalTestamentContextMax = 4096
+
+type compactTestamentContext struct {
+	Value        string
+	Truncated    bool
+	ArtifactID   string
+	ArtifactKind string
+}
+
+func compactTestamentDeltaContext(testament *Testament) compactTestamentContext {
+	if testament == nil {
+		return compactTestamentContext{}
+	}
+	value := firstNonEmpty(testament.Context, testament.Summary)
+	out := compactTestamentContext{Value: value}
+	if len(value) <= canonicalTestamentContextMax {
+		return out
+	}
+	out.Value = value[:canonicalTestamentContextMax] + "…"
+	out.Truncated = true
+	if artifact := firstContextReferenceArtifact(testament.Artifacts); artifact != nil {
+		out.ArtifactID = strings.TrimSpace(artifact.ID)
+		out.ArtifactKind = strings.TrimSpace(artifact.Kind)
+	}
+	return out
+}
+
+func firstContextReferenceArtifact(artifacts []*Artifact) *Artifact {
+	for _, artifact := range artifacts {
+		if artifact != nil && strings.TrimSpace(artifact.ID) != "" && artifact.Kind == ArtifactKindResponseText {
+			return artifact
+		}
+	}
+	for _, artifact := range artifacts {
+		if artifact != nil && strings.TrimSpace(artifact.ID) != "" {
+			return artifact
+		}
+	}
+	return nil
+}
+
+func presentationHeaderContext(p *Presentation) map[string]any {
+	normalized := NormalizePresentation(p)
+	if normalized == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if len(normalized.Audiences) > 0 {
+		audiences := make([]string, 0, len(normalized.Audiences))
+		for _, audience := range normalized.Audiences {
+			audiences = append(audiences, string(audience))
+		}
+		out["audiences"] = audiences
+	}
+	if len(normalized.Surfaces) > 0 {
+		surfaces := make([]string, 0, len(normalized.Surfaces))
+		for _, surface := range normalized.Surfaces {
+			surfaces = append(surfaces, string(surface))
+		}
+		out["surfaces"] = surfaces
+	}
+	if normalized.Format != "" {
+		out["format"] = string(normalized.Format)
+	}
+	if normalized.Title != "" {
+		out["title"] = normalized.Title
+	}
+	if normalized.Placement != "" {
+		out["placement"] = string(normalized.Placement)
+	}
+	if normalized.ReplaceKey != "" {
+		out["replace_key"] = normalized.ReplaceKey
+	}
+	if normalized.Priority != 0 {
+		out["priority"] = normalized.Priority
+	}
 	return out
 }
 

@@ -405,15 +405,16 @@ func (d *Designer) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:           d.id,
-		SessionID:         d.config.SessionID,
-		Bus:               bus,
-		Board:             d.designerBoard(),
-		Scope:             d.scope,
-		ProcessEntry:      d.processClaimsEntry,
-		Identity:          d.identity,
-		Factory:           d.factory,
-		ContinuationStore: d.continuationStore,
+		AgentID:             d.id,
+		SessionID:           d.config.SessionID,
+		Bus:                 bus,
+		Board:               d.designerBoard(),
+		Scope:               d.scope,
+		ProcessEntry:        d.processClaimsEntry,
+		Identity:            d.identity,
+		Factory:             d.factory,
+		ContinuationStore:   d.continuationStore,
+		ExpectedToolRuntime: d.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("designer_claims_inbox_start_failed", "error", err.Error())

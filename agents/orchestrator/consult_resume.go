@@ -21,21 +21,14 @@ import (
 func (o *Orchestrator) resumeContinuation(
 	ctx context.Context,
 	snapshot *shared.TurnSnapshot,
-	results map[string]*claims.ConsultResolvedDelta,
+	results map[string]*shared.AwaitedClaimResult,
 ) error {
 	if snapshot == nil || snapshot.Request == nil {
 		return fmt.Errorf("orchestrator: nil consult-yield snapshot on resume")
 	}
 
 	if snapshot.AccumulatorState.AgentID != "" {
-		acc := claims.RestoreAccumulator(
-			snapshot.AccumulatorState.AgentID,
-			snapshot.AccumulatorState.SessionID,
-			snapshot.AccumulatorState.ClaimID,
-			snapshot.AccumulatorState.Started,
-			snapshot.AccumulatorState.Artifacts,
-			snapshot.AccumulatorState.Notes,
-		)
+		acc := shared.RestoreAccumulatorFromSnapshot(snapshot.AccumulatorState)
 		ctx = claims.WithTestamentAccumulator(ctx, acc)
 		defer acc.Flush(ctx, o.orchestratorBoardOrNil(), o.orchestratorScope())
 	}
@@ -91,7 +84,7 @@ func orchestratorLedgerCorrelation(ledger *steering.SteeringLedger, sessionID st
 	return "orchestrator:turn"
 }
 
-func formatOrchestratorAwaitResults(results map[string]*claims.ConsultResolvedDelta) string {
+func formatOrchestratorAwaitResults(results map[string]*shared.AwaitedClaimResult) string {
 	formatted := shared.FormatConsultResults(results)
 	encoded, err := json.Marshal(formatted)
 	if err != nil {

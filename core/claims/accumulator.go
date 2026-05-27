@@ -135,10 +135,16 @@ type TestamentAccumulator struct {
 	agentID   string
 	sessionID string
 	claimID   string // parent claim being processed; threaded into ArtifactProgressSink callbacks
-	artifacts []*Artifact
-	notes     []string
-	started   time.Time
-	flushed   bool
+	// responseClaimID is the claim this accumulator's final testament
+	// answers. It is intentionally separate from claimID: claimID is a
+	// live routing anchor for artifact progress, while responseClaimID
+	// is the durable RelationshipClaim edge added to the flushed
+	// testament. Callers must opt in for directed-work responses.
+	responseClaimID string
+	artifacts       []*Artifact
+	notes           []string
+	started         time.Time
+	flushed         bool
 
 	// context is the testament's developing-conclusion narrative,
 	// updatable via SetContext while the testament is still in
@@ -341,15 +347,30 @@ func fireOnAccumulatorClosed(sink AccumulatorLifecycleSink, agentID, sessionID s
 	sink.OnAccumulatorClosed(agentID, sessionID)
 }
 
-// WithClaimID attaches the parent claim ID. The accumulator threads
-// this into ArtifactProgressSink callbacks so the UI can route
-// artifact events to the correct chat row.
+// WithClaimID attaches the parent claim ID used for live artifact
+// routing. This does not, by itself, make the final testament answer
+// that claim; directed responders must also call WithResponseClaimID.
 func (a *TestamentAccumulator) WithClaimID(claimID string) *TestamentAccumulator {
 	if a == nil {
 		return nil
 	}
 	a.mu.Lock()
 	a.claimID = strings.TrimSpace(claimID)
+	a.mu.Unlock()
+	return a
+}
+
+// WithResponseClaimID marks the final flushed testament as an answer
+// to the given claim by adding a RelationshipClaim relation. This is
+// opt-in so routine accumulators can route progress under a claim
+// without waking claim/auditor lifecycles unless they are actually
+// submitting a directed response.
+func (a *TestamentAccumulator) WithResponseClaimID(claimID string) *TestamentAccumulator {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	a.responseClaimID = strings.TrimSpace(claimID)
 	a.mu.Unlock()
 	return a
 }
@@ -374,6 +395,18 @@ func (a *TestamentAccumulator) ClaimID() string {
 	}
 	a.mu.Lock()
 	id := a.claimID
+	a.mu.Unlock()
+	return id
+}
+
+// ResponseClaimID returns the durable claim relation target that will
+// be stamped on Flush, if any.
+func (a *TestamentAccumulator) ResponseClaimID() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	id := a.responseClaimID
 	a.mu.Unlock()
 	return id
 }
@@ -633,6 +666,7 @@ type accumulatorFlushPayload struct {
 	agentID           string
 	sessionID         string
 	claimID           string
+	responseClaimID   string
 	contextValue      string
 	contextTransition int64
 	accID             string
@@ -659,6 +693,7 @@ func (a *TestamentAccumulator) beginFlush() *accumulatorFlushPayload {
 		agentID:           a.agentID,
 		sessionID:         a.sessionID,
 		claimID:           a.claimID,
+		responseClaimID:   a.responseClaimID,
 		contextValue:      a.context,
 		contextTransition: a.contextTransition,
 		accID:             a.id,
@@ -700,10 +735,21 @@ func submitAccumulatorFlush(ctx context.Context, board *ClaimsBoard, p *accumula
 	})
 
 	summary := deriveTestamentSummary(artifacts, p.notes)
-	// claimID is informational on the accumulator (used by the
-	// artifact-progress sink for chat-row routing); intentionally
-	// not added as a Relation here — see Flush doc comment.
+	// claimID is the live routing anchor used by the artifact-progress
+	// sink. responseClaimID is the durable answer edge; only callers
+	// that explicitly opted in through WithResponseClaimID get a
+	// RelationshipClaim on the submitted testament.
 	claimID := p.claimID
+	relations := []Relation{
+		{Related: p.agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+	}
+	if responseClaimID := strings.TrimSpace(p.responseClaimID); responseClaimID != "" {
+		relations = append(relations, Relation{
+			Related:      responseClaimID,
+			RelatedType:  RelatedTypeClaim,
+			Relationship: RelationshipClaim,
+		})
+	}
 
 	// Pre-stamp the testament ID so the post-submit final
 	// TestamentContextDelta can carry it. The board's
@@ -721,10 +767,8 @@ func submitAccumulatorFlush(ctx context.Context, board *ClaimsBoard, p *accumula
 		// arrived as TestamentContextDeltas keyed by AccumulatorID.
 		Context:           p.contextValue,
 		ContextTransition: p.contextTransition,
-		Relations: []Relation{
-			{Related: p.agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
-		},
-		Artifacts: artifacts,
+		Relations:         relations,
+		Artifacts:         artifacts,
 	}
 	action := Action{AgentID: p.agentID, Type: ActionTypeTestament}
 	if err := board.SubmitTestaments(ctx, action, []Testament{testament}); err != nil {

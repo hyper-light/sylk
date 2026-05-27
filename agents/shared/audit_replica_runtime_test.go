@@ -162,8 +162,8 @@ func TestAuditReplicaRuntime_HappyPathEmitsDecision(t *testing.T) {
 		turns: []scriptedTurn{
 			{
 				toolCalls: []providers.ToolCall{{
-					ID:   "call-1",
-					Name: AuditToolEmitDecision,
+					ID:        "call-1",
+					Name:      AuditToolEmitDecision,
 					Arguments: `{"decision":"accepted","summary":"looks good"}`,
 				}},
 			},
@@ -314,7 +314,7 @@ func TestAuditReplicaRuntime_FallbackRejectionOnExhaustedBudget(t *testing.T) {
 // inspector+tester pairs" invariant.
 func TestAuditReplicaRuntime_ParallelAuditsRunConcurrently(t *testing.T) {
 	const (
-		numAudits   = 3
+		numAudits    = 3
 		perTurnDelay = 120 * time.Millisecond
 	)
 	sess, _ := openRuntimeTestSession(t, "parallel")
@@ -472,14 +472,14 @@ func TestAuditReplicaRuntime_MergesAfterReturnsNewerDescriptors(t *testing.T) {
 	}
 	finalizer := func(*AuditMergeResult) {}
 	rt, err := NewAuditReplicaRuntime(AuditReplicaConfig{
-		ReplicaID:    "r-merges",
-		Request:      &AuditMergeRequest{ReplicaID: "r-merges"},
-		SessionID:    "sess",
-		Session:      sess,
-		ReplicaVFS:   vfs,
-		Finalizer:    finalizer,
-		Ledger:       runtimeTestLedger(t, "r-merges"),
-		Provider:     provider,
+		ReplicaID:  "r-merges",
+		Request:    &AuditMergeRequest{ReplicaID: "r-merges"},
+		SessionID:  "sess",
+		Session:    sess,
+		ReplicaVFS: vfs,
+		Finalizer:  finalizer,
+		Ledger:     runtimeTestLedger(t, "r-merges"),
+		Provider:   provider,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -531,17 +531,17 @@ func TestAuditReplicaRuntime_ContextGovernorPerReplica(t *testing.T) {
 	var gotResult *AuditMergeResult
 	finalizer := func(r *AuditMergeResult) { gotResult = r }
 	rt, err := NewAuditReplicaRuntime(AuditReplicaConfig{
-		ReplicaID:    "r-gov",
-		Request:      &AuditMergeRequest{ReplicaID: "r-gov"},
-		SessionID:    "sess",
-		Session:      sess,
-		ReplicaVFS:   vfs,
-		Finalizer:    finalizer,
-		Ledger:       runtimeTestLedger(t, "r-gov"),
-		Provider:     provider,
-		Model:        "claude-opus-4",
-		MaxTokens:    8192,
-		MaxToolRuns:  16,
+		ReplicaID:   "r-gov",
+		Request:     &AuditMergeRequest{ReplicaID: "r-gov"},
+		SessionID:   "sess",
+		Session:     sess,
+		ReplicaVFS:  vfs,
+		Finalizer:   finalizer,
+		Ledger:      runtimeTestLedger(t, "r-gov"),
+		Provider:    provider,
+		Model:       "claude-opus-4",
+		MaxTokens:   8192,
+		MaxToolRuns: 16,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -554,7 +554,7 @@ func TestAuditReplicaRuntime_ContextGovernorPerReplica(t *testing.T) {
 	ctx = WithAuditDecisionFinalizer(ctx, finalizer)
 	// Wrap the provider to snoop ctx at stream time.
 	rt.cfg.Provider = &ctxSnoopingProvider{
-		inner:   provider,
+		inner: provider,
 		onCtx: func(c context.Context) {
 			if seenGovernor == nil {
 				seenGovernor = ContextGovernorFromContext(c)
@@ -587,18 +587,17 @@ func (p *ctxSnoopingProvider) Stream(ctx context.Context, req *providers.Request
 	return p.inner.Stream(ctx, req)
 }
 
-// TestAuditReplicaRuntime_ConsultPeerToolOmittedWithoutTopic verifies
-// the tool set gating: consult_peer is only exposed when the runtime
-// has a ResponseTopic. Without one, the LLM never sees a tool it
-// can't invoke.
-func TestAuditReplicaRuntime_ConsultPeerToolOmittedWithoutTopic(t *testing.T) {
+// TestAuditReplicaRuntime_ConsultPeerToolAlwaysOmitted verifies the
+// Phase 7 contract: audit replicas do not expose consult_peer even if
+// legacy callers still pass includeConsult/ResponseTopic.
+func TestAuditReplicaRuntime_ConsultPeerToolAlwaysOmitted(t *testing.T) {
 	toolsNoConsult := buildAuditReplicaTools(AgentTypeInspectorGlobal, false)
 	toolsWithConsult := buildAuditReplicaTools(AgentTypeInspectorGlobal, true)
 	if findToolByName(toolsNoConsult, AuditToolConsultPeer) != nil {
 		t.Error("consult_peer present in tool set when includeConsult=false")
 	}
-	if findToolByName(toolsWithConsult, AuditToolConsultPeer) == nil {
-		t.Error("consult_peer missing from tool set when includeConsult=true")
+	if findToolByName(toolsWithConsult, AuditToolConsultPeer) != nil {
+		t.Error("consult_peer present in tool set when includeConsult=true")
 	}
 }
 
@@ -611,10 +610,10 @@ func findToolByName(tools []providers.Tool, name string) *providers.Tool {
 	return nil
 }
 
-// TestAuditReplicaRuntime_ConsultPeerReturnsErrorForUnconfiguredReplica
-// verifies that invoking consult_peer without a ResponseTopic +
-// Bus returns a clear error rather than panicking or hanging.
-func TestAuditReplicaRuntime_ConsultPeerReturnsErrorForUnconfiguredReplica(t *testing.T) {
+// TestAuditReplicaRuntime_ConsultPeerReturnsDisabledError verifies
+// that invoking stale consult_peer calls returns a clear error rather
+// than panicking, hanging, or attempting RouteSync.
+func TestAuditReplicaRuntime_ConsultPeerReturnsDisabledError(t *testing.T) {
 	sess, vfs := openRuntimeTestSession(t, "no-consult")
 	provider := &scriptedProvider{
 		turns: []scriptedTurn{
@@ -644,7 +643,7 @@ func TestAuditReplicaRuntime_ConsultPeerReturnsErrorForUnconfiguredReplica(t *te
 		Finalizer:  finalizer,
 		Ledger:     runtimeTestLedger(t, "r-no-consult"),
 		Provider:   provider,
-		// Bus nil, ResponseTopic empty — consult_peer unconfigured.
+		// Bus nil, ResponseTopic empty — consult_peer remains disabled.
 	})
 	if err != nil {
 		t.Fatal(err)

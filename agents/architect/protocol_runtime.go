@@ -475,14 +475,13 @@ func (r *planningProtocolRunner) run() error {
 	}
 	r.architect.applyProtocolRuntimeProfile(req, r.plan.SessionID)
 
+	// The protocol is user-facing and synchronous: the caller is waiting
+	// for the plan presentation. Stamp only the continuation store so peer
+	// tools wait on canonical claim/testament deltas inline instead of
+	// returning in-flight tickets or yielding to a background resume.
+	loopCtx = r.architect.withSynchronousPeerWait(loopCtx)
 	ledger := shared.SteeringLedgerFromContext(loopCtx)
 
-	// Synchronously-driven planning protocol turn — caller awaits the
-	// architect's response. Don't stamp WithContinuationStore: yielding
-	// would strand the caller while the resume runs in the background
-	// with no synchronous reply path. Consult_peer falls through to
-	// inline RouteSync (runLegacyConsultWait) so the loop completes
-	// before this function returns.
 	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
 		return r.architect.executeToolLoop(
 			loopCtx, req, "planning_protocol",
@@ -563,7 +562,7 @@ func (r *planningProtocolRunner) buildProtocolPrompt() string {
 	if history, ok := r.request.Params["conversation_history"].(string); ok && history != "" {
 		fmt.Fprintf(&b, "\nConversation history:\n%s\n", history)
 	}
-	b.WriteString("\nBegin by invoking plan with action=analyze.")
+	b.WriteString("\nBegin with evidence review. Call recall_forward for the stable planning topic when applicable. If no usable carried-forward evidence answers the planning uncertainty, issue one targeted consult_peer and wait for it to complete. Only after fresh evidence is attached should you invoke plan(action=analyze).")
 	return b.String()
 }
 

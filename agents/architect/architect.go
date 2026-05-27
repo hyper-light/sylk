@@ -139,9 +139,9 @@ type Architect struct {
 	// executes at a time, preventing cancel/new-request interleaving.
 	requestSerializer *shared.RequestSerializer
 
-	// continuationStore handles ConsultResolvedDelta deliveries when
+	// continuationStore handles canonical peer-response deltas when
 	// the LLM yields mid-turn via await_consults. Constructed in
-	// Start; passed to WireClaimsIntake so consult resolutions bypass
+	// Start; passed to WireClaimsIntake so consult responses bypass
 	// processClaimsEntry (which would fire a fresh inference loop)
 	// and instead wake the parked continuation.
 	continuationStore *shared.ContinuationStore
@@ -820,10 +820,11 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	}
 
 	// ContinuationStore: must exist before WireClaimsIntake so the
-	// inbox routes ConsultResolvedDelta deliveries to it instead of
-	// firing fresh inference via processClaimsEntry. ResumeFn wakes
-	// a yielded LLM turn by reconstructing its TurnState and re-
-	// entering the agent's tool loop; see resumeContinuation.
+	// inbox routes expected canonical peer-response deltas to it
+	// instead of firing fresh inference via processClaimsEntry.
+	// ResumeFn wakes a yielded LLM turn by reconstructing its
+	// TurnState and re-entering the agent's tool loop; see
+	// resumeContinuation.
 	a.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
 		AgentID:   a.id,
 		SessionID: a.config.SessionID,
@@ -843,16 +844,17 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	// across the session — the architect is the canonical author of
 	// corrective actions on rejection.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:           a.id,
-		SessionID:         a.config.SessionID,
-		Role:              claims.RoleSubject | claims.RoleRemediator,
-		Bus:               bus,
-		Board:             a.architectBoard(),
-		Scope:             a.scope,
-		ProcessEntry:      a.processClaimsEntry,
-		Identity:          a.identity,
-		Factory:           a.factory,
-		ContinuationStore: a.continuationStore,
+		AgentID:             a.id,
+		SessionID:           a.config.SessionID,
+		Role:                claims.RoleSubject | claims.RoleRemediator,
+		Bus:                 bus,
+		Board:               a.architectBoard(),
+		Scope:               a.scope,
+		ProcessEntry:        a.processClaimsEntry,
+		Identity:            a.identity,
+		Factory:             a.factory,
+		ContinuationStore:   a.continuationStore,
+		ExpectedToolRuntime: a.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("architect_claims_inbox_start_failed", "error", err.Error())
@@ -3136,7 +3138,54 @@ func shouldFallbackToPlanningProtocolAfterConversation(req *ArchitectRequest, re
 	if req == nil || readyPlan != nil || stalledPlan != nil {
 		return false
 	}
-	return isConversationFallbackPlanningIntent(req.Intent)
+	return isConversationFallbackPlanningIntent(req.Intent) && isExplicitPlanningProtocolStartRequest(req)
+}
+
+func isExplicitPlanningProtocolStartRequest(req *ArchitectRequest) bool {
+	if req == nil {
+		return false
+	}
+	normalized := normalizeArchitectDecisionText(req.Query)
+	if normalized == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"plan it",
+		"plan this",
+		"plan that",
+		"plan it out",
+		"plan this out",
+		"plan that out",
+		"plan out",
+		"create a plan",
+		"create the plan",
+		"make a plan",
+		"make the plan",
+		"prepare a plan",
+		"prepare the plan",
+		"draft a plan",
+		"draft the plan",
+		"write a plan",
+		"write the plan",
+		"put together a plan",
+		"formalize this",
+		"formalize it",
+		"formalise this",
+		"formalise it",
+	} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	if !architectIsLowInformationFollowup(req.Query) {
+		return false
+	}
+	for i := len(req.ConversationHistory) - 1; i >= 0 && i >= len(req.ConversationHistory)-4; i-- {
+		if shouldDeferPlanningProtocolForUserConfirmation(req.ConversationHistory[i].AgentReply) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldDeferPlanningProtocolForUserConfirmation(response string) bool {

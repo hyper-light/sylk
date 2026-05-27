@@ -10,9 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/adalundhe/sylk/agents/guide"
-	agentShared "github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -62,117 +59,6 @@ func loadPlanContextSkill(gi *GlobalInspector) *skills.Skill {
 			}, nil
 		}).
 		Build()
-}
-
-// Phase 2.K / GI-A refactor (docs/PIPELINE_SKILL_REFACTOR.md §10.K.1):
-// consult_librarian_style + consult_academic_approach +
-// consult_archivalist_context + request_architect_research folded into
-// shared consult_peer(target_agent_type=…). The consultAgent helper
-// below stays because the request_architect_research programmatic
-// surface and existing tests exercise its sync bus path; knowledge-
-// agent routing now flows through the fabric-backed consult_peer
-// primitive registered via CrossPipelineSkills.
-
-func (gi *GlobalInspector) consultAgent(ctx context.Context, target, prompt string, metadata map[string]any) (string, error) {
-	prompt = strings.TrimSpace(prompt)
-	admission := agentShared.AdmitConsultation(ctx, target, prompt, metadata)
-	if !admission.Allowed {
-		return "", agentShared.ConsultationAdmissionError(admission)
-	}
-	spec := agentShared.InterAgentBranchSpec{
-		Kind:       agentShared.InterAgentToolEventKindConsult,
-		ToolName:   "consult_" + strings.ReplaceAll(strings.TrimSpace(target), "-", "_"),
-		AgentTypes: []string{target},
-		Summary:    prompt,
-		Args: map[string]any{
-			"target": target,
-			"query":  prompt,
-		},
-	}
-	gi.globalInspectorPostClaim(ctx,
-		claims.Action{AgentID: "inspector", Type: claims.ActionTypeConsultation},
-		globalInspectorConsultClaim(
-			"Consult "+target+": "+truncateGlobalInspector(prompt, 60),
-			"Global inspector peer consultation",
-			target,
-			[]claims.ClaimScopeEntry{{Kind: "consultation", Key: target}},
-			[]*claims.Validation{
-				globalInspectorValidation(claims.ValidationTypeReceipt, true, "Peer responds to consultation", "response.success"),
-			},
-		),
-	)
-	msg, err := agentShared.WithInterAgentBranchMessage(ctx, spec, func(branchCtx context.Context, branch agentShared.InterAgentBranchHandle) (*guide.Message, error) {
-		branchMetadata := branch.ApplyMetadata(branchCtx, admission.Metadata)
-		resp, routeErr := gi.requestRouteSync(branchCtx, target, prompt, branchMetadata)
-		if routeErr != nil {
-			agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, false, nil, routeErr)
-			return resp, routeErr
-		}
-		content, extractErr := extractConsultationResponse(resp)
-		agentShared.RecordConsultationOutcome(branchCtx, admission.AttemptID, extractErr == nil, content, extractErr)
-		return resp, extractErr
-	})
-	if err != nil {
-		return "", err
-	}
-	return extractConsultationResponse(msg)
-}
-
-func consultationBlockedResult(target string, err *agentShared.ConsultationPressureError) map[string]any {
-	result := map[string]any{
-		"consulted": false,
-		"blocked":   true,
-		"target":    strings.TrimSpace(target),
-		"status":    "deferred",
-	}
-	if err == nil {
-		return result
-	}
-	if message := strings.TrimSpace(err.Error()); message != "" {
-		result["guidance"] = message
-		result["error"] = message
-	}
-	if recovery := agentShared.ConsultationPressureRecovery(err); len(recovery) > 0 {
-		result["recovery"] = recovery
-	}
-	return result
-}
-
-func extractConsultationResponse(msg *guide.Message) (string, error) {
-	if msg == nil {
-		return "", fmt.Errorf("consultation response is missing")
-	}
-	if errText, ok := msg.GetError(); ok && strings.TrimSpace(errText) != "" {
-		return "", fmt.Errorf("%s", strings.TrimSpace(errText))
-	}
-	resp, ok := msg.GetRouteResponse()
-	if !ok || resp == nil {
-		return "", fmt.Errorf("consultation response payload is unsupported")
-	}
-	if !resp.Success {
-		return "", fmt.Errorf("%s", strings.TrimSpace(resp.Error))
-	}
-	switch typed := resp.Data.(type) {
-	case string:
-		return strings.TrimSpace(typed), nil
-	case map[string]any:
-		for _, key := range []string{"response", "content", "message", "result"} {
-			if value, ok := typed[key].(string); ok && strings.TrimSpace(value) != "" {
-				return strings.TrimSpace(value), nil
-			}
-		}
-		data, err := json.Marshal(typed)
-		if err != nil {
-			return "", fmt.Errorf("marshal consultation response: %w", err)
-		}
-		return strings.TrimSpace(string(data)), nil
-	default:
-		data, err := json.Marshal(resp.Data)
-		if err != nil {
-			return "", fmt.Errorf("marshal consultation response: %w", err)
-		}
-		return strings.TrimSpace(string(data)), nil
-	}
 }
 
 func (gi *GlobalInspector) loadPlanContext(

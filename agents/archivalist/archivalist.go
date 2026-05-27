@@ -596,15 +596,16 @@ func (a *Archivalist) Start(bus guide.EventBus) error {
 	// flushed testament) lands here for curation and persistence —
 	// no upstream RouteRequest dispatch required.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:      a.id,
-		SessionID:    a.defaultSessionID,
-		Role:         claims.RoleSubject | claims.RoleArchivist,
-		Bus:          bus,
-		Board:        a.archivalistBoard(),
-		Scope:        a.scope,
-		ProcessEntry: a.processClaimsEntry,
-		Identity:     a.identity,
-		Factory:      a.factory,
+		AgentID:             a.id,
+		SessionID:           a.defaultSessionID,
+		Role:                claims.RoleSubject | claims.RoleArchivist,
+		Bus:                 bus,
+		Board:               a.archivalistBoard(),
+		Scope:               a.scope,
+		ProcessEntry:        a.processClaimsEntry,
+		Identity:            a.identity,
+		Factory:             a.factory,
+		ExpectedToolRuntime: a.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("archivalist_claims_inbox_start_failed", "error", err.Error())

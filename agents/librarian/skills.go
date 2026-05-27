@@ -9,10 +9,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/skills"
@@ -31,7 +31,9 @@ func (l *Librarian) registerCoreSkills() {
 	// collapse into `search(kind=…)` on the visible surface. The
 	// per-kind builders stay available for internal callers above.
 	l.skills.Register(searchFacadeSkill(l))
-	l.skills.Register(consultSkill(l))
+	// Librarian is a reactive knowledge agent. Outbound peer work must be
+	// posted as directed claims by the requesting agent, not initiated through
+	// the legacy synchronous consult skill.
 	l.skills.Register(assessHealthSkill(l))
 	l.skills.Register(queryStructureSkill(l))
 	l.skills.Register(repoBriefSkill(l))
@@ -168,6 +170,19 @@ func (l *Librarian) registerFabricSkills() {
 	}
 }
 
+func (l *Librarian) currentSessionID(ctx context.Context) string {
+	if sessionID := versioning.SessionIDFromContext(ctx); sessionID != "" {
+		return sessionID
+	}
+	if l == nil {
+		return ""
+	}
+	if sessionID, _ := l.activeSessionID.Load().(string); strings.TrimSpace(sessionID) != "" {
+		return strings.TrimSpace(sessionID)
+	}
+	return strings.TrimSpace(l.config.SessionID)
+}
+
 type librarianDiag struct{}
 
 func (d *librarianDiag) AgentName() string                         { return "librarian" }
@@ -226,6 +241,7 @@ func searchCodebaseSkill(l *Librarian) *skills.Skill {
 				Intent:    IntentRecall,
 				Domain:    DomainCode,
 				Query:     params.Query,
+				SessionID: l.currentSessionID(ctx),
 				Timestamp: time.Now(),
 				Params: map[string]any{
 					"types":       params.Types,
@@ -287,6 +303,7 @@ func findPatternSkill(l *Librarian) *skills.Skill {
 				Intent:    IntentRecall,
 				Domain:    DomainPatterns,
 				Query:     query,
+				SessionID: l.currentSessionID(ctx),
 				Timestamp: time.Now(),
 				Params: map[string]any{
 					"pattern_type":     params.PatternType,
@@ -596,6 +613,7 @@ func locateSymbolSkill(l *Librarian) *skills.Skill {
 				Intent:    IntentRecall,
 				Domain:    DomainCode,
 				Query:     params.Symbol,
+				SessionID: l.currentSessionID(ctx),
 				Timestamp: time.Now(),
 				Params: map[string]any{
 					"include_usages":     params.IncludeUsages,
@@ -644,6 +662,9 @@ func knowledgeSearchSkill(l *Librarian) *skills.Skill {
 			l.mu.Unlock()
 
 			if backend != nil {
+				if err := waitForCommittedKnowledgeBackend(ctx, l.currentSessionID(ctx)); err != nil {
+					return nil, err
+				}
 				result, err := backend.Search(ctx, &search.SearchRequest{
 					Query: params.Query,
 					Limit: params.Limit,
@@ -681,6 +702,7 @@ func knowledgeSearchSkill(l *Librarian) *skills.Skill {
 						"head_version": result.HeadVersion,
 					}, nil
 				}
+				return nil, fmt.Errorf("knowledge backend search: %w", err)
 			}
 			if ks == nil {
 				return nil, fmt.Errorf("knowledge store not available (indexing may still be in progress)")

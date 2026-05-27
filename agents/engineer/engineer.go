@@ -481,8 +481,8 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 
 	// ContinuationStore for ticket-mode consult_peer + await_consults.
 	// Must be constructed before WireClaimsIntake so the inbox routes
-	// ConsultResolvedDelta deliveries to it instead of firing fresh
-	// inference via processClaimsEntry.
+	// expected canonical peer-response deltas to it instead of firing
+	// fresh inference via processClaimsEntry.
 	e.continuationStore = shared.NewContinuationStore(shared.ContinuationStoreConfig{
 		AgentID:   e.id,
 		SessionID: e.config.SessionID,
@@ -494,15 +494,16 @@ func (e *Engineer) Start(bus guide.EventBus) error {
 
 	// Claims intake: event-driven delta processing.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
-		AgentID:           e.id,
-		SessionID:         e.config.SessionID,
-		Bus:               bus,
-		Board:             e.engineerBoard(),
-		Scope:             e.scope,
-		ProcessEntry:      e.processClaimsEntry,
-		Identity:          e.identity,
-		Factory:           e.factory,
-		ContinuationStore: e.continuationStore,
+		AgentID:             e.id,
+		SessionID:           e.config.SessionID,
+		Bus:                 bus,
+		Board:               e.engineerBoard(),
+		Scope:               e.scope,
+		ProcessEntry:        e.processClaimsEntry,
+		Identity:            e.identity,
+		Factory:             e.factory,
+		ContinuationStore:   e.continuationStore,
+		ExpectedToolRuntime: e.toolRuntime(),
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("engineer_claims_inbox_start_failed", "error", err.Error())

@@ -13,15 +13,9 @@ import (
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
-	skillsPkg "github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/steering"
 	"github.com/adalundhe/sylk/core/versioning"
 )
-
-// skillsPkgSkill is a local alias so consult_peer's skill handle
-// has a compact name. The cross_pipeline skill builder returns
-// *skills.Skill values; we interrogate Name and invoke Handler.
-type skillsPkgSkill = skillsPkg.Skill
 
 // AuditReplicaRuntime is the Stage-3 per-replica audit execution
 // surface. Each per-merge audit spawns a fresh runtime; the runtime
@@ -114,11 +108,11 @@ type AuditReplicaConfig struct {
 	AgentDisplayName string
 	Logger           *slog.Logger
 
-	// ResponseTopic is the bus topic the replica's consult_peer
-	// synchronous round-trips receive responses on. Typically the
-	// singleton inspector's / tester's Responses topic. When
-	// non-empty, the runtime exposes the consult_peer tool; when
-	// empty, consult_peer is omitted from the tool set entirely.
+	// ResponseTopic is retained for callers that still populate the
+	// old sync-route audit configuration. Audit replicas no longer
+	// expose consult_peer: peer work must be posted as claims and
+	// resolved through canonical deltas, not a synchronous RouteSync
+	// response channel.
 	ResponseTopic string
 
 	// ThinkingBudget is the Anthropic extended-thinking budget for
@@ -221,7 +215,7 @@ func (r *AuditReplicaRuntime) Run(ctx context.Context) error {
 		},
 		Model:     r.cfg.Model,
 		MaxTokens: r.cfg.MaxTokens,
-		Tools:     buildAuditReplicaTools(r.cfg.AgentType, r.cfg.ResponseTopic != ""),
+		Tools:     buildAuditReplicaTools(r.cfg.AgentType, false),
 	}
 
 	for turn := 0; turn <= r.cfg.MaxToolRuns; turn++ {
@@ -563,56 +557,13 @@ func (r *AuditReplicaRuntime) handleMergesAfter(call providers.ToolCall) auditTo
 	return auditToolResult{callID: call.ID, name: call.Name, output: string(body)}
 }
 
-// handleConsultPeer routes the audit's question to a peer agent
-// (e.g., academic, librarian, or another global agent) via the
-// cross-pipeline consult primitive. Synchronous round-trip: the
-// replica's LLM sees the peer's response inline.
-//
-// Requires the config to supply a non-empty ResponseTopic so the
-// sync helper knows where to wait for the terminal response. Without
-// a topic the tool is omitted from the replica's tool set by
-// buildAuditReplicaTools (defense-in-depth: the LLM never sees a
-// tool it can't invoke).
+// handleConsultPeer hard-disables the legacy audit-replica sync
+// consult path. Audit replicas are intentionally bounded by their
+// static local tool set; inter-agent audit work must be expressed as
+// claims and answered by canonical deltas, not RouteSync.
 func (r *AuditReplicaRuntime) handleConsultPeer(ctx context.Context, call providers.ToolCall) auditToolResult {
-	if r.cfg.Bus == nil || r.cfg.ResponseTopic == "" {
-		return auditToolResult{callID: call.ID, name: call.Name, output: "consult_peer is not configured for this audit replica", isError: true}
-	}
-	// Construct the cross-pipeline skill on the fly with this
-	// replica's identity. The skill's handler does the heavy work
-	// (authority gate, deadline, activity emission, RouteSync).
-	sessionID := r.cfg.SessionID
-	agentID := r.cfg.ReplicaID
-	agentType := r.cfg.AgentType
-	mergedVer := r.cfg.MergedVersion.String()
-	skillsList := CrossPipelineSkills(CrossPipelineSkillConfig{
-		SessionID:  func() string { return sessionID },
-		AgentID:    func() string { return agentID },
-		AgentType:  func() string { return agentType },
-		PipelineID: func() string { return "audit-replica:" + mergedVer },
-		RouteSync: RouteSyncFromBus(
-			func() guide.EventBus { return r.cfg.Bus },
-			func() string { return r.cfg.ResponseTopic },
-		),
-	})
-	var consultSkill *skillsPkgSkill
-	for _, s := range skillsList {
-		if s != nil && s.Name == "consult_peer" {
-			consultSkill = s
-			break
-		}
-	}
-	if consultSkill == nil || consultSkill.Handler == nil {
-		return auditToolResult{callID: call.ID, name: call.Name, output: "consult_peer not permitted for this replica's agent type", isError: true}
-	}
-	result, err := consultSkill.Handler(ctx, json.RawMessage(call.Arguments))
-	if err != nil {
-		return auditToolResult{callID: call.ID, name: call.Name, output: "consult failed: " + err.Error(), isError: true}
-	}
-	body, marshalErr := json.Marshal(result)
-	if marshalErr != nil {
-		return auditToolResult{callID: call.ID, name: call.Name, output: "consult result marshal: " + marshalErr.Error(), isError: true}
-	}
-	return auditToolResult{callID: call.ID, name: call.Name, output: string(body)}
+	_ = ctx
+	return auditToolResult{callID: call.ID, name: call.Name, output: "consult_peer is disabled for audit replicas; post a claim-backed consultation outside the audit replica instead", isError: true}
 }
 
 // handleEmitDecision fires the ctx-scoped finalizer with the

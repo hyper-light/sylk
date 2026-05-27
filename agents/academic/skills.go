@@ -10,10 +10,10 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
-	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/activity"
-	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/fabric"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/google/uuid"
 )
@@ -23,7 +23,8 @@ func (a *Academic) registerCoreSkills() {
 	a.skills.Register(researchTopicSkill(a))
 	a.skills.Register(findBestPracticesSkill(a))
 	a.skills.Register(compareApproachesSkill(a))
-	a.skills.Register(consultSkill(a))
+	// Academic is reactive for peer work. It answers directed claims; it does
+	// not expose the legacy synchronous consult skill.
 	a.skills.Register(shared.NewSelfDiagnosticSkill(&academicDiag{a: a}))
 	a.skills.Register(skills.NewRerouteSkill(skills.RerouteConfig{
 		AgentID:   "academic",
@@ -209,105 +210,6 @@ func cloneViaLibrarianSkill(a *Academic) *skills.Skill {
 				"data":    evidence.Data,
 				"error":   evidence.Error,
 			}, nil
-		}).
-		Build()
-}
-
-// consultTargets enumerates valid consultation targets for the Academic.
-var consultTargets = map[string]string{
-	"librarian":   "Codebase patterns, existing implementations, and dependency information",
-	"archivalist": "Historical context on code decisions and past changes",
-}
-
-func academicConsultFailureResult(target, query, scope string, err error) map[string]any {
-	result := map[string]any{
-		"target":   strings.TrimSpace(target),
-		"query":    strings.TrimSpace(query),
-		"scope":    strings.TrimSpace(scope),
-		"success":  false,
-		"status":   "failed",
-		"guidance": "Continue with direct research or synthesize current evidence instead of repeating the same consultation.",
-	}
-	if err != nil {
-		if message := strings.TrimSpace(err.Error()); message != "" {
-			result["error"] = message
-		}
-	}
-	return result
-}
-
-func consultSkill(a *Academic) *skills.Skill {
-	return skills.NewSkill("consult").
-		Description("Consult a domain expert agent. Targets: librarian (codebase patterns), archivalist (historical context).").
-		Domain("consultation").
-		Keywords("consult", "librarian", "archivalist", "codebase", "patterns", "history").
-		Priority(85).
-		EnumParam("target", "Agent to consult", []string{"librarian", "archivalist"}, true).
-		StringParam("query", "Consultation question", true).
-		StringParam("scope", "Scope for consultation", false).
-		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			var params struct {
-				Target string `json:"target"`
-				Query  string `json:"query"`
-				Scope  string `json:"scope"`
-			}
-			if err := json.Unmarshal(input, &params); err != nil {
-				return nil, fmt.Errorf("invalid parameters: %w", err)
-			}
-			if _, ok := consultTargets[params.Target]; !ok {
-				return nil, fmt.Errorf("invalid target %q: must be librarian or archivalist", params.Target)
-			}
-			if params.Query == "" {
-				return nil, fmt.Errorf("query is required")
-			}
-			if execState := academicResearchExecutionStateFromContext(ctx); execState != nil {
-				if err := execState.recordConsultAttempt(params.Target, params.Query, params.Scope); err != nil {
-					academicLogDuplicateConsultationBlocked(ctx, params.Target, params.Query, params.Scope)
-					a.academicSubmitTestament(ctx, a.academicTestament(
-						"Duplicate consultation blocked: "+params.Target,
-						"committed",
-						[]*claims.Artifact{
-							a.academicArtifact("target", params.Target),
-							a.academicArtifact("query", truncateAcademic(params.Query, 200)),
-							a.academicArtifact("reason", err.Error()),
-						},
-					))
-					return academicConsultFailureResult(params.Target, params.Query, params.Scope, err), nil
-				}
-			}
-			a.academicPostClaim(ctx,
-				claims.Action{AgentID: "academic", Type: claims.ActionTypeConsultation},
-				academicConsultClaim(
-					"Consult "+params.Target+": "+truncateAcademic(params.Query, 60),
-					"Knowledge consultation",
-					params.Target,
-					[]claims.ClaimScopeEntry{{Kind: "consultation", Key: params.Target}},
-					[]*claims.Validation{
-						academicValidation(claims.ValidationTypeReceipt, true, "Consultation succeeded", "evidence.Success == true"),
-					},
-				),
-			)
-			evidence, err := a.requestConsultation(ctx, params.Target, params.Query, params.Scope, "")
-			if err != nil {
-				if errors.Is(err, skills.ErrDelegatedRequested) {
-					return nil, err
-				}
-				return academicConsultFailureResult(params.Target, params.Query, params.Scope, err), nil
-			}
-			result := map[string]any{
-				"target":  params.Target,
-				"success": evidence.Success,
-				"data":    evidence.Data,
-			}
-			if evidence.Success {
-				result["status"] = "ok"
-			} else {
-				result["status"] = "failed"
-			}
-			if message := strings.TrimSpace(evidence.Error); message != "" {
-				result["error"] = message
-			}
-			return result, nil
 		}).
 		Build()
 }

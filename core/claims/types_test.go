@@ -62,6 +62,39 @@ func TestValidationStatusIsTerminal(t *testing.T) {
 	}
 }
 
+func TestValidationTypeSemanticsDocumentEveryKnownType(t *testing.T) {
+	known := KnownValidationTypes()
+	if len(known) == 0 {
+		t.Fatal("KnownValidationTypes returned no values")
+	}
+	seen := map[ValidationType]bool{}
+	for _, ty := range known {
+		if seen[ty] {
+			t.Fatalf("duplicate validation type %q", ty)
+		}
+		seen[ty] = true
+		sem, ok := ValidationTypeSemanticsFor(ty)
+		if !ok {
+			t.Fatalf("validation type %q has no semantics", ty)
+		}
+		if sem.Mode != ValidationEvaluationMechanical && sem.Mode != ValidationEvaluationAgentic {
+			t.Fatalf("validation type %q has invalid mode %q", ty, sem.Mode)
+		}
+		if sem.Description == "" {
+			t.Fatalf("validation type %q has empty description", ty)
+		}
+		if ty == ValidationTypeReceipt && sem.Mode != ValidationEvaluationMechanical {
+			t.Fatalf("receipt mode = %q, want mechanical", sem.Mode)
+		}
+		if ty != ValidationTypeReceipt && sem.Mode != ValidationEvaluationAgentic {
+			t.Fatalf("%q mode = %q, want agentic", ty, sem.Mode)
+		}
+	}
+	if _, ok := ValidationTypeSemanticsFor(ValidationType("new_type_without_docs")); ok {
+		t.Fatal("unknown validation type unexpectedly had semantics")
+	}
+}
+
 func TestBoardPhaseIsTerminal(t *testing.T) {
 	if !BoardPhaseComplete.IsTerminal() {
 		t.Error("complete should be terminal")

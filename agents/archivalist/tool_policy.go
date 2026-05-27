@@ -21,7 +21,6 @@ func archivalistVisibleSkillNames() []string {
 		ToolArchivalistQuery,
 		ToolArchivalistRecord,
 		ToolArchivalistIntent,
-		"consult",
 		ToolUpdateFileState,
 		"knowledge_query",
 		"knowledge_memory",

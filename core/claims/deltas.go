@@ -46,7 +46,6 @@ const (
 	DeltaKindValidation       = "validation"
 	DeltaKindClaimStatus      = "claim_status"
 	DeltaKindPhase            = "phase"
-	DeltaKindConsultResolved  = "consult_resolved"
 	DeltaKindClaimContext     = "claim_context"
 	DeltaKindTestamentContext = "testament_context"
 )
@@ -248,85 +247,16 @@ func (d PhaseDelta) DeltaKey() string {
 func (d PhaseDelta) DeltaSequence() uint64  { return d.Sequence }
 func (d PhaseDelta) DeltaSessionID() string { return d.SessionID }
 
-// ────────────────────────────────────────────────────────────────────
-// ConsultResolvedDelta
-// ────────────────────────────────────────────────────────────────────
-
-// ConsultResolvedDelta is emitted when a peer consultation completes.
-// It is published on the originating agent's personal consult-resolved
-// topic so only the awaiter receives it; broadcast fan-out is avoided.
-//
-// The originating agent's ClaimsInbox subscribes to its own pattern
-// (ConsultResolvedPattern) and matches incoming ConsultResolvedDeltas
-// against pending ConsultContinuation claims by ConsultID. When the
-// last awaited consult resolves, the inbox dispatcher wakes the
-// continuation: re-acquire a replica lease, restore the serialized
-// LLM turn state from the continuation's artifact, and re-enter the
-// agent's tool loop with the resolved result populated for the
-// await_consults tool call.
-//
-// Status values: "completed" (peer returned a successful response),
-// "error" (peer returned an explicit failure), "timeout" (the
-// deadline elapsed before the peer responded), "cancelled" (the
-// originator or the peer aborted the consult).
-type ConsultResolvedDelta struct {
-	SessionID string    `json:"session_id"`
-	BoardID   string    `json:"board_id"`
-	Sequence  uint64    `json:"sequence"`
-	EmittedAt time.Time `json:"emitted_at"`
-
-	// ConsultID is the unique identifier the originator stamped on
-	// the consult_peer call. Matches ConsultContinuation artifacts'
-	// awaited_consult_id entries.
-	ConsultID string `json:"consult_id"`
-
-	// OriginatorAgentID is the agent that issued the consult — i.e.
-	// the recipient of this delta. The bus pattern routes the delta
-	// to that agent's inbox exclusively.
-	OriginatorAgentID string `json:"originator_agent_id"`
-
-	// ResponderAgentID is the agent that answered the consult, for
-	// causal-graph attribution. May be empty for system-emitted
-	// resolutions (timeout, cancellation).
-	ResponderAgentID string `json:"responder_agent_id,omitempty"`
-
-	// Status reports the resolution outcome. See ConsultStatus*
-	// constants.
-	Status string `json:"status"`
-
-	// ResponsePayload carries the peer's response for the originator
-	// to feed back into the LLM tool result. Encoded as raw JSON so
-	// the responder can shape it freely; the originator's
-	// await_consults handler propagates it verbatim into the tool
-	// result message.
-	ResponsePayload json.RawMessage `json:"response_payload,omitempty"`
-
-	// ResponseSummary is a short textual summary suitable for logs
-	// and UI rows; not authoritative — the LLM consumes
-	// ResponsePayload.
-	ResponseSummary string `json:"response_summary,omitempty"`
-
-	// ErrorMessage carries a human-readable failure description when
-	// Status is "error" / "timeout" / "cancelled". Empty otherwise.
-	ErrorMessage string `json:"error_message,omitempty"`
-}
-
-// ConsultStatus* enumerates the resolution outcomes carried by
-// ConsultResolvedDelta.Status. Stored as strings so the wire format
-// is human-debuggable and forward-compatible with new statuses.
+// ConsultStatus* enumerates continuation result outcomes. These are
+// not a delta kind; canonical testament / validation / claim
+// transition deltas carry the result, and the continuation store uses
+// these string statuses internally.
 const (
 	ConsultStatusCompleted = "completed"
 	ConsultStatusError     = "error"
 	ConsultStatusTimeout   = "timeout"
 	ConsultStatusCancelled = "cancelled"
 )
-
-func (d ConsultResolvedDelta) DeltaKind() string { return DeltaKindConsultResolved }
-func (d ConsultResolvedDelta) DeltaKey() string {
-	return DeltaKindConsultResolved + "|" + d.ConsultID
-}
-func (d ConsultResolvedDelta) DeltaSequence() uint64  { return d.Sequence }
-func (d ConsultResolvedDelta) DeltaSessionID() string { return d.SessionID }
 
 // ────────────────────────────────────────────────────────────────────
 // JSON envelope
@@ -347,6 +277,15 @@ func MarshalDelta(d Delta) ([]byte, error) {
 	if d == nil {
 		return nil, fmt.Errorf("nil delta")
 	}
+	if canonical, ok := d.(CanonicalDelta); ok {
+		return json.Marshal(canonical)
+	}
+	if canonical, ok := d.(*CanonicalDelta); ok {
+		if canonical == nil {
+			return nil, fmt.Errorf("nil canonical delta")
+		}
+		return json.Marshal(canonical)
+	}
 	payload, err := json.Marshal(d)
 	if err != nil {
 		return nil, fmt.Errorf("marshal delta payload: %w", err)
@@ -357,11 +296,31 @@ func MarshalDelta(d Delta) ([]byte, error) {
 // UnmarshalDelta decodes a DeltaEnvelope JSON byte slice back into
 // a concrete Delta based on the Kind discriminator.
 func UnmarshalDelta(data []byte) (Delta, error) {
+	if canonical, ok, err := canonicalDeltaFromJSON(data, true); ok || err != nil {
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal canonical delta: %w", err)
+		}
+		return canonical, nil
+	}
 	var env DeltaEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, fmt.Errorf("unmarshal envelope: %w", err)
 	}
 	return decodeDeltaPayload(env.Kind, env.Payload)
+}
+
+// UnmarshalDeltaTolerant decodes known legacy envelopes strictly but
+// accepts future canonical action values. Observer paths use this when
+// an unknown action should be ignored/logged instead of aborting bus
+// handling.
+func UnmarshalDeltaTolerant(data []byte) (Delta, error) {
+	if canonical, ok, err := canonicalDeltaFromJSON(data, false); ok || err != nil {
+		if err != nil {
+			return nil, fmt.Errorf("unmarshal canonical delta: %w", err)
+		}
+		return canonical, nil
+	}
+	return UnmarshalDelta(data)
 }
 
 func decodeDeltaPayload(kind string, payload json.RawMessage) (Delta, error) {
@@ -380,9 +339,6 @@ func decodeDeltaPayload(kind string, payload json.RawMessage) (Delta, error) {
 		return d, decodeInto(payload, &d)
 	case DeltaKindPhase:
 		var d PhaseDelta
-		return d, decodeInto(payload, &d)
-	case DeltaKindConsultResolved:
-		var d ConsultResolvedDelta
 		return d, decodeInto(payload, &d)
 	default:
 		return nil, fmt.Errorf("unknown delta kind %q", kind)
@@ -403,10 +359,15 @@ func decodeInto(payload json.RawMessage, dst any) error {
 // Artifact kind prefixes classified as errors. Anchored to the "error"
 // family per the errors-as-artifacts principle in docs/CLAIMS.md §2.6.
 const (
-	ArtifactKindError           = "error"
-	ArtifactKindErrorTrace      = "error_trace"
-	ArtifactKindErrorDiagnostic = "error_diagnostic"
-	ArtifactKindProjectionError = "projection_error"
+	ArtifactKindError                   = "error"
+	ArtifactKindErrorTrace              = "error_trace"
+	ArtifactKindErrorDiagnostic         = "error_diagnostic"
+	ArtifactKindProjectionError         = "projection_error"
+	ArtifactKindToolTimeout             = "tool_timeout"
+	ArtifactKindPermissionDenied        = "permission_denied"
+	ArtifactKindPolicyDenied            = "policy_denied"
+	ArtifactKindMissingDependency       = "missing_dependency"
+	ArtifactKindInvalidExpectedToolCall = "invalid_expected_tool_call"
 
 	ArtifactKindProjectionReceipt = "projection_receipt"
 )
@@ -440,7 +401,12 @@ func isErrorArtifactKind(kind string) bool {
 	return kind == ArtifactKindError ||
 		kind == ArtifactKindErrorTrace ||
 		kind == ArtifactKindErrorDiagnostic ||
-		kind == ArtifactKindProjectionError
+		kind == ArtifactKindProjectionError ||
+		kind == ArtifactKindToolTimeout ||
+		kind == ArtifactKindPermissionDenied ||
+		kind == ArtifactKindPolicyDenied ||
+		kind == ArtifactKindMissingDependency ||
+		kind == ArtifactKindInvalidExpectedToolCall
 }
 
 // CollectArtifactKinds returns the unique artifact kinds in

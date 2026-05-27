@@ -16,7 +16,7 @@ import (
 // eviction. Higher priority is inserted ahead in the per-subscription
 // queue and is the last to be dropped under DropOldest.
 //
-//   - ConsultResolved → Critical (a parked caller is waiting)
+//   - ConsultResponse → Critical (a parked caller is waiting)
 //   - ConsultRequest  → High     (the agent owes a reply)
 //   - Directed        → Normal   (task / challenge / corrective)
 //   - Phase           → Low      (recoverable from board state)
