@@ -21,16 +21,20 @@ import (
 const (
 	walNamespace = "claims_board"
 
-	walEventActionPosted        = "action_posted"
-	walEventClaimUpdated        = "claim_updated"
-	walEventClaimContextSet     = "claim_context_set"
-	walEventTestamentContextSet = "testament_context_set"
-	walEventTestamentSubmitted  = "testament_submitted"
-	walEventValidationEvaluated = "validation_evaluated"
-	walEventClaimAccepted       = "claim_accepted"
-	walEventClaimRejected       = "claim_rejected"
-	walEventPhaseTransition     = "phase_transition"
-	walEventBoardComplete       = "board_complete"
+	walEventActionPosted                 = "action_posted"
+	walEventClaimActionGenerated         = "claim_action_generated"
+	walEventClaimLifecycleTransition     = "claim_lifecycle_transition"
+	walEventTestamentActionGenerated     = "testament_action_generated"
+	walEventTestamentLifecycleTransition = "testament_lifecycle_transition"
+	walEventClaimUpdated                 = "claim_updated"
+	walEventClaimContextSet              = "claim_context_set"
+	walEventTestamentContextSet          = "testament_context_set"
+	walEventTestamentSubmitted           = "testament_submitted"
+	walEventValidationEvaluated          = "validation_evaluated"
+	walEventClaimAccepted                = "claim_accepted"
+	walEventClaimRejected                = "claim_rejected"
+	walEventPhaseTransition              = "phase_transition"
+	walEventBoardComplete                = "board_complete"
 )
 
 type walEvent struct {
@@ -474,8 +478,16 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 		return nil
 	}
 	switch event.Kind {
+	case walEventClaimActionGenerated:
+		return db.applyClaimActionGenerated(event)
 	case walEventActionPosted:
 		return db.applyActionPosted(event)
+	case walEventClaimLifecycleTransition:
+		return db.applyClaimLifecycleTransition(event)
+	case walEventTestamentActionGenerated:
+		return db.applyTestamentActionGenerated(event)
+	case walEventTestamentLifecycleTransition:
+		return db.applyTestamentLifecycleTransition(event)
 	case walEventClaimUpdated:
 		return db.applyClaimUpdated(event)
 	case walEventClaimContextSet:
@@ -514,6 +526,27 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 	}
 }
 
+func (db *DurableBoard) applyClaimActionGenerated(event *walEvent) error {
+	var payload struct {
+		Action Action  `json:"action"`
+		Claims []Claim `json:"claims"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	b := db.board
+	b.actions[payload.Action.ID] = &payload.Action
+	for i := range payload.Claims {
+		c := &payload.Claims[i]
+		if _, exists := b.claims[c.ID]; exists {
+			continue
+		}
+		b.claims[c.ID] = c
+		b.claimOrder = append(b.claimOrder, c.ID)
+	}
+	return nil
+}
+
 func (db *DurableBoard) applyActionPosted(event *walEvent) error {
 	var payload struct {
 		Action Action  `json:"action"`
@@ -539,6 +572,38 @@ func (db *DurableBoard) applyActionPosted(event *walEvent) error {
 	records := b.outboxRecordsForPostActionLocked(payload.Action, payload.Claims, event.CreatedAt)
 	setOutboxRecordSequence(records, event.Sequence)
 	db.insertReplayOutbox(records)
+	return nil
+}
+
+func (db *DurableBoard) applyClaimLifecycleTransition(event *walEvent) error {
+	var payload struct {
+		ClaimIDs          []string             `json:"claim_ids"`
+		To                ClaimLifecycleStatus `json:"to"`
+		AgentID           string               `json:"agent_id"`
+		Reason            string               `json:"reason"`
+		Changed           time.Time            `json:"changed"`
+		FailureAction     *Action              `json:"failure_action,omitempty"`
+		FailureTestaments []Testament          `json:"failure_testaments,omitempty"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
+	if payload.FailureAction != nil {
+		db.board.actions[payload.FailureAction.ID] = payload.FailureAction
+	}
+	for i := range payload.FailureTestaments {
+		t := &payload.FailureTestaments[i]
+		db.board.testaments[t.ID] = t
+	}
+	for _, claimID := range payload.ClaimIDs {
+		if c, ok := db.board.claims[claimID]; ok {
+			db.board.transitionClaimLifecycleLocked(c, payload.To, payload.AgentID, payload.Reason, changed)
+			if payload.To == ClaimLifecyclePostFailed && !c.Status.IsTerminal() {
+				c.Status = ClaimStatusRejected
+			}
+		}
+	}
 	return nil
 }
 
@@ -570,6 +635,9 @@ func (db *DurableBoard) applyClaimUpdated(event *walEvent) error {
 		})
 		c.Status = ClaimStatusInProgress
 	}
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleProgressed) {
+		db.board.transitionClaimLifecycleLocked(c, ClaimLifecycleProgressed, payload.AgentID, "work progressed", now)
+	}
 	c.Accessed = now
 	db.insertReplayOutbox([]ClaimsOutboxRecord{
 		db.board.outboxRecordLocked(event.Sequence, "claim", c.ID, walEventClaimUpdated, event.CreatedAt),
@@ -597,6 +665,58 @@ func (db *DurableBoard) applyClaimContextSet(event *walEvent) error {
 	db.insertReplayOutbox([]ClaimsOutboxRecord{
 		db.board.outboxRecordLocked(event.Sequence, "claim", c.ID, walEventClaimUpdated, event.CreatedAt),
 	})
+	return nil
+}
+
+func (db *DurableBoard) applyTestamentActionGenerated(event *walEvent) error {
+	var payload struct {
+		Action     Action      `json:"action"`
+		Testaments []Testament `json:"testaments"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	b := db.board
+	b.actions[payload.Action.ID] = &payload.Action
+	for i := range payload.Testaments {
+		t := &payload.Testaments[i]
+		if _, exists := b.testaments[t.ID]; exists {
+			continue
+		}
+		b.testaments[t.ID] = t
+	}
+	return nil
+}
+
+func (db *DurableBoard) applyTestamentLifecycleTransition(event *walEvent) error {
+	var payload struct {
+		TestamentIDs []string                 `json:"testament_ids"`
+		To           TestamentLifecycleStatus `json:"to"`
+		AgentID      string                   `json:"agent_id"`
+		Reason       string                   `json:"reason"`
+		Changed      time.Time                `json:"changed"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
+	for _, testamentID := range payload.TestamentIDs {
+		t, ok := db.board.testaments[testamentID]
+		if !ok {
+			continue
+		}
+		db.board.transitionTestamentLifecycleLocked(t, payload.To, payload.AgentID, payload.Reason, changed)
+		if payload.To == TestamentLifecyclePosted {
+			db.board.resolveClaimForTestamentLocked(t, changed)
+		}
+		if payload.To == TestamentLifecycleReceived {
+			if claimID := ClaimIDFromRelations(t.Relations); claimID != "" {
+				if c, found := db.board.claims[claimID]; found {
+					db.board.transitionClaimLifecycleLocked(c, ClaimLifecycleTestamentAcknowledged, payload.AgentID, "testament acknowledged", changed)
+				}
+			}
+		}
+	}
 	return nil
 }
 

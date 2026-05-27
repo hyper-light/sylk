@@ -42,11 +42,13 @@ type ClaimsBoard struct {
 	iteration     int
 	maxIterations int
 
-	actions    map[string]*Action
-	claims     map[string]*Claim
-	testaments map[string]*Testament
-	claimOrder []string
-	phaseLog   []StatusChange
+	actions                 map[string]*Action
+	claims                  map[string]*Claim
+	testaments              map[string]*Testament
+	claimOrder              []string
+	phaseLog                []StatusChange
+	claimGenerationKeys     map[string]string
+	testamentGenerationKeys map[string]string
 
 	// relationsIdx is a secondary index over every Relation carried
 	// by every object. Serves the named board-context queries
@@ -115,23 +117,25 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		maxIter = defaultMaxIterations
 	}
 	b := &ClaimsBoard{
-		boardID:            boardID,
-		pipelineID:         cfg.PipelineID,
-		taskID:             cfg.TaskID,
-		sessionID:          cfg.SessionID,
-		sessionDir:         cfg.SessionDir,
-		parentBoardID:      cfg.ParentBoardID,
-		phase:              BoardPhaseImplementation,
-		maxIterations:      maxIter,
-		actions:            make(map[string]*Action),
-		claims:             make(map[string]*Claim),
-		testaments:         make(map[string]*Testament),
-		relationsIdx:       newRelationsIndex(),
-		projectionErrors:   make(map[string]string),
-		scope:              cfg.Scope,
-		agentRefResolver:   cfg.AgentRefResolver,
-		legacySessionNoWAL: cfg.LegacySessionNoWAL,
-		rollout:            boardRolloutConfig(cfg.Rollout),
+		boardID:                 boardID,
+		pipelineID:              cfg.PipelineID,
+		taskID:                  cfg.TaskID,
+		sessionID:               cfg.SessionID,
+		sessionDir:              cfg.SessionDir,
+		parentBoardID:           cfg.ParentBoardID,
+		phase:                   BoardPhaseImplementation,
+		maxIterations:           maxIter,
+		actions:                 make(map[string]*Action),
+		claims:                  make(map[string]*Claim),
+		testaments:              make(map[string]*Testament),
+		claimGenerationKeys:     make(map[string]string),
+		testamentGenerationKeys: make(map[string]string),
+		relationsIdx:            newRelationsIndex(),
+		projectionErrors:        make(map[string]string),
+		scope:                   cfg.Scope,
+		agentRefResolver:        cfg.AgentRefResolver,
+		legacySessionNoWAL:      cfg.LegacySessionNoWAL,
+		rollout:                 boardRolloutConfig(cfg.Rollout),
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
@@ -411,6 +415,11 @@ func (b *ClaimsBoard) stampClaimLocked(c *Claim, action *Action, now time.Time) 
 	c.Status = ClaimStatusPending
 	c.ActionType = action.Type
 	c.ExpectedToolCalls = stampExpectedToolCalls(c.ExpectedToolCalls)
+	c.LifecycleStatus = ClaimLifecyclePosted
+	c.LifecycleHistory = append(c.LifecycleHistory,
+		StatusChange{To: string(ClaimLifecycleGenerated), Reason: "claim generated", AgentID: action.AgentID, Changed: now},
+		StatusChange{From: string(ClaimLifecycleGenerated), To: string(ClaimLifecyclePosted), Reason: "claim posted for action", AgentID: action.AgentID, Changed: now},
+	)
 	c.StatusHistory = append(c.StatusHistory, StatusChange{
 		To:      string(ClaimStatusPending),
 		Reason:  "claim posted",
@@ -483,6 +492,9 @@ func (b *ClaimsBoard) UpdateClaimProgress(ctx context.Context, claimID string, u
 		return err
 	}
 	c.Accessed = now
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleProgressed) {
+		b.transitionClaimLifecycleLocked(c, ClaimLifecycleProgressed, agentID, "work progressed", now)
+	}
 	if c.Status == ClaimStatusPending {
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
 			From:    string(ClaimStatusPending),
@@ -709,6 +721,8 @@ func (b *ClaimsBoard) SubmitTestaments(ctx context.Context, action Action, testa
 	resolutions := make([]claimResolution, len(testaments))
 	for i := range testaments {
 		b.stampTestamentLocked(&testaments[i], &action, now)
+		b.transitionTestamentLifecycleLocked(&testaments[i], TestamentLifecycleGenerated, action.AgentID, "testament generated", now)
+		b.transitionTestamentLifecycleLocked(&testaments[i], TestamentLifecyclePosted, action.AgentID, "testament posted", now)
 	}
 
 	outboxRecords := b.outboxRecordsForSubmitTestamentsLocked(action, testaments, now)
@@ -885,6 +899,9 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 		return claimResolution{}
 	}
 	var result claimResolution
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleTestamentGenerated) {
+		b.transitionClaimLifecycleLocked(c, ClaimLifecycleTestamentGenerated, t.AgentID, "testament generated", now)
+	}
 	if !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
 		prevStatus := c.Status
 		transition := claimStatusTransition{
@@ -928,6 +945,9 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 			c.Status = ClaimStatusRejected
 			c.Accessed = now
 			b.adjustStatusCounter(prevStatus, ClaimStatusRejected)
+			if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleValidationFailed) {
+				b.transitionClaimLifecycleLocked(c, ClaimLifecycleValidationFailed, t.AgentID, "required receipt validation failed on error testament", now)
+			}
 			result.transitions = append(result.transitions, transition)
 		}
 	} else {
@@ -953,6 +973,9 @@ func (b *ClaimsBoard) resolveClaimForTestamentLocked(t *Testament, now time.Time
 			b.adjustStatusCounter(ClaimStatusTestified, ClaimStatusAccepted)
 			c.Status = ClaimStatusAccepted
 			c.Accessed = now
+			if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleSatisfied) {
+				b.transitionClaimLifecycleLocked(c, ClaimLifecycleSatisfied, t.AgentID, "all required validations passed", now)
+			}
 			result.transitions = append(result.transitions, transition)
 		}
 	}
@@ -1100,6 +1123,9 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	v.StatusHistory = append(v.StatusHistory, change)
 	v.Status = toStatus
 	v.Accessed = now
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleValidating) {
+		b.transitionClaimLifecycleLocked(c, ClaimLifecycleValidating, change.AgentID, "validation started", now)
+	}
 
 	if accepted {
 		prevStatus := c.Status
@@ -1113,6 +1139,9 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		c.Status = ClaimStatusAccepted
 		c.Accessed = now
 		b.adjustStatusCounter(prevStatus, ClaimStatusAccepted)
+		if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleSatisfied) {
+			b.transitionClaimLifecycleLocked(c, ClaimLifecycleSatisfied, change.AgentID, "all required validations passed", now)
+		}
 	}
 
 	validationDelta := b.buildValidationDeltaLocked(c, v, change, accepted, now)
@@ -1268,6 +1297,9 @@ func (b *ClaimsBoard) RejectClaim(ctx context.Context, claimID string, change St
 	c.StatusHistory = append(c.StatusHistory, change)
 	c.Status = ClaimStatusRejected
 	c.Accessed = now
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleValidationFailed) {
+		b.transitionClaimLifecycleLocked(c, ClaimLifecycleValidationFailed, change.AgentID, change.Reason, now)
+	}
 	b.adjustStatusCounter(fromStatus, ClaimStatusRejected)
 
 	b.applyPreparedRemediationLocked(replacements, replacementClaims)
@@ -1388,6 +1420,11 @@ func (b *ClaimsBoard) stampRemediationClaimLocked(rc *Claim, replacements *Actio
 	rc.Iteration = b.iteration + 1
 	rc.ActionType = replacements.Type
 	rc.ExpectedToolCalls = stampExpectedToolCalls(rc.ExpectedToolCalls)
+	rc.LifecycleStatus = ClaimLifecyclePosted
+	rc.LifecycleHistory = append(rc.LifecycleHistory,
+		StatusChange{To: string(ClaimLifecycleGenerated), Reason: "remediation claim generated", AgentID: agentID, Changed: now},
+		StatusChange{From: string(ClaimLifecycleGenerated), To: string(ClaimLifecyclePosted), Reason: "remediation claim posted", AgentID: agentID, Changed: now},
+	)
 	rc.StatusHistory = append(rc.StatusHistory, StatusChange{
 		To:      string(ClaimStatusPending),
 		Reason:  "remediation for rejected claim " + rejectedID,
@@ -2254,6 +2291,8 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.relationsIdx = newRelationsIndex()
+	b.claimGenerationKeys = make(map[string]string)
+	b.testamentGenerationKeys = make(map[string]string)
 	b.countTotal.Store(0)
 	b.countPending.Store(0)
 	b.countInProgress.Store(0)
@@ -2267,6 +2306,14 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 			continue
 		}
 		b.indexRelations(a.ID, a.Relations)
+		if a.IdempotencyKey != "" {
+			switch a.Type {
+			case ActionTypeTestament:
+				b.testamentGenerationKeys[a.IdempotencyKey] = a.ID
+			default:
+				b.claimGenerationKeys[a.IdempotencyKey] = a.ID
+			}
+		}
 		if a.Sequence > high {
 			high = a.Sequence
 		}

@@ -505,10 +505,11 @@ type Action struct {
 	Accessed   time.Time  `json:"accessed"`
 
 	// ── Action-specific ──
-	Type          ActionType     `json:"type"`
-	Status        ActionStatus   `json:"status"`
-	StatusHistory []StatusChange `json:"status_history"`
-	Priority      int            `json:"priority,omitempty"`
+	Type           ActionType     `json:"type"`
+	Status         ActionStatus   `json:"status"`
+	StatusHistory  []StatusChange `json:"status_history"`
+	Priority       int            `json:"priority,omitempty"`
+	IdempotencyKey string         `json:"idempotency_key,omitempty"`
 }
 
 // Claim is a precise, atomic, specific assertion issued by one agent
@@ -534,10 +535,16 @@ type Claim struct {
 	ActionType    ActionType        `json:"action_type"`
 	Status        ClaimStatus       `json:"status"`
 	StatusHistory []StatusChange    `json:"status_history"`
-	Priority      int               `json:"priority,omitempty"`
-	Deadline      time.Time         `json:"deadline,omitempty"`
-	Tags          []string          `json:"tags,omitempty"`
-	Iteration     int               `json:"iteration"`
+	// LifecycleStatus is the fine-grained claims/testaments lifecycle
+	// state. Status remains the coarse compatibility projection used
+	// by existing board queues and summaries.
+	LifecycleStatus  ClaimLifecycleStatus `json:"lifecycle_status,omitempty"`
+	LifecycleHistory []StatusChange       `json:"lifecycle_history,omitempty"`
+	IdempotencyKey   string               `json:"idempotency_key,omitempty"`
+	Priority         int                  `json:"priority,omitempty"`
+	Deadline         time.Time            `json:"deadline,omitempty"`
+	Tags             []string             `json:"tags,omitempty"`
+	Iteration        int                  `json:"iteration"`
 
 	// Context is the mutable narrative status describing what this
 	// claim's owner is currently doing. Distinct from Description
@@ -633,9 +640,12 @@ type Testament struct {
 	Accessed   time.Time  `json:"accessed"`
 
 	// ── Testament-specific ──
-	Summary    string        `json:"summary"`
-	Confidence string        `json:"confidence,omitempty"` // hint, tentative, committed, consensus
-	Duration   time.Duration `json:"duration,omitempty"`
+	Summary          string                   `json:"summary"`
+	Confidence       string                   `json:"confidence,omitempty"` // hint, tentative, committed, consensus
+	Duration         time.Duration            `json:"duration,omitempty"`
+	LifecycleStatus  TestamentLifecycleStatus `json:"lifecycle_status,omitempty"`
+	LifecycleHistory []StatusChange           `json:"lifecycle_history,omitempty"`
+	IdempotencyKey   string                   `json:"idempotency_key,omitempty"`
 
 	// Context is the mutable narrative of the testament's developing
 	// synthesis. Distinct from Summary (durable conclusion text set on
@@ -1141,6 +1151,9 @@ func CloneTestamentEntity(t *Testament) *Testament {
 	if len(t.Relations) > 0 {
 		cp.Relations = append([]Relation(nil), t.Relations...)
 	}
+	if len(t.LifecycleHistory) > 0 {
+		cp.LifecycleHistory = append([]StatusChange(nil), t.LifecycleHistory...)
+	}
 	cp.Presentation = ClonePresentation(t.Presentation)
 	if len(t.Artifacts) > 0 {
 		cp.Artifacts = make([]*Artifact, len(t.Artifacts))
@@ -1191,6 +1204,9 @@ func CloneClaimEntity(c *Claim) *Claim {
 	}
 	if len(c.StatusHistory) > 0 {
 		cp.StatusHistory = append([]StatusChange(nil), c.StatusHistory...)
+	}
+	if len(c.LifecycleHistory) > 0 {
+		cp.LifecycleHistory = append([]StatusChange(nil), c.LifecycleHistory...)
 	}
 	return &cp
 }
