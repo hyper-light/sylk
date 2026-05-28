@@ -12,7 +12,7 @@ import (
 
 var (
 	ErrValidatorRegistrationInvalid  = errors.New("validator registration invalid")
-	ErrValidatorRegistrationConflict = errors.New("validator registration conflicts with existing immutable metadata")
+	ErrValidatorRegistrationConflict = errors.New("validator id is already registered")
 	ErrValidatorNotRegistered        = errors.New("validator is not registered")
 	ErrValidatorConcurrencyExhausted = errors.New("validator concurrency budget exhausted")
 	ErrValidatorDispatchInvalid      = errors.New("validator dispatch invalid")

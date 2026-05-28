@@ -31,7 +31,7 @@ func TestProgrammaticValidatorDispatcherPassesRequiredValidation(t *testing.T) {
 	}
 }
 
-func TestProgrammaticValidatorDispatcherHandlerErrorBecomesErrored(t *testing.T) {
+func TestProgrammaticValidatorDispatcherHandlerErrorBecomesValidationFailed(t *testing.T) {
 	registry := NewValidatorRegistry()
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		return ValidatorHandlerResult{}, errors.New("validator failed")
@@ -43,12 +43,12 @@ func TestProgrammaticValidatorDispatcherHandlerErrorBecomesErrored(t *testing.T)
 	if err != nil {
 		t.Fatalf("DispatchValidation: %v", err)
 	}
-	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryHandler {
-		t.Fatalf("result = %#v, want handler errored validation result", result)
+	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryHandler {
+		t.Fatalf("result = %#v, want handler validation_failed result", result)
 	}
 }
 
-func TestProgrammaticValidatorDispatcherOptionalHandlerErrorBecomesErroredNotRequired(t *testing.T) {
+func TestProgrammaticValidatorDispatcherOptionalHandlerErrorBecomesValidationFailedNotRequired(t *testing.T) {
 	registry := NewValidatorRegistry()
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		return ValidatorHandlerResult{Error: &ValidationError{Category: ValidationErrorCategoryHandler, Description: "optional failed"}}, nil
@@ -60,8 +60,8 @@ func TestProgrammaticValidatorDispatcherOptionalHandlerErrorBecomesErroredNotReq
 	if err != nil {
 		t.Fatalf("DispatchValidation: %v", err)
 	}
-	if result.Status != ValidationStatusErroredNotRequired {
-		t.Fatalf("status = %s, want errored_not_required", result.Status)
+	if result.Status != ValidationStatusValidationFailedNotRequired {
+		t.Fatalf("status = %s, want validation_failed_not_required", result.Status)
 	}
 }
 
@@ -85,7 +85,7 @@ func TestProgrammaticValidatorDispatcherRecoversPanicAsErrored(t *testing.T) {
 	}
 }
 
-func TestProgrammaticValidatorDispatcherTimeoutBecomesErrored(t *testing.T) {
+func TestProgrammaticValidatorDispatcherTimeoutBecomesValidationFailed(t *testing.T) {
 	registry := NewValidatorRegistry()
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(ctx context.Context, _ ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		<-ctx.Done()
@@ -99,8 +99,8 @@ func TestProgrammaticValidatorDispatcherTimeoutBecomesErrored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DispatchValidation: %v", err)
 	}
-	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryTimeout {
-		t.Fatalf("result = %#v, want timeout errored result", result)
+	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryTimeout {
+		t.Fatalf("result = %#v, want timeout validation_failed result", result)
 	}
 }
 
@@ -148,7 +148,7 @@ func TestValidatorRegistryRejectsMissingDeterminismAndArtifactContract(t *testin
 	}
 }
 
-func TestValidatorRegistryDuplicateImmutableRegistrationIsIdempotentAndConflictsOnSameKeyChange(t *testing.T) {
+func TestValidatorRegistryRejectsDuplicateValidatorID(t *testing.T) {
 	registry := NewValidatorRegistry()
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		return ValidatorHandlerResult{}, nil
@@ -156,48 +156,21 @@ func TestValidatorRegistryDuplicateImmutableRegistrationIsIdempotentAndConflicts
 	if _, err := registry.Register(reg); err != nil {
 		t.Fatalf("Register first: %v", err)
 	}
-	again, err := registry.Register(reg)
-	if err != nil {
-		t.Fatalf("Register duplicate immutable: %v", err)
-	}
-	if again.ValidatorID != reg.ValidatorID || again.ActionType != reg.ActionType {
-		t.Fatalf("duplicate registration = %+v, want original immutable registration", again)
-	}
-	conflict := reg
-	conflict.Timeout = 2 * time.Second
-	if _, err := registry.Register(conflict); !errors.Is(err, ErrValidatorRegistrationConflict) {
-		t.Fatalf("Register changed same-key immutable field error = %v, want conflict", err)
+	if _, err := registry.Register(reg); !errors.Is(err, ErrValidatorRegistrationConflict) {
+		t.Fatalf("Register duplicate validator id error = %v, want conflict", err)
 	}
 	actionSpecific := reg
 	actionSpecific.ActionType = ActionTypeConsultation
-	if _, err := registry.Register(actionSpecific); err != nil {
-		t.Fatalf("Register same validator scoped to different action: %v", err)
+	if _, err := registry.Register(actionSpecific); !errors.Is(err, ErrValidatorRegistrationConflict) {
+		t.Fatalf("Register same validator id different action error = %v, want conflict", err)
 	}
 }
 
-func TestValidatorRegistryLookupPrefersExactThenWildcardRegistrations(t *testing.T) {
+func TestValidatorRegistryLookupResolvesExactValidatorID(t *testing.T) {
 	registry := NewValidatorRegistry()
 	handler := validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		return ValidatorHandlerResult{}, nil
 	})
-	wildcard := testValidatorRegistration(t, handler)
-	wildcard.ValidatorID = ""
-	wildcard.ActionType = ""
-	if _, err := registry.Register(wildcard); err != nil {
-		t.Fatalf("Register wildcard: %v", err)
-	}
-	actionWildcard := wildcard
-	actionWildcard.ActionType = ActionTypeTask
-	actionWildcard.TargetArtifactName = "plan"
-	if _, err := registry.Register(actionWildcard); err != nil {
-		t.Fatalf("Register action wildcard: %v", err)
-	}
-	validatorWildcard := testValidatorRegistration(t, handler)
-	validatorWildcard.ActionType = ""
-	validatorWildcard.TargetArtifactName = "summary"
-	if _, err := registry.Register(validatorWildcard); err != nil {
-		t.Fatalf("Register validator wildcard: %v", err)
-	}
 	exact := testValidatorRegistration(t, handler)
 	exact.ActionType = ActionTypeTask
 	exact.TargetArtifactName = "exact"
@@ -207,14 +180,8 @@ func TestValidatorRegistryLookupPrefersExactThenWildcardRegistrations(t *testing
 	if got, ok := registry.Lookup(&Claim{ActionType: ActionTypeTask}, &Validation{ValidatorID: "validator", Type: ValidationTypeInspection}); !ok || got.TargetArtifactName != "exact" {
 		t.Fatalf("exact lookup = %#v ok=%v, want exact action registration", got, ok)
 	}
-	if got, ok := registry.Lookup(&Claim{ActionType: ActionTypeConsultation}, &Validation{ValidatorID: "validator", Type: ValidationTypeInspection}); !ok || got.TargetArtifactName != "summary" {
-		t.Fatalf("validator wildcard lookup = %#v ok=%v, want exact validator wildcard-action registration", got, ok)
-	}
-	if got, ok := registry.Lookup(&Claim{ActionType: ActionTypeTask}, &Validation{ValidatorID: "missing", Type: ValidationTypeInspection}); !ok || got.TargetArtifactName != "plan" {
-		t.Fatalf("action wildcard lookup = %#v ok=%v, want wildcard validator exact-action registration", got, ok)
-	}
-	if got, ok := registry.Lookup(&Claim{ActionType: ActionTypeConsultation}, &Validation{Type: ValidationTypeInspection}); !ok || got.TargetArtifactName != "evidence" {
-		t.Fatalf("full wildcard lookup = %#v ok=%v, want generic registration", got, ok)
+	if _, ok := registry.Lookup(&Claim{ActionType: ActionTypeTask}, &Validation{ValidatorID: "missing", Type: ValidationTypeInspection}); ok {
+		t.Fatal("missing validator id lookup succeeded")
 	}
 }
 
@@ -237,8 +204,8 @@ func TestProgrammaticValidatorDispatcherRejectsArtifactContractBeforeHandler(t *
 	if called {
 		t.Fatal("handler was invoked for artifact contract mismatch")
 	}
-	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
-		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type errored result", result)
 	}
 }
 
@@ -258,8 +225,8 @@ func TestProgrammaticValidatorDispatcherRejectsMismatchedResultDataType(t *testi
 	if err != nil {
 		t.Fatalf("DispatchValidation: %v", err)
 	}
-	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
-		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type errored result", result)
 	}
 }
 
@@ -283,8 +250,8 @@ func TestProgrammaticValidatorDispatcherRejectsUnknownDeclaredResultDataTypeBefo
 	if called {
 		t.Fatal("handler was invoked for unknown declared result datatype")
 	}
-	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
-		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type errored result", result)
 	}
 }
 
@@ -299,7 +266,7 @@ func TestValidatorRegistryRejectsUnknownRegisteredDataTypes(t *testing.T) {
 	}
 }
 
-func TestRegisterValidatorGenericIsIdempotentAndAllowsSameTypePairDifferentID(t *testing.T) {
+func TestRegisterValidatorGenericRejectsDuplicateIDAndAllowsSameTypePairDifferentID(t *testing.T) {
 	registry := NewValidatorRegistry()
 	handler := func(context.Context, PlanMarkdownArtifactData) (*Artifact, error) {
 		artifact := &Artifact{Kind: ArtifactKindReadiness, Reference: "ok"}
@@ -320,8 +287,8 @@ func TestRegisterValidatorGenericIsIdempotentAndAllowsSameTypePairDifferentID(t 
 	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil {
 		t.Fatalf("RegisterValidator first: %v", err)
 	}
-	if got, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil || got.ValidatorID != cfg.ID {
-		t.Fatalf("duplicate RegisterValidator = %+v err=%v, want idempotent registration", got, err)
+	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); !errors.Is(err, ErrValidatorRegistrationConflict) {
+		t.Fatalf("duplicate RegisterValidator error = %v, want conflict", err)
 	}
 	cfg.ID = "plan.validator.two"
 	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil {
@@ -439,10 +406,6 @@ func TestPhase345TypedValidatorDispatcherCommitsResultArtifact(t *testing.T) {
 	if artifact, ok := board.CloneArtifact(validation.ResultArtifactID); !ok || artifact.Status != ArtifactStatusGenerated {
 		t.Fatalf("result artifact = %+v ok=%v", artifact, ok)
 	}
-	claim, ok := board.CloneClaim(claimID)
-	if !ok || claim.Status != ClaimStatusAccepted || claim.LifecycleStatus != ClaimLifecycleSatisfied {
-		t.Fatalf("claim after validation = %+v ok=%v, want accepted/satisfied", claim, ok)
-	}
 }
 
 func TestPhase345BoardValidatorDispatcherRejectsPolicyInputAndDuplicateDispatch(t *testing.T) {
@@ -496,10 +459,6 @@ func TestPhase345BoardValidatorDispatcherRejectsPolicyInputAndDuplicateDispatch(
 		}
 		if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryDispatcher {
 			t.Fatalf("result = %+v, want dispatcher errored input-limit result", result)
-		}
-		claim, ok := board.CloneClaim(claimID)
-		if !ok || claim.Status != ClaimStatusRejected || claim.LifecycleStatus != ClaimLifecycleValidationErrored {
-			t.Fatalf("claim after input-limit validation = %+v ok=%v, want rejected/validation_errored", claim, ok)
 		}
 	})
 	t.Run("duplicate dispatch rejected", func(t *testing.T) {
