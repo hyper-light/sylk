@@ -85,11 +85,12 @@ const (
 // (Action, Claim, or Validation). Every transition is recorded — the
 // full lifecycle is auditable.
 type StatusChange struct {
-	From    string    `json:"from"`     // previous status value
-	To      string    `json:"to"`       // new status value
-	Reason  string    `json:"reason"`   // why the transition happened
-	AgentID string    `json:"agent_id"` // which agent instance caused it
-	Changed time.Time `json:"changed"`  // UTC timestamp
+	From          string    `json:"from"`                     // previous status value
+	To            string    `json:"to"`                       // new status value
+	Reason        string    `json:"reason"`                   // why the transition happened
+	AgentID       string    `json:"agent_id,omitempty"`       // legacy agent instance alias
+	ParticipantID string    `json:"participant_id,omitempty"` // canonical participant instance
+	Changed       time.Time `json:"changed"`                  // UTC timestamp
 }
 
 // ParticipantRef is the generalized identity reference used by the

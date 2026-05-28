@@ -366,11 +366,12 @@ type Relation struct {
 // (Action, Claim, or Validation). Every transition is recorded — the
 // full lifecycle is auditable.
 type StatusChange struct {
-    From    string    `json:"from"`     // previous status value
-    To      string    `json:"to"`       // new status value
-    Reason  string    `json:"reason"`   // why the transition happened
-    AgentID string    `json:"agent_id"` // which agent instance caused it
-    Changed time.Time `json:"changed"`  // UTC timestamp
+    From          string    `json:"from"`                     // previous status value
+    To            string    `json:"to"`                       // new status value
+    Reason        string    `json:"reason"`                   // why the transition happened
+    AgentID       string    `json:"agent_id,omitempty"`       // legacy agent instance alias
+    ParticipantID string    `json:"participant_id,omitempty"` // canonical participant instance
+    Changed       time.Time `json:"changed"`                  // UTC timestamp
 }
 
 // ClaimScopeEntry identifies one element of a claim's affected scope.
@@ -614,8 +615,12 @@ validation lifecycle delta names are `validation.ready`,
 `validation.errored_not_required`, `validation.validating_quality_bar`,
 `validation.quality_bar_validation_failed`,
 `validation.quality_bar_validation_failed_not_required`, and
-`validation.validated`. Legacy validation statuses are compatibility
-projections only.
+`validation.validated`. Upward propagation lifecycle delta names are
+`testament.validated`, `testament.validation_failed`,
+`testament.validation_incomplete`, `testament.validation_errored`,
+`claim.satisfied`, `claim.validation_failed`,
+`claim.validation_incomplete`, and `claim.validation_errored`. Legacy
+validation statuses are compatibility projections only.
 
 ```go
 // Artifact is evidence attached to a testament. Immutable — once

@@ -21,6 +21,7 @@ const (
 	ArtifactDataTypeCarryForwardContinuity     = "sylk.carry_forward.continuity_cursor.v1"
 	ArtifactDataTypeCarryForwardSessionCursor  = "sylk.carry_forward.session_cursor.v1"
 	ArtifactDataTypePresentationEvidence       = "sylk.presentation_evidence.v1"
+	ArtifactDataTypeKnowledgeReadiness         = "sylk.knowledge_readiness.v1"
 )
 
 var (
@@ -237,6 +238,13 @@ type PresentationEvidenceArtifactData struct {
 	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
+type KnowledgeReadinessArtifactData struct {
+	Component  string         `json:"component"`
+	QualityBar string         `json:"quality_bar,omitempty"`
+	Reference  string         `json:"reference,omitempty"`
+	Metadata   map[string]any `json:"metadata,omitempty"`
+}
+
 func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 	if registry == nil {
 		return fmt.Errorf("type registry is required")
@@ -256,6 +264,7 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeCarryForwardContinuity, CarryForwardContinuityCursorData{}},
 		{ArtifactDataTypeCarryForwardSessionCursor, CarryForwardSessionCursorData{}},
 		{ArtifactDataTypePresentationEvidence, PresentationEvidenceArtifactData{}},
+		{ArtifactDataTypeKnowledgeReadiness, KnowledgeReadinessArtifactData{}},
 	}
 	for _, entry := range entries {
 		if err := registry.Register(entry.dataType, entry.sample, codec); err != nil {

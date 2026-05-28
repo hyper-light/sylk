@@ -180,12 +180,21 @@ func TestIntegration_MultiSessionIsolation(t *testing.T) {
 		t.Errorf("sessB DepthBlocked = %d, want 0", got)
 	}
 
-	// Clock isolation: A's elapsed does not count B's.
-	time.Sleep(50 * time.Millisecond)
+	// Clock isolation: A and B advance independently over the same
+	// sampled interval. Compare interval deltas instead of absolute
+	// elapsed values so scheduler delays between session opens do not
+	// masquerade as cross-session leakage.
+	const clockSampleWindow = 50 * time.Millisecond
 	if aClock, bClock := sessA.Clock(), sessB.Clock(); aClock != nil && bClock != nil {
+		startCheck := time.Now().UTC()
+		aStart := aClock.Elapsed(startCheck)
+		bStart := bClock.Elapsed(startCheck)
+		time.Sleep(clockSampleWindow)
 		nowCheck := time.Now().UTC()
-		if delta := aClock.Elapsed(nowCheck) - bClock.Elapsed(nowCheck); delta > 30*time.Millisecond || delta < -30*time.Millisecond {
-			t.Errorf("clocks diverged by %v — isolation leak?", delta)
+		aDelta := aClock.Elapsed(nowCheck) - aStart
+		bDelta := bClock.Elapsed(nowCheck) - bStart
+		if aDelta != bDelta {
+			t.Errorf("clock deltas diverged: A=%v B=%v", aDelta, bDelta)
 		}
 	}
 }
@@ -340,6 +349,6 @@ func (b *captureBusShared) Subscribe(string, guide.MessageHandler) (guide.Subscr
 func (b *captureBusShared) SubscribeAsync(string, guide.MessageHandler) (guide.Subscription, error) {
 	return nil, nil
 }
-func (b *captureBusShared) Close() error                            { return nil }
+func (b *captureBusShared) Close() error                             { return nil }
 func (b *captureBusShared) CloseWithContext(_ context.Context) error { return nil }
 func (b *captureBusShared) count() int                               { return len(b.published) }

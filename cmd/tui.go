@@ -711,8 +711,13 @@ func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.D
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	deps, err := buildBootstrapDeps(phase1, phase2, phase3, phase4)
+	if err != nil {
+		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
+		return ui.Deps{}, nil, err
+	}
 	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
-	return buildBootstrapDeps(phase1, phase2, phase3, phase4), buildBootstrapCleanup(phase1, phase3, phase4), nil
+	return deps, buildBootstrapCleanup(phase1, phase3, phase4), nil
 }
 
 func tuiRunSessionConfig() session.Config {
@@ -778,6 +783,59 @@ func bootstrapSystemParticipants(phase1 *bootstrapPhase1, phase2 bootstrapPhase2
 			"claims_outbox":               claims.CurrentRolloutConfig().ClaimsOutbox,
 			"session_id":                  sessionID,
 		}),
+	}
+}
+
+func bootstrapKnowledgeBackends(phase1 *bootstrapPhase1) []boot.SystemParticipantActivation {
+	sessionID := phaseDefaultSessionID(phase1)
+	backendReady := phase1 != nil && phase1.knowledgeBackend != nil
+	storeReady := phase1 != nil && phase1.knowledgeStore != nil
+	forestReady := phase1 != nil && phase1.forest != nil
+	return []boot.SystemParticipantActivation{
+		boot.NewServiceParticipantReadiness(boot.SystemKnowledgeGraphReaderID, "knowledge_graph_reader", backendReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemKnowledgeGraphWriterID, "knowledge_graph_writer", backendReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemDocumentDBReaderID, "document_db_reader", storeReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemDocumentDBWriterID, "document_db_writer", storeReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemMemoryForestAgentID, "memory_forest", forestReady, map[string]any{"session_id": sessionID}),
+	}
+}
+
+func bootstrapInfrastructureServices(phase1 *bootstrapPhase1, phase2 bootstrapPhase2, phase3 bootstrapPhase3) []boot.SystemParticipantActivation {
+	sessionID := phaseDefaultSessionID(phase1)
+	vfsReady := phase3.orch != nil
+	providerReady := phase1 != nil && phase1.googleGateway != nil && phase1.anthropicGateway != nil && phase1.openaiGateway != nil
+	guardianReady := phase2.guardianResult.err == nil && phase1 != nil && phase1.guardianRef.Load() != nil
+	return []boot.SystemParticipantActivation{
+		boot.NewServiceParticipantReadiness(boot.SystemVFSPipelineProvisionerID, "vfs_pipeline_provisioner", vfsReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemVFSToolProvisionerID, "vfs_tool_provisioner", vfsReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemVFSGlobalProvisionerID, "vfs_global_provisioner", vfsReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemDAGProcessorID, "dag_processor", phase1 != nil && phase1.daemonCtrl != nil, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemToolRuntimeID, "tool_runtime", phase1 != nil && phase1.runtime != nil, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemProviderGatewayID, "provider_gateway", providerReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemGuardianServiceID, "guardian_service", guardianReady, map[string]any{"session_id": sessionID}),
+	}
+}
+
+func bootstrapAlwaysHotAgents(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) []boot.SystemParticipantActivation {
+	sessionID := phaseDefaultSessionID(phase1)
+	agents := []boot.SystemParticipantActivation{
+		boot.NewSystemParticipantActivation(boot.SystemGuideAgentID, "guide", phase3.guide != nil, map[string]any{"session_id": sessionID}),
+	}
+	if phase3.orch != nil {
+		agents = append(agents, boot.NewSystemParticipantActivation("orchestrator", "orchestrator", true, map[string]any{"session_id": sessionID}))
+	}
+	if phase1 != nil && phase1.guardianRef.Load() != nil {
+		agents = append(agents, boot.NewSystemParticipantActivation("guardian", "guardian", true, map[string]any{"session_id": sessionID}))
+	}
+	return agents
+}
+
+func bootstrapUserFacingSurfaces(phase1 *bootstrapPhase1, phase3 bootstrapPhase3) []boot.SystemParticipantActivation {
+	sessionID := phaseDefaultSessionID(phase1)
+	boardReady := phase1 != nil && phase1.defaultSession != nil && phase1.defaultSession.ClaimsBoard() != nil
+	return []boot.SystemParticipantActivation{
+		boot.NewServiceParticipantReadiness(boot.SystemUIBridgeID, "ui_bridge", phase3.guide != nil && boardReady, map[string]any{"session_id": sessionID}),
+		boot.NewServiceParticipantReadiness(boot.SystemCanonicalDeltaObserverID, "canonical_delta_observer", boardReady, map[string]any{"session_id": sessionID}),
 	}
 }
 
@@ -1404,6 +1462,14 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 	if phase3.scribeFactory != nil {
 		orch.SetScribeFactory(phase3.scribeFactory)
 	}
+	if phase1.bootOps != nil {
+		if _, err := phase1.bootOps.CommitPhase3(phase1.ctx, boot.Phase3Status{
+			Backends: bootstrapKnowledgeBackends(phase1),
+			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return bootstrapPhase3{}, fmt.Errorf("claims operations phase 3: %w", err)
+		}
+	}
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 	return phase3, nil
@@ -1881,6 +1947,20 @@ func startBootstrapPhase4(
 		modelSwapper: buildModelSwapper(phase1.containerReg, phase3.activationCtrl, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
 		phase4Done:   make(chan struct{}),
 	}
+	if phase1.bootOps != nil {
+		if _, err := phase1.bootOps.CommitPhase4(phase1.ctx, boot.Phase4Status{
+			Services: bootstrapInfrastructureServices(phase1, phase2, phase3),
+			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return nil, fmt.Errorf("claims operations phase 4: %w", err)
+		}
+		if _, err := phase1.bootOps.CommitPhase5(phase1.ctx, boot.Phase5Status{
+			Agents:  bootstrapAlwaysHotAgents(phase1, phase3),
+			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return nil, fmt.Errorf("claims operations phase 5: %w", err)
+		}
+	}
 
 	bootLogger, bootLogErr := agentlog.NewBootEventLogger(filepath.Join(phase1.projectRoot, ".sylk"))
 	if bootLogErr != nil {
@@ -2183,8 +2263,8 @@ func buildBootstrapDeps(
 	phase2 bootstrapPhase2,
 	phase3 bootstrapPhase3,
 	phase4 *bootstrapPhase4,
-) ui.Deps {
-	return ui.Deps{
+) (ui.Deps, error) {
+	deps := ui.Deps{
 		ActivityPub:        phase1.activityPub,
 		SessionManager:     phase1.sessionMgr,
 		GuideBus:           phase1.guideBus,
@@ -2210,6 +2290,20 @@ func buildBootstrapDeps(
 		KnowledgeStore:  phase1.knowledgeStore,
 		Forest:          phase1.forest,
 	}
+	if phase1.bootOps != nil {
+		if _, err := phase1.bootOps.CommitPhase6(phase1.ctx, boot.Phase6Status{
+			Surfaces: bootstrapUserFacingSurfaces(phase1, phase3),
+			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return ui.Deps{}, fmt.Errorf("claims operations phase 6: %w", err)
+		}
+		if _, err := phase1.bootOps.CommitPhase7(phase1.ctx, boot.Phase7Status{
+			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return ui.Deps{}, fmt.Errorf("claims operations phase 7: %w", err)
+		}
+	}
+	return deps, nil
 }
 
 func makeInterruptAllAgentsFn(

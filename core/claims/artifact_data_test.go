@@ -1,8 +1,10 @@
 package claims
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -14,6 +16,21 @@ func (panicCodec) Marshal(any) ([]byte, error) {
 
 func (panicCodec) Unmarshal([]byte, any) error {
 	panic("unmarshal exploded")
+}
+
+type countingCodec struct {
+	marshalCount   atomic.Int64
+	unmarshalCount atomic.Int64
+}
+
+func (c *countingCodec) Marshal(value any) ([]byte, error) {
+	c.marshalCount.Add(1)
+	return json.Marshal(value)
+}
+
+func (c *countingCodec) Unmarshal(data []byte, target any) error {
+	c.unmarshalCount.Add(1)
+	return json.Unmarshal(data, target)
 }
 
 func TestSetAndGetArtifactData(t *testing.T) {
@@ -33,6 +50,9 @@ func TestSetAndGetArtifactData(t *testing.T) {
 	}
 	if value.Markdown != "# Plan" || value.Title != "Plan" {
 		t.Fatalf("decoded value = %+v", value)
+	}
+	if got := MustArtifactData[PlanMarkdownArtifactData](artifact); got.Markdown != "# Plan" {
+		t.Fatalf("test-only must helper = %+v", got)
 	}
 }
 
@@ -78,6 +98,27 @@ func TestArtifactDataCodecPanicIsControlledError(t *testing.T) {
 	}
 }
 
+func TestArtifactDataHelpersCallCodecExactlyOnce(t *testing.T) {
+	registry := NewTypeRegistry()
+	codec := &countingCodec{}
+	if err := registry.Register("counting.v1", syntheticArtifactPayload{}, codec); err != nil {
+		t.Fatal(err)
+	}
+	artifact := &Artifact{ID: "counting"}
+	if err := SetArtifactDataWithRegistry(registry, artifact, syntheticArtifactPayload{Name: "x"}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if codec.marshalCount.Load() != 1 {
+		t.Fatalf("marshal count = %d, want 1", codec.marshalCount.Load())
+	}
+	if _, err := ArtifactDataWithRegistry[syntheticArtifactPayload](registry, artifact); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if codec.unmarshalCount.Load() != 1 {
+		t.Fatalf("unmarshal count = %d, want 1", codec.unmarshalCount.Load())
+	}
+}
+
 func TestApplyBuiltinArtifactDataBridgePlanMarkdown(t *testing.T) {
 	artifact := &Artifact{
 		ID:        "legacy-plan",
@@ -101,6 +142,28 @@ func TestApplyBuiltinArtifactDataBridgePlanMarkdown(t *testing.T) {
 	referenceOnly := fixtureMalformedLegacyArtifact()
 	if _, err := ArtifactData[PlanMarkdownArtifactData](&referenceOnly); !errors.Is(err, ErrArtifactDataMismatch) {
 		t.Fatalf("legacy artifact forced through typed decode: %v", err)
+	}
+}
+
+func TestApplyBuiltinArtifactDataBridgeKnowledgeReadiness(t *testing.T) {
+	artifact := &Artifact{
+		ID:        "knowledge-ready",
+		Kind:      ArtifactKindReadiness,
+		Reference: "committed knowledge backend ready",
+		Metadata: map[string]any{
+			"component":   KnowledgeBackendAgentID,
+			"quality_bar": KnowledgeBackendReadyQuality,
+		},
+	}
+	if err := ApplyBuiltinArtifactDataBridge(artifact); err != nil {
+		t.Fatalf("bridge: %v", err)
+	}
+	value, err := ArtifactData[KnowledgeReadinessArtifactData](artifact)
+	if err != nil {
+		t.Fatalf("typed read after bridge: %v", err)
+	}
+	if value.Component != KnowledgeBackendAgentID || value.QualityBar != KnowledgeBackendReadyQuality {
+		t.Fatalf("bridge value = %+v", value)
 	}
 }
 

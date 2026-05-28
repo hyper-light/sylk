@@ -102,41 +102,57 @@ func TestValidationDeclarationAllowsQualityBarOnlyLegacy(t *testing.T) {
 }
 
 func TestArtifactAndValidationTransitionTables(t *testing.T) {
-	for _, step := range []struct {
+	artifactValid := []struct {
 		from ArtifactStatus
 		to   ArtifactStatus
 	}{
+		{"", ArtifactStatusGenerated},
+		{"", ArtifactStatusGenerationFailed},
 		{ArtifactStatusGenerated, ArtifactStatusReceived},
+		{ArtifactStatusGenerated, ArtifactStatusReceiptFailed},
 		{ArtifactStatusGenerated, ArtifactStatusAttached},
 		{ArtifactStatusReceived, ArtifactStatusAttached},
+		{ArtifactStatusReceived, ArtifactStatusReceiptFailed},
 		{ArtifactStatusAttached, ArtifactStatusValidating},
 		{ArtifactStatusValidating, ArtifactStatusValidated},
 		{ArtifactStatusValidating, ArtifactStatusValidationFailed},
-	} {
+	}
+	for _, step := range artifactValid {
 		if !CanTransitionArtifactStatus(step.from, step.to) {
 			t.Fatalf("artifact transition %s -> %s rejected", step.from, step.to)
 		}
 	}
-	if CanTransitionArtifactStatus(ArtifactStatusGenerated, ArtifactStatusValidated) {
-		t.Fatal("generated -> validated should be rejected")
+	for _, step := range forbiddenArtifactTransitions(artifactValid) {
+		if CanTransitionArtifactStatus(step.from, step.to) {
+			t.Fatalf("artifact transition %s -> %s should be rejected", step.from, step.to)
+		}
 	}
 
-	for _, step := range []struct {
+	validationValid := []struct {
 		from ValidationStatus
 		to   ValidationStatus
 	}{
+		{"", ValidationStatusReady},
 		{ValidationStatusReady, ValidationStatusValidating},
 		{ValidationStatusValidating, ValidationStatusValidated},
 		{ValidationStatusValidating, ValidationStatusValidatingQualityBar},
+		{ValidationStatusValidating, ValidationStatusValidationFailed},
 		{ValidationStatusValidating, ValidationStatusValidationFailedNotRequired},
+		{ValidationStatusValidating, ValidationStatusErrored},
+		{ValidationStatusValidating, ValidationStatusErroredNotRequired},
+		{ValidationStatusValidatingQualityBar, ValidationStatusValidated},
 		{ValidationStatusValidatingQualityBar, ValidationStatusQualityBarValidationFailed},
-	} {
+		{ValidationStatusValidatingQualityBar, ValidationStatusQualityBarValidationFailedNotRequired},
+	}
+	for _, step := range validationValid {
 		if !CanTransitionValidationStatus(step.from, step.to) {
 			t.Fatalf("validation transition %s -> %s rejected", step.from, step.to)
 		}
 	}
-	if CanTransitionValidationStatus(ValidationStatusReady, ValidationStatusValidated) {
-		t.Fatal("ready -> validated should be rejected")
+	for _, step := range forbiddenValidationTransitions(validationValid) {
+		if CanTransitionValidationStatus(step.from, step.to) {
+			t.Fatalf("validation transition %s -> %s should be rejected", step.from, step.to)
+		}
 	}
 }
 
@@ -145,6 +161,9 @@ func TestDuplicateTerminalTransitionIsNoopAndInvalidReturnsTypedError(t *testing
 	applied, err := TransitionArtifactStatus(artifact, ArtifactStatusValidated, "architect", "done", fixtureClock())
 	if err != nil || !applied {
 		t.Fatalf("first transition applied=%v err=%v", applied, err)
+	}
+	if artifact.StatusHistory[0].ParticipantID != "architect" || artifact.StatusHistory[0].AgentID != "architect" {
+		t.Fatalf("transition actor fields = %+v", artifact.StatusHistory[0])
 	}
 	applied, err = TransitionArtifactStatus(artifact, ArtifactStatusValidated, "architect", "duplicate", fixtureClock().Add(time.Second))
 	if err != nil || applied || len(artifact.StatusHistory) != 1 {
@@ -155,6 +174,66 @@ func TestDuplicateTerminalTransitionIsNoopAndInvalidReturnsTypedError(t *testing
 	if !errors.As(err, &transitionErr) || transitionErr.Actor != "architect" {
 		t.Fatalf("expected typed transition error with actor, got %v", err)
 	}
+}
+
+func forbiddenArtifactTransitions(valid []struct {
+	from ArtifactStatus
+	to   ArtifactStatus
+}) []struct {
+	from ArtifactStatus
+	to   ArtifactStatus
+} {
+	allowed := map[[2]ArtifactStatus]bool{}
+	for _, step := range valid {
+		allowed[[2]ArtifactStatus{step.from, step.to}] = true
+	}
+	statuses := append([]ArtifactStatus{""}, KnownArtifactStatuses()...)
+	out := make([]struct {
+		from ArtifactStatus
+		to   ArtifactStatus
+	}, 0)
+	for _, from := range statuses {
+		for _, to := range statuses {
+			if from == to || allowed[[2]ArtifactStatus{from, to}] {
+				continue
+			}
+			out = append(out, struct {
+				from ArtifactStatus
+				to   ArtifactStatus
+			}{from: from, to: to})
+		}
+	}
+	return out
+}
+
+func forbiddenValidationTransitions(valid []struct {
+	from ValidationStatus
+	to   ValidationStatus
+}) []struct {
+	from ValidationStatus
+	to   ValidationStatus
+} {
+	allowed := map[[2]ValidationStatus]bool{}
+	for _, step := range valid {
+		allowed[[2]ValidationStatus{step.from, step.to}] = true
+	}
+	statuses := append([]ValidationStatus{""}, KnownValidationLifecycleStatuses()...)
+	out := make([]struct {
+		from ValidationStatus
+		to   ValidationStatus
+	}, 0)
+	for _, from := range statuses {
+		for _, to := range statuses {
+			if from == to || allowed[[2]ValidationStatus{from, to}] {
+				continue
+			}
+			out = append(out, struct {
+				from ValidationStatus
+				to   ValidationStatus
+			}{from: from, to: to})
+		}
+	}
+	return out
 }
 
 func TestCloneArtifactDefensiveCopiesLifecycleData(t *testing.T) {

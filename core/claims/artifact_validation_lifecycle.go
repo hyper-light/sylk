@@ -355,12 +355,14 @@ func validationDeclaresTypedHandler(v *Validation) bool {
 }
 
 func statusChange[S ~string](from, to S, actor, reason string, changed time.Time) StatusChange {
+	actor = strings.TrimSpace(actor)
 	return StatusChange{
-		From:    string(from),
-		To:      string(to),
-		Reason:  strings.TrimSpace(reason),
-		AgentID: strings.TrimSpace(actor),
-		Changed: changeTime(changed),
+		From:          string(from),
+		To:            string(to),
+		Reason:        strings.TrimSpace(reason),
+		AgentID:       actor,
+		ParticipantID: actor,
+		Changed:       changeTime(changed),
 	}
 }
 

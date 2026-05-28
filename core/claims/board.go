@@ -470,6 +470,16 @@ func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
 		if v.Status == "" {
 			v.Status = ValidationStatusPending
 		}
+		if len(v.StatusHistory) == 0 {
+			actorID := firstNonEmpty(v.ParticipantID, v.AgentID, c.AgentID)
+			v.StatusHistory = append(v.StatusHistory, StatusChange{
+				To:            string(v.Status),
+				Reason:        "validation ready",
+				AgentID:       actorID,
+				ParticipantID: actorID,
+				Changed:       now,
+			})
+		}
 		if v.Timeout > 0 && v.Deadline.IsZero() {
 			v.Deadline = now.Add(v.Timeout)
 		}
@@ -837,11 +847,13 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.Accessed = now
 		if artifact.Status == "" {
 			artifact.Status = ArtifactStatusGenerated
+			actorID := firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID)
 			artifact.StatusHistory = append(artifact.StatusHistory, StatusChange{
-				To:      string(ArtifactStatusGenerated),
-				Reason:  "artifact generated",
-				AgentID: firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID),
-				Changed: now,
+				To:            string(ArtifactStatusGenerated),
+				Reason:        "artifact generated",
+				AgentID:       actorID,
+				ParticipantID: actorID,
+				Changed:       now,
 			})
 		}
 		ApplyDefaultArtifactPresentation(artifact)

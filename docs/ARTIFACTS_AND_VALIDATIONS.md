@@ -801,14 +801,16 @@ type StatusChange struct {
     From          string         `json:"from"`
     To            string         `json:"to"`
     Reason        string         `json:"reason"`
-    ParticipantID string         `json:"participant_id"`
+    AgentID       string         `json:"agent_id,omitempty"`
+    ParticipantID string         `json:"participant_id,omitempty"`
     Changed       time.Time      `json:"changed"`
 }
 ```
 
 The committing party stamps `ParticipantID` with its own canonical
-UID. The full status history is replayable from the WAL and provides
-the durable audit trail for the artifact's lifecycle.
+UID; `AgentID` is the legacy alias preserved during migration. The
+full status history is replayable from the WAL and provides the
+durable audit trail for the artifact's lifecycle.
 
 ## 6. Validation Structure
 
@@ -1396,6 +1398,7 @@ strings:
 | `ArtifactKindContinuityCursor` | `sylk.carry_forward.continuity_cursor.v1` |
 | `ArtifactKindSessionCursor` | `sylk.carry_forward.session_cursor.v1` |
 | Presentation evidence helper output | `sylk.presentation_evidence.v1` |
+| `ArtifactKindReadiness` | `sylk.knowledge_readiness.v1` |
 
 Registration of a typed validator via `RegisterValidator[T, R]`
 implicitly registers `T` and `R` with the type registry if not

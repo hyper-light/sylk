@@ -3,6 +3,7 @@ package claims
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -43,9 +44,51 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeCarryForwardContinuity,
 		ArtifactDataTypeCarryForwardSessionCursor,
 		ArtifactDataTypePresentationEvidence,
+		ArtifactDataTypeKnowledgeReadiness,
 	} {
 		if !strings.Contains(body, dataType) {
 			t.Fatalf("ARTIFACTS_AND_VALIDATIONS.md missing data type %s", dataType)
+		}
+	}
+}
+
+func TestArtifactsAndValidationsDocsCrossReferenceDeltaActions(t *testing.T) {
+	root := repoRootForClaimsTest(t)
+	for _, doc := range []string{
+		"docs/CLAIMS.md",
+		"docs/CLAIMS_AND_DELTAS.md",
+		"docs/CLAIMS_AND_TESTAMENTS_LIFECYCLE.md",
+	} {
+		body := readDocForClaimsTest(t, root, doc)
+		for _, action := range phaseZeroArtifactValidationDeltaActions() {
+			if !strings.Contains(body, action) {
+				t.Fatalf("%s missing artifact/validation delta action %s", doc, action)
+			}
+		}
+		for _, action := range phaseZeroPropagationDeltaActions() {
+			if !strings.Contains(body, action) {
+				t.Fatalf("%s missing propagation delta action %s", doc, action)
+			}
+		}
+	}
+}
+
+func TestArtifactsAndValidationsDocsMatchStatusChangeFields(t *testing.T) {
+	root := repoRootForClaimsTest(t)
+	docs := []string{
+		readDocForClaimsTest(t, root, "docs/CLAIMS.md"),
+		readDocForClaimsTest(t, root, "docs/ARTIFACTS_AND_VALIDATIONS.md"),
+	}
+	statusChange := reflect.TypeOf(StatusChange{})
+	for i := 0; i < statusChange.NumField(); i++ {
+		field := statusChange.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		for _, body := range docs {
+			if !strings.Contains(body, field.Name) {
+				t.Fatalf("docs missing StatusChange field %s", field.Name)
+			}
 		}
 	}
 }
@@ -64,6 +107,24 @@ func validationStatusDocNames() []string {
 		out = append(out, "validation."+string(status))
 	}
 	return out
+}
+
+func phaseZeroArtifactValidationDeltaActions() []string {
+	out := append(artifactStatusDocNames(), validationStatusDocNames()...)
+	return out
+}
+
+func phaseZeroPropagationDeltaActions() []string {
+	return []string{
+		"testament.validated",
+		"testament.validation_failed",
+		"testament.validation_incomplete",
+		"testament.validation_errored",
+		"claim.satisfied",
+		"claim.validation_failed",
+		"claim.validation_incomplete",
+		"claim.validation_errored",
+	}
 }
 
 func repoRootForClaimsTest(t *testing.T) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -12,18 +13,43 @@ import (
 )
 
 const (
-	BootSequencerAgentID          = "sys:boot_sequencer"
-	IdentityRegistryAgentID       = "sys:identity_registry"
-	ActivationControllerAgentID   = "sys:activation_controller"
-	SystemBusAdministratorAgentID = "sys:bus_administrator"
-	SystemSessionManagerAgentID   = "sys:session_manager"
-	SystemFabricSubscriberAgentID = "sys:fabric_subscriber"
+	BootSequencerAgentID           = "sys:boot_sequencer"
+	IdentityRegistryAgentID        = "sys:identity_registry"
+	ActivationControllerAgentID    = "sys:activation_controller"
+	SystemBusAdministratorAgentID  = "sys:bus_administrator"
+	SystemSessionManagerAgentID    = "sys:session_manager"
+	SystemFabricSubscriberAgentID  = "sys:fabric_subscriber"
+	SystemKnowledgeGraphReaderID   = "sys:knowledge_graph_reader"
+	SystemKnowledgeGraphWriterID   = "sys:knowledge_graph_writer"
+	SystemDocumentDBReaderID       = "sys:document_db_reader"
+	SystemDocumentDBWriterID       = "sys:document_db_writer"
+	SystemMemoryForestAgentID      = "sys:memory_forest"
+	SystemVFSPipelineProvisionerID = "sys:vfs_pipeline_provisioner"
+	SystemVFSToolProvisionerID     = "sys:vfs_tool_provisioner"
+	SystemVFSGlobalProvisionerID   = "sys:vfs_global_provisioner"
+	SystemDAGProcessorID           = "sys:dag_processor"
+	SystemToolRuntimeID            = "sys:tool_runtime"
+	SystemProviderGatewayID        = "sys:provider_gateway"
+	SystemGuardianServiceID        = "sys:guardian_service"
+	SystemGuideAgentID             = "guide"
+	SystemUIBridgeID               = "sys:ui_bridge"
+	SystemCanonicalDeltaObserverID = "sys:canonical_delta_observer"
 
 	BootPhaseDurableSubstrate   BootOperationPhase = "durable_substrate"
 	BootPhaseSystemParticipants BootOperationPhase = "system_participants"
+	BootPhaseKnowledgeBackends  BootOperationPhase = "knowledge_backends"
+	BootPhaseInfrastructure     BootOperationPhase = "infrastructure_services"
+	BootPhaseAgentActivation    BootOperationPhase = "agent_activation"
+	BootPhaseUserSurfaces       BootOperationPhase = "user_facing_surfaces"
+	BootPhaseComplete           BootOperationPhase = "boot_complete"
 
 	bootPhase1Order = 1
 	bootPhase2Order = 2
+	bootPhase3Order = 3
+	bootPhase4Order = 4
+	bootPhase5Order = 5
+	bootPhase6Order = 6
+	bootPhase7Order = 7
 
 	bootOperationKeyPrefix = "boot.operations"
 	bootValidationQuality  = "receipt.received"
@@ -89,6 +115,7 @@ type Phase1Status struct {
 type SystemParticipantActivation struct {
 	ParticipantID   string
 	ParticipantType string
+	SubjectID       string
 	Ready           bool
 	Context         map[string]any
 }
@@ -96,6 +123,50 @@ type SystemParticipantActivation struct {
 type Phase2Status struct {
 	Participants []SystemParticipantActivation
 	Context      map[string]any
+}
+
+type Phase3Status struct {
+	Backends []SystemParticipantActivation
+	Context  map[string]any
+}
+
+type Phase4Status struct {
+	Services []SystemParticipantActivation
+	Context  map[string]any
+}
+
+type Phase5Status struct {
+	Agents  []SystemParticipantActivation
+	Context map[string]any
+}
+
+type Phase6Status struct {
+	Surfaces []SystemParticipantActivation
+	Context  map[string]any
+}
+
+type Phase7Status struct {
+	Context map[string]any
+}
+
+type BootPhaseHealth struct {
+	Phase          BootOperationPhase
+	Outcome        string
+	ClaimID        string
+	TestamentID    string
+	Duration       time.Duration
+	ReadinessCount int
+	FailureCount   int
+	Warnings       []string
+}
+
+type BootHealth struct {
+	BoardID           string
+	SessionID         string
+	HighWaterSequence uint64
+	OutboxLag         uint64
+	TerminalFailures  int
+	Phases            []BootPhaseHealth
 }
 
 type PhaseCommitResult struct {
@@ -124,6 +195,17 @@ type bootTestamentSpec struct {
 	summary     string
 	duration    time.Duration
 	artifacts   []*claims.Artifact
+}
+
+type readinessPhaseConfig struct {
+	phase          BootOperationPhase
+	order          int
+	prerequisite   BootOperationPhase
+	participants   []SystemParticipantActivation
+	requiredIDs    []string
+	context        map[string]any
+	defaultSubject string
+	summary        string
 }
 
 func NewOperationsSequencer(cfg OperationsConfig) (*OperationsSequencer, error) {
@@ -185,9 +267,16 @@ func NewSystemParticipantActivation(participantID, participantType string, ready
 	return SystemParticipantActivation{
 		ParticipantID:   strings.TrimSpace(participantID),
 		ParticipantType: strings.TrimSpace(participantType),
+		SubjectID:       ActivationControllerAgentID,
 		Ready:           ready,
 		Context:         cloneMetadata(context),
 	}
+}
+
+func NewServiceParticipantReadiness(participantID, participantType string, ready bool, context map[string]any) SystemParticipantActivation {
+	participant := NewSystemParticipantActivation(participantID, participantType, ready, context)
+	participant.SubjectID = strings.TrimSpace(participantID)
+	return participant
 }
 
 func RequiredSystemParticipants() []SystemParticipantActivation {
@@ -195,6 +284,41 @@ func RequiredSystemParticipants() []SystemParticipantActivation {
 		NewSystemParticipantActivation(SystemBusAdministratorAgentID, "bus_administrator", true, nil),
 		NewSystemParticipantActivation(SystemSessionManagerAgentID, "session_manager", true, nil),
 		NewSystemParticipantActivation(SystemFabricSubscriberAgentID, "fabric_subscriber", true, nil),
+	}
+}
+
+func RequiredKnowledgeBackends() []SystemParticipantActivation {
+	return []SystemParticipantActivation{
+		NewServiceParticipantReadiness(SystemKnowledgeGraphReaderID, "knowledge_graph_reader", true, nil),
+		NewServiceParticipantReadiness(SystemKnowledgeGraphWriterID, "knowledge_graph_writer", true, nil),
+		NewServiceParticipantReadiness(SystemDocumentDBReaderID, "document_db_reader", true, nil),
+		NewServiceParticipantReadiness(SystemDocumentDBWriterID, "document_db_writer", true, nil),
+		NewServiceParticipantReadiness(SystemMemoryForestAgentID, "memory_forest", true, nil),
+	}
+}
+
+func RequiredInfrastructureServices() []SystemParticipantActivation {
+	return []SystemParticipantActivation{
+		NewServiceParticipantReadiness(SystemVFSPipelineProvisionerID, "vfs_pipeline_provisioner", true, nil),
+		NewServiceParticipantReadiness(SystemVFSToolProvisionerID, "vfs_tool_provisioner", true, nil),
+		NewServiceParticipantReadiness(SystemVFSGlobalProvisionerID, "vfs_global_provisioner", true, nil),
+		NewServiceParticipantReadiness(SystemDAGProcessorID, "dag_processor", true, nil),
+		NewServiceParticipantReadiness(SystemToolRuntimeID, "tool_runtime", true, nil),
+		NewServiceParticipantReadiness(SystemProviderGatewayID, "provider_gateway", true, nil),
+		NewServiceParticipantReadiness(SystemGuardianServiceID, "guardian_service", true, nil),
+	}
+}
+
+func RequiredAlwaysHotAgents() []SystemParticipantActivation {
+	return []SystemParticipantActivation{
+		NewSystemParticipantActivation(SystemGuideAgentID, "guide", true, nil),
+	}
+}
+
+func RequiredUserFacingSurfaces() []SystemParticipantActivation {
+	return []SystemParticipantActivation{
+		NewServiceParticipantReadiness(SystemUIBridgeID, "ui_bridge", true, nil),
+		NewServiceParticipantReadiness(SystemCanonicalDeltaObserverID, "canonical_delta_observer", true, nil),
 	}
 }
 
@@ -217,39 +341,157 @@ func (s *OperationsSequencer) CommitPhase1(ctx context.Context, status Phase1Sta
 func (s *OperationsSequencer) CommitPhase2(ctx context.Context, status Phase2Status) (PhaseCommitResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.requirePhaseSatisfied(BootPhaseDurableSubstrate); err != nil {
-		return PhaseCommitResult{Phase: BootPhaseSystemParticipants}, err
-	}
-	if existing := s.phaseResultIfSatisfied(BootPhaseSystemParticipants); existing.ClaimID != "" {
-		return existing, nil
-	}
-	participantClaimIDs, participantTestamentIDs, err := s.commitSystemParticipants(ctx, status.Participants)
-	if err != nil {
-		claim, claimErr := s.ensureClaimActive(ctx, phaseClaimSpec(BootPhaseSystemParticipants, bootPhase2Order, s.identity.BootSequencerUID))
-		if claimErr != nil {
-			return PhaseCommitResult{Phase: BootPhaseSystemParticipants, ParticipantClaimIDs: participantClaimIDs, ParticipantTestamentIDs: participantTestamentIDs}, errors.Join(err, claimErr)
-		}
-		testamentID, failureErr := s.completeClaimFailure(ctx, claim.ID, phaseFailureTestamentSpec(BootPhaseSystemParticipants, err, status.Context, s.identity))
-		return phaseResult(BootPhaseSystemParticipants, claim.ID, testamentID, participantClaimIDs, participantTestamentIDs), errors.Join(err, failureErr)
-	}
-	start := time.Now()
-	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(BootPhaseSystemParticipants, bootPhase2Order, s.identity.BootSequencerUID))
-	if err != nil {
-		return PhaseCommitResult{Phase: BootPhaseSystemParticipants, ParticipantClaimIDs: participantClaimIDs, ParticipantTestamentIDs: participantTestamentIDs}, err
-	}
-	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, phase2TestamentSpec(status, time.Since(start), s.identity))
-	return phaseResult(BootPhaseSystemParticipants, claim.ID, testamentID, participantClaimIDs, participantTestamentIDs), err
+	return s.commitReadinessPhase(ctx, readinessPhaseConfig{
+		phase:          BootPhaseSystemParticipants,
+		order:          bootPhase2Order,
+		prerequisite:   BootPhaseDurableSubstrate,
+		participants:   status.Participants,
+		requiredIDs:    requiredParticipantIDs(BootPhaseSystemParticipants),
+		context:        status.Context,
+		defaultSubject: ActivationControllerAgentID,
+		summary:        "boot.phase_2_complete",
+	})
 }
 
-func (s *OperationsSequencer) commitSystemParticipants(ctx context.Context, participants []SystemParticipantActivation) ([]string, []string, error) {
-	normalized, err := validatePhase2Participants(participants)
-	if err != nil {
-		return nil, nil, err
+func (s *OperationsSequencer) CommitPhase3(ctx context.Context, status Phase3Status) (PhaseCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitReadinessPhase(ctx, readinessPhaseConfig{
+		phase:          BootPhaseKnowledgeBackends,
+		order:          bootPhase3Order,
+		prerequisite:   BootPhaseSystemParticipants,
+		participants:   status.Backends,
+		requiredIDs:    requiredParticipantIDs(BootPhaseKnowledgeBackends),
+		context:        status.Context,
+		defaultSubject: "",
+		summary:        "boot.phase_3_complete",
+	})
+}
+
+func (s *OperationsSequencer) CommitPhase4(ctx context.Context, status Phase4Status) (PhaseCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitReadinessPhase(ctx, readinessPhaseConfig{
+		phase:          BootPhaseInfrastructure,
+		order:          bootPhase4Order,
+		prerequisite:   BootPhaseKnowledgeBackends,
+		participants:   status.Services,
+		requiredIDs:    requiredParticipantIDs(BootPhaseInfrastructure),
+		context:        status.Context,
+		defaultSubject: "",
+		summary:        "boot.phase_4_complete",
+	})
+}
+
+func (s *OperationsSequencer) CommitPhase5(ctx context.Context, status Phase5Status) (PhaseCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitReadinessPhase(ctx, readinessPhaseConfig{
+		phase:          BootPhaseAgentActivation,
+		order:          bootPhase5Order,
+		prerequisite:   BootPhaseInfrastructure,
+		participants:   status.Agents,
+		requiredIDs:    requiredParticipantIDs(BootPhaseAgentActivation),
+		context:        status.Context,
+		defaultSubject: ActivationControllerAgentID,
+		summary:        "boot.phase_5_complete",
+	})
+}
+
+func (s *OperationsSequencer) CommitPhase6(ctx context.Context, status Phase6Status) (PhaseCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitReadinessPhase(ctx, readinessPhaseConfig{
+		phase:          BootPhaseUserSurfaces,
+		order:          bootPhase6Order,
+		prerequisite:   BootPhaseAgentActivation,
+		participants:   status.Surfaces,
+		requiredIDs:    requiredParticipantIDs(BootPhaseUserSurfaces),
+		context:        status.Context,
+		defaultSubject: "",
+		summary:        "boot.phase_6_complete",
+	})
+}
+
+func (s *OperationsSequencer) CommitPhase7(ctx context.Context, status Phase7Status) (PhaseCommitResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.requirePhaseSatisfied(BootPhaseUserSurfaces); err != nil {
+		return PhaseCommitResult{Phase: BootPhaseComplete}, err
 	}
-	claimIDs := make([]string, 0, len(normalized))
-	testamentIDs := make([]string, 0, len(normalized))
-	for _, participant := range normalized {
-		claimID, testamentID, err := s.commitSystemParticipant(ctx, participant)
+	if existing := s.phaseResultIfSatisfied(BootPhaseComplete); existing.ClaimID != "" {
+		return existing, nil
+	}
+	start := time.Now()
+	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(BootPhaseComplete, bootPhase7Order, s.identity.BootSequencerUID))
+	if err != nil {
+		return PhaseCommitResult{Phase: BootPhaseComplete}, err
+	}
+	spec := phase7TestamentSpec(status, time.Since(start), s.identity, s.bootPhaseSummary())
+	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, spec)
+	return phaseResult(BootPhaseComplete, claim.ID, testamentID, nil, nil), err
+}
+
+func (s *OperationsSequencer) BootHealth() BootHealth {
+	if s == nil || s.board == nil {
+		return BootHealth{}
+	}
+	return BootHealthFromBoard(s.board)
+}
+
+func BootHealthFromBoard(board *claims.ClaimsBoard) BootHealth {
+	if board == nil {
+		return BootHealth{}
+	}
+	projectionHealth := board.ProjectionHealth()
+	return BootHealth{
+		BoardID:           board.BoardID(),
+		SessionID:         board.SessionID(),
+		HighWaterSequence: board.HighWaterSequence(),
+		OutboxLag:         projectionHealth.MaxLag,
+		TerminalFailures:  projectionHealth.TerminalFailures,
+		Phases:            bootPhaseHealthFromProjection(board.Projection()),
+	}
+}
+
+func (s *OperationsSequencer) commitReadinessPhase(ctx context.Context, cfg readinessPhaseConfig) (PhaseCommitResult, error) {
+	if err := s.requirePhaseSatisfied(cfg.prerequisite); err != nil {
+		return PhaseCommitResult{Phase: cfg.phase}, err
+	}
+	if existing := s.phaseResultIfSatisfied(cfg.phase); existing.ClaimID != "" {
+		return existing, nil
+	}
+	participants, err := validatePhaseParticipants(cfg.phase, cfg.participants, cfg.requiredIDs)
+	if err != nil {
+		return s.commitPhaseFailure(ctx, cfg, nil, nil, err)
+	}
+	participantClaimIDs, participantTestamentIDs, err := s.commitPhaseParticipants(ctx, cfg, participants)
+	if err != nil {
+		return s.commitPhaseFailure(ctx, cfg, participantClaimIDs, participantTestamentIDs, err)
+	}
+	start := time.Now()
+	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(cfg.phase, cfg.order, s.identity.BootSequencerUID))
+	if err != nil {
+		return PhaseCommitResult{Phase: cfg.phase, ParticipantClaimIDs: participantClaimIDs, ParticipantTestamentIDs: participantTestamentIDs}, err
+	}
+	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, phaseReadinessTestamentSpec(cfg, participants, time.Since(start), s.identity))
+	return phaseResult(cfg.phase, claim.ID, testamentID, participantClaimIDs, participantTestamentIDs), err
+}
+
+func (s *OperationsSequencer) commitPhaseFailure(ctx context.Context, cfg readinessPhaseConfig, participantClaims, participantTestaments []string, cause error) (PhaseCommitResult, error) {
+	claim, claimErr := s.ensureClaimActive(ctx, phaseClaimSpec(cfg.phase, cfg.order, s.identity.BootSequencerUID))
+	if claimErr != nil {
+		return PhaseCommitResult{Phase: cfg.phase, ParticipantClaimIDs: participantClaims, ParticipantTestamentIDs: participantTestaments}, errors.Join(cause, claimErr)
+	}
+	testamentID, failureErr := s.completeClaimFailure(ctx, claim.ID, phaseFailureTestamentSpec(cfg.phase, cause, cfg.context, s.identity))
+	return phaseResult(cfg.phase, claim.ID, testamentID, participantClaims, participantTestaments), errors.Join(cause, failureErr)
+}
+
+func (s *OperationsSequencer) commitPhaseParticipants(ctx context.Context, cfg readinessPhaseConfig, participants []SystemParticipantActivation) ([]string, []string, error) {
+	claimIDs := make([]string, 0, len(participants))
+	testamentIDs := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		claimID, testamentID, err := s.commitPhaseParticipant(ctx, cfg, participant)
 		claimIDs = appendNonEmpty(claimIDs, claimID)
 		testamentIDs = appendNonEmpty(testamentIDs, testamentID)
 		if err != nil {
@@ -259,17 +501,17 @@ func (s *OperationsSequencer) commitSystemParticipants(ctx context.Context, part
 	return claimIDs, testamentIDs, nil
 }
 
-func (s *OperationsSequencer) commitSystemParticipant(ctx context.Context, participant SystemParticipantActivation) (string, string, error) {
-	claim, err := s.ensureClaimActive(ctx, participantClaimSpec(participant, s.identity.BootSequencerUID))
+func (s *OperationsSequencer) commitPhaseParticipant(ctx context.Context, cfg readinessPhaseConfig, participant SystemParticipantActivation) (string, string, error) {
+	claim, err := s.ensureClaimActive(ctx, participantClaimSpec(cfg.phase, cfg.order, participant, s.identity.BootSequencerUID, cfg.defaultSubject))
 	if err != nil {
 		return "", "", err
 	}
 	if !participant.Ready {
 		err := fmt.Errorf("%w: %s not ready", ErrBootReadinessIncomplete, participant.ParticipantID)
-		testamentID, failureErr := s.completeClaimFailure(ctx, claim.ID, participantFailureTestamentSpec(participant, err, s.identity.BootSequencerUID))
+		testamentID, failureErr := s.completeClaimFailure(ctx, claim.ID, participantFailureTestamentSpec(cfg.phase, participant, err, s.identity.BootSequencerUID))
 		return claim.ID, testamentID, errors.Join(err, failureErr)
 	}
-	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, participantSuccessTestamentSpec(participant, s.identity.BootSequencerUID))
+	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, participantSuccessTestamentSpec(cfg.phase, participant, s.identity.BootSequencerUID))
 	return claim.ID, testamentID, err
 }
 
@@ -487,16 +729,17 @@ func phaseClaimSpec(phase BootOperationPhase, order int, bootSequencerUID string
 	}
 }
 
-func participantClaimSpec(participant SystemParticipantActivation, bootSequencerUID string) bootClaimSpec {
+func participantClaimSpec(phase BootOperationPhase, order int, participant SystemParticipantActivation, bootSequencerUID, defaultSubject string) bootClaimSpec {
+	subject := firstNonEmptyString(participant.SubjectID, defaultSubject, participant.ParticipantID)
 	return bootClaimSpec{
 		actionType:            claims.ActionTypeActivation,
-		key:                   participantClaimKey(participant.ParticipantID),
+		key:                   participantClaimKey(phase, participant.ParticipantID),
 		issuer:                bootSequencerUID,
-		subject:               ActivationControllerAgentID,
+		subject:               subject,
 		title:                 "Activate " + participant.ParticipantType,
 		description:           "Activation controller must activate and report readiness for " + participant.ParticipantID + ".",
 		validationDescription: "Activation readiness testament received for " + participant.ParticipantID + ".",
-		priority:              bootPhase2Order,
+		priority:              order,
 	}
 }
 
@@ -549,13 +792,34 @@ func phase1TestamentSpec(status Phase1Status, dur time.Duration, identity Proces
 }
 
 func phase2TestamentSpec(status Phase2Status, dur time.Duration, identity ProcessIdentity) bootTestamentSpec {
+	return phaseReadinessTestamentSpec(readinessPhaseConfig{phase: BootPhaseSystemParticipants, summary: "boot.phase_2_complete"}, status.Participants, dur, identity)
+}
+
+func phaseReadinessTestamentSpec(cfg readinessPhaseConfig, participants []SystemParticipantActivation, dur time.Duration, identity ProcessIdentity) bootTestamentSpec {
 	return bootTestamentSpec{
-		key:         phaseTestamentKey(BootPhaseSystemParticipants, "complete"),
+		key:         phaseTestamentKey(cfg.phase, "complete"),
 		agentID:     identity.BootSequencerUID,
 		validatorID: identity.BootSequencerUID,
-		summary:     "boot.phase_2_complete",
+		summary:     cfg.summary,
 		duration:    dur,
-		artifacts:   phase2Artifacts(status, dur, identity),
+		artifacts:   phaseReadinessArtifacts(cfg.phase, participants, dur, identity),
+	}
+}
+
+func phase7TestamentSpec(status Phase7Status, dur time.Duration, identity ProcessIdentity, phases []BootPhaseHealth) bootTestamentSpec {
+	return bootTestamentSpec{
+		key:         phaseTestamentKey(BootPhaseComplete, "satisfied"),
+		agentID:     identity.BootSequencerUID,
+		validatorID: identity.BootSequencerUID,
+		summary:     "boot.satisfied",
+		duration:    dur,
+		artifacts: []*claims.Artifact{
+			phaseTimingArtifact(string(BootPhaseComplete), dur),
+			readinessArtifact(identity.BootSequencerUID, "boot_complete", true, mergeMetadata(status.Context, map[string]any{
+				"phase_count": len(phases),
+				"phases":      bootPhaseHealthMetadata(phases),
+			})),
+		},
 	}
 }
 
@@ -571,33 +835,35 @@ func phaseFailureTestamentSpec(phase BootOperationPhase, cause error, metadata m
 	}
 }
 
-func participantSuccessTestamentSpec(participant SystemParticipantActivation, bootSequencerUID string) bootTestamentSpec {
+func participantSuccessTestamentSpec(phase BootOperationPhase, participant SystemParticipantActivation, bootSequencerUID string) bootTestamentSpec {
+	actorID := participantActorID(participant)
 	return bootTestamentSpec{
-		key:         participantTestamentKey(participant.ParticipantID, "complete"),
-		agentID:     ActivationControllerAgentID,
+		key:         participantTestamentKey(phase, participant.ParticipantID, "complete"),
+		agentID:     actorID,
 		validatorID: bootSequencerUID,
 		summary:     "boot.participant_activated." + participant.ParticipantType,
 		artifacts: []*claims.Artifact{
-			readinessArtifact(ActivationControllerAgentID, participant.ParticipantID, true, participantMetadata(participant)),
+			readinessArtifact(actorID, participant.ParticipantID, true, participantMetadata(participant)),
 		},
 	}
 }
 
-func participantFailureTestamentSpec(participant SystemParticipantActivation, cause error, bootSequencerUID string) bootTestamentSpec {
+func participantFailureTestamentSpec(phase BootOperationPhase, participant SystemParticipantActivation, cause error, bootSequencerUID string) bootTestamentSpec {
+	actorID := participantActorID(participant)
 	return bootTestamentSpec{
-		key:         participantTestamentKey(participant.ParticipantID, "failed"),
-		agentID:     ActivationControllerAgentID,
+		key:         participantTestamentKey(phase, participant.ParticipantID, "failed"),
+		agentID:     actorID,
 		validatorID: bootSequencerUID,
 		summary:     "boot.participant_failed." + participant.ParticipantType,
 		artifacts: []*claims.Artifact{
-			failureArtifact(ActivationControllerAgentID, cause, participantMetadata(participant)),
+			failureArtifact(actorID, cause, participantMetadata(participant)),
 		},
 	}
 }
 
-func phase2Artifacts(status Phase2Status, dur time.Duration, identity ProcessIdentity) []*claims.Artifact {
-	artifacts := []*claims.Artifact{phaseTimingArtifact(string(BootPhaseSystemParticipants), dur)}
-	for _, participant := range status.Participants {
+func phaseReadinessArtifacts(phase BootOperationPhase, participants []SystemParticipantActivation, dur time.Duration, identity ProcessIdentity) []*claims.Artifact {
+	artifacts := []*claims.Artifact{phaseTimingArtifact(string(phase), dur)}
+	for _, participant := range participants {
 		artifacts = append(artifacts, readinessArtifact(identity.BootSequencerUID, participant.ParticipantID, participant.Ready, mergeMetadata(participantMetadata(participant), processMetadata(identity))))
 	}
 	return artifacts
@@ -638,15 +904,19 @@ func validatePhase1Status(status Phase1Status) error {
 }
 
 func validatePhase2Participants(participants []SystemParticipantActivation) ([]SystemParticipantActivation, error) {
-	normalized := normalizeParticipants(participants)
+	return validatePhaseParticipants(BootPhaseSystemParticipants, participants, requiredParticipantIDs(BootPhaseSystemParticipants))
+}
+
+func validatePhaseParticipants(phase BootOperationPhase, participants []SystemParticipantActivation, requiredIDs []string) ([]SystemParticipantActivation, error) {
+	normalized := normalizeParticipants(participants, requiredIDs)
 	missing := missingParticipantDefinitions(normalized)
 	if len(missing) != 0 {
 		return nil, fmt.Errorf("%w: %s", ErrBootReadinessIncomplete, strings.Join(missing, ", "))
 	}
-	return normalized, nil
+	return normalizeParticipantSubjects(phase, normalized), nil
 }
 
-func normalizeParticipants(participants []SystemParticipantActivation) []SystemParticipantActivation {
+func normalizeParticipants(participants []SystemParticipantActivation, requiredIDs []string) []SystemParticipantActivation {
 	byID := make(map[string]SystemParticipantActivation, len(participants))
 	for _, participant := range participants {
 		id := strings.TrimSpace(participant.ParticipantID)
@@ -656,12 +926,17 @@ func normalizeParticipants(participants []SystemParticipantActivation) []SystemP
 		participant.ParticipantID = id
 		participant.ParticipantType = firstNonEmptyString(participant.ParticipantType, id)
 		participant.Context = cloneMetadata(participant.Context)
-		byID[id] = participant
+		byID[id] = mergeParticipant(byID[id], participant)
 	}
-	out := make([]SystemParticipantActivation, 0, len(requiredParticipantIDs()))
-	for _, id := range requiredParticipantIDs() {
+	if len(requiredIDs) == 0 {
+		return sortedParticipants(byID)
+	}
+	out := make([]SystemParticipantActivation, 0, len(requiredIDs)+len(byID))
+	for _, id := range requiredIDs {
 		out = append(out, byID[id])
+		delete(byID, id)
 	}
+	out = append(out, sortedParticipants(byID)...)
 	return out
 }
 
@@ -673,6 +948,39 @@ func missingParticipantDefinitions(participants []SystemParticipantActivation) [
 		}
 	}
 	return missing
+}
+
+func normalizeParticipantSubjects(_ BootOperationPhase, participants []SystemParticipantActivation) []SystemParticipantActivation {
+	out := make([]SystemParticipantActivation, 0, len(participants))
+	for _, participant := range participants {
+		participant.SubjectID = firstNonEmptyString(participant.SubjectID, participant.ParticipantID)
+		out = append(out, participant)
+	}
+	return out
+}
+
+func mergeParticipant(existing, candidate SystemParticipantActivation) SystemParticipantActivation {
+	if strings.TrimSpace(existing.ParticipantID) == "" {
+		return candidate
+	}
+	existing.ParticipantType = firstNonEmptyString(existing.ParticipantType, candidate.ParticipantType)
+	existing.SubjectID = firstNonEmptyString(existing.SubjectID, candidate.SubjectID)
+	existing.Ready = existing.Ready && candidate.Ready
+	existing.Context = mergeMetadata(existing.Context, candidate.Context)
+	return existing
+}
+
+func sortedParticipants(byID map[string]SystemParticipantActivation) []SystemParticipantActivation {
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]SystemParticipantActivation, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out
 }
 
 func missingReadiness(readiness map[string]bool) []string {
@@ -716,6 +1024,7 @@ func participantMetadata(participant SystemParticipantActivation) map[string]any
 	return mergeMetadata(participant.Context, map[string]any{
 		"participant_id":   participant.ParticipantID,
 		"participant_type": participant.ParticipantType,
+		"subject_id":       participant.SubjectID,
 		"ready":            participant.Ready,
 	})
 }
@@ -766,12 +1075,16 @@ func phaseTestamentKey(phase BootOperationPhase, outcome string) string {
 	return strings.Join([]string{bootOperationKeyPrefix, string(phase), strings.TrimSpace(outcome), "testament"}, ":")
 }
 
-func participantClaimKey(participantID string) string {
-	return strings.Join([]string{bootOperationKeyPrefix, string(BootPhaseSystemParticipants), sanitizeKeyPart(participantID), "claim"}, ":")
+func participantActorID(participant SystemParticipantActivation) string {
+	return firstNonEmptyString(participant.SubjectID, ActivationControllerAgentID)
 }
 
-func participantTestamentKey(participantID, outcome string) string {
-	return strings.Join([]string{bootOperationKeyPrefix, string(BootPhaseSystemParticipants), sanitizeKeyPart(participantID), strings.TrimSpace(outcome), "testament"}, ":")
+func participantClaimKey(phase BootOperationPhase, participantID string) string {
+	return strings.Join([]string{bootOperationKeyPrefix, string(phase), sanitizeKeyPart(participantID), "claim"}, ":")
+}
+
+func participantTestamentKey(phase BootOperationPhase, participantID, outcome string) string {
+	return strings.Join([]string{bootOperationKeyPrefix, string(phase), sanitizeKeyPart(participantID), strings.TrimSpace(outcome), "testament"}, ":")
 }
 
 func validationIDForKey(key string) string {
@@ -782,8 +1095,29 @@ func sanitizeKeyPart(value string) string {
 	return strings.NewReplacer(":", "_", "/", "_", " ", "_").Replace(strings.TrimSpace(value))
 }
 
-func requiredParticipantIDs() []string {
-	return []string{SystemBusAdministratorAgentID, SystemSessionManagerAgentID, SystemFabricSubscriberAgentID}
+func requiredParticipantIDs(phase BootOperationPhase) []string {
+	switch phase {
+	case BootPhaseSystemParticipants:
+		return participantIDs(RequiredSystemParticipants())
+	case BootPhaseKnowledgeBackends:
+		return participantIDs(RequiredKnowledgeBackends())
+	case BootPhaseInfrastructure:
+		return participantIDs(RequiredInfrastructureServices())
+	case BootPhaseAgentActivation:
+		return participantIDs(RequiredAlwaysHotAgents())
+	case BootPhaseUserSurfaces:
+		return participantIDs(RequiredUserFacingSurfaces())
+	default:
+		return nil
+	}
+}
+
+func participantIDs(participants []SystemParticipantActivation) []string {
+	ids := make([]string, 0, len(participants))
+	for _, participant := range participants {
+		ids = append(ids, participant.ParticipantID)
+	}
+	return ids
 }
 
 func phaseOrder(phase BootOperationPhase) int {
@@ -792,9 +1126,129 @@ func phaseOrder(phase BootOperationPhase) int {
 		return bootPhase1Order
 	case BootPhaseSystemParticipants:
 		return bootPhase2Order
+	case BootPhaseKnowledgeBackends:
+		return bootPhase3Order
+	case BootPhaseInfrastructure:
+		return bootPhase4Order
+	case BootPhaseAgentActivation:
+		return bootPhase5Order
+	case BootPhaseUserSurfaces:
+		return bootPhase6Order
+	case BootPhaseComplete:
+		return bootPhase7Order
 	default:
 		return 0
 	}
+}
+
+func (s *OperationsSequencer) bootPhaseSummary() []BootPhaseHealth {
+	if s == nil || s.board == nil {
+		return nil
+	}
+	return bootPhaseHealthFromProjection(s.board.Projection())
+}
+
+func bootPhaseHealthFromProjection(proj *claims.ClaimsBoardProjection) []BootPhaseHealth {
+	if proj == nil {
+		return nil
+	}
+	byClaim := testamentsByClaimID(proj)
+	out := make([]BootPhaseHealth, 0, len(allBootPhases()))
+	for _, phase := range allBootPhases() {
+		claim := claimForPhase(proj, phase)
+		out = append(out, bootPhaseHealthForClaim(phase, claim, byClaim[claimID(claim)]))
+	}
+	return out
+}
+
+func bootPhaseHealthForClaim(phase BootOperationPhase, claim *claims.Claim, testament *claims.Testament) BootPhaseHealth {
+	health := BootPhaseHealth{Phase: phase, Outcome: "pending"}
+	if claim == nil {
+		health.Outcome = "missing"
+		return health
+	}
+	health.ClaimID = claim.ID
+	health.Outcome = string(claim.LifecycleStatus)
+	if testament == nil {
+		return health
+	}
+	health.TestamentID = testament.ID
+	health.Duration = testament.Duration
+	health.ReadinessCount, health.FailureCount = countBootArtifacts(testament.Artifacts)
+	return health
+}
+
+func countBootArtifacts(artifacts []*claims.Artifact) (int, int) {
+	readiness := 0
+	failures := 0
+	for _, artifact := range artifacts {
+		if artifact == nil {
+			continue
+		}
+		readiness += boolToInt(artifact.Kind == artifactKindBootReadiness || artifact.Kind == claims.ArtifactKindReadiness)
+		failures += boolToInt(artifact.Kind == artifactKindBootFailure || artifact.Kind == claims.ArtifactKindErrorDiagnostic || artifact.Kind == claims.ArtifactKindError)
+	}
+	return readiness, failures
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func claimForPhase(proj *claims.ClaimsBoardProjection, phase BootOperationPhase) *claims.Claim {
+	key := phaseClaimKey(phase)
+	for i := range proj.Claims {
+		if proj.Claims[i].IdempotencyKey == key {
+			return &proj.Claims[i]
+		}
+	}
+	return nil
+}
+
+func testamentsByClaimID(proj *claims.ClaimsBoardProjection) map[string]*claims.Testament {
+	out := make(map[string]*claims.Testament, len(proj.Testaments))
+	for i := range proj.Testaments {
+		testament := &proj.Testaments[i]
+		out[claims.ClaimIDFromRelations(testament.Relations)] = testament
+	}
+	return out
+}
+
+func claimID(claim *claims.Claim) string {
+	if claim == nil {
+		return ""
+	}
+	return claim.ID
+}
+
+func allBootPhases() []BootOperationPhase {
+	return []BootOperationPhase{
+		BootPhaseDurableSubstrate,
+		BootPhaseSystemParticipants,
+		BootPhaseKnowledgeBackends,
+		BootPhaseInfrastructure,
+		BootPhaseAgentActivation,
+		BootPhaseUserSurfaces,
+		BootPhaseComplete,
+	}
+}
+
+func bootPhaseHealthMetadata(phases []BootPhaseHealth) []map[string]any {
+	out := make([]map[string]any, 0, len(phases))
+	for _, phase := range phases {
+		out = append(out, map[string]any{
+			"phase":           string(phase.Phase),
+			"outcome":         phase.Outcome,
+			"claim_id":        phase.ClaimID,
+			"testament_id":    phase.TestamentID,
+			"readiness_count": phase.ReadinessCount,
+			"failure_count":   phase.FailureCount,
+		})
+	}
+	return out
 }
 
 func defaultBootProcessUID(board *claims.ClaimsBoard) string {

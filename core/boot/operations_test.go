@@ -139,6 +139,112 @@ func TestOperationsPhase2ParticipantFailureFailsPhase(t *testing.T) {
 	assertProjectionCounts(t, db.Board(), 5, 5)
 }
 
+func TestOperationsPhases3Through7CommitFullBootLifecycle(t *testing.T) {
+	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
+	t.Cleanup(func() { _ = db.Close() })
+	commitPhase1And2(t, db.Board(), seq)
+
+	phase3, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()})
+	if err != nil {
+		t.Fatalf("CommitPhase3: %v", err)
+	}
+	phase4, err := seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()})
+	if err != nil {
+		t.Fatalf("CommitPhase4: %v", err)
+	}
+	phase5, err := seq.CommitPhase5(context.Background(), Phase5Status{Agents: RequiredAlwaysHotAgents()})
+	if err != nil {
+		t.Fatalf("CommitPhase5: %v", err)
+	}
+	phase6, err := seq.CommitPhase6(context.Background(), Phase6Status{Surfaces: RequiredUserFacingSurfaces()})
+	if err != nil {
+		t.Fatalf("CommitPhase6: %v", err)
+	}
+	phase7, err := seq.CommitPhase7(context.Background(), Phase7Status{})
+	if err != nil {
+		t.Fatalf("CommitPhase7: %v", err)
+	}
+
+	for _, result := range []PhaseCommitResult{phase3, phase4, phase5, phase6, phase7} {
+		assertClaimSatisfied(t, db.Board(), result.ClaimID)
+		assertTestamentLifecycle(t, db.Board(), result.TestamentID, claims.TestamentLifecycleValidated, expectedBootSummary(result.Phase))
+	}
+	health := seq.BootHealth()
+	if got, want := len(health.Phases), len(allBootPhases()); got != want {
+		t.Fatalf("boot health phases = %d, want %d", got, want)
+	}
+	for _, phase := range health.Phases {
+		if phase.Outcome == "missing" {
+			t.Fatalf("phase %s missing from health", phase.Phase)
+		}
+	}
+}
+
+func TestOperationsPhase3RequiresPhase2Satisfied(t *testing.T) {
+	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := seq.CommitPhase1(context.Background(), readyPhase1Status(db.Board())); err != nil {
+		t.Fatalf("CommitPhase1: %v", err)
+	}
+	_, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()})
+	if !errors.Is(err, ErrBootPhaseNotSatisfied) {
+		t.Fatalf("CommitPhase3 error = %v, want ErrBootPhaseNotSatisfied", err)
+	}
+}
+
+func TestOperationsPhase3MissingBackendFailsAndBlocksPhase4(t *testing.T) {
+	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
+	t.Cleanup(func() { _ = db.Close() })
+	commitPhase1And2(t, db.Board(), seq)
+
+	backends := RequiredKnowledgeBackends()
+	result, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: backends[:len(backends)-1]})
+	if !errors.Is(err, ErrBootReadinessIncomplete) {
+		t.Fatalf("CommitPhase3 error = %v, want ErrBootReadinessIncomplete", err)
+	}
+	assertClaimLifecycle(t, db.Board(), result.ClaimID, claims.ClaimLifecycleValidationFailed)
+	_, err = seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()})
+	if !errors.Is(err, ErrBootPhaseNotSatisfied) {
+		t.Fatalf("CommitPhase4 error = %v, want ErrBootPhaseNotSatisfied", err)
+	}
+}
+
+func TestOperationsPhase3ConcurrentRetriesRemainIdempotent(t *testing.T) {
+	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
+	t.Cleanup(func() { _ = db.Close() })
+	commitPhase1And2(t, db.Board(), seq)
+	attempts := RequiredKnowledgeBackends()
+	errs := make(chan error, len(attempts))
+	ids := make(chan string, len(attempts))
+	var wg sync.WaitGroup
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()})
+			errs <- err
+			ids <- result.ClaimID
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	close(ids)
+	first := ""
+	for id := range ids {
+		if first == "" {
+			first = id
+		}
+		if id != first {
+			t.Fatalf("concurrent CommitPhase3 claim id = %s, want %s", id, first)
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("CommitPhase3 concurrent error: %v", err)
+		}
+	}
+}
+
 func TestOperationsPhase1ConcurrentCallsRemainIdempotent(t *testing.T) {
 	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
 	t.Cleanup(func() { _ = db.Close() })
@@ -161,6 +267,33 @@ func TestOperationsPhase1ConcurrentCallsRemainIdempotent(t *testing.T) {
 		}
 	}
 	assertProjectionCounts(t, db.Board(), 1, 1)
+}
+
+func commitPhase1And2(t *testing.T, board *claims.ClaimsBoard, seq *OperationsSequencer) {
+	t.Helper()
+	if _, err := seq.CommitPhase1(context.Background(), readyPhase1Status(board)); err != nil {
+		t.Fatalf("CommitPhase1: %v", err)
+	}
+	if _, err := seq.CommitPhase2(context.Background(), Phase2Status{Participants: RequiredSystemParticipants()}); err != nil {
+		t.Fatalf("CommitPhase2: %v", err)
+	}
+}
+
+func expectedBootSummary(phase BootOperationPhase) string {
+	switch phase {
+	case BootPhaseKnowledgeBackends:
+		return "boot.phase_3_complete"
+	case BootPhaseInfrastructure:
+		return "boot.phase_4_complete"
+	case BootPhaseAgentActivation:
+		return "boot.phase_5_complete"
+	case BootPhaseUserSurfaces:
+		return "boot.phase_6_complete"
+	case BootPhaseComplete:
+		return "boot.satisfied"
+	default:
+		return ""
+	}
 }
 
 func operationsDurableConfig(t *testing.T) claims.ClaimsBoardConfig {

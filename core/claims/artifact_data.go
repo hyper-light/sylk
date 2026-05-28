@@ -90,14 +90,6 @@ func ArtifactDataWithRegistry[T any](registry *TypeRegistry, artifact *Artifact)
 	return zero, nil
 }
 
-func MustArtifactData[T any](artifact *Artifact) T {
-	value, err := ArtifactData[T](artifact)
-	if err != nil {
-		panic(err)
-	}
-	return value
-}
-
 func ArtifactContentHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
@@ -136,6 +128,13 @@ func ApplyBuiltinArtifactDataBridge(artifact *Artifact) error {
 			Reason:       artifact.Reference,
 			Required:     metadataBool(artifact.Metadata, ExpectedToolMetadataRequired),
 			ValidationID: metadataString(artifact.Metadata, ExpectedToolMetadataValidationID),
+		})
+	case ArtifactKindReadiness:
+		return SetArtifactData(artifact, KnowledgeReadinessArtifactData{
+			Component:  metadataString(artifact.Metadata, "component"),
+			QualityBar: metadataString(artifact.Metadata, "quality_bar"),
+			Reference:  artifact.Reference,
+			Metadata:   cloneAnyMap(artifact.Metadata),
 		})
 	default:
 		return nil

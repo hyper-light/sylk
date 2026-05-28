@@ -519,7 +519,8 @@ projections:
 **Testament lifecycle actions** (7, per LIFECYCLE §7):
 `testament.generated`, `testament.posted`, `testament.received`,
 `testament.validating`, `testament.validation_incomplete`,
-`testament.validation_failed`, `testament.validated`.
+`testament.validation_failed`, `testament.validation_errored`,
+`testament.validated`.
 
 **Artifact lifecycle actions** (8, per ARTIFACTS_AND_VALIDATIONS §12.1):
 `artifact.generated`, `artifact.generation_failed`,

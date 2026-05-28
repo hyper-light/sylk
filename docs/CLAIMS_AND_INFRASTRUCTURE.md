@@ -3417,7 +3417,2225 @@ truth. A direct call still produces a testament; that testament is the
 same canonical record the service handler would produce for the same
 inputs.
 
-## 19. Final Architecture Statement
+## 19. Detailed Phased Implementation Plan
+
+The roadmap in §17 is intentionally broad. This section is the execution
+checklist: each phase has concrete items, source references, current API
+integration points, acceptance criteria, and required test coverage.
+
+Plan-wide implementation rules:
+
+1. Integration and e2e mocks are generated with `github.com/vektra/mockery`
+   via `.mockery.yaml` or local `//go:generate mockery` directives. Hand
+   fakes are allowed only for same-package unit tests that do not cross a
+   package boundary.
+2. Infrastructure truth must land as claims, testaments, artifacts,
+   validations, and canonical deltas. A Go error may control local flow,
+   but it is not the workflow record.
+3. Every goroutine is launched through `core/concurrency.GoroutineScope.Go`
+   or a narrow interface with the same contract, such as
+   `core/claims.ScopeProvider`.
+4. Every queue, timeout, concurrency budget, replay batch, and retention
+   limit is derived from registration metadata or normalized runtime
+   configuration.
+5. SQLite remains relational storage only. Search stays on Bleve or the
+   custom vector store described by the search architecture.
+
+### 19.1 Phase 0 - Contract Inventory and Mock Boundaries
+
+Goal: turn the participant model into a source-backed contract before
+additional infrastructure migrations land.
+
+#### 19.1.1 Maintain the operations inventory as the canonical gap map
+
+Description: Keep `core/claims/operations_inventory.go` as the
+machine-checkable map from this document's infrastructure requirements
+to current package boundaries. The inventory must distinguish complete
+surfaces from partial and planned surfaces, especially where the prose
+is ahead of implementation. It must include participant registration,
+service dispatch, programmatic validation, boot phases, UI observer
+intake, recovery audits, shutdown, and telemetry.
+
+File references:
+
+- `core/claims/operations_inventory.go`
+- `core/claims/operations_inventory_test.go`
+- `docs/CLAIMS_AND_INFRASTRUCTURE.md`
+- `docs/CLAIMS_OPERATIONS.md`
+- `docs/CLAIMS_AND_DELTAS.md`
+- `docs/ARTIFACTS_AND_VALIDATIONS.md`
+
+Existing APIs and integration points:
+
+- `claims.OperationsInventory`
+- `claims.OperationsInventoryEntry`
+- `claims.OperationsSurfaceImplemented`
+- `claims.OperationsSurfacePartial`
+- `claims.OperationsSurfacePlanned`
+- `claims.KnownDeltaActions`
+- `claims.KnownValidationTypes`
+
+Acceptance criteria:
+
+- Every non-negotiable semantic in §2 has an inventory row.
+- Every service category in §14 has an inventory row.
+- Every canonical delta action and validation type is generated into
+  inventory rather than hand-maintained.
+- The inventory explicitly marks cancellation graph traversal, recovery
+  orphan audits, shutdown drain, and telemetry exporters as planned
+  until those surfaces are implemented.
+- Documentation tests fail when a new delta action, validation type, or
+  participant category lacks an inventory mapping.
+
+Test cases:
+
+- Unit happy path: `OperationsInventory` returns sorted, deterministic
+  entries and includes all known delta actions and validation types.
+- Unit negative path: a fixture that omits one known delta action fails
+  the inventory coverage test.
+- Unit edge case: duplicate inventory keys fail deterministically with
+  the duplicate key named in the assertion.
+- Unit race: call `OperationsInventory` concurrently under `go test
+  -race` and assert no map mutation races.
+- Unit deadlock: inventory construction must not call board mutation,
+  bus subscription, or registry locks.
+- Integration with mockery: generated mocks for `DeltaPublisher`,
+  `DeltaSubscriber`, `ScopeProvider`, `ClaimsProjector`,
+  `AgentRefResolver`, `ClaimPostPolicy`, `ServiceHandler`, and
+  `ValidatorHandler` compile against every inventory boundary that
+  names them.
+- E2E with mockery: wire a mocked delta bus, projector, service
+  handler, and validator handler into a durable board scenario; assert
+  the inventory's "implemented" boundaries are actually reachable.
+- Simulated usage: a developer adds a new service participant type and
+  runs the inventory test; failure explains the missing package and
+  boundary row.
+
+#### 19.1.2 Keep mockery generation authoritative
+
+Description: `.mockery.yaml` must remain the single mock-generation
+source for cross-package claims infrastructure tests. Local
+`//go:generate mockery` directives are allowed as discoverability hints,
+but generated mock names and directories must match `.mockery.yaml`.
+
+File references:
+
+- `.mockery.yaml`
+- `core/claims/validator_interfaces.go`
+- `core/claims/service_dispatch.go`
+- `core/claims/mocks/*`
+- `ui/bridge/claims_interfaces.go`
+- `ui/bridge/mocks/*`
+
+Existing APIs and integration points:
+
+- `claims.ValidationDispatcher`
+- `claims.ValidatorHandler`
+- `claims.AgentTurnEvaluator`
+- `claims.ArtifactLifecycleBusSink`
+- `claims.ValidationLifecycleBusSink`
+- `claims.ClaimsClock`
+- `claims.TestamentGenerator`
+- `claims.ServiceHandler`
+- `claims.DeltaPublisher`
+- `claims.DeltaSubscriber`
+- `claims.DeltaSubscription`
+- `claims.DeltaBus`
+- `claims.ClaimsProjector`
+- `claims.ScopeProvider`
+- `bridge.ClaimPresentationSink`
+- `bridge.ClaimArtifactSink`
+
+Acceptance criteria:
+
+- Every interface used by integration/e2e tests has a `.mockery.yaml`
+  entry.
+- Generated mocks live under package-local `mocks` directories.
+- Generated mocks are not edited manually.
+- Mock drift is detectable by a CI command or test.
+- Integration/e2e tests do not define cross-package hand fakes for
+  interfaces covered by `.mockery.yaml`.
+
+Test cases:
+
+- Unit happy path: generated mocks satisfy their source interfaces via
+  compile-time assertions.
+- Unit negative path: a stale generated mock fixture fails the drift
+  check.
+- Unit edge case: nil-safe production implementations such as
+  `NoopDeltaBus` still work without mocks.
+- Unit race: mock expectations that are allowed to run concurrently use
+  ordering constraints only where the production contract requires
+  ordering.
+- Unit deadlock: mocked callbacks that block are released by context
+  cancellation in tests.
+- Integration with mockery: use generated bus, scope, service handler,
+  validator handler, and clock mocks in one package-spanning test.
+- E2E with mockery: run a complete claim-posted -> service handler ->
+  testament -> validation -> UI presentation path with only generated
+  mocks for external boundaries.
+- Simulated usage: regenerate mocks after adding a new interface and
+  assert the repository diff contains only generated mock updates and
+  intended test changes.
+
+#### 19.1.3 Add contract doc-lints for participant language
+
+Description: Ensure docs consistently describe participant-agnostic
+behavior while preserving agent-specific language only where the runtime
+is truly LLM-agent-specific. This prevents future docs from reintroducing
+the agent-only framing that this document removes.
+
+File references:
+
+- `docs/CLAIMS.md`
+- `docs/CLAIMS_AND_DELTAS.md`
+- `docs/CLAIMS_AND_TESTAMENTS_LIFECYCLE.md`
+- `docs/CLAIMS_VISIBILITY.md`
+- `docs/CLAIMS_AND_INFRASTRUCTURE.md`
+- planned checker under `scripts/ci/` or `core/claims/*_docs_test.go`
+
+Existing APIs and integration points:
+
+- `ParticipantRef` alias in `core/claims/types.go`
+- `AgentRef` compatibility helpers in `core/claims/canonical_delta.go`
+- `ParticipantCategory` in `core/claims/participants.go`
+
+Acceptance criteria:
+
+- Participant-agnostic sections use participant terminology.
+- Agent-specific sections explicitly name LLM tool-loop, accumulator,
+  conversation, or provider gateway behavior.
+- `AgentRef` is described as compatibility naming where code has not
+  completed the rename.
+- The doc-lint has allowlisted excerpts for historical migration notes.
+
+Test cases:
+
+- Unit happy path: allowed agent-specific sections pass.
+- Unit negative path: fixture docs using "agent" for a service/system
+  participant fail with section and line.
+- Unit edge case: code identifiers such as `AgentRef` and `AgentID`
+  are allowed inside backticks where compatibility is intentional.
+- Integration with mockery: not needed for pure doc-lint logic.
+- E2E with mockery: run the doc-lint as part of the full claims
+  infrastructure e2e CI profile after generated mocks are present.
+- Race/deadlock: checker uses read-only file scanning and spawns no
+  goroutines.
+- Simulated usage: reviewer adds a service participant section with
+  agent-only wording; CI fails before merge.
+
+### 19.2 Phase 1 - Participant Identity and Registration
+
+Goal: make participant identity deterministic, bounded, immutable where
+required, and usable by both agent and service dispatch.
+
+#### 19.2.1 Finalize participant registration semantics
+
+Description: Harden `ParticipantRegistration` so every participant
+declares category, route key, scope keys, queue capacity, concurrency
+budget, handler timeout, determinism, actions, generation, and canonical
+reference. This registration is the source of operational budgets and
+service identity.
+
+File references:
+
+- `core/claims/participants.go`
+- `core/claims/participants_test.go`
+- `core/claims/types.go`
+- `core/claims/canonical_delta.go`
+- `docs/CLAIMS_AND_INFRASTRUCTURE.md`
+
+Existing APIs and integration points:
+
+- `ParticipantRegistration`
+- `ParticipantRegistry`
+- `ParticipantRegistration.Validate`
+- `ParticipantRegistration.AgentRef`
+- `ParticipantRegistrationFromAgentRef`
+- `NewServiceParticipantRegistration`
+- `ParticipantCategoryAgent`
+- `ParticipantCategoryService`
+- `ParticipantCategorySystem`
+- `ParticipantCategoryExternal`
+- `HandlerDeterminismPure`
+- `HandlerDeterminismContent`
+- `HandlerDeterminismSideEffect`
+- `HandlerDeterminismNondeterministic`
+
+Acceptance criteria:
+
+- Registration rejects empty UID, route key, category, determinism, or
+  action set.
+- Registration rejects zero or negative queue and concurrency budgets.
+- Service/system/external participants require scope keys; agent
+  compatibility registrations may derive scope keys from labels.
+- Immutable fields cannot change for an existing UID.
+- Higher generation can replace lower generation only when immutable
+  metadata is identical.
+- `ParticipantRegistration.AgentRef()` always returns a normalized ref
+  with UID, type/name, category, and generation.
+
+Test cases:
+
+- Unit happy path: service registration validates and produces a
+  normalized reference.
+- Unit negative path: missing category, route key, scope keys, budget,
+  determinism, or actions returns `ErrParticipantRegistrationInvalid`.
+- Unit edge case: action lists with duplicates normalize to sorted
+  unique action types.
+- Unit race: concurrent `Register` calls for identical metadata return
+  one canonical record without data races.
+- Unit deadlock: registry lock is not held while any caller-provided
+  callback could run; registration is pure metadata mutation.
+- Integration with mockery: mocked `AgentRefResolver` resolves a
+  registered service UID and canonical delta routing uses the UID topic.
+- E2E with mockery: register agent, service, system, and external
+  participants, post claims to each through a mocked bus, and assert
+  route keys and categories are preserved.
+- Simulated usage: restart process with the same service scope keys and
+  assert registration UID remains stable while generation handling is
+  explicit.
+
+#### 19.2.2 Lock deterministic UID derivation
+
+Description: Treat `DeriveParticipantUID` as a compatibility boundary.
+The function must remain deterministic across process restarts and must
+normalize scope keys in a documented way. Any future UID material change
+must be introduced as an explicit new derivation version, not as a silent
+change.
+
+File references:
+
+- `core/claims/participants.go`
+- `core/claims/participants_test.go`
+- `core/boot/operations.go`
+- `core/container/identity_registry.go`
+
+Existing APIs and integration points:
+
+- `DeriveParticipantUID`
+- `participantIdentityMaterial`
+- `sanitizeParticipantSegment`
+- `InitialParticipantGeneration`
+- boot `ProcessIdentity`
+- boot process-scoped IDs from `core/boot/operations.go`
+
+Acceptance criteria:
+
+- Identical category, route key, and scope keys produce identical UIDs.
+- Scope key map ordering never changes the UID.
+- Different category, route key, or scope key values produce different
+  UIDs.
+- UID strings are safe for canonical topic segments.
+- Process-scoped boot identities remain intentionally separate from
+  deterministic service identities.
+
+Test cases:
+
+- Unit happy path: stable fixture inputs produce golden UID outputs.
+- Unit negative path: empty category or route key is rejected.
+- Unit edge case: whitespace, slash, colon, tab, and newline in route
+  key are sanitized consistently.
+- Unit race: concurrent UID derivation on shared input maps cannot
+  mutate caller maps.
+- Unit deadlock: UID derivation performs no I/O and acquires no global
+  locks.
+- Integration with mockery: mocked identity registry allocates service
+  IDs using `DeriveParticipantUID` and rejects mismatched supplied UIDs.
+- E2E with mockery: boot identity registry, activation controller, and
+  service dispatch with deterministic UIDs, then replay board state and
+  confirm topic routing remains valid.
+- Simulated usage: operator rotates process UID on restart; service UIDs
+  remain stable while process-scoped boot sequencer UID rotates.
+
+#### 19.2.3 Integrate participant refs into canonical deltas
+
+Description: Route participant deltas through canonical refs without
+forcing every call site to be renamed at once. `ParticipantRef` may
+remain a type alias during migration, but canonical delta validation and
+delivery must be category-aware.
+
+File references:
+
+- `core/claims/types.go`
+- `core/claims/canonical_delta.go`
+- `core/claims/topics.go`
+- `core/claims/canonical_delta_test.go`
+- `core/claims/topics_test.go`
+
+Existing APIs and integration points:
+
+- `type ParticipantRef = AgentRef`
+- `AgentRef`
+- `AgentRefResolver`
+- `AgentRefFromIdentity`
+- `DegradedAgentRef`
+- `CanonicalAgentRefTopic`
+- `CanonicalAgentTopic`
+- `CanonicalAgentTypeTopic`
+- `DeltaDelivery`
+- `ValidateCanonicalDeltaStrict`
+- `ValidateCanonicalDeltaTolerant`
+
+Acceptance criteria:
+
+- Canonical deltas include category when available.
+- UID-addressed delivery is preferred over degraded type delivery.
+- Degraded references include `Unresolved` and `ResolutionReason`.
+- Delivery validation rejects missing delivery for actions that require
+  it.
+- Existing agent-only code continues to compile during alias migration.
+
+Test cases:
+
+- Unit happy path: canonical delta with service ref validates strictly.
+- Unit negative path: `claim.posted` without delivery fails strict
+  validation.
+- Unit edge case: degraded ref routes through `agent_type` topic and
+  cannot spoof a UID route.
+- Unit race: concurrent topic construction has no shared mutable state.
+- Unit deadlock: delta validation does not call resolver or bus.
+- Integration with mockery: mocked `AgentRefResolver` resolves UID refs
+  for service and system participants; mocked bus receives expected
+  topics.
+- E2E with mockery: post a claim to a service participant, deliver it
+  through canonical UID topic, and assert the service dispatcher accepts
+  it.
+- Simulated usage: legacy relation has only a route key; canonical delta
+  records degraded delivery and later operator can see why.
+
+### 19.3 Phase 2 - Artifact Data and Typed Validation Contracts
+
+Goal: make infrastructure evidence machine-checkable through typed
+artifact payloads and validation target contracts.
+
+#### 19.3.1 Enforce artifact type registration
+
+Description: Use `TypeRegistry` as the authoritative mapping between
+stable artifact `DataType` strings and deterministic codecs. Service
+handlers and validators must use registered datatypes for typed evidence
+instead of ad hoc metadata inspection.
+
+File references:
+
+- `core/claims/type_registry.go`
+- `core/claims/type_registry_test.go`
+- `core/claims/artifact_data.go`
+- `core/claims/artifact_data_test.go`
+- `core/claims/artifact_docs_test.go`
+- `docs/ARTIFACTS_AND_VALIDATIONS.md`
+
+Existing APIs and integration points:
+
+- `TypeRegistry`
+- `RegisteredArtifactType`
+- `ArtifactDataCodec`
+- `JSONArtifactCodec`
+- `RegisterBuiltinArtifactDataTypes`
+- `DefaultTypeRegistry`
+- `DefaultTypeRegistryError`
+- built-in datatypes such as `ArtifactDataTypePlanMarkdown`,
+  `ArtifactDataTypeExpectedToolOutput`,
+  `ArtifactDataTypePresentationEvidence`, and
+  `ArtifactDataTypeKnowledgeReadiness`
+
+Acceptance criteria:
+
+- Every typed artifact payload used by service handlers has a registered
+  datatype.
+- Duplicate datatype registration fails with `ErrArtifactTypeDuplicate`.
+- Duplicate Go type registration under another datatype fails.
+- Codec nil, empty datatype, nil sample, nil payload, and empty payload
+  are rejected.
+- Built-in datatype list in docs is checked against the registry.
+
+Test cases:
+
+- Unit happy path: register a synthetic datatype, list it, and look it
+  up by datatype and Go type.
+- Unit negative path: duplicate datatype, duplicate Go type, nil codec,
+  empty datatype, and nil sample fail.
+- Unit edge case: pointer and value samples normalize to the same Go
+  type.
+- Unit race: concurrent registry lookups and listing are race-free.
+- Unit deadlock: codec registration does not call codec methods while
+  holding locks.
+- Integration with mockery: mocked `ValidatorHandler` receives typed
+  artifact data produced by `SetArtifactDataWithRegistry`.
+- E2E with mockery: service handler emits typed readiness evidence;
+  programmatic validator checks `DataType` and validates the payload.
+- Simulated usage: adding a new service artifact type requires a new
+  registry entry and doc entry before tests pass.
+
+#### 19.3.2 Require content hashes for typed artifact payloads
+
+Description: Typed artifacts must carry deterministic bytes, content
+hash, and size so replay and validators can prove payload integrity.
+`SetArtifactData` and `ArtifactData` are the canonical helpers.
+
+File references:
+
+- `core/claims/artifact_data.go`
+- `core/claims/artifact_data_test.go`
+- `core/claims/types.go`
+- `core/claims/board.go`
+
+Existing APIs and integration points:
+
+- `SetArtifactData`
+- `SetArtifactDataWithRegistry`
+- `ArtifactData`
+- `ArtifactDataWithRegistry`
+- `ArtifactContentHash`
+- `Artifact.DataType`
+- `Artifact.Data`
+- `Artifact.ContentHash`
+- `Artifact.Size`
+
+Acceptance criteria:
+
+- Setting typed data writes datatype, bytes, hash, and size.
+- Reading typed data verifies datatype and content hash.
+- Hash mismatch fails with `ErrArtifactDataHashMismatch`.
+- Empty typed data fails with `ErrArtifactDataEmpty`.
+- Codec panic is recovered as `ErrArtifactCodecPanic`.
+
+Test cases:
+
+- Unit happy path: set and retrieve each built-in payload type.
+- Unit negative path: mismatched datatype, unknown datatype, empty data,
+  corrupt data, hash mismatch, and codec panic fail with wrapped errors.
+- Unit edge case: empty but valid JSON object is accepted when bytes are
+  non-empty.
+- Unit race: concurrent reads of immutable artifact data are race-free.
+- Unit deadlock: codecs are invoked outside registry locks.
+- Integration with mockery: mocked validator handler receives an
+  artifact with a valid content hash and returns a result artifact.
+- E2E with mockery: durable board replay preserves typed artifact bytes,
+  hash, and size for a service-produced testament.
+- Simulated usage: operator inspects a validation failure and can see
+  whether failure was content mismatch, datatype mismatch, or validator
+  logic.
+
+#### 19.3.3 Enforce typed validation declarations
+
+Description: Typed validations must name target artifact, validator,
+artifact datatype, and optional result datatype. This lets programmatic
+validators know exactly which artifact they are authorized to inspect.
+
+File references:
+
+- `core/claims/types.go`
+- `core/claims/artifact_validation_lifecycle.go`
+- `core/claims/artifact_validation_lifecycle_test.go`
+- `core/claims/validator_registry.go`
+- `docs/ARTIFACTS_AND_VALIDATIONS.md`
+
+Existing APIs and integration points:
+
+- `Validation.TargetArtifactName`
+- `Validation.ValidatorID`
+- `Validation.ArtifactDataType`
+- `Validation.ResultDataType`
+- `Validation.EvaluatorRef`
+- `Validation.EvaluatedAt`
+- `ValidateTypedValidationDeclaration`
+- `ValidatorRegistration.TargetArtifactName`
+- `ValidatorRegistration.ArtifactDataType`
+- `ValidatorRegistration.ResultDataType`
+
+Acceptance criteria:
+
+- A validation that declares any typed handler field must include
+  `TargetArtifactName`, `ValidatorID`, and `ArtifactDataType`.
+- Validator dispatch rejects artifact-name or datatype mismatches.
+- Optional validations produce optional failure statuses when they fail.
+- Result artifacts use registered result datatypes when declared.
+- Legacy validations without typed fields remain accepted as agentic
+  compatibility records.
+
+Test cases:
+
+- Unit happy path: a fully declared typed validation passes
+  declaration validation.
+- Unit negative path: missing target artifact name, validator ID, or
+  artifact datatype fails with a precise error.
+- Unit edge case: legacy validation with none of the typed fields still
+  passes declaration validation.
+- Unit race: validation declaration checks run concurrently with board
+  reads without mutating validation state.
+- Unit deadlock: declaration validation does not read the board or call
+  the validator registry.
+- Integration with mockery: mocked `ValidatorHandler` is not invoked
+  when artifact target contract fails.
+- E2E with mockery: service handler emits two artifacts; validator only
+  evaluates the named target artifact.
+- Simulated usage: engineer adds a new typed validation without
+  `ArtifactDataType`; unit tests fail before integration tests run.
+
+### 19.4 Phase 3 - Service Dispatch Runtime
+
+Goal: make deterministic services consume `claim.posted` deltas and
+produce ordinary testaments without agent-specific tool loops.
+
+#### 19.4.1 Harden `ServiceDispatcher` lifecycle
+
+Description: `ServiceDispatcher` must subscribe to narrow participant
+topics, deduplicate canonical deltas, enforce concurrency budgets,
+launch handlers under scope, and close subscriptions idempotently.
+
+File references:
+
+- `core/claims/service_dispatch.go`
+- `core/claims/service_dispatch_test.go`
+- `core/claims/bus_publisher.go`
+- `core/claims/topics.go`
+- `core/claims/participants.go`
+
+Existing APIs and integration points:
+
+- `ServiceDispatcher`
+- `ServiceDispatcherConfig`
+- `NewServiceDispatcher`
+- `ServiceDispatcher.Start`
+- `ServiceDispatcher.Close`
+- `ServiceDispatcher.DispatchDelta`
+- `ServiceHandler`
+- `ServiceClaimRequest`
+- `ServiceClaimResult`
+- `DeltaSubscriber`
+- `DeltaSubscription`
+- `ScopeProvider`
+
+Acceptance criteria:
+
+- Constructor rejects nil board, nil scope, nil handler, or invalid
+  participant registration.
+- Subscription topics are derived from participant refs and session ID.
+- Duplicate `DeltaKey` values are ignored.
+- In-flight handler count cannot exceed `ConcurrencyBudget`.
+- Dedup memory is bounded by `QueueCapacity`.
+- `Close` unsubscribes every subscription and returns joined errors.
+
+Test cases:
+
+- Unit happy path: valid dispatcher starts, subscribes, dispatches one
+  canonical claim, and closes.
+- Unit negative path: nil board/scope/handler or invalid participant
+  fails constructor.
+- Unit edge case: duplicate delta delivery triggers one handler
+  invocation.
+- Unit race: concurrent `DispatchDelta` calls respect concurrency and
+  dedup without map races.
+- Unit deadlock: handler execution occurs outside dispatcher mutex.
+- Integration with mockery: generated `DeltaSubscriber`,
+  `DeltaSubscription`, `ScopeProvider`, and `ServiceHandler` mocks
+  assert subscription, scope launch, handler call, and close behavior.
+- E2E with mockery: mocked bus delivers claim-posted canonical delta to
+  service dispatcher; handler returns artifacts; board receives posted
+  testament.
+- Simulated usage: service participant receives a burst of claims equal
+  to and greater than its budget; accepted claims run, overflow is
+  recorded.
+
+#### 19.4.2 Convert service outcomes into durable testaments
+
+Description: Handler results must become generated and posted
+testaments with normalized artifacts. Failure, panic, overflow, and
+missing claim paths must produce claim lifecycle failure evidence rather
+than only returning errors.
+
+File references:
+
+- `core/claims/service_dispatch.go`
+- `core/claims/board_lifecycle.go`
+- `core/claims/types.go`
+- `core/claims/deltas.go`
+- `core/claims/lifecycle_test.go`
+
+Existing APIs and integration points:
+
+- `ClaimsBoard.CloneClaim`
+- `AcknowledgeClaimReceipt`
+- `UpdateClaimProgress`
+- `GenerateTestamentAction`
+- `PostGeneratedTestament`
+- `RecordClaimValidationError`
+- `LifecycleFailureOptions`
+- `ArtifactKindErrorDiagnostic`
+- `ArtifactKindReadiness`
+- `ValidationErrorCategoryHandler`
+- `ValidationErrorCategoryDispatcher`
+- `ValidationErrorCategoryPanic`
+
+Acceptance criteria:
+
+- Success path acknowledges receipt, marks progress, posts testament,
+  and advances receipt-only validation when possible.
+- Empty handler artifacts are normalized to a deterministic readiness
+  artifact.
+- Handler Go error records validation error with category `handler`.
+- Panic is recovered and recorded with category `handler_panic` and
+  bounded stack evidence.
+- Overflow records category `dispatcher`.
+- Missing claim returns an error and does not panic.
+
+Test cases:
+
+- Unit happy path: handler returns summary and artifacts; testament is
+  posted with claim relation and deterministic confidence.
+- Unit negative path: handler returns error; claim records validation
+  error artifact.
+- Unit edge case: handler returns nil/empty artifacts; dispatcher emits
+  readiness artifact.
+- Unit race: handler returns success while context cancellation fires;
+  exactly one terminal durable outcome is visible.
+- Unit deadlock: failure recording does not call handler while holding
+  board locks.
+- Integration with mockery: mocked handler success, error, panic, and
+  blocking paths are exercised against a real board.
+- E2E with mockery: durable board, mocked bus, mocked scope, mocked
+  handler, and mocked UI bridge sinks observe service-produced
+  testament deltas.
+- Simulated usage: VFS provisioner-style handler emits capacity,
+  attachment, and state-hash artifacts; validators consume them.
+
+#### 19.4.3 Add service dispatch boot integration
+
+Description: Boot must register service dispatchers after identity and
+bus are available and before user-facing work can post claims to those
+services. Registration outcomes are activation claims and readiness
+testaments.
+
+File references:
+
+- `core/boot/operations.go`
+- `core/boot/operations_test.go`
+- `cmd/tui.go`
+- `core/claims/session_registry.go`
+- `core/claims/session_inbox_registry.go`
+- `core/claims/service_dispatch.go`
+
+Existing APIs and integration points:
+
+- `boot.InitializePhase0`
+- `boot.NewOperationsSequencer`
+- `CommitPhase1` through `CommitPhase7`
+- `RequiredSystemParticipants`
+- `RequiredKnowledgeBackends`
+- `RequiredInfrastructureServices`
+- `RequiredAlwaysHotAgents`
+- `RequiredUserSurfaces`
+- `claims.DefaultSessionBoardRegistry`
+- `claims.DefaultSessionInboxRegistry`
+
+Acceptance criteria:
+
+- Service dispatchers are created only after durable substrate and bus
+  readiness are satisfied.
+- Registration failure creates boot failure evidence and blocks later
+  phases.
+- Registered services appear in boot health and readiness artifacts.
+- Dispatchers close during shutdown and remove stale registry entries.
+
+Test cases:
+
+- Unit happy path: boot status with all required services ready commits
+  phase readiness testaments.
+- Unit negative path: one service dispatch registration fails; boot
+  records phase failure and does not claim boot complete.
+- Unit edge case: optional service omitted from config produces a
+  warning, required service omitted fails.
+- Unit race: boot retry and dispatcher close cannot double-register or
+  double-unsubscribe.
+- Unit deadlock: boot phase commit does not wait on handler execution.
+- Integration with mockery: mock service handler, bus, scope, and
+  claim post policy; assert registration and readiness claims.
+- E2E with mockery: headless boot wires identity registry, DAG
+  processor, VFS provisioner, provider gateway, guardian, and UI bridge
+  dispatchers using generated mocks.
+- Simulated usage: restart after phase 4 completes; boot replay returns
+  existing service readiness claims and does not duplicate dispatchers.
+
+### 19.5 Phase 4 - Programmatic Validation Runtime
+
+Goal: make deterministic validation the first-class path for mechanical
+quality bars while preserving agentic fallback where judgment is needed.
+
+#### 19.5.1 Finalize validator registration and lookup
+
+Description: `ValidatorRegistry` must hold immutable validator
+registrations keyed by validator ID, validation type, and action type,
+with wildcard lookup for generic validators.
+
+File references:
+
+- `core/claims/validator_registry.go`
+- `core/claims/validator_registry_test.go`
+- `core/claims/validator_interfaces.go`
+- `core/claims/types.go`
+
+Existing APIs and integration points:
+
+- `ValidatorRegistration`
+- `ValidatorRegistry`
+- `ValidatorRegistry.Register`
+- `ValidatorRegistry.Lookup`
+- `ValidatorHandler`
+- `ValidationType`
+- `ActionType`
+- `HandlerDeterminism`
+
+Acceptance criteria:
+
+- Registration requires validation type, determinism, timeout,
+  concurrency budget, artifact target contract, and handler.
+- Duplicate immutable registrations are idempotent.
+- Conflicting registrations return `ErrValidatorRegistrationConflict`.
+- Lookup tries exact validator/action, exact validator/wildcard action,
+  wildcard validator/exact action, then wildcard/wildcard.
+- Lookup never mutates registry state.
+
+Test cases:
+
+- Unit happy path: exact and wildcard lookups return expected
+  registrations.
+- Unit negative path: missing handler, timeout, budget, validation type,
+  determinism, or target contract fails registration.
+- Unit edge case: generic validator for validation type applies across
+  action types only when no more specific validator exists.
+- Unit race: concurrent register/lookup is race-free.
+- Unit deadlock: registry lookup does not invoke validator handlers.
+- Integration with mockery: generated `ValidatorHandler` mock is
+  registered and returned by lookup.
+- E2E with mockery: service handler emits artifact, registry resolves
+  validator, dispatcher evaluates artifact.
+- Simulated usage: adding a new action-specific validator overrides a
+  generic validator without changing historical registrations.
+
+#### 19.5.2 Dispatch validators with bounded execution
+
+Description: `ProgrammaticValidatorDispatcher` must validate artifact
+target contracts, enforce per-validator concurrency, run handlers under
+context timeout, recover panics, and return structured results without
+owning board mutation.
+
+File references:
+
+- `core/claims/validator_registry.go`
+- `core/claims/validator_interfaces.go`
+- `core/claims/validator_registry_test.go`
+- `core/claims/artifact_validation_lifecycle.go`
+
+Existing APIs and integration points:
+
+- `ProgrammaticValidatorDispatcher`
+- `NewProgrammaticValidatorDispatcher`
+- `DispatchValidation`
+- `ValidationDispatchRequest`
+- `ValidationDispatchResult`
+- `ValidatorHandlerRequest`
+- `ValidatorHandlerResult`
+- `ValidationError`
+- `ValidationErrorCategoryArtifactType`
+- `ValidationErrorCategoryDispatcher`
+- `ValidationErrorCategoryHandler`
+- `ValidationErrorCategoryTimeout`
+- `ValidationErrorCategoryPanic`
+- `ClaimsClock`
+
+Acceptance criteria:
+
+- Missing validator returns `ErrValidatorNotRegistered` with dispatcher
+  error result.
+- Artifact-name and datatype mismatch return artifact-type validation
+  failure.
+- Concurrency exhaustion returns dispatcher error result, not an
+  untracked goroutine or silent drop.
+- Handler Go error returns handler error result.
+- Handler panic returns panic error result and diagnostic artifact.
+- Timeout returns timeout error result.
+- Optional validations map to optional failure statuses.
+
+Test cases:
+
+- Unit happy path: validator returns result artifact and validated
+  status.
+- Unit negative path: handler error, missing validator, target mismatch,
+  concurrency exhaustion, timeout, and panic each return distinct
+  categories.
+- Unit edge case: optional validation failure maps to optional terminal
+  status.
+- Unit race: concurrent dispatches for one validator respect channel
+  budget and are race-free.
+- Unit deadlock: timeout cancellation releases the concurrency token.
+- Integration with mockery: generated `ValidatorHandler` and
+  `ClaimsClock` mocks drive deterministic success, error, timeout, and
+  panic scenarios.
+- E2E with mockery: typed artifact from a service testament is validated
+  and the caller commits the returned lifecycle status to a real board.
+- Simulated usage: validator dependency unavailable produces an errored
+  validation that an operator can inspect as structured evidence.
+
+#### 19.5.3 Commit validator results through board lifecycle
+
+Description: The dispatcher returns results; board-facing code must
+translate those results into validation status transitions, result
+artifacts, quality-bar phases, and claim satisfaction/rejection rules.
+
+File references:
+
+- `core/claims/board_lifecycle.go`
+- `core/claims/artifact_validation_lifecycle.go`
+- `core/claims/types.go`
+- `core/claims/canonical_delta.go`
+- `core/claims/canonical_delta_projector.go`
+
+Existing APIs and integration points:
+
+- `ClaimsBoard.EvaluateValidation`
+- `TransitionValidationStatus`
+- `ValidationStatusCompatibilityProjection`
+- `ValidationStatusPassesRequired`
+- `ValidationStatusPendingRequired`
+- `ValidationStatus.IsBlockingFailure`
+- `ValidationStatus.IsOptionalFailure`
+- `ValidationLifecycleBusSink`
+- `ArtifactLifecycleBusSink`
+
+Acceptance criteria:
+
+- Programmatic result commits the typed validation lifecycle status.
+- Compatibility projections keep legacy consumers working.
+- Result artifacts attach to the testament or claim context required by
+  `ARTIFACTS_AND_VALIDATIONS`.
+- Required validation failure blocks claim satisfaction.
+- Optional validation failure is visible but does not block satisfaction.
+- Canonical deltas preserve evaluator identity/category when present.
+
+Test cases:
+
+- Unit happy path: required validation result `validated` satisfies the
+  validation and eventually the claim.
+- Unit negative path: required validation failure prevents claim
+  satisfaction and emits validation failure delta.
+- Unit edge case: optional validation failure is recorded but claim can
+  still satisfy when required validations pass.
+- Unit race: two validators attempting to commit same validation result
+  converge on one terminal state.
+- Unit deadlock: board does not invoke validator handler while holding
+  board mutation lock.
+- Integration with mockery: mocked lifecycle bus sinks receive artifact
+  and validation lifecycle events in sequence.
+- E2E with mockery: service dispatch, validator dispatch, board commit,
+  canonical delta projection, and UI sink all observe the same
+  validation result.
+- Simulated usage: agentic fallback handles a judgment validation after
+  programmatic contract validators complete.
+
+### 19.6 Phase 5 - Boot and Core System Services
+
+Goal: make system participants and boot phases real claims-plane
+participants before domain services depend on them.
+
+#### 19.6.1 Treat boot sequencer as a service participant
+
+Description: The boot sequencer already posts boot claims and
+testaments. This item completes participant registration, service
+identity, health projection, and dispatch alignment for the boot
+sequencer itself.
+
+File references:
+
+- `core/boot/operations.go`
+- `core/boot/operations_test.go`
+- `core/claims/participants.go`
+- `core/claims/service_dispatch.go`
+- `docs/CLAIMS_OPERATIONS.md`
+
+Existing APIs and integration points:
+
+- `InitializePhase0`
+- `ProcessIdentity`
+- `NewProcessIdentity`
+- `ProcessIdentityFromUID`
+- `NewOperationsSequencer`
+- `CommitPhase1` through `CommitPhase7`
+- `BootHealth`
+- `BootPhaseHealth`
+
+Acceptance criteria:
+
+- Boot sequencer and identity registry process UIDs are explicit
+  process-scoped identities.
+- Boot phase claims use deterministic idempotency keys.
+- Boot health summarizes phase outcome, claim ID, testament ID,
+  duration, readiness count, failure count, warnings, high-water
+  sequence, outbox lag, and terminal failures.
+- Re-running boot after replay returns existing satisfied phase results.
+- Failed phase blocks later phases and posts failure evidence.
+
+Test cases:
+
+- Unit happy path: phase 0 through phase 7 commit satisfied outcomes.
+- Unit negative path: missing process start, invalid process UID, and
+  incomplete readiness fail with typed errors.
+- Unit edge case: replayed completed phase returns existing IDs without
+  duplicate claims.
+- Unit race: concurrent `CommitPhaseN` retries converge on one phase
+  claim/testament pair.
+- Unit deadlock: boot commits do not wait for service handler queues
+  while holding sequencer mutex.
+- Integration with mockery: mocked `ClaimPostPolicy`, `DeltaPublisher`,
+  `ClaimsProjector`, and `ScopeProvider` assert boot lifecycle and
+  outbox behavior.
+- E2E with mockery: headless process startup boots all system services
+  through mocked readiness reporters and validates final boot health.
+- Simulated usage: crash after phase 4, reopen durable board, resume
+  boot, and compare final projection with uninterrupted boot.
+
+#### 19.6.2 Convert identity registry and activation controller
+
+Description: Identity allocation and activation are prerequisites for
+other services. Convert them to service handlers with deterministic
+testaments and validators before converting DAG/VFS/knowledge services.
+
+File references:
+
+- `core/container/identity_registry.go`
+- `core/agents/identity/*`
+- `core/boot/operations.go`
+- `core/claims/participants.go`
+- `core/claims/service_dispatch.go`
+- `agents/orchestrator/bootstrap_gate.go`
+- `agents/orchestrator/pipeline_pod.go`
+
+Existing APIs and integration points:
+
+- `DeriveParticipantUID`
+- `ParticipantRegistry`
+- `ServiceDispatcher`
+- `ServiceHandler`
+- boot `ActivationControllerAgentID`
+- boot `IdentityRegistryAgentID`
+- agent identity factory and registry packages
+
+Acceptance criteria:
+
+- Identity allocation, lookup, lineage, and activation readiness are
+  represented as claims and testaments.
+- Allocation is deterministic for the same scope keys.
+- Activation controller reports tier, replica count, readiness, and
+  failure reasons as typed artifacts.
+- Direct call paths synthesize equivalent claims during migration.
+- Validators check UID determinism, uniqueness, generation monotonicity,
+  tier achieved, replica count, and activation duration.
+
+Test cases:
+
+- Unit happy path: allocate, lookup, lineage, activate, and deactivate
+  produce expected typed artifacts.
+- Unit negative path: UID collision, invalid scope keys, failed
+  activation, and generation regression produce validation failures.
+- Unit edge case: repeated allocation for same logical participant is
+  idempotent.
+- Unit race: concurrent allocation and activation requests converge on
+  one UID and one activation state.
+- Unit deadlock: identity registry handler does not call dispatcher
+  registration while holding identity locks.
+- Integration with mockery: mock dispatcher, service handler, validator
+  handler, and activation backend.
+- E2E with mockery: boot allocates identity and activates always-hot
+  agents using service claims and readiness testaments.
+- Simulated usage: operator asks why an agent failed to activate and
+  finds the activation failure artifact on the board.
+
+#### 19.6.3 Convert session manager, fabric subscriber, and bus transport
+
+Description: Session lifecycle, fabric subscription, and bus readiness
+are system participants. They must produce durable claims-plane evidence
+for creation, subscription, delivery, overflow, and shutdown.
+
+File references:
+
+- `core/claims/session_registry.go`
+- `core/claims/session_inbox_registry.go`
+- `agents/orchestrator/fabric_install.go`
+- `agents/orchestrator/bus_install.go`
+- `agents/guide/*`
+- `core/mcp/fabric/*`
+- `core/claims/bus_publisher.go`
+
+Existing APIs and integration points:
+
+- `SessionBoardRegistry`
+- `SessionInboxRegistry`
+- `DeltaPublisher`
+- `DeltaSubscriber`
+- `DroppedCounter`
+- `ClaimsInbox`
+- `WireClaimsIntake`
+- Fabric projectors and bus adapters
+
+Acceptance criteria:
+
+- Session create, attach, switch, close, and recover actions are claims.
+- Fabric subscription attach/detach/test delivery outcomes are
+  testaments.
+- Bus transport overflow and subscriber failure produce artifacts or
+  telemetry, never silent drops.
+- Session registries remove stale entries on shutdown.
+- Direct UI/agent paths continue to work while emitting equivalent
+  claims evidence.
+
+Test cases:
+
+- Unit happy path: session registration, inbox registration, lookup,
+  removal, and replacement-for-reason behave deterministically.
+- Unit negative path: duplicate board registration without reason fails.
+- Unit edge case: closing an already removed inbox is idempotent.
+- Unit race: session switch while inbox receives deltas has no stale
+  mutation of active session.
+- Unit deadlock: registry locks are not held while closing inboxes.
+- Integration with mockery: mocked bus subscriptions expose dropped
+  counters and unsubscribe errors.
+- E2E with mockery: create a session, attach fabric, deliver claim
+  deltas, overflow observation traffic, and close session cleanly.
+- Simulated usage: process restarts with a stale registry entry; startup
+  replaces it with a reason and records a recovery artifact.
+
+### 19.7 Phase 6 - DAG, VFS, and Workspace Infrastructure
+
+Goal: convert the infrastructure that creates executable workspaces and
+pipeline topology.
+
+#### 19.7.1 Convert DAG processor service
+
+Description: DAG allocation, query, correction, deallocation, and
+pipeline state transitions become service-handler actions. Agent
+orchestrator paths issue claims instead of mutating DAG state directly.
+
+File references:
+
+- `agents/orchestrator/dag_bridge.go`
+- `agents/orchestrator/dag_layer_flush.go`
+- `agents/orchestrator/node_dispatcher.go`
+- `agents/orchestrator/pipeline_runtime.go`
+- `agents/orchestrator/task_pipeline_state.go`
+- planned service package or adapter under `core/claims` or
+  `agents/orchestrator`
+
+Existing APIs and integration points:
+
+- `ServiceDispatcher`
+- `ServiceHandler`
+- `ParticipantRegistration`
+- orchestrator DAG bridge and node dispatcher types
+- `ClaimsBoard.GenerateClaimAction`
+- `ClaimsBoard.GenerateTestamentAction`
+- programmatic validators
+
+Acceptance criteria:
+
+- DAG processor registers as service participant with deterministic
+  scope keys.
+- Actions include allocate pipeline, deallocate pipeline, query state,
+  repair DAG, and report health.
+- Artifacts include DAG hash, node count, edge count, cycle check,
+  planned pods, and health summary.
+- Validators check acyclicity, required node coverage, scope subset,
+  pod count, and health.
+- Legacy direct DAG paths synthesize equivalent claims during migration.
+
+Test cases:
+
+- Unit happy path: valid DAG allocation produces typed DAG and health
+  artifacts.
+- Unit negative path: cyclic graph, missing required node, failed pod
+  allocation, and invalid scope produce validation failures.
+- Unit edge case: empty optional layer, single-node graph, and repeated
+  repair claim are deterministic.
+- Unit race: concurrent DAG repair and query produce consistent
+  snapshots.
+- Unit deadlock: handler does not hold DAG lock while posting board
+  testaments.
+- Integration with mockery: mock scheduler, service handler,
+  validators, scope, and bus.
+- E2E with mockery: orchestrator posts pipeline allocation claim, DAG
+  service responds, validators pass, and orchestrator continuation
+  resumes.
+- Simulated usage: user asks for task execution; pipeline topology is
+  visible as DAG service testaments.
+
+#### 19.7.2 Convert pipeline, tool, and global VFS provisioners
+
+Description: Pipeline VFS, per-tool VFS, and global merge services must
+emit claims evidence for provision, attach, detach, snapshot, promote,
+merge, and rollback operations.
+
+File references:
+
+- `core/versioning/*`
+- `agents/shared/pipeline_vfs_skills.go`
+- `agents/shared/parallel_global_vfs_integration_test.go`
+- `core/container/pod/*`
+- `docs/TOOL_VFS.md`
+- `docs/PARALLEL_GLOBAL_VFS.md`
+
+Existing APIs and integration points:
+
+- versioning VFS managers, replica lifecycle, merge pipe, disk flusher,
+  session VFS, workspace write skills
+- `ServiceHandler`
+- `SetArtifactData`
+- `ValidatorRegistry`
+- expected tool execution artifacts
+
+Acceptance criteria:
+
+- VFS handlers register separate participants for pipeline, tool, and
+  global scopes.
+- Artifacts include mount reference, scope boundary, capacity budget,
+  base version, CoW layer chain, snapshot hash, merge preview, conflict
+  set, and resulting version.
+- Validators check attachment, capacity, base version, scope subset,
+  read/write boundary, merge acyclicity, conflict absence, and reachable
+  merged version.
+- Quota or policy failure is a testament artifact, not only a Go error.
+- Shutdown detaches mounts and records interrupted/shutdown artifacts.
+
+Test cases:
+
+- Unit happy path: provision, attach, snapshot, detach, promote, and
+  merge each create expected typed artifacts.
+- Unit negative path: quota exceeded, invalid base version, forbidden
+  scope, merge conflict, and mount failure each produce structured
+  failures.
+- Unit edge case: read-only scope, empty write set, no-op merge, and
+  repeated detach are idempotent.
+- Unit race: concurrent tool VFS allocations for one pipeline remain
+  isolated.
+- Unit deadlock: merge handler does not hold versioning lock while
+  posting claim/testament lifecycle transitions.
+- Integration with mockery: mock VFS backend, merge backend, validators,
+  bus, and scope.
+- E2E with mockery: tool execution requests a tool VFS, writes through
+  it, snapshots, validates, and merges to global VFS.
+- Simulated usage: user cancels during merge; child VFS claims mark
+  interrupted and no orphan mount remains.
+
+#### 19.7.3 Convert tool runtime execution
+
+Description: Tool runtime execution becomes a service participant so
+tool start, policy check, sandbox selection, stdout/stderr summaries,
+exit status, and artifacts are board-visible.
+
+File references:
+
+- `core/toolruntime/*`
+- `agents/shared/tool_publish.go`
+- `agents/shared/toolloop.go`
+- `agents/shared/strict_disk_exec.go`
+- `agents/shared/command_approval_gate.go`
+- `core/claims/expected_tool_execution.go`
+
+Existing APIs and integration points:
+
+- `ExpectedToolCall`
+- `ExecuteValidationExpectedTools`
+- `ExpectedToolExecutor`
+- `ExpectedToolPolicy`
+- `ExpectedToolArgumentRedactor`
+- `ValidationExpectedToolRemediationPoster`
+- tool publish/testimony helpers
+
+Acceptance criteria:
+
+- Tool execution requests are claims against tool runtime.
+- Artifacts include tool name, redacted args, policy decision,
+  execution mode, started/ended time, exit status, output summary,
+  produced artifact refs, and sandbox scope.
+- Validators check policy allow, execution mode, scope boundary,
+  duration, expected output, and required artifact presence.
+- Approval-gated tools link to guardian claims.
+- Tool runtime interruption records interrupted artifacts and releases
+  resources.
+
+Test cases:
+
+- Unit happy path: allowed tool produces output and result artifacts.
+- Unit negative path: policy denied, approval missing, timeout,
+  non-zero exit, missing dependency, and invalid expected tool call
+  produce structured artifacts.
+- Unit edge case: output truncation marks `content_truncated` metadata
+  and preserves full board artifact when required.
+- Unit race: two expected tools for one validation obey declared
+  concurrency and artifact ordering.
+- Unit deadlock: tool runtime does not block claims intake bus while
+  waiting for external command completion.
+- Integration with mockery: mock expected tool executor, policy,
+  redactor, remediation poster, guardian approval service, and scope.
+- E2E with mockery: validation posts expected tool calls, tool runtime
+  executes mocked tools, validator consumes output artifacts, and claim
+  satisfies.
+- Simulated usage: engineer claim asks for tests; tool runtime service
+  records test command evidence and validator accepts it.
+
+### 19.8 Phase 7 - Knowledge, Memory, and Document Services
+
+Goal: convert knowledge and document backends into claims participants
+without violating the storage architecture.
+
+#### 19.8.1 Convert knowledge graph writer and reader
+
+Description: Knowledge graph writes and reads become service claims with
+typed evidence for node/edge changes, vector references, readiness, and
+query result shape.
+
+File references:
+
+- `core/knowledge/*`
+- `core/knowledge/graph/*`
+- `core/knowledge/query/*`
+- `core/vectorgraphdb/*`
+- `core/claims/knowledge_readiness.go`
+- `core/knowledge/claims_subscriber.go`
+
+Existing APIs and integration points:
+
+- knowledge store, graph nodes/edges, relation validators, query
+  coordinator, vector searcher, Bleve searcher, claims subscriber
+- `ArtifactDataTypeKnowledgeReadiness`
+- `KnowledgeReadinessArtifactData`
+- `claims.ClaimsProjector`
+- `ServiceHandler`
+- `ProgrammaticValidatorDispatcher`
+
+Acceptance criteria:
+
+- Writer actions include ingest nodes, ingest edges, update embeddings,
+  delete stale entries, and report readiness.
+- Reader actions include graph traversal, semantic query, hybrid query,
+  and readiness check.
+- Artifacts include node count, edge count, embedding dimension, vector
+  index refs, query result shape, score range, and staleness marker.
+- Validators check embedding dimension, node retrievability, edge
+  consistency, query shape, score range, and readiness.
+- Bleve remains the full-text search engine; no SQLite search extension
+  is introduced.
+
+Test cases:
+
+- Unit happy path: writer emits typed node/edge readiness artifacts and
+  validators pass.
+- Unit negative path: bad embedding dimension, dangling edge, malformed
+  query result, and unavailable backend produce validation failures.
+- Unit edge case: empty query result, no-op ingest, and duplicate node
+  update are deterministic.
+- Unit race: reader and writer claims running concurrently produce
+  consistent snapshots or explicit staleness artifacts.
+- Unit deadlock: knowledge projector does not hold graph locks while
+  committing board artifacts.
+- Integration with mockery: mock graph store, vector searcher, Bleve
+  searcher, projector, validators, and bus.
+- E2E with mockery: service claim writes knowledge, reader query claim
+  retrieves it, validators check shape, and UI observer sees evidence.
+- Simulated usage: Memory Forest harvests a service-produced knowledge
+  precedent and later recall uses that testament.
+
+#### 19.8.2 Convert memory forest and carry-forward surfaces
+
+Description: Memory Forest, carry-forward, recall-forward, and
+continuity cursors become explicit service claims so continuity evidence
+is board-visible and replayable.
+
+File references:
+
+- `agents/shared/memory_forest.go`
+- `core/claims/carry_forward.go`
+- `core/claims/carry_forward_durable.go`
+- `core/claims/skills_carry_forward.go`
+- `docs/CARRY_FORWARD.md`
+- `docs/MEMORY_FOREST.md`
+
+Existing APIs and integration points:
+
+- carry-forward skills
+- `ArtifactDataTypeCarryForwardWorkingContext`
+- `ArtifactDataTypeCarryForwardEvidenceDigest`
+- `ArtifactDataTypeCarryForwardSourceIndex`
+- `ArtifactDataTypeCarryForwardContinuity`
+- `ArtifactDataTypeCarryForwardSessionCursor`
+- `ProjectionHealthSkill`
+
+Acceptance criteria:
+
+- Carry-forward preview and advance are claims with deterministic
+  source windows.
+- Artifacts include working context, evidence digest, source index,
+  continuity cursor, and session cursor.
+- Validators check source availability, cursor monotonicity, digest
+  consistency, and contradiction state.
+- Legacy sessions without WAL produce explicit fallback artifacts.
+- Repair operations write report testaments when requested.
+
+Test cases:
+
+- Unit happy path: carry-forward advance writes typed continuity
+  artifacts with monotonic sequence boundaries.
+- Unit negative path: stale, contradicted, missing source, and legacy
+  no-WAL states produce explicit non-evidence or fallback artifacts.
+- Unit edge case: empty source window and duplicate advance are
+  idempotent.
+- Unit race: simultaneous advance requests for one topic converge on
+  one cursor.
+- Unit deadlock: carry-forward service does not call projection repair
+  while holding topic locks.
+- Integration with mockery: mock board provider, projector, knowledge
+  backend, and validator handler.
+- E2E with mockery: agent writes continuity, process restarts, recall
+  service returns usable evidence from board state.
+- Simulated usage: operator repairs projection lag before carry-forward
+  and receives a report testament.
+
+#### 19.8.3 Convert document database services
+
+Description: Document ingestion and retrieval become service claims.
+Full-text behavior uses Bleve as documented; relational SQLite remains
+pure relational storage.
+
+File references:
+
+- `core/search/bleve/*`
+- `core/search/indexer/*`
+- `core/search/document.go`
+- `core/knowledge/query/bleve_searcher.go`
+- `docs/DB.md`
+- `docs/CHUNKING.md`
+
+Existing APIs and integration points:
+
+- Bleve index manager and async queue
+- search indexer scanner/builder/incremental paths
+- document/chunking code
+- `ServiceHandler`
+- `TypeRegistry`
+- `ValidatorRegistry`
+
+Acceptance criteria:
+
+- Writer actions include document ingest, update, delete, chunk, and
+  index.
+- Reader actions include document lookup, metadata query, full-text
+  search through Bleve, and result-shape query.
+- Artifacts include document ID, chunk count, index path, content hash,
+  result shape, and staleness metadata.
+- Validators check document indexed, attachment list, chunk boundaries,
+  result shape, and full-text backend readiness.
+- No plan or code path introduces SQLite full-text extensions.
+
+Test cases:
+
+- Unit happy path: document ingest emits chunk and index artifacts.
+- Unit negative path: malformed document, failed chunking, unavailable
+  Bleve index, and stale result produce validation failures.
+- Unit edge case: empty document, binary attachment, duplicate ingest,
+  and delete of absent doc are handled deterministically.
+- Unit race: concurrent ingest and query produce consistent result or
+  explicit staleness artifact.
+- Unit deadlock: index writer does not hold document lock while
+  committing claim testament.
+- Integration with mockery: mock Bleve store/searcher, document store,
+  chunker, and validators.
+- E2E with mockery: ingest document, query through mocked Bleve, validate
+  result shape, and render evidence through UI observer.
+- Simulated usage: archivalist persists a handoff document and later
+  reader service returns it through claims evidence.
+
+### 19.9 Phase 8 - Guardian, Provider Gateway, and External Boundaries
+
+Goal: make policy gates, provider calls, and external inputs observable
+without making nondeterministic behavior replay-executed.
+
+#### 19.9.1 Convert remaining guardian gates
+
+Description: Deterministic guardian gates become service handlers while
+conversational guardian behavior remains agentic. Approval, branch
+protection, diff review, command/fetch approval, rollback, and policy
+classification produce testaments.
+
+File references:
+
+- `agents/guardian/*`
+- `agents/shared/command_approval_gate.go`
+- `agents/shared/command_approval_scope.go`
+- `agents/shared/command_approval_hold.go`
+- `agents/shared/preflight_attestation.go`
+- `agents/shared/emit_audit_decision_skill.go`
+- `core/search/git/*`
+
+Existing APIs and integration points:
+
+- guardian `processClaimsEntry`
+- `ActionTypeGuardianCheck`
+- `ActionTypeCheckpoint`
+- `ArtifactKindPermissionDenied`
+- `ArtifactKindPolicyDenied`
+- command approval gate and hold types
+- git safety and preflight verification helpers
+
+Acceptance criteria:
+
+- Guardian service actions include approval check, policy check,
+  branch protection, diff review, rollback authorization, and command
+  gate.
+- Artifacts include policy rule, approval subject, user decision,
+  branch state, diff findings, rollback receipt, and denial reason.
+- Validators check policy match, user approval present, branch
+  protection, diff findings absent, and rollback receipt.
+- User-denied and policy-denied outcomes are normal testaments, not
+  exceptions.
+- Conversational guardian claims still route through agent intake.
+
+Test cases:
+
+- Unit happy path: approval allowed, policy allowed, branch protected,
+  and diff clean outcomes validate.
+- Unit negative path: user denial, missing approval, branch violation,
+  unsafe diff, and rollback failure produce structured artifacts.
+- Unit edge case: repeated identical approval request is idempotent and
+  cites prior decision where policy allows.
+- Unit race: approval arrives while timeout fires; sequence ordering
+  determines final result.
+- Unit deadlock: guardian service does not wait on user input while
+  holding dispatcher concurrency token beyond declared timeout.
+- Integration with mockery: mock user approval source, policy engine,
+  git manager, validator handler, bus, and scope.
+- E2E with mockery: tool runtime posts guardian-check claim, guardian
+  service responds, tool runtime resumes or denies based on testament.
+- Simulated usage: command requiring approval is denied; agent sees a
+  policy-denied artifact and can explain it to the user.
+
+#### 19.9.2 Convert LLM provider gateway claims
+
+Description: Provider gateway calls are nondeterministic service claims.
+Replay trusts stored testaments and never replays provider calls.
+
+File references:
+
+- `core/providers/*`
+- `agents/shared/streaming_llm_turn.go`
+- `agents/shared/llm_call_context.go`
+- `agents/shared/context_budget.go`
+- `core/container/context_budget.go`
+- `docs/CONTEXT.md`
+
+Existing APIs and integration points:
+
+- provider adapter interfaces
+- streaming turn provider
+- context budget and quota code
+- `HandlerDeterminismNondeterministic`
+- `ServiceHandler`
+- `ValidationRegistry`
+
+Acceptance criteria:
+
+- Provider dispatch claims include model, identity, task ref, budget,
+  prompt hash, and streaming mode metadata.
+- Testaments include response summary, usage, finish reason, provider
+  request ID, latency, rate-limit state, and error artifacts.
+- Validators check response present, usage in budget, rate-limit not
+  exceeded, model allowed, and identity present.
+- Replay does not call provider; it reconstructs from stored testament.
+- Streaming partials are bounded and summarized.
+
+Test cases:
+
+- Unit happy path: provider success produces response and usage
+  artifacts.
+- Unit negative path: missing identity, provider error, rate limit,
+  budget exceeded, timeout, and malformed response produce structured
+  failures.
+- Unit edge case: empty-but-valid model response, cancelled stream, and
+  partial output are represented explicitly.
+- Unit race: provider response and cancellation arrive concurrently;
+  one terminal outcome is committed.
+- Unit deadlock: streaming callback cannot block board mutation or bus
+  delivery indefinitely.
+- Integration with mockery: mock provider adapter, stream publisher,
+  context budget, validator, bus, and scope.
+- E2E with mockery: agent claim requires LLM turn, provider gateway
+  returns mocked streamed response, agent accumulator posts testament.
+- Simulated usage: replay a session containing LLM calls and assert no
+  mock provider call occurs during replay.
+
+#### 19.9.3 Convert external adapters
+
+Description: External CI, deploy controllers, user approvals, and other
+outside systems enter through gateway adapters that convert inbound
+events to claims or testaments with explicit external participant refs.
+
+File references:
+
+- `core/mcp/server/*`
+- `core/mcp/fabric/*`
+- `core/mcp/durable/*`
+- `cmd/mcp.go`
+- `agents/guide/*`
+- planned adapter package under `core/claims` or `core/mcp`
+
+Existing APIs and integration points:
+
+- `ParticipantCategoryExternal`
+- `DeltaPublisher`
+- `ClaimsBoard.GenerateClaimAction`
+- `ClaimsBoard.GenerateTestamentAction`
+- MCP durable journal and fabric connection types
+
+Acceptance criteria:
+
+- External source identity is normalized to participant ref with
+  category `external`.
+- Inbound event idempotency keys prevent duplicate claims.
+- Gateway stores raw event digest and parsed payload artifact.
+- Validation checks source authenticity, schema, freshness, and
+  referenced claim existence.
+- Malformed external event becomes a rejected/errored testament, not a
+  dropped message.
+
+Test cases:
+
+- Unit happy path: valid external event creates claim/testament with
+  external ref.
+- Unit negative path: invalid signature, stale timestamp, unknown
+  referenced claim, and malformed payload produce structured errors.
+- Unit edge case: duplicate external event is deduplicated by
+  idempotency key.
+- Unit race: duplicate events delivered concurrently create one board
+  record.
+- Unit deadlock: adapter does not call external network while holding
+  board locks.
+- Integration with mockery: mock external verifier, board-facing
+  publisher, validator, and bus.
+- E2E with mockery: mocked CI result enters as external testament and
+  satisfies a validation on an existing claim.
+- Simulated usage: deployment controller reports failure; operator sees
+  external participant testament with raw digest and parsed reason.
+
+### 19.10 Phase 9 - UI, Agent Adoption, and Legacy Coexistence
+
+Goal: ensure every participant category appears through one UI and agent
+claims surface while legacy direct calls are gradually removed.
+
+#### 19.10.1 Make UI participant-aware
+
+Description: UI rendering must show service/system/external testaments
+and artifacts through the same claims-driven tree as agent evidence. It
+must not infer participant category from display strings.
+
+File references:
+
+- `ui/bridge/claims.go`
+- `ui/bridge/claims_interfaces.go`
+- `ui/bridge/mocks/*`
+- `ui/agent/model.go`
+- `docs/CLAIMS_UI.md`
+
+Existing APIs and integration points:
+
+- `ClaimsBridge.startClaimsIntake`
+- `ClaimsBridge.processClaimsEntry`
+- `ClaimsBridge.processBoardMutationDelta`
+- `ClaimPresentationSink`
+- `ClaimArtifactSink`
+- `claims.RoleObserver`
+- `claims.RoleAuditor`
+- `ClaimContextDelta`
+- `TestamentContextDelta`
+
+Acceptance criteria:
+
+- UI shows participant category and route/UID where useful for
+  service/system/external facts.
+- UI observer does not wake agent inference.
+- Service testaments, typed artifacts, validation results, and failure
+  artifacts render under the correct claim row.
+- Stale session deltas are ignored.
+- Free-floating presentation testaments remain visible until canonical
+  coverage replaces the board delta fallback.
+
+Test cases:
+
+- Unit happy path: UI bridge routes service, system, external, and agent
+  deltas into stable messages.
+- Unit negative path: stale session, malformed delta, and missing board
+  are ignored or reported without panic.
+- Unit edge case: context delta arrives before row creation; later claim
+  delta reconciles row state.
+- Unit race: out-of-order context/testament/validation terminal deltas
+  produce stable final UI state.
+- Unit deadlock: UI bridge lock is not held while publishing to sinks.
+- Integration with mockery: generated `ClaimPresentationSink`,
+  `ClaimArtifactSink`, bus, and scope mocks assert UI publication.
+- E2E with mockery: service handler emits typed artifact; UI observer
+  receives canonical deltas and publishes a visible service row.
+- Simulated usage: user opens a session after boot and sees boot,
+  service readiness, and validation evidence from claims only.
+
+#### 19.10.2 Migrate agents to participant-aware references
+
+Description: Agent code can still use agent-specific execution
+discipline, but claim relations, expected tool calls, consult/challenge
+flows, and continuation results must preserve participant identity and
+not assume every subject is an LLM agent.
+
+File references:
+
+- `agents/shared/claims_intake.go`
+- `agents/shared/consult_continuations.go`
+- `agents/shared/cross_pipeline_skills.go`
+- `agents/*/claims_testimony.go`
+- `agents/orchestrator/task_dispatch_claims.go`
+- `agents/engineer/refactor_loop.go`
+
+Existing APIs and integration points:
+
+- `shared.WireClaimsIntake`
+- `shared.ClaimsIntakeConfig`
+- `shared.NewClaimsEntryAccumulator`
+- `shared.WithContinuationStore`
+- `ContinuationStore.DeliverClaimResult`
+- `ContinuationStore.RecoverPendingContinuations`
+- `claims.Expectation`
+- `claims.GraphEntryPoint`
+
+Acceptance criteria:
+
+- Agents can issue claims to service/system participants where the
+  action permits it.
+- Claims intake still suppresses system-internal actions from waking
+  agents.
+- Continuations resume from service-produced testaments as well as
+  agent-produced testaments.
+- Consult/challenge skills reject unsupported service targets with a
+  structured artifact rather than trying an LLM loop.
+- Agent testimony preserves participant IDs on artifacts and status
+  changes.
+
+Test cases:
+
+- Unit happy path: agent-issued service claim registers expectation and
+  resumes from service testament.
+- Unit negative path: unsupported service consult returns policy/contract
+  artifact and does not wake a non-agent.
+- Unit edge case: degraded participant ref still routes through allowed
+  legacy topic while recording resolution reason.
+- Unit race: response delta arrives before expectation registration and
+  is replayed from orphan buffer.
+- Unit deadlock: `processClaimsEntry` always dispatches through scope
+  and never blocks bus delivery.
+- Integration with mockery: mock bus, continuation store resume, service
+  handler, provider gateway, and scope.
+- E2E with mockery: architect issues service-backed DAG/VFS claim,
+  service responds, engineer continuation resumes, and UI renders the
+  service evidence.
+- Simulated usage: agent asks knowledge reader service for evidence and
+  receives a board-visible service testament instead of an ad hoc tool
+  response.
+
+#### 19.10.3 Remove or synthesize legacy direct-call paths
+
+Description: During migration, direct infrastructure calls may remain,
+but every direct call must synthesize the equivalent claim/testament
+pair. Once all callers migrate, direct-call bypasses are removed or
+hard-disabled.
+
+File references:
+
+- `agents/orchestrator/*`
+- `agents/shared/*`
+- `core/versioning/*`
+- `core/knowledge/*`
+- `core/search/*`
+- `core/container/*`
+- `cmd/sylk-lint/main.go`
+- planned analyzer under `core/ci/analyzers/claimsops`
+
+Existing APIs and integration points:
+
+- `ClaimsBoard.GenerateClaimAction`
+- `ClaimsBoard.GenerateTestamentAction`
+- `ClaimsBoard.RecordClaimLifecycleFailure`
+- `ServiceDispatcher`
+- existing `nodirectexec` analyzer pattern
+
+Acceptance criteria:
+
+- Every remaining direct-call path has a migration wrapper that writes
+  equivalent claims-plane evidence.
+- Analyzer blocks new infrastructure mutations that bypass claims
+  evidence.
+- Bypass allowlist is explicit, narrow, and documented.
+- Removing a legacy path does not delete historical replay
+  compatibility.
+
+Test cases:
+
+- Unit happy path: direct-call wrapper synthesizes claim/testament with
+  same typed artifacts as service path.
+- Unit negative path: direct-call failure synthesizes error testament.
+- Unit edge case: direct-call wrapper invoked inside an existing claim
+  links synthesized claim with `caused_by` relation.
+- Unit race: service path and direct wrapper for same idempotency key
+  converge on one board record.
+- Unit deadlock: wrapper does not call service dispatcher while holding
+  subsystem locks.
+- Integration with mockery: mock subsystem backend and board-facing
+  interfaces to assert synthetic evidence.
+- E2E with mockery: run old caller and new service caller for same
+  operation; final board evidence is equivalent.
+- Simulated usage: analyzer catches a newly added direct infrastructure
+  mutation before merge.
+
+### 19.11 Phase 10 - Recovery, Cancellation, Shutdown, and Replay Audits
+
+Goal: prove infrastructure participants recover and shut down with the
+same deterministic guarantees as agent participants.
+
+#### 19.11.1 Reconcile service work after crash
+
+Description: After WAL replay, the runtime must inspect non-terminal
+service claims, in-flight validation states, and pending continuations,
+then either resume deterministic work or record structured recovery
+failure evidence.
+
+File references:
+
+- `core/claims/board_durable.go`
+- `core/claims/service_dispatch.go`
+- `core/claims/validator_registry.go`
+- `agents/shared/consult_continuations.go`
+- `docs/CLAIMS_OPERATIONS.md`
+
+Existing APIs and integration points:
+
+- `OpenDurableBoard`
+- `DurableBoard.DrainOutbox`
+- `ClaimsBoard.Projection`
+- `RecordClaimLifecycleFailure`
+- `ProgrammaticValidatorDispatcher`
+- `ContinuationStore.RecoverPendingContinuations`
+
+Acceptance criteria:
+
+- Recovery identifies service claims stuck at generated, posted,
+  received, progressed, validating, and testament-generated boundaries.
+- Pure/content handlers can be re-dispatched only when their determinism
+  contract permits it.
+- Side-effect/nondeterministic handlers are not re-executed unless an
+  idempotency artifact proves safety.
+- Missing or unrecoverable work records recovery error artifacts.
+- Recovery work is bounded by configured worker and scan budgets.
+
+Test cases:
+
+- Unit happy path: posted deterministic service claim is re-dispatched
+  after replay and completes.
+- Unit negative path: nondeterministic in-flight claim is not
+  re-executed and receives recovery-required artifact.
+- Unit edge case: claim already satisfied before crash is skipped.
+- Unit race: recovery and late bus redelivery of same delta do not
+  double-invoke handler.
+- Unit deadlock: recovery scan does not hold board locks while
+  dispatching handlers.
+- Integration with mockery: mock deterministic and nondeterministic
+  service handlers, validator handlers, outbox projector, and scope.
+- E2E with mockery: crash after service receipt, reopen board, recover
+  service work, validate, and project UI deltas.
+- Simulated usage: operator sees recovery summary with orphan service
+  claim IDs and resolution outcomes.
+
+#### 19.11.2 Propagate cancellation through service and validation work
+
+Description: Cancellation must walk claim relations and cancel service
+handlers, validators, provider calls, tool runtime work, and
+continuations associated with each claim.
+
+File references:
+
+- `core/claims/relations_index.go`
+- `core/claims/service_dispatch.go`
+- `core/claims/validator_registry.go`
+- `agents/shared/consult_continuations.go`
+- `core/concurrency/goroutine_scope.go`
+- planned `core/claims/cancellation.go`
+
+Existing APIs and integration points:
+
+- `RelationshipCausedBy`
+- `RelationshipDependsOn`
+- `RecordClaimProgressFailure`
+- `LifecycleFailureOptions`
+- `ArtifactKindInterrupted`
+- `GoroutineScope.SignalShutdown`
+- `GoroutineScope.Shutdown`
+
+Acceptance criteria:
+
+- Cancellation starts from root claim(s), traverses descendants
+  deterministically, and commits leaf failures before parent failures.
+- Service and validator contexts are cancelled promptly.
+- Ignored context cancellation becomes a stuck-cancellation finding.
+- Every cancelled claim cites the originating cancellation claim.
+- Already terminal descendants are listed in summary but not mutated.
+
+Test cases:
+
+- Unit happy path: root -> service child -> validator grandchild
+  cancellation records interrupted failures in reverse BFS order.
+- Unit negative path: missing root claim produces cancellation error
+  testament without touching unrelated claims.
+- Unit edge case: relation cycle, duplicate relations, terminal child,
+  and concurrent new child are handled deterministically.
+- Unit race: service success and cancellation compete; sequence ordering
+  determines final state.
+- Unit deadlock: cancellation does not hold relation index lock while
+  waiting for scope workers.
+- Integration with mockery: mock service handler, validator handler,
+  scope, bus, and UI sinks; assert cancellation deltas.
+- E2E with mockery: user interrupt cancels DAG, VFS, tool runtime, and
+  provider gateway claims; UI rows close from claims evidence.
+- Simulated usage: long-press interrupt cancels all active root claims
+  for one session and leaves other sessions untouched.
+
+#### 19.11.3 Add replay determinism audits
+
+Description: Replay audit must re-run only declared pure/content
+handlers and validators, compare outputs, and write divergence evidence
+to an audit board without mutating historical WAL.
+
+File references:
+
+- `core/claims/board_durable.go`
+- `core/claims/participants.go`
+- `core/claims/validator_registry.go`
+- `core/claims/artifact_data.go`
+- planned `core/claims/replay_audit.go`
+
+Existing APIs and integration points:
+
+- `HandlerDeterminismPure`
+- `HandlerDeterminismContent`
+- `HandlerDeterminismSideEffect`
+- `HandlerDeterminismNondeterministic`
+- `ArtifactContentHash`
+- `SetArtifactData`
+- `ArtifactData`
+- `OperationsInventory`
+
+Acceptance criteria:
+
+- Pure handler/validator audit compares full result artifact payloads.
+- Content handler/validator audit compares content hashes and declared
+  stable fields.
+- Side-effect and nondeterministic participants are reported as trusted
+  stored outputs, not re-executed.
+- Divergence becomes `validator_nondeterministic` or
+  `handler_nondeterministic` audit artifact.
+- Audit results are written to a separate audit board.
+
+Test cases:
+
+- Unit happy path: pure validator re-execution matches stored result.
+- Unit negative path: synthetic nondeterministic handler declared pure
+  produces divergence artifact.
+- Unit edge case: content-equivalent output with different timestamp is
+  accepted only if timestamp is declared unstable.
+- Unit race: audit runs while live board mutates another session
+  without shared-state races.
+- Unit deadlock: audit never writes to original board.
+- Integration with mockery: mock pure/content/nondeterministic handlers
+  and validators to assert correct execution policy.
+- E2E with mockery: replay a recorded WAL into an audit board, run
+  audits, and inspect divergence testaments.
+- Simulated usage: operator audits a production incident and gets a
+  board-visible divergence report.
+
+#### 19.11.4 Implement deterministic shutdown ordering
+
+Description: Shutdown must stop new intake, signal scopes, cancel active
+claims, drain continuations and outbox, save snapshots, close files, and
+unregister session/inbox entries in a fixed order.
+
+File references:
+
+- `core/concurrency/goroutine_scope.go`
+- `core/claims/session_registry.go`
+- `core/claims/session_inbox_registry.go`
+- `core/claims/board_durable.go`
+- `agents/shared/consult_continuations.go`
+- `cmd/tui.go`
+
+Existing APIs and integration points:
+
+- `GoroutineScope.SignalShutdown`
+- `GoroutineScope.Shutdown`
+- `ClaimsInbox.Close`
+- `ContinuationStore.Stop`
+- `DurableBoard.DrainOutbox`
+- `DurableBoard.SaveSnapshot`
+- `DurableBoard.Close`
+- registry `Remove` methods
+
+Acceptance criteria:
+
+- Shutdown is idempotent and safe during partial startup.
+- New service dispatch and inbox intake are rejected after shutdown
+  signal.
+- Active work receives cancellation evidence before hard drain.
+- Outbox drains final cancellation/shutdown deltas before snapshot.
+- Leak reports include worker descriptions and stack dump.
+
+Test cases:
+
+- Unit happy path: all resources close in documented order.
+- Unit negative path: stuck worker returns `GoroutineLeakError`.
+- Unit edge case: shutdown before boot, during boot, after boot failure,
+  and after normal completion.
+- Unit race: concurrent shutdown calls share one drain.
+- Unit deadlock: shutdown does not wait on outbox projection while
+  holding registry locks.
+- Integration with mockery: mock inboxes, continuation stores, durable
+  board, scope, and projectors to assert order and failure behavior.
+- E2E with mockery: process shutdown with active service claims,
+  validators, continuations, and outbox lag leaves durable shutdown
+  evidence.
+- Simulated usage: SIGTERM during provider gateway request records
+  interrupted provider artifact and drains within deadline.
+
+### 19.12 Phase 11 - Observability, CI Enforcement, and Production Rollout
+
+Goal: make participant infrastructure observable, enforceable, and safe
+to roll out or roll back.
+
+#### 19.12.1 Instrument participant telemetry and health skills
+
+Description: Add metrics and skills for participant registry health,
+service dispatch queues, validator dispatch, artifact datatype coverage,
+boot phase health, cancellation state, recovery state, and projection
+health.
+
+File references:
+
+- `core/claims/outbox_health.go`
+- `core/claims/skills.go`
+- `core/claims/skills_carry_forward.go`
+- `agents/archivalist/skills_core.go`
+- `agents/engineer/tool_policy.go`
+- planned `core/claims/telemetry.go`
+- planned `core/claims/skills_infrastructure.go`
+
+Existing APIs and integration points:
+
+- `ProjectionHealth`
+- `ProjectionHealthHistory`
+- `ProjectionHealthSkill`
+- `OperationsInventory`
+- `ServiceDispatcher`
+- `ProgrammaticValidatorDispatcher`
+- `TypeRegistry.ListArtifactTypes`
+
+Acceptance criteria:
+
+- Operators can query participant registrations, service queue depth,
+  validator queue depth, typed artifact registry, boot health, recovery
+  findings, cancellation state, and projection health.
+- Metrics use bounded-cardinality labels.
+- Skill outputs are bounded and structured.
+- Repair skills support dry-run by default.
+- Mutating repair skills write report testaments when requested.
+
+Test cases:
+
+- Unit happy path: each skill validates params and returns bounded
+  healthy output.
+- Unit negative path: missing board, unknown session, unknown
+  participant, and non-dry-run repair without authorization fail.
+- Unit edge case: in-memory board without durable outbox reports warning
+  instead of panic.
+- Unit race: health queries run while service dispatchers mutate state.
+- Unit deadlock: telemetry callbacks never call board mutation under
+  board locks.
+- Integration with mockery: mock telemetry sink, board provider,
+  projector, service dispatcher, and validator dispatcher.
+- E2E with mockery: operator detects validator backlog, projection lag,
+  and boot failure through skills and repairs projection lag.
+- Simulated usage: staging dashboard shows all service participants and
+  queue budgets after boot.
+
+#### 19.12.2 Add static analyzers and CI gates
+
+Description: Extend CI to block new invariant violations: raw
+goroutines, unbounded queues, broad claims subscriptions, missing
+determinism, missing artifact datatype, missing mockery coverage, and
+infrastructure direct-call bypasses.
+
+File references:
+
+- `cmd/sylk-lint/main.go`
+- `cmd/nogo/main.go`
+- `core/ci/analyzers/nodirectexec/analyzer.go`
+- planned `core/ci/analyzers/claimsops/*`
+- `.mockery.yaml`
+- `Makefile`
+
+Existing APIs and integration points:
+
+- existing `go/analysis` multichecker
+- existing `nogo` analyzer
+- existing `nodirectexec` analyzer
+- participant, service dispatch, validator, and artifact type APIs
+
+Acceptance criteria:
+
+- CI runs normal tests, claims infrastructure race tests, mockery drift,
+  docs traceability, and claims operations analyzers.
+- Analyzer diagnostics name the replacement API.
+- Analyzer allowlists are minimal and justified.
+- Generated mocks do not trigger analyzer findings.
+- A new infrastructure service cannot merge without handler,
+  participant registration, determinism, typed artifacts, validators,
+  and tests.
+
+Test cases:
+
+- Unit happy path: clean analyzer testdata passes.
+- Unit negative path: raw `go`, literal unbounded channel, broad
+  claims topic, missing determinism, missing datatype, and bypass
+  mutation fail.
+- Unit edge case: approved low-level packages and `_test.go` fixtures
+  are exempt only where documented.
+- Unit race/deadlock: analyzers are pure compile-time passes and do not
+  perform network or blocking I/O.
+- Integration with mockery: run analyzers after mock generation and
+  assert generated mocks are clean.
+- E2E with mockery: full pre-submit profile runs docs, analyzers,
+  generated mocks, and infrastructure e2e tests.
+- Simulated usage: developer adds a new service with missing validator;
+  CI fails with handler/validator/doc guidance.
+
+#### 19.12.3 Roll out with feature gates and shadow comparisons
+
+Description: Ship participant infrastructure behind rollout gates so
+legacy paths, synthetic evidence wrappers, shadow service handlers, and
+fully enabled service dispatch can coexist safely during migration.
+
+File references:
+
+- `core/claims/rollout.go`
+- `core/claims/rollout_test.go`
+- `core/claims/outbox_health.go`
+- `cmd/tui.go`
+- `docs/CLAIMS_OPERATIONS.md`
+- planned `core/claims/infrastructure_rollout.go`
+
+Existing APIs and integration points:
+
+- `RolloutConfig`
+- `CurrentRolloutConfig`
+- `ClaimsBoard.RolloutConfig`
+- `ProjectionHealth.FeatureFlags`
+- `ProjectionHealth.ShadowDiffs`
+- `DisableOutbox`
+
+Acceptance criteria:
+
+- Each migrated infrastructure subsystem has disabled, shadow, and
+  enabled rollout states where shadow is meaningful.
+- Shadow mode compares service-handler testament artifacts to legacy
+  direct-call synthetic artifacts.
+- Rollback disables dispatch/projection behavior without deleting WAL,
+  outbox, or board evidence.
+- Feature flag state is visible in projection health.
+- Critical shadow diffs block promotion to enabled.
+
+Test cases:
+
+- Unit happy path: rollout config normalizes defaults and exposes flags.
+- Unit negative path: invalid rollout value fails or falls back according
+  to documented policy.
+- Unit edge case: disabled outbox still allows board mutations and
+  reports health warning.
+- Unit race: rollout snapshot is immutable for each board mutation.
+- Unit deadlock: shadow comparison cannot block primary service
+  dispatch indefinitely.
+- Integration with mockery: mock legacy backend and service handler with
+  matching and divergent artifacts.
+- E2E with mockery: run disabled -> shadow -> enabled -> rollback for
+  one service and assert durable evidence is preserved.
+- Simulated usage: staging enables DAG service in shadow, observes zero
+  critical diffs, then enables service dispatch.
+
+#### 19.12.4 Complete production readiness evidence
+
+Description: Final rollout is itself a claims cycle. The readiness claim
+must carry evidence for tests, race runs, analyzer runs, mockery drift,
+docs coverage, performance measurements, runbook simulations, rollout,
+rollback, and open risks.
+
+File references:
+
+- `docs/CLAIMS_AND_INFRASTRUCTURE.md`
+- `docs/CLAIMS_OPERATIONS.md`
+- `docs/PERFORMANCE.md`
+- `scripts/ci/*`
+- `core/claims/*_test.go`
+- `core/boot/*_test.go`
+- `agents/shared/*_test.go`
+- `ui/bridge/*_test.go`
+
+Existing APIs and integration points:
+
+- `ClaimsBoard.GenerateClaimAction`
+- `ClaimsBoard.GenerateTestamentAction`
+- `ClaimsBoard.EvaluateValidation`
+- `TypeRegistry`
+- `OperationsInventory`
+- operator health skills
+
+Acceptance criteria:
+
+- Readiness claim includes artifacts for unit, integration, e2e, race,
+  analyzer, docs, performance, runbook, shadow diff, rollback, and open
+  risk evidence.
+- Required validations block readiness satisfaction when evidence is
+  missing or failing.
+- Waivers are explicit artifacts with owner, scope, expiry, and
+  compensating control.
+- Rollback has been executed in a mock/staging scenario without data
+  loss.
+- Remaining planned inventory entries have owner claims and deadlines.
+
+Test cases:
+
+- Unit happy path: readiness report builder accepts complete evidence.
+- Unit negative path: missing race, analyzer, mockery, or rollback
+  evidence prevents satisfaction.
+- Unit edge case: optional waiver artifact is accepted only with owner,
+  reason, expiry, and compensating control.
+- Unit race: readiness evidence collection can run while projection
+  health is queried.
+- Unit deadlock: readiness report generation is read-only until final
+  testament commit.
+- Integration with mockery: mock CI evidence providers, health skills,
+  and board submission.
+- E2E with mockery: full readiness claim is posted, evidence artifacts
+  attach, validations pass, and final claim satisfies.
+- Simulated usage: release manager reads one board claim and sees the
+  production readiness state of the participant infrastructure rollout.
+
+## 20. Final Architecture Statement
 
 Claims constrain work. Testaments answer claims. Artifacts prove
 testaments. Validations check artifacts. Deltas transport committed

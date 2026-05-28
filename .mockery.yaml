@@ -215,6 +215,58 @@ packages:
         config:
           mockname: "TestamentGenerator"
 
+      DeltaPublisher:
+        config:
+          mockname: "DeltaPublisher"
+
+      DeltaSubscriber:
+        config:
+          mockname: "DeltaSubscriber"
+
+      DeltaSubscription:
+        config:
+          mockname: "DeltaSubscription"
+
+      DeltaBus:
+        config:
+          mockname: "DeltaBus"
+
+      ClaimsProjector:
+        config:
+          mockname: "ClaimsProjector"
+
+      AgentRefResolver:
+        config:
+          mockname: "AgentRefResolver"
+
+      ClaimPostPolicy:
+        config:
+          mockname: "ClaimPostPolicy"
+
+      ScopeProvider:
+        config:
+          mockname: "ScopeProvider"
+
+      ServiceHandler:
+        config:
+          mockname: "ServiceHandler"
+
+      ExpectedToolExecutor:
+        config:
+          mockname: "ExpectedToolExecutor"
+
+      ExpectedToolPolicy:
+        config:
+          mockname: "ExpectedToolPolicy"
+
+      ExpectedToolArgumentRedactor:
+        config:
+          mockname: "ExpectedToolArgumentRedactor"
+
+      ValidationExpectedToolRemediationPoster:
+        config:
+          mockname: "ValidationExpectedToolRemediationPoster"
+
   github.com/adalundhe/sylk/ui/bridge:
     config:
       dir: "ui/bridge/mocks"
