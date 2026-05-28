@@ -477,6 +477,23 @@ Universal base fields on `Action`, `Claim`, `Testament`, `Validation`,
 and `Artifact` rename `AgentID` to `ParticipantID`. Backward compatibility
 during migration preserves `AgentID` as a derived projection.
 
+Artifact and validation lifecycle terminology is owned by
+`docs/ARTIFACTS_AND_VALIDATIONS.md`. Infrastructure participants must
+emit and consume the exact artifact states `artifact.generated`,
+`artifact.generation_failed`, `artifact.received`,
+`artifact.receipt_failed`, `artifact.attached`,
+`artifact.validating`, `artifact.validation_failed`, and
+`artifact.validated`; and the exact validation states
+`validation.ready`, `validation.validating`,
+`validation.validation_failed`,
+`validation.validation_failed_not_required`, `validation.errored`,
+`validation.errored_not_required`, `validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`, and
+`validation.validated`. Legacy validation statuses `pending`,
+`in_progress`, `passed`, `incomplete`, `failed`, `errored`, and
+`skipped` are compatibility projections only.
+
 ### 5.3 ProgrammaticValidator Interface
 
 ```go

@@ -92,6 +92,11 @@ type StatusChange struct {
 	Changed time.Time `json:"changed"`  // UTC timestamp
 }
 
+// ParticipantRef is the generalized identity reference used by the
+// artifacts-and-validations lifecycle. AgentRef remains the concrete
+// in-repo representation during migration.
+type ParticipantRef = AgentRef
+
 // ClaimScopeEntry identifies one element of a claim's affected scope.
 type ClaimScopeEntry struct {
 	Kind string `json:"kind"` // "file", "symbol", "api", "test_surface", "component", "ux_surface"
@@ -333,32 +338,35 @@ func (s ClaimStatus) IsActive() bool {
 type ValidationStatus string
 
 const (
-	ValidationStatusPending    ValidationStatus = "pending"     // not yet evaluated
-	ValidationStatusInProgress ValidationStatus = "in_progress" // evaluator working
-	ValidationStatusPassed     ValidationStatus = "passed"      // meets quality bar (terminal)
-	ValidationStatusIncomplete ValidationStatus = "incomplete"  // required evidence was missing (terminal)
-	ValidationStatusFailed     ValidationStatus = "failed"      // does not meet quality bar (terminal)
-	ValidationStatusErrored    ValidationStatus = "errored"     // evaluator infrastructure failed (terminal)
-	ValidationStatusSkipped    ValidationStatus = "skipped"     // explicitly waived (terminal)
+	ValidationStatusReady                                 ValidationStatus = "ready"
+	ValidationStatusValidating                            ValidationStatus = "validating"
+	ValidationStatusValidationFailed                      ValidationStatus = "validation_failed"
+	ValidationStatusValidationFailedNotRequired           ValidationStatus = "validation_failed_not_required"
+	ValidationStatusErrored                               ValidationStatus = "errored"
+	ValidationStatusErroredNotRequired                    ValidationStatus = "errored_not_required"
+	ValidationStatusValidatingQualityBar                  ValidationStatus = "validating_quality_bar"
+	ValidationStatusQualityBarValidationFailed            ValidationStatus = "quality_bar_validation_failed"
+	ValidationStatusQualityBarValidationFailedNotRequired ValidationStatus = "quality_bar_validation_failed_not_required"
+	ValidationStatusValidated                             ValidationStatus = "validated"
+
+	// Legacy compatibility statuses. These continue to load and
+	// project through existing board paths while typed validation
+	// orchestration migrates to the lifecycle statuses above.
+	ValidationStatusPending    ValidationStatus = "pending"
+	ValidationStatusInProgress ValidationStatus = "in_progress"
+	ValidationStatusPassed     ValidationStatus = "passed"
+	ValidationStatusIncomplete ValidationStatus = "incomplete"
+	ValidationStatusFailed     ValidationStatus = "failed"
+	ValidationStatusSkipped    ValidationStatus = "skipped"
 )
 
 // IsTerminal reports whether this validation status is a terminal state.
 func (s ValidationStatus) IsTerminal() bool {
-	switch s {
-	case ValidationStatusPassed, ValidationStatusIncomplete, ValidationStatusFailed, ValidationStatusErrored, ValidationStatusSkipped:
-		return true
-	default:
-		return false
-	}
+	return validationTerminalStatuses[s]
 }
 
 func (s ValidationStatus) IsNegativeTerminal() bool {
-	switch s {
-	case ValidationStatusIncomplete, ValidationStatusFailed, ValidationStatusErrored:
-		return true
-	default:
-		return false
-	}
+	return validationNegativeTerminalStatuses[s]
 }
 
 // ValidationType classifies what kind of check a validation performs.
@@ -439,6 +447,68 @@ const (
 
 // IsTerminal reports whether this board phase is terminal.
 func (p BoardPhase) IsTerminal() bool { return p == BoardPhaseComplete }
+
+// ArtifactStatus tracks the artifact lifecycle defined in
+// docs/ARTIFACTS_AND_VALIDATIONS.md §5.
+type ArtifactStatus string
+
+const (
+	ArtifactStatusGenerated        ArtifactStatus = "generated"
+	ArtifactStatusGenerationFailed ArtifactStatus = "generation_failed"
+	ArtifactStatusReceived         ArtifactStatus = "received"
+	ArtifactStatusReceiptFailed    ArtifactStatus = "receipt_failed"
+	ArtifactStatusAttached         ArtifactStatus = "attached"
+	ArtifactStatusValidating       ArtifactStatus = "validating"
+	ArtifactStatusValidationFailed ArtifactStatus = "validation_failed"
+	ArtifactStatusValidated        ArtifactStatus = "validated"
+)
+
+// ArtifactErrorCategory classifies durable artifact lifecycle failures.
+type ArtifactErrorCategory string
+
+const (
+	ArtifactErrorCategoryGeneration        ArtifactErrorCategory = "generation"
+	ArtifactErrorCategoryReceiptMetadata   ArtifactErrorCategory = "receipt_metadata"
+	ArtifactErrorCategoryReceiptStructural ArtifactErrorCategory = "receipt_structural"
+	ArtifactErrorCategoryValidation        ArtifactErrorCategory = "validation"
+	ArtifactErrorCategoryTimeout           ArtifactErrorCategory = "timeout"
+	ArtifactErrorCategoryPanic             ArtifactErrorCategory = "panic"
+	ArtifactErrorCategoryInterruption      ArtifactErrorCategory = "interruption"
+	ArtifactErrorCategoryInternal          ArtifactErrorCategory = "internal"
+)
+
+// ArtifactError is durable evidence attached to a failed artifact state.
+type ArtifactError struct {
+	Category    ArtifactErrorCategory `json:"category"`
+	Description string                `json:"description"`
+	Payload     map[string]any        `json:"payload,omitempty"`
+	Source      ParticipantRef        `json:"source"`
+	OccurredAt  time.Time             `json:"occurred_at"`
+}
+
+// ValidationErrorCategory classifies typed validation lifecycle failures.
+type ValidationErrorCategory string
+
+const (
+	ValidationErrorCategoryHandler      ValidationErrorCategory = "handler"
+	ValidationErrorCategoryQualityBar   ValidationErrorCategory = "quality_bar"
+	ValidationErrorCategoryTimeout      ValidationErrorCategory = "timeout"
+	ValidationErrorCategoryArtifactType ValidationErrorCategory = "artifact_type_mismatch"
+	ValidationErrorCategoryDispatcher   ValidationErrorCategory = "dispatcher"
+	ValidationErrorCategoryDependency   ValidationErrorCategory = "dependency_unavailable"
+	ValidationErrorCategoryPanic        ValidationErrorCategory = "handler_panic"
+	ValidationErrorCategoryInterruption ValidationErrorCategory = "interruption"
+	ValidationErrorCategoryInternal     ValidationErrorCategory = "internal"
+)
+
+// ValidationError is durable evidence attached to a failed validation.
+type ValidationError struct {
+	Category    ValidationErrorCategory `json:"category"`
+	Description string                  `json:"description"`
+	Payload     map[string]any          `json:"payload,omitempty"`
+	Source      ParticipantRef          `json:"source"`
+	OccurredAt  time.Time               `json:"occurred_at"`
+}
 
 // PresentationAudience identifies who a presentation is intended for.
 // It is rendering intent, not access control; agents continue to query
@@ -597,7 +667,7 @@ func (c *Claim) AllValidationsPassed() bool {
 		return false // no validations = not validated
 	}
 	for _, v := range c.Validations {
-		if v.Required && v.Status != ValidationStatusPassed {
+		if v.Required && !ValidationStatusPassesRequired(v.Status) {
 			return false
 		}
 	}
@@ -609,7 +679,7 @@ func (c *Claim) AllValidationsPassed() bool {
 func (c *Claim) PendingValidationCount() int {
 	count := 0
 	for _, v := range c.Validations {
-		if v.Required && v.Status == ValidationStatusPending {
+		if v.Required && ValidationStatusPendingRequired(v.Status) {
 			count++
 		}
 	}
@@ -697,22 +767,30 @@ type Artifact struct {
 	// Testament.
 	TestamentID string `json:"testament_id"`
 
-	AgentID    string     `json:"agent_id"`
-	SessionID  string     `json:"session_id"`
-	PipelineID string     `json:"pipeline_id"`
-	TaskID     string     `json:"task_id"`
-	Sequence   uint64     `json:"sequence"`
-	Relations  []Relation `json:"relations"`
-	Created    time.Time  `json:"created"`
-	Accessed   time.Time  `json:"accessed"`
+	ClaimID       string     `json:"claim_id,omitempty"`
+	AgentID       string     `json:"agent_id"`
+	ParticipantID string     `json:"participant_id,omitempty"`
+	SessionID     string     `json:"session_id"`
+	PipelineID    string     `json:"pipeline_id"`
+	TaskID        string     `json:"task_id"`
+	Sequence      uint64     `json:"sequence"`
+	Relations     []Relation `json:"relations"`
+	Created       time.Time  `json:"created"`
+	Accessed      time.Time  `json:"accessed"`
 
 	// ── Artifact-specific ──
-	Kind        string         `json:"kind"`                   // free-form: "code_reference", "test_output", etc.
-	Reference   string         `json:"reference"`              // content or pointer
-	Metadata    map[string]any `json:"metadata,omitempty"`     // kind-specific structured data
-	ContentHash string         `json:"content_hash,omitempty"` // SHA-256 for integrity/dedup
-	Size        int64          `json:"size,omitempty"`         // byte size
-	Ephemeral   bool           `json:"ephemeral,omitempty"`    // transient vs durable
+	ArtifactName  string           `json:"artifact_name,omitempty"`
+	Kind          string           `json:"kind"`                   // free-form: "code_reference", "test_output", etc.
+	DataType      string           `json:"data_type,omitempty"`    // registered typed payload discriminator
+	Data          []byte           `json:"data,omitempty"`         // canonical typed payload bytes
+	Reference     string           `json:"reference"`              // content or pointer
+	Metadata      map[string]any   `json:"metadata,omitempty"`     // kind-specific structured data
+	ContentHash   string           `json:"content_hash,omitempty"` // SHA-256 for integrity/dedup
+	Size          int64            `json:"size,omitempty"`         // byte size
+	Ephemeral     bool             `json:"ephemeral,omitempty"`    // transient vs durable
+	Status        ArtifactStatus   `json:"status,omitempty"`
+	StatusHistory []StatusChange   `json:"status_history,omitempty"`
+	Errors        []*ArtifactError `json:"errors,omitempty"`
 	// Presentation carries optional UI rendering intent for the
 	// artifact Reference or dereferenced content. It never removes the
 	// artifact from normal board evidence queries.
@@ -729,24 +807,34 @@ type Validation struct {
 	// belongs to. Every Validation has exactly one parent Claim.
 	ClaimID string `json:"claim_id"`
 
-	AgentID    string     `json:"agent_id"`
-	SessionID  string     `json:"session_id"`
-	PipelineID string     `json:"pipeline_id"`
-	TaskID     string     `json:"task_id"`
-	Sequence   uint64     `json:"sequence"`
-	Relations  []Relation `json:"relations"`
-	Created    time.Time  `json:"created"`
-	Accessed   time.Time  `json:"accessed"`
+	AgentID       string     `json:"agent_id"`
+	ParticipantID string     `json:"participant_id,omitempty"`
+	SessionID     string     `json:"session_id"`
+	PipelineID    string     `json:"pipeline_id"`
+	TaskID        string     `json:"task_id"`
+	Sequence      uint64     `json:"sequence"`
+	Relations     []Relation `json:"relations"`
+	Created       time.Time  `json:"created"`
+	Accessed      time.Time  `json:"accessed"`
 
 	// ── Validation-specific ──
-	Description   string           `json:"description"`
-	QualityBar    string           `json:"quality_bar"`
-	Type          ValidationType   `json:"type"`
-	Status        ValidationStatus `json:"status"`
-	StatusHistory []StatusChange   `json:"status_history"`
-	Required      bool             `json:"required"`
-	Weight        int              `json:"weight,omitempty"`
-	Deadline      time.Time        `json:"deadline,omitempty"`
+	TargetArtifactName string           `json:"target_artifact_name,omitempty"`
+	ValidatorID        string           `json:"validator_id,omitempty"`
+	ArtifactDataType   string           `json:"artifact_data_type,omitempty"`
+	ResultDataType     string           `json:"result_data_type,omitempty"`
+	Description        string           `json:"description"`
+	QualityBar         string           `json:"quality_bar"`
+	Type               ValidationType   `json:"type"`
+	Status             ValidationStatus `json:"status"`
+	StatusHistory      []StatusChange   `json:"status_history"`
+	Required           bool             `json:"required"`
+	Weight             int              `json:"weight,omitempty"`
+	Timeout            time.Duration    `json:"timeout,omitempty"`
+	Deadline           time.Time        `json:"deadline,omitempty"`
+	ResultArtifactID   string           `json:"result_artifact_id,omitempty"`
+	Error              *ValidationError `json:"error,omitempty"`
+	EvaluatedAt        time.Time        `json:"evaluated_at,omitempty"`
+	EvaluatorRef       *ParticipantRef  `json:"evaluator_ref,omitempty"`
 
 	// ExpectedToolCalls describes concrete tool work the evaluator
 	// should perform or explicitly account for while verifying this
@@ -755,7 +843,9 @@ type Validation struct {
 }
 
 // Passed reports whether this validation has a terminal passed status.
-func (v *Validation) Passed() bool { return v.Status == ValidationStatusPassed }
+func (v *Validation) Passed() bool {
+	return v != nil && (v.Status == ValidationStatusPassed || v.Status == ValidationStatusValidated)
+}
 
 // ────────────────────────────────────────────────────────────────────
 // Projection and helpers
@@ -1154,8 +1244,17 @@ func CloneArtifact(a *Artifact) *Artifact {
 		return nil
 	}
 	cp := *a
+	if len(a.Data) > 0 {
+		cp.Data = append([]byte(nil), a.Data...)
+	}
 	if len(a.Relations) > 0 {
 		cp.Relations = append([]Relation(nil), a.Relations...)
+	}
+	if len(a.StatusHistory) > 0 {
+		cp.StatusHistory = append([]StatusChange(nil), a.StatusHistory...)
+	}
+	if len(a.Errors) > 0 {
+		cp.Errors = cloneArtifactErrors(a.Errors)
 	}
 	cp.Metadata = cloneAnyMap(a.Metadata)
 	cp.Presentation = ClonePresentation(a.Presentation)
@@ -1217,6 +1316,13 @@ func CloneClaimEntity(c *Claim) *Claim {
 			if len(validation.StatusHistory) > 0 {
 				v.StatusHistory = append([]StatusChange(nil), validation.StatusHistory...)
 			}
+			if validation.Error != nil {
+				v.Error = cloneValidationError(validation.Error)
+			}
+			if validation.EvaluatorRef != nil {
+				ref := cloneParticipantRef(*validation.EvaluatorRef)
+				v.EvaluatorRef = &ref
+			}
 			if len(validation.ExpectedToolCalls) > 0 {
 				v.ExpectedToolCalls = append([]ExpectedToolCall(nil), validation.ExpectedToolCalls...)
 			}
@@ -1230,6 +1336,45 @@ func CloneClaimEntity(c *Claim) *Claim {
 		cp.LifecycleHistory = append([]StatusChange(nil), c.LifecycleHistory...)
 	}
 	return &cp
+}
+
+func cloneArtifactErrors(in []*ArtifactError) []*ArtifactError {
+	out := make([]*ArtifactError, len(in))
+	for i, errEntry := range in {
+		if errEntry == nil {
+			continue
+		}
+		cp := *errEntry
+		cp.Payload = cloneAnyMap(errEntry.Payload)
+		cp.Source = cloneParticipantRef(errEntry.Source)
+		out[i] = &cp
+	}
+	return out
+}
+
+func cloneValidationError(in *ValidationError) *ValidationError {
+	if in == nil {
+		return nil
+	}
+	cp := *in
+	cp.Payload = cloneAnyMap(in.Payload)
+	cp.Source = cloneParticipantRef(in.Source)
+	return &cp
+}
+
+func cloneParticipantRef(in ParticipantRef) ParticipantRef {
+	out := in
+	if in.Task != nil {
+		task := *in.Task
+		out.Task = &task
+	}
+	if len(in.Labels) > 0 {
+		out.Labels = make(map[string]string, len(in.Labels))
+		for k, v := range in.Labels {
+			out.Labels[k] = v
+		}
+	}
+	return out
 }
 
 func cloneAnyMap(in map[string]any) map[string]any {

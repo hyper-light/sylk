@@ -19,6 +19,17 @@ func TestNewAgentIdentityRegistry(t *testing.T) {
 	}
 }
 
+func TestAgentIdentityRegistryBootstrapUID(t *testing.T) {
+	reg := NewAgentIdentityRegistryWithUID("sys:identity_registry:proc/test", []string{"architect"})
+	if got, want := reg.UID(), "sys:identity_registry:proc/test"; got != want {
+		t.Fatalf("UID() = %q, want %q", got, want)
+	}
+	id, ok := reg.Get("architect")
+	if !ok || id != "architect" {
+		t.Fatalf("Get(architect) = (%q,%t), want (architect,true)", id, ok)
+	}
+}
+
 func TestIdentityRegistryGetUnknown(t *testing.T) {
 	reg := NewAgentIdentityRegistry([]string{"engineer"})
 

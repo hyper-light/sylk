@@ -3,6 +3,20 @@
 This document defines the canonical lifecycle for claims, testaments,
 validations, and their deltas.
 
+Artifact and typed validation lifecycles are owned by
+`docs/ARTIFACTS_AND_VALIDATIONS.md` and use the canonical states
+`artifact.generated`, `artifact.generation_failed`,
+`artifact.received`, `artifact.receipt_failed`, `artifact.attached`,
+`artifact.validating`, `artifact.validation_failed`,
+`artifact.validated`, `validation.ready`, `validation.validating`,
+`validation.validation_failed`,
+`validation.validation_failed_not_required`, `validation.errored`,
+`validation.errored_not_required`, `validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`, and
+`validation.validated`. This document consumes those states for claim
+and testament propagation rather than redefining them.
+
 The purpose is to make claims and testaments the only workflow state
 machine. The board owns durable truth. The Guide event bus transports
 committed lifecycle deltas. Agents, UI, validators, and continuations react

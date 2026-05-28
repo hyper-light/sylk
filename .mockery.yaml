@@ -182,6 +182,52 @@ packages:
         config:
           mockname: "MockProviderAdapter"
 
+  github.com/adalundhe/sylk/core/claims:
+    config:
+      dir: "core/claims/mocks"
+      outpkg: "mocks"
+    interfaces:
+      ValidationDispatcher:
+        config:
+          mockname: "ValidationDispatcher"
+
+      ValidatorHandler:
+        config:
+          mockname: "ValidatorHandler"
+
+      AgentTurnEvaluator:
+        config:
+          mockname: "AgentTurnEvaluator"
+
+      ArtifactLifecycleBusSink:
+        config:
+          mockname: "ArtifactLifecycleBusSink"
+
+      ValidationLifecycleBusSink:
+        config:
+          mockname: "ValidationLifecycleBusSink"
+
+      ClaimsClock:
+        config:
+          mockname: "ClaimsClock"
+
+      TestamentGenerator:
+        config:
+          mockname: "TestamentGenerator"
+
+  github.com/adalundhe/sylk/ui/bridge:
+    config:
+      dir: "ui/bridge/mocks"
+      outpkg: "mocks"
+    interfaces:
+      ClaimPresentationSink:
+        config:
+          mockname: "ClaimPresentationSink"
+
+      ClaimArtifactSink:
+        config:
+          mockname: "ClaimArtifactSink"
+
   github.com/adalundhe/sylk/core/pipeline:
     config:
       dir: "core/pipeline/mocks"

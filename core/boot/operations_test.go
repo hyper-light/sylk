@@ -3,11 +3,52 @@ package boot
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
 )
+
+func TestInitializePhase0CreatesProcessScopedIdentityAndInMemoryBoard(t *testing.T) {
+	startedAt := time.Date(2026, time.May, 28, 12, 34, 56, 789, time.UTC)
+	result, err := InitializePhase0(Phase0Config{StartedAt: startedAt})
+	if err != nil {
+		t.Fatalf("InitializePhase0: %v", err)
+	}
+	wantProcessUID := strconv.FormatInt(startedAt.UnixNano(), 10)
+	if result.Identity.ProcessUID != wantProcessUID {
+		t.Fatalf("process uid = %q, want %q", result.Identity.ProcessUID, wantProcessUID)
+	}
+	if got, want := result.Identity.BootSequencerUID, "sys:boot_sequencer:proc/"+wantProcessUID; got != want {
+		t.Fatalf("boot sequencer uid = %q, want %q", got, want)
+	}
+	if got, want := result.Identity.IdentityRegistryUID, "sys:identity_registry:proc/"+wantProcessUID; got != want {
+		t.Fatalf("identity registry uid = %q, want %q", got, want)
+	}
+	if result.Board == nil {
+		t.Fatal("phase 0 board is nil")
+	}
+	if result.Board.SessionDir() != "" {
+		t.Fatalf("phase 0 board session dir = %q, want in-memory", result.Board.SessionDir())
+	}
+	assertProjectionCounts(t, result.Board, 0, 0)
+}
+
+func TestInitializePhase0RequiresStartEntropy(t *testing.T) {
+	_, err := InitializePhase0(Phase0Config{})
+	if !errors.Is(err, ErrBootProcessStartRequired) {
+		t.Fatalf("InitializePhase0 error = %v, want ErrBootProcessStartRequired", err)
+	}
+}
+
+func TestProcessIdentityRejectsRoutableSeparatorCharacters(t *testing.T) {
+	_, err := ProcessIdentityFromUID("bad/uid", time.Time{})
+	if !errors.Is(err, ErrBootProcessUIDInvalid) {
+		t.Fatalf("ProcessIdentityFromUID error = %v, want ErrBootProcessUIDInvalid", err)
+	}
+}
 
 func TestOperationsPhase1CommitsDurableLifecycleAndReplaysIdempotently(t *testing.T) {
 	cfg := operationsDurableConfig(t)
@@ -18,6 +59,7 @@ func TestOperationsPhase1CommitsDurableLifecycleAndReplaysIdempotently(t *testin
 	}
 	assertClaimSatisfied(t, db.Board(), result.ClaimID)
 	assertTestamentValidated(t, db.Board(), result.TestamentID, "boot.phase_1_complete")
+	assertBootClaimUsesProcessScopedSequencer(t, db.Board(), result.ClaimID, testProcessIdentity())
 	assertProjectionCounts(t, db.Board(), 1, 1)
 	if err := db.Close(); err != nil {
 		t.Fatalf("close first durable board: %v", err)
@@ -138,12 +180,20 @@ func openOperationsBoard(t *testing.T, cfg claims.ClaimsBoardConfig) (*claims.Du
 	if err != nil {
 		t.Fatalf("OpenDurableBoard: %v", err)
 	}
-	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessUID: "proc-test"})
+	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessIdentity: testProcessIdentity()})
 	if err != nil {
 		_ = db.Close()
 		t.Fatalf("NewOperationsSequencer: %v", err)
 	}
 	return db, seq
+}
+
+func testProcessIdentity() ProcessIdentity {
+	return ProcessIdentity{
+		ProcessUID:          "testproc",
+		BootSequencerUID:    "sys:boot_sequencer:proc/testproc",
+		IdentityRegistryUID: "sys:identity_registry:proc/testproc",
+	}
 }
 
 func readyPhase1Status(board *claims.ClaimsBoard) Phase1Status {
@@ -172,6 +222,20 @@ func assertActivationClaimSatisfied(t *testing.T, board *claims.ClaimsBoard, cla
 	}
 	if got := claims.SubjectAgentID(claim.Relations); got != ActivationControllerAgentID {
 		t.Fatalf("claim %s subject = %s, want %s", claimID, got, ActivationControllerAgentID)
+	}
+}
+
+func assertBootClaimUsesProcessScopedSequencer(t *testing.T, board *claims.ClaimsBoard, claimID string, identity ProcessIdentity) {
+	t.Helper()
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		t.Fatalf("claim %s not found", claimID)
+	}
+	if got := claims.IssuerAgentID(claim.Relations); got != identity.BootSequencerUID {
+		t.Fatalf("claim %s issuer = %s, want %s", claimID, got, identity.BootSequencerUID)
+	}
+	if got := claims.SubjectAgentID(claim.Relations); got != identity.BootSequencerUID {
+		t.Fatalf("claim %s subject = %s, want %s", claimID, got, identity.BootSequencerUID)
 	}
 }
 

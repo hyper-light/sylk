@@ -1008,6 +1008,21 @@ clear rollback point, deterministic acceptance criteria, and tests that
 exercise success, failure, edge, concurrency, deadlock, and simulated
 usage paths.
 
+The operational state vocabulary is shared with
+`docs/ARTIFACTS_AND_VALIDATIONS.md`: `artifact.generated`,
+`artifact.generation_failed`, `artifact.received`,
+`artifact.receipt_failed`, `artifact.attached`,
+`artifact.validating`, `artifact.validation_failed`,
+`artifact.validated`, `validation.ready`, `validation.validating`,
+`validation.validation_failed`,
+`validation.validation_failed_not_required`, `validation.errored`,
+`validation.errored_not_required`, `validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`, and
+`validation.validated`. Legacy validation statuses `pending`,
+`in_progress`, `passed`, `incomplete`, `failed`, `errored`, and
+`skipped` are compatibility projections during replay and rollback.
+
 Plan-wide rules:
 
 1. Every integration or e2e mock is generated with

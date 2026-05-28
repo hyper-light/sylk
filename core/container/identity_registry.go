@@ -15,6 +15,7 @@ import (
 // resolve an agent's type from its canonical ID without additional lookup.
 type AgentIdentityRegistry struct {
 	mu      sync.RWMutex
+	uid     string
 	ids     map[string]string // agentType -> canonical ID
 	reverse map[string]string // canonical ID -> agentType
 }
@@ -23,7 +24,16 @@ type AgentIdentityRegistry struct {
 // IDs for the given agent types. Each type gets exactly one stable ID for
 // the lifetime of the registry.
 func NewAgentIdentityRegistry(agentTypes []string) *AgentIdentityRegistry {
+	return NewAgentIdentityRegistryWithUID("", agentTypes)
+}
+
+// NewAgentIdentityRegistryWithUID creates a registry with a process-scoped
+// bootstrap UID. Runtime boot uses this before ordinary allocation claims are
+// available; callers that do not participate in boot can use
+// NewAgentIdentityRegistry.
+func NewAgentIdentityRegistryWithUID(uid string, agentTypes []string) *AgentIdentityRegistry {
 	r := &AgentIdentityRegistry{
+		uid:     strings.TrimSpace(uid),
 		ids:     make(map[string]string, len(agentTypes)),
 		reverse: make(map[string]string, len(agentTypes)),
 	}
@@ -39,6 +49,13 @@ func NewAgentIdentityRegistry(agentTypes []string) *AgentIdentityRegistry {
 		r.reverse[agentType] = agentType
 	}
 	return r
+}
+
+// UID returns the registry's bootstrap identity, when one was supplied.
+func (r *AgentIdentityRegistry) UID() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.uid
 }
 
 // Get returns the canonical ID for the given agent type.

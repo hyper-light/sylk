@@ -480,9 +480,10 @@ const (
     ArtifactErrorCategoryReceiptStructural ArtifactErrorCategory = "receipt_structural"
     ArtifactErrorCategoryReceiptMetadata   ArtifactErrorCategory = "receipt_metadata"
     ArtifactErrorCategoryValidation        ArtifactErrorCategory = "validation"
-    ArtifactErrorCategoryValidatorErrored  ArtifactErrorCategory = "validator_errored"
-    ArtifactErrorCategoryQualityBar        ArtifactErrorCategory = "quality_bar"
     ArtifactErrorCategoryTimeout           ArtifactErrorCategory = "timeout"
+    ArtifactErrorCategoryPanic             ArtifactErrorCategory = "panic"
+    ArtifactErrorCategoryInterruption      ArtifactErrorCategory = "interruption"
+    ArtifactErrorCategoryInternal          ArtifactErrorCategory = "internal"
 )
 ```
 
@@ -975,6 +976,8 @@ const (
     ValidationErrorCategoryDispatcher    ValidationErrorCategory = "dispatcher"
     ValidationErrorCategoryDependency    ValidationErrorCategory = "dependency_unavailable"
     ValidationErrorCategoryPanic         ValidationErrorCategory = "handler_panic"
+    ValidationErrorCategoryInterruption  ValidationErrorCategory = "interruption"
+    ValidationErrorCategoryInternal      ValidationErrorCategory = "internal"
 )
 ```
 
@@ -3434,6 +3437,13 @@ states intent; this matrix states the work.
 Phase 0 does not change runtime behavior. It makes the written contract,
 interface boundaries, fixtures, and test harness precise enough that the
 later implementation cannot drift.
+
+Production rollout boundary: Phases 0 through 4 are contract, schema,
+helper, board, WAL, and projection work only. Phase 5 may run
+deterministic validators behind explicit opt-in gates for controlled
+production callers. Phase 7 is the first phase that permits normal
+production testifiers to use streaming artifact submission as the
+default runtime path.
 
 #### Item 0.A: Cross-document contract reconciliation
 

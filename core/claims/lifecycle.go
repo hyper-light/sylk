@@ -55,6 +55,7 @@ type LifecycleTransitionError struct {
 	EntityID   string
 	From       string
 	To         string
+	Actor      string
 	Reason     string
 }
 
@@ -66,7 +67,11 @@ func (e *LifecycleTransitionError) Error() string {
 	if reason == "" {
 		reason = "transition is not allowed"
 	}
-	return fmt.Sprintf("cannot transition %s %q lifecycle from %q to %q: %s", e.EntityType, e.EntityID, e.From, e.To, reason)
+	actor := strings.TrimSpace(e.Actor)
+	if actor == "" {
+		return fmt.Sprintf("cannot transition %s %q lifecycle from %q to %q: %s", e.EntityType, e.EntityID, e.From, e.To, reason)
+	}
+	return fmt.Sprintf("cannot transition %s %q lifecycle from %q to %q by %q: %s", e.EntityType, e.EntityID, e.From, e.To, actor, reason)
 }
 
 func newClaimLifecycleTransitionError(claimID string, from, to ClaimLifecycleStatus, reason string) error {

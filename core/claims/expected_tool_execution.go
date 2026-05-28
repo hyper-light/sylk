@@ -338,13 +338,13 @@ func expectedToolLifecycleActor(result *ValidationExpectedToolExecutionResult) s
 
 func testamentLifecycleForValidationStatus(status ValidationStatus) TestamentLifecycleStatus {
 	switch status {
-	case ValidationStatusPassed:
+	case ValidationStatusPassed, ValidationStatusValidated, ValidationStatusSkipped:
 		return TestamentLifecycleValidated
 	case ValidationStatusIncomplete:
 		return TestamentLifecycleValidationIncomplete
-	case ValidationStatusFailed:
+	case ValidationStatusFailed, ValidationStatusValidationFailed, ValidationStatusValidationFailedNotRequired, ValidationStatusQualityBarValidationFailed, ValidationStatusQualityBarValidationFailedNotRequired:
 		return TestamentLifecycleValidationFailed
-	case ValidationStatusErrored:
+	case ValidationStatusErrored, ValidationStatusErroredNotRequired:
 		return TestamentLifecycleValidationErrored
 	default:
 		return TestamentLifecycleValidationErrored

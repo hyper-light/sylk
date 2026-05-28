@@ -22,6 +22,20 @@ testaments or artifacts are intended to be rendered to a user-facing surface.
 Visibility in this document means presentation/rendering intent. It does not
 mean access control.
 
+Visibility consumers use the lifecycle vocabulary from
+`docs/ARTIFACTS_AND_VALIDATIONS.md` without inventing display-only
+states: `artifact.generated`, `artifact.generation_failed`,
+`artifact.received`, `artifact.receipt_failed`, `artifact.attached`,
+`artifact.validating`, `artifact.validation_failed`,
+`artifact.validated`, `validation.ready`, `validation.validating`,
+`validation.validation_failed`,
+`validation.validation_failed_not_required`, `validation.errored`,
+`validation.errored_not_required`, `validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`, and
+`validation.validated`. Legacy validation statuses are rendered only
+through compatibility projections.
+
 ## 2. Non-Negotiable Semantics
 
 ### 2.1 Claims are constraints, not display flags
@@ -2244,4 +2258,3 @@ Presentation does not create a second channel, does not create user-only
 artifacts, and does not reduce agent accessibility. It is a durable,
 replayable, board-backed rendering contract layered onto the existing claims
 graph.
-

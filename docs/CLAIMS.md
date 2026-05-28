@@ -885,9 +885,9 @@ const (
 |---|---|---|---|---|
 | Action | Yes | Yes | Yes | Aggregate lifecycle tracks claim progress |
 | Claim | Yes | Yes | Yes | Transitions through pending -> testified -> accepted/rejected |
-| Testament | **Immutable** | No | No | Proof chain integrity — corrections produce new testaments with `supersedes` relation |
-| Validation | Yes | Yes | Yes | Evaluation lifecycle: pending -> in_progress -> passed/failed/skipped |
-| Artifact | **Immutable** | No | No | Evidence integrity — ContentHash always valid, validations reference exact evidence |
+| Testament | **Immutable after terminal post** | Yes | Yes | Fine-grained testament lifecycle is tracked in `LifecycleStatus`; corrections produce new testaments with `supersedes` relation |
+| Validation | Yes | Yes | Yes | Legacy statuses (`pending`, `in_progress`, `passed`, `failed`, `errored`, `skipped`) remain compatibility projections; typed validation lifecycle uses `ready`, `validating`, `validating_quality_bar`, `validated`, and failure variants |
+| Artifact | Content immutable, lifecycle mutable | Yes | Yes | `Data`, `ContentHash`, and evidence content are immutable; receipt and validation lifecycle transitions append `StatusHistory` |
 
 ### 4.11 Complete Field Summary
 
@@ -901,8 +901,8 @@ const (
 |---|---|---|---|---|---|
 | `Type` | x | | | x | |
 | `ActionType` | | x | | | |
-| `Status` | x | x | | x | |
-| `StatusHistory` | x | x | | x | |
+| `Status` | x | x | | x | x |
+| `StatusHistory` | x | x | | x | x |
 | `Priority` | x | x | | | |
 | `Title` | | x | | | |
 | `Description` | | x | | x | |
@@ -916,14 +916,30 @@ const (
 | `QualityBar` | | | | x | |
 | `Required` | | | | x | |
 | `Weight` | | | | x | |
+| `TargetArtifactName` | | | | x | |
+| `ValidatorID` | | | | x | |
+| `ArtifactDataType` | | | | x | |
+| `ResultDataType` | | | | x | |
+| `Timeout` | | | | x | |
+| `ResultArtifactID` | | | | x | |
+| `Error` | | | | x | |
+| `EvaluatedAt` | | | | x | |
+| `EvaluatorRef` | | | | x | |
+| `ArtifactName` | | | | | x |
+| `DataType` | | | | | x |
+| `Data` | | | | | x |
 | `Kind` | | | | | x |
 | `Reference` | | | | | x |
 | `Metadata` | | | | | x |
 | `ContentHash` | | | | | x |
 | `Size` | | | | | x |
 | `Ephemeral` | | | | | x |
+| `Errors` | | | | | x |
+| `Presentation` | | | x | | x |
 
-**Total: 9 universal + 4 Action + 9 Claim + 3 Testament + 8 Validation + 6 Artifact = 39 unique fields across 5 types.**
+This summary is intentionally high-level. The authoritative typed artifact
+and validation field contracts are the Go structs in `core/claims/types.go`
+and `docs/ARTIFACTS_AND_VALIDATIONS.md` §§4 and 6.
 
 ### 4.12 ClaimsBoard
 

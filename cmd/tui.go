@@ -395,6 +395,8 @@ type bootstrapPhase1 struct {
 	projectRoot string
 	start       time.Time
 
+	bootIdentity   boot.ProcessIdentity
+	phase0Board    *claims.ClaimsBoard
 	scope          *concurrency.GoroutineScope
 	guideBus       guide.EventBus
 	activityPub    events.ActivityPublisher
@@ -794,6 +796,12 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 
 	phase1.scope = concurrency.NewGoroutineScope(ctx, "tui", nil)
 	phase1.scope.SetMaxLifetime(24 * time.Hour)
+	phase0, err := boot.InitializePhase0(boot.Phase0Config{StartedAt: start, Scope: &concurrency.ScopeAdapter{Scope: phase1.scope}})
+	if err != nil {
+		return phase1, fmt.Errorf("claims operations phase 0: %w", err)
+	}
+	phase1.bootIdentity = phase0.Identity
+	phase1.phase0Board = phase0.Board
 
 	guideChannelBus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	phase1.guideBus = guideChannelBus
@@ -854,8 +862,8 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.defaultSession = defaultSession
 	_ = phase1.sessionMgr.Switch(defaultSession.ID())
 	bootOps, err := boot.NewOperationsSequencer(boot.OperationsConfig{
-		Board:      defaultSession.ClaimsBoard(),
-		ProcessUID: fmt.Sprintf("proc:%d", start.UnixNano()),
+		Board:           defaultSession.ClaimsBoard(),
+		ProcessIdentity: phase1.bootIdentity,
 	})
 	if err != nil {
 		return phase1, fmt.Errorf("claims operations boot sequencer: %w", err)
@@ -948,7 +956,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.anthropicGateway.SetEventHook(llmEventHook)
 	phase1.openaiGateway.SetEventHook(llmEventHook)
 
-	phase1.identityReg = container.NewAgentIdentityRegistry([]string{
+	phase1.identityReg = container.NewAgentIdentityRegistryWithUID(phase1.bootIdentity.IdentityRegistryUID, []string{
 		"architect", "engineer", "designer", "inspector", "tester",
 		"inspector-pipeline", "tester-pipeline",
 		"librarian", "archivalist", "academic", "orchestrator",

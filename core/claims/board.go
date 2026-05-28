@@ -460,6 +460,7 @@ func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
 			v.ID = uuid.NewString()
 		}
 		v.ClaimID = c.ID
+		v.ParticipantID = firstNonEmpty(v.ParticipantID, v.AgentID, c.AgentID)
 		v.SessionID = b.sessionID
 		v.PipelineID = b.pipelineID
 		v.TaskID = b.taskID
@@ -468,6 +469,9 @@ func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
 		v.Accessed = now
 		if v.Status == "" {
 			v.Status = ValidationStatusPending
+		}
+		if v.Timeout > 0 && v.Deadline.IsZero() {
+			v.Deadline = now.Add(v.Timeout)
 		}
 		v.ExpectedToolCalls = stampExpectedToolCalls(v.ExpectedToolCalls)
 	}
@@ -822,12 +826,24 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 			artifact.ID = uuid.NewString()
 		}
 		artifact.TestamentID = t.ID
+		artifact.AgentID = firstNonEmpty(artifact.AgentID, t.AgentID)
+		artifact.ClaimID = firstNonEmpty(artifact.ClaimID, ClaimIDFromRelations(t.Relations))
+		artifact.ParticipantID = firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID)
 		artifact.SessionID = b.sessionID
 		artifact.PipelineID = b.pipelineID
 		artifact.TaskID = b.taskID
 		artifact.Sequence = b.nextSeq()
 		artifact.Created = now
 		artifact.Accessed = now
+		if artifact.Status == "" {
+			artifact.Status = ArtifactStatusGenerated
+			artifact.StatusHistory = append(artifact.StatusHistory, StatusChange{
+				To:      string(ArtifactStatusGenerated),
+				Reason:  "artifact generated",
+				AgentID: firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID),
+				Changed: now,
+			})
+		}
 		ApplyDefaultArtifactPresentation(artifact)
 		artifact.Presentation = NormalizePresentation(artifact.Presentation)
 	}
@@ -2590,7 +2606,7 @@ func claimAcceptedAfterValidation(c *Claim, validationID string, next Validation
 		if v.ID == validationID {
 			status = next
 		}
-		if status != ValidationStatusPassed {
+		if !ValidationStatusPassesRequired(status) {
 			return false
 		}
 	}
@@ -2598,18 +2614,7 @@ func claimAcceptedAfterValidation(c *Claim, validationID string, next Validation
 }
 
 func isKnownValidationStatus(status ValidationStatus) bool {
-	switch status {
-	case ValidationStatusPending,
-		ValidationStatusInProgress,
-		ValidationStatusPassed,
-		ValidationStatusIncomplete,
-		ValidationStatusFailed,
-		ValidationStatusErrored,
-		ValidationStatusSkipped:
-		return true
-	default:
-		return false
-	}
+	return status.Valid()
 }
 
 func validationClaimOutcome(c *Claim, v *Validation, status ValidationStatus, accepted bool) (ClaimStatus, ClaimLifecycleStatus, bool) {
@@ -2625,7 +2630,9 @@ func validationClaimOutcome(c *Claim, v *Validation, status ValidationStatus, ac
 	switch status {
 	case ValidationStatusIncomplete:
 		return ClaimStatusRejected, ClaimLifecycleValidationIncomplete, true
-	case ValidationStatusFailed:
+	case ValidationStatusFailed,
+		ValidationStatusValidationFailed,
+		ValidationStatusQualityBarValidationFailed:
 		return ClaimStatusRejected, ClaimLifecycleValidationFailed, true
 	case ValidationStatusErrored:
 		return ClaimStatusRejected, ClaimLifecycleValidationErrored, true
