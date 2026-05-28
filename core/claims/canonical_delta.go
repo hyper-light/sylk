@@ -45,6 +45,7 @@ const (
 	DeltaActionTestamentValidating           DeltaAction = "testament.validating"
 	DeltaActionTestamentValidationIncomplete DeltaAction = "testament.validation_incomplete"
 	DeltaActionTestamentValidationFailed     DeltaAction = "testament.validation_failed"
+	DeltaActionTestamentValidationErrored    DeltaAction = "testament.validation_errored"
 	DeltaActionTestamentValidated            DeltaAction = "testament.validated"
 
 	DeltaActionValidationEvaluated DeltaAction = "validation.evaluated"
@@ -77,6 +78,7 @@ var testamentLifecycleDeltaActions = map[TestamentLifecycleStatus]DeltaAction{
 	TestamentLifecycleValidating:           DeltaActionTestamentValidating,
 	TestamentLifecycleValidationIncomplete: DeltaActionTestamentValidationIncomplete,
 	TestamentLifecycleValidationFailed:     DeltaActionTestamentValidationFailed,
+	TestamentLifecycleValidationErrored:    DeltaActionTestamentValidationErrored,
 	TestamentLifecycleValidated:            DeltaActionTestamentValidated,
 }
 
@@ -234,6 +236,7 @@ func DeltaActionMayCompleteExpectedWork(action DeltaAction) bool {
 		DeltaActionTestamentValidated,
 		DeltaActionTestamentValidationIncomplete,
 		DeltaActionTestamentValidationFailed,
+		DeltaActionTestamentValidationErrored,
 		DeltaActionClaimTestamentAcknowledged,
 		DeltaActionClaimSatisfied,
 		DeltaActionClaimValidationIncomplete,

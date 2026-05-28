@@ -1065,6 +1065,7 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 		DeltaActionTestamentValidating,
 		DeltaActionTestamentValidationIncomplete,
 		DeltaActionTestamentValidationFailed,
+		DeltaActionTestamentValidationErrored,
 		DeltaActionTestamentValidated,
 		DeltaActionValidationEvaluated:
 		return role.Has(RoleObserver)
@@ -1312,7 +1313,8 @@ func canonicalPriority(delta CanonicalDelta) WorkUnitPriority {
 		DeltaActionTestamentGenerated,
 		DeltaActionTestamentValidating,
 		DeltaActionTestamentValidationIncomplete,
-		DeltaActionTestamentValidationFailed:
+		DeltaActionTestamentValidationFailed,
+		DeltaActionTestamentValidationErrored:
 		return PriorityAdvisory
 	default:
 		return PriorityAdvisory

@@ -44,6 +44,7 @@ const (
 	TestamentLifecycleValidating           TestamentLifecycleStatus = "validating"
 	TestamentLifecycleValidationIncomplete TestamentLifecycleStatus = "validation_incomplete"
 	TestamentLifecycleValidationFailed     TestamentLifecycleStatus = "validation_failed"
+	TestamentLifecycleValidationErrored    TestamentLifecycleStatus = "validation_errored"
 	TestamentLifecycleValidated            TestamentLifecycleStatus = "validated"
 )
 
@@ -77,6 +78,7 @@ func KnownTestamentLifecycleStatuses() []TestamentLifecycleStatus {
 		TestamentLifecycleValidating,
 		TestamentLifecycleValidationIncomplete,
 		TestamentLifecycleValidationFailed,
+		TestamentLifecycleValidationErrored,
 		TestamentLifecycleValidated,
 	}
 }
@@ -114,6 +116,7 @@ func (s TestamentLifecycleStatus) Valid() bool {
 		TestamentLifecycleValidating,
 		TestamentLifecycleValidationIncomplete,
 		TestamentLifecycleValidationFailed,
+		TestamentLifecycleValidationErrored,
 		TestamentLifecycleValidated:
 		return true
 	default:
@@ -143,6 +146,7 @@ func (s TestamentLifecycleStatus) IsTerminal() bool {
 	switch s {
 	case TestamentLifecycleValidationIncomplete,
 		TestamentLifecycleValidationFailed,
+		TestamentLifecycleValidationErrored,
 		TestamentLifecycleValidated:
 		return true
 	default:
@@ -157,7 +161,9 @@ func (s ClaimLifecycleStatus) IsFailure() bool {
 }
 
 func (s TestamentLifecycleStatus) IsFailure() bool {
-	return s == TestamentLifecycleValidationIncomplete || s == TestamentLifecycleValidationFailed
+	return s == TestamentLifecycleValidationIncomplete ||
+		s == TestamentLifecycleValidationFailed ||
+		s == TestamentLifecycleValidationErrored
 }
 
 func IsClaimLifecycleActionable(status ClaimLifecycleStatus) bool {
@@ -239,7 +245,7 @@ func CanTransitionTestamentLifecycle(from, to TestamentLifecycleStatus) bool {
 	case TestamentLifecycleReceived:
 		return to == TestamentLifecycleValidating
 	case TestamentLifecycleValidating:
-		return oneOfTestamentLifecycle(to, TestamentLifecycleValidated, TestamentLifecycleValidationIncomplete, TestamentLifecycleValidationFailed)
+		return oneOfTestamentLifecycle(to, TestamentLifecycleValidated, TestamentLifecycleValidationIncomplete, TestamentLifecycleValidationFailed, TestamentLifecycleValidationErrored)
 	default:
 		return false
 	}

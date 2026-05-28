@@ -517,6 +517,70 @@ func TestIntegration_EvaluateValidationEmitsCanonicalValidationDelta(t *testing.
 	}
 }
 
+func TestIntegration_CompleteTestamentValidationErroredEmitsCanonicalLifecycleDeltas(t *testing.T) {
+	bus := newCaptureBus()
+	board := newBusBackedBoard(t, bus)
+	ctx := context.Background()
+	claim := Claim{
+		ID:          "claim-testament-validation-errored",
+		Title:       "Validate response",
+		Description: "Validate the posted response.",
+		ActionType:  ActionTypeConsultation,
+		Relations: []Relation{
+			{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: "librarian", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+		Validations: []*Validation{{
+			ID:          "validation-inspect-response",
+			Type:        ValidationTypeInspection,
+			Required:    true,
+			Description: "inspect response",
+			QualityBar:  "validator completes without infrastructure error",
+		}},
+	}
+	if _, err := board.GenerateClaimAction(ctx, Action{Type: ActionTypeConsultation, AgentID: "architect"}, []Claim{claim}, GenerateClaimActionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.PostGeneratedClaim(ctx, claim.ID, "architect", ClaimPostOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	testamentID := "testament-validation-errored"
+	if _, err := board.GenerateTestamentAction(ctx, Action{Type: ActionTypeTestament, AgentID: "librarian"}, []Testament{{
+		ID:        testamentID,
+		AgentID:   "librarian",
+		Summary:   "response",
+		Relations: []Relation{{Related: claim.ID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim}},
+		Artifacts: []*Artifact{{Kind: ArtifactKindResponseText, Reference: "response"}},
+	}}, GenerateTestamentActionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.PostGeneratedTestament(ctx, testamentID, "librarian", TestamentPostOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.AcknowledgeTestamentReceipt(ctx, testamentID, "architect"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.BeginTestamentValidation(ctx, testamentID, "architect"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.CompleteTestamentValidation(ctx, testamentID, "architect", TestamentLifecycleValidationErrored, "validator unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	if got := bus.filterPublishedByKind(string(DeltaActionTestamentValidationErrored)); len(got) != 2 {
+		t.Fatalf("expected testament.validation_errored on claim+board topics, got %d", len(got))
+	}
+	claimDeltas := bus.filterPublishedByKind(string(DeltaActionClaimValidationErrored))
+	if len(claimDeltas) != 2 {
+		t.Fatalf("expected claim.validation_errored on claim+board topics, got %d", len(claimDeltas))
+	}
+	for _, published := range claimDeltas {
+		d := published.delta.(CanonicalDelta)
+		if status, ok := d.ClaimLifecycleStatus(); !ok || status != ClaimLifecycleValidationErrored {
+			t.Fatalf("claim lifecycle status = %q ok=%v", status, ok)
+		}
+	}
+}
+
 func TestIntegration_RejectClaimEmitsStatusDelta(t *testing.T) {
 	bus := newCaptureBus()
 	board := newBusBackedBoard(t, bus)

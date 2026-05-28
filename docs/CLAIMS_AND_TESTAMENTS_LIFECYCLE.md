@@ -451,6 +451,8 @@ testament.validating
   -> testament.validation_incomplete
 testament.validating
   -> testament.validation_failed
+testament.validating
+  -> testament.validation_errored
 ```
 
 Error states may be represented through claim lifecycle failures, testament
@@ -519,6 +521,16 @@ The parent claim should transition to `claim.validation_failed` unless
 another posted testament satisfies the failed validations in the same
 transaction.
 
+### testament.validation_errored
+
+Testament validation could not complete because the validator, evaluator,
+artifact reader, expected validation tool, or infrastructure failed.
+
+This is not a verdict on missing evidence or evidence quality. It is the
+testament-side counterpart to `claim.validation_errored`. The error must be
+captured as an artifact linked to the testament, claim, or nearest durable
+parent that exists.
+
 ### testament.validated
 
 Testament validation completed and all artifacts met their validations.
@@ -550,7 +562,7 @@ Important relationships:
 | `claim.satisfied` | `testament.validated` | Required validations passed. |
 | `claim.validation_incomplete` | `testament.validation_incomplete` | Required evidence is missing. |
 | `claim.validation_failed` | `testament.validation_failed` | Evidence exists but fails quality bars. |
-| `claim.validation_errored` | any | The validation process itself failed. |
+| `claim.validation_errored` | `testament.validation_errored` | The validation process itself failed. |
 
 ## 7. Delta Actions
 
@@ -584,6 +596,7 @@ Testament delta actions:
 - `testament.validating`
 - `testament.validation_incomplete`
 - `testament.validation_failed`
+- `testament.validation_errored`
 - `testament.validated`
 
 Validation verdict details may still be represented as validation records,
@@ -895,8 +908,9 @@ a projection if callers still need coarse categories.
 
 **Description:** Add explicit testament lifecycle statuses:
 `generated`, `posted`, `received`, `validating`, `validation_incomplete`,
-`validation_failed`, and `validated`. Testament status is independent from
-claim status while remaining related through claim/testament relations.
+`validation_failed`, `validation_errored`, and `validated`. Testament
+status is independent from claim status while remaining related through
+claim/testament relations.
 
 **Examples:**
 
@@ -918,6 +932,8 @@ claim status while remaining related through claim/testament relations.
   target agent or sender.
 - Testament terminal validation statuses update related claim lifecycle
   according to the claim validation outcome.
+- `testament.validation_errored` updates the related claim to
+  `claim.validation_errored`, not `claim.validation_failed`.
 - Large artifacts remain by reference; status transitions carry compact
   artifact headers only.
 
@@ -929,6 +945,8 @@ claim status while remaining related through claim/testament relations.
   standalone.
 - Unit: terminal testament validation states reject revalidation without a
   superseding/amending testament.
+- Unit: `testament.validation_errored` is terminal and classified as a
+  failure.
 - Integration with mockery board store: generated testament reloads with
   artifact headers and relations.
 - Integration with mockery source ack handler: source commits
@@ -940,6 +958,9 @@ claim status while remaining related through claim/testament relations.
 - E2E negative: relationless response does not resolve the parent claim.
 - E2E edge: two testaments answer one claim; validation uses the selected or
   latest applicable testament according to relation and supersession rules.
+- E2E validator-error: validator infrastructure failure moves the testament
+  to `validation_errored` and the claim to `validation_errored` with an
+  error artifact.
 
 #### Item 1.3: Define Transition Graph and Terminality Helpers
 
@@ -970,6 +991,8 @@ UI, and skills.
 - Unit table tests cover every testament status pair.
 - Unit: helper classifications cover all statuses exactly once where
   applicable.
+- Unit: claim/testament validation-error mapping is covered explicitly:
+  `testament.validation_errored -> claim.validation_errored`.
 - Integration static test: packages outside `core/claims` do not define
   duplicate terminal status lists.
 - E2E replay: terminal states remain terminal after board restart.
@@ -987,6 +1010,10 @@ for local control flow, but workflow truth is the error artifact.
 - Testament generation fails because an expected artifact cannot be
   serialized. The parent claim transitions to
   `testament_generation_failed` with the serialization error artifact.
+- Testament validation errors because a validator backend is unavailable.
+  The testament transitions to `validation_errored`; the claim transitions
+  to `validation_errored`; the unavailable-backend error is preserved as an
+  artifact.
 
 **Acceptance Criteria:**
 
@@ -1002,6 +1029,8 @@ for local control flow, but workflow truth is the error artifact.
 - Unit: every failure status requires structured error payload.
 - Unit: timeout, interruption, policy denial, unavailable dependency, and
   panic recovery map to distinct error artifact kinds.
+- Unit: testament validation error paths preserve error artifact metadata
+  and do not collapse into `validation_failed`.
 - Integration with mockery artifact sink: failed lifecycle transition stores
   error artifact before or atomically with status transition.
 - Integration negative: artifact sink failure is recorded on the nearest
@@ -1113,12 +1142,17 @@ responses and lets failures be recorded before the source/evaluator wakes.
 - Source/evaluator is not woken by `testament.generated`; it is woken by
   `testament.posted`.
 - Post failure preserves generated testament and records failure state.
+- Testament validation-error completion is exposed through the same
+  testament validation API as validated/incomplete/failed completion, with
+  `testament.validation_errored` as an allowed terminal target.
 
 **Test Cases:**
 
 - Unit: generated testament requires claim relation and testament action
   relation unless standalone.
 - Unit: posted testament without generated status fails.
+- Unit: completing testament validation with `validation_errored` succeeds
+  only from `testament.validating`.
 - Unit: artifact headers are validated for required fields and bounded
   sizes.
 - Integration with mockery artifact store: full artifacts are stored before
@@ -1127,6 +1161,8 @@ responses and lets failures be recorded before the source/evaluator wakes.
   applies supersession/selection rules deterministically.
 - E2E: target generates testament, source does not validate until posted.
 - E2E failure: testament post fails and source agent is not woken.
+- E2E validator-error: source/evaluator records a testament validation
+  error through the board API and no extra workflow path is used.
 
 #### Item 2.4: Add Receipt and Acknowledgment APIs
 
@@ -1188,6 +1224,9 @@ transition events with lifecycle-specific actions.
 - Delta schema contains every lifecycle action listed in this document.
 - Old broad actions are removed or treated as projections, not workflow
   inputs.
+- `testament.validation_errored` has a canonical delta action and round
+  trips through the same schema as other testament validation terminal
+  states.
 - Generated deltas are observable but not actionable.
 - Posted and received deltas carry receiver dimensions when relevant.
 - Delta refs can reference actions, claims, testaments, validations, and
@@ -1198,6 +1237,8 @@ transition events with lifecycle-specific actions.
 - Unit: enum coverage test ensures every lifecycle status has a delta
   action or documented non-delta projection.
 - Unit: JSON round trip for every lifecycle delta.
+- Unit: `testament.validation_errored` maps to and from
+  `TestamentLifecycleValidationErrored`.
 - Unit: malformed lifecycle action fails decode.
 - Integration with mockery delta publisher: board mutation emits exact
   lifecycle delta after commit.
@@ -1216,6 +1257,8 @@ receiver-specific facts.
 - `claim.posted:<board>:<claim>:<version>` for board fact.
 - `claim.received:<board>:<claim>:<receiver_uid>` for receiver ack.
 - `testament.posted:<board>:<testament>:<claim>` for response activation.
+- `testament.validation_errored:<board>:<testament>:<claim>` for
+  validator infrastructure failure.
 
 **Acceptance Criteria:**
 
@@ -1228,6 +1271,8 @@ receiver-specific facts.
 **Test Cases:**
 
 - Unit: deterministic key table for every delta action.
+- Unit: `testament.validation_errored` key is stable across replay and
+  distinct from `testament.validation_failed`.
 - Unit: receiver dimension changes key.
 - Unit: replayed object version yields same key.
 - Integration with mockery replay source: duplicate WAL events dedupe.
@@ -1245,6 +1290,9 @@ event bus. The Guide bus remains transport. It does not own workflow truth.
   message to the target agent topic.
 - Board commits `testament.posted`; Guide bus publishes to the source or
   evaluator topic.
+- Board commits `testament.validation_errored`; Guide bus publishes the
+  testament lifecycle fact to observer topics and the corresponding
+  `claim.validation_errored` fact to claim observers/continuations.
 - UI subscribes to session-wide lifecycle deltas.
 
 **Acceptance Criteria:**
@@ -1261,6 +1309,8 @@ event bus. The Guide bus remains transport. It does not own workflow truth.
 
 - Unit: topic helper table covers every action and receiver pattern.
 - Unit: generated actions route only to observer topics.
+- Unit: `testament.validation_errored` routes as a terminal testament
+  lifecycle fact and does not wake target work.
 - Integration with mockery Guide bus: exact topic and payload published.
 - Integration failure: bus publish failure does not roll back committed board
   state and is retry-visible.
@@ -1288,6 +1338,9 @@ UI terminal closure.
 - ClaimsInbox ignores generated deltas for work execution.
 - Continuation store ignores generated deltas for wakeups.
 - UI may render generated state but cannot close or resume rows from it.
+- `testament.validation_errored` is terminal, not generated/progress, and
+  can close testament-specific rows while the paired
+  `claim.validation_errored` closes claim-level waits.
 
 **Test Cases:**
 
@@ -1324,6 +1377,8 @@ It should not process old raw claim-created events as work.
 - Receipt is committed before work execution begins.
 - Source/evaluator receipt is committed before validation begins.
 - Generated, progress, and observer-only deltas do not start tool loops.
+- `testament.validation_errored` is observer/terminal-result information;
+  it never starts target-agent work.
 - Dedup store is bounded and keyed by delta key.
 - ClaimsInbox has tracked goroutine ownership and clean shutdown.
 
@@ -1337,6 +1392,8 @@ It should not process old raw claim-created events as work.
   commit fails.
 - Integration with mockery continuation store: `testament.posted` resolves
   waiting consult continuation exactly once.
+- Integration with mockery ClaimsInbox: `testament.validation_errored`
+  reaches observer projections but does not invoke target `ProcessEntry`.
 - Integration race: duplicate posted delta and replayed receipt do not
   start duplicate work.
 - Integration deadlock: ClaimsInbox close during delivery drains workers.
@@ -1365,6 +1422,9 @@ events.
 - Wait completion records the delta key that satisfied the wait.
 - Timeouts produce error artifacts and failure lifecycle states.
 - Duplicate terminal deltas are idempotent.
+- Testament validation-error waits complete from the paired
+  `claim.validation_errored` lifecycle fact, and the satisfying delta key is
+  recorded.
 
 **Test Cases:**
 
@@ -1375,6 +1435,9 @@ events.
 - Integration race: terminal and timeout fire concurrently; exactly one
   outcome commits.
 - Integration negative: progress delta does not wake consult wait.
+- Integration negative: `testament.validation_errored` alone does not wake a
+  claim-level consult wait unless the paired `claim.validation_errored` is
+  also committed.
 - E2E: consult resumes only after posted testament is acknowledged.
 - E2E: challenge response row closes while claim validation remains pending
   when configured that way.
@@ -1436,7 +1499,8 @@ responses, missing evidence, failed evidence, and validator errors.
   `testament.validation_incomplete`.
 - Present but failing artifacts produce `claim.validation_failed` and
   `testament.validation_failed`.
-- Validator infrastructure failure produces `claim.validation_errored`.
+- Validator infrastructure failure produces `claim.validation_errored` and
+  `testament.validation_errored` when a testament is under validation.
 - Validation outcomes include reason, reviewed artifacts, evaluator
   identity, and status history.
 
@@ -2092,4 +2156,3 @@ testament/artifact obligations.
   correctly and does not duplicate consults across phases.
 - E2E negative: agent attempts self-consult; lifecycle policy rejects before
   work starts and prompt recovery produces correct alternative.
-

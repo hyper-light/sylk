@@ -59,6 +59,7 @@ func TestTestamentLifecycleTransitionGraph(t *testing.T) {
 		{TestamentLifecycleValidating, TestamentLifecycleValidated},
 		{TestamentLifecycleValidating, TestamentLifecycleValidationIncomplete},
 		{TestamentLifecycleValidating, TestamentLifecycleValidationFailed},
+		{TestamentLifecycleValidating, TestamentLifecycleValidationErrored},
 	}
 	for _, tc := range allowed {
 		if !CanTransitionTestamentLifecycle(tc.from, tc.to) {
@@ -67,6 +68,12 @@ func TestTestamentLifecycleTransitionGraph(t *testing.T) {
 	}
 	if CanTransitionTestamentLifecycle(TestamentLifecycleValidated, TestamentLifecyclePosted) {
 		t.Fatal("terminal testament lifecycle state allowed transition back to posted")
+	}
+	if !TestamentLifecycleValidationErrored.IsTerminal() {
+		t.Fatal("testament validation_errored must be terminal")
+	}
+	if !TestamentLifecycleValidationErrored.IsFailure() {
+		t.Fatal("testament validation_errored must be classified as failure")
 	}
 }
 
@@ -557,6 +564,7 @@ func TestTestamentValidationLifecycleUpdatesParentClaim(t *testing.T) {
 		{name: "validated", to: TestamentLifecycleValidated, claimTo: ClaimLifecycleSatisfied, coarseStatus: ClaimStatusAccepted, passFirst: true},
 		{name: "incomplete", to: TestamentLifecycleValidationIncomplete, claimTo: ClaimLifecycleValidationIncomplete, coarseStatus: ClaimStatusRejected},
 		{name: "failed", to: TestamentLifecycleValidationFailed, claimTo: ClaimLifecycleValidationFailed, coarseStatus: ClaimStatusRejected},
+		{name: "errored", to: TestamentLifecycleValidationErrored, claimTo: ClaimLifecycleValidationErrored, coarseStatus: ClaimStatusRejected},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1498,7 +1498,8 @@ func lifecycleFailureMetadata(claimID string, to ClaimLifecycleStatus, opts Life
 func isTerminalTestamentValidationStatus(status TestamentLifecycleStatus) bool {
 	return status == TestamentLifecycleValidated ||
 		status == TestamentLifecycleValidationIncomplete ||
-		status == TestamentLifecycleValidationFailed
+		status == TestamentLifecycleValidationFailed ||
+		status == TestamentLifecycleValidationErrored
 }
 
 func claimLifecycleForTestamentValidation(status TestamentLifecycleStatus) ClaimLifecycleStatus {
@@ -1511,6 +1512,8 @@ func claimLifecycleForTestamentValidation(status TestamentLifecycleStatus) Claim
 		return ClaimLifecycleValidationIncomplete
 	case TestamentLifecycleValidationFailed:
 		return ClaimLifecycleValidationFailed
+	case TestamentLifecycleValidationErrored:
+		return ClaimLifecycleValidationErrored
 	default:
 		return ""
 	}
