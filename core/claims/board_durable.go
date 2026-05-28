@@ -795,6 +795,7 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 	if !ok {
 		return nil
 	}
+	var validation *Validation
 	for _, v := range c.Validations {
 		if v.ID == payload.ValidationID {
 			change := payload.Change
@@ -804,18 +805,27 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 			v.StatusHistory = append(v.StatusHistory, change)
 			v.Status = ValidationStatus(change.To)
 			v.Accessed = event.CreatedAt
+			validation = v
 			break
 		}
 	}
-	if c.AllValidationsPassed() && c.Status != ClaimStatusAccepted {
-		c.Status = ClaimStatusAccepted
+	accepted := c.AllValidationsPassed()
+	nextStatus, nextLifecycle, hasOutcome := validationClaimOutcome(c, validation, validationStatusOf(validation), accepted)
+	if hasOutcome && c.Status != nextStatus {
+		c.Status = nextStatus
 		c.Accessed = event.CreatedAt
+	}
+	if hasOutcome && CanTransitionClaimLifecycle(c.LifecycleStatus, nextLifecycle) {
+		db.board.transitionClaimLifecycleLocked(c, nextLifecycle, event.AgentID, validationClaimOutcomeReason(nextStatus, nextLifecycle, ""), event.CreatedAt)
 	}
 	records := []ClaimsOutboxRecord{
 		db.board.outboxRecordLocked(event.Sequence, "validation", payload.ValidationID, walEventValidationEvaluated, event.CreatedAt),
 	}
-	if c.Status == ClaimStatusAccepted {
+	switch nextStatus {
+	case ClaimStatusAccepted:
 		records = append(records, db.board.outboxRecordLocked(event.Sequence, "claim", c.ID, walEventClaimAccepted, event.CreatedAt))
+	case ClaimStatusRejected:
+		records = append(records, db.board.outboxRecordLocked(event.Sequence, "claim", c.ID, walEventClaimRejected, event.CreatedAt))
 	}
 	db.insertReplayOutbox(records)
 	return nil

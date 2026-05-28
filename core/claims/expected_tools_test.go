@@ -259,6 +259,58 @@ func TestExecuteValidationExpectedToolsSuccessProducesEvidenceAndPasses(t *testi
 	}
 }
 
+func TestExecuteValidationExpectedToolsFailedEvidenceRejectsClaim(t *testing.T) {
+	board, claimID, validationID := boardWithExpectedValidation(t, ExpectedToolCall{Tool: "run_tests", Required: true})
+	result, err := ExecuteValidationExpectedTools(context.Background(), board, claimID, validationID, ExpectedToolExecutionOptions{
+		AgentID:      "tester",
+		Executor:     &fakeExpectedToolExecutor{out: ExpectedToolExecutionOutput{Output: map[string]any{"passed": false}, Summary: "tests failed"}},
+		AllowedTools: map[string]bool{"run_tests": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ValidationStatus != ValidationStatusFailed {
+		t.Fatalf("validation status = %s, want failed", result.ValidationStatus)
+	}
+	claim, _ := board.CloneClaim(claimID)
+	if claim.Status != ClaimStatusRejected {
+		t.Fatalf("claim status = %s, want rejected", claim.Status)
+	}
+	if claim.LifecycleStatus != ClaimLifecycleValidationFailed {
+		t.Fatalf("claim lifecycle = %s, want validation_failed", claim.LifecycleStatus)
+	}
+}
+
+func TestExecuteValidationExpectedToolsMissingEvidenceMarksIncomplete(t *testing.T) {
+	board, claimID, validationID := boardWithExpectedValidation(t, ExpectedToolCall{
+		Tool:              "workspace_read",
+		Required:          true,
+		ProducesArtifacts: []string{"workspace_observation"},
+	})
+	result, err := ExecuteValidationExpectedTools(context.Background(), board, claimID, validationID, ExpectedToolExecutionOptions{
+		AgentID:      "inspector",
+		Executor:     &fakeExpectedToolExecutor{out: ExpectedToolExecutionOutput{Summary: "completed without workspace artifact"}},
+		AllowedTools: map[string]bool{"workspace_read": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ValidationStatus != ValidationStatusIncomplete {
+		t.Fatalf("validation status = %s, want incomplete", result.ValidationStatus)
+	}
+	artifact, ok := board.CloneArtifact(result.Attempts[0].ErrorArtifactID)
+	if !ok {
+		t.Fatal("missing-evidence artifact not committed")
+	}
+	if artifact.Kind != ArtifactKindMissingEvidence {
+		t.Fatalf("artifact kind = %q, want missing_evidence", artifact.Kind)
+	}
+	claim, _ := board.CloneClaim(claimID)
+	if claim.LifecycleStatus != ClaimLifecycleValidationIncomplete {
+		t.Fatalf("claim lifecycle = %s, want validation_incomplete", claim.LifecycleStatus)
+	}
+}
+
 func TestExecuteValidationExpectedToolsPolicyDeniedFailsWithArtifact(t *testing.T) {
 	board, claimID, validationID := boardWithExpectedValidation(t, ExpectedToolCall{Tool: "bash", Required: true})
 	exec := &fakeExpectedToolExecutor{}
@@ -276,11 +328,15 @@ func TestExecuteValidationExpectedToolsPolicyDeniedFailsWithArtifact(t *testing.
 	if len(exec.calls) != 0 {
 		t.Fatalf("policy-denied tool executed: %+v", exec.calls)
 	}
-	if result.ValidationStatus != ValidationStatusFailed {
-		t.Fatalf("validation status = %s, want failed", result.ValidationStatus)
+	if result.ValidationStatus != ValidationStatusErrored {
+		t.Fatalf("validation status = %s, want errored", result.ValidationStatus)
 	}
 	if len(result.RemediationClaimIDs) != 1 || result.RemediationClaimIDs[0] != "remediate-1" {
 		t.Fatalf("remediation ids = %+v", result.RemediationClaimIDs)
+	}
+	claim, _ := board.CloneClaim(claimID)
+	if claim.LifecycleStatus != ClaimLifecycleValidationErrored {
+		t.Fatalf("claim lifecycle = %s, want validation_errored", claim.LifecycleStatus)
 	}
 	artifact, ok := board.CloneArtifact(result.Attempts[0].ErrorArtifactID)
 	if !ok {
@@ -359,8 +415,8 @@ func TestExecuteValidationExpectedToolsRequiredSkipFailsValidation(t *testing.T)
 	if got := result.Attempts[0].Status; got != ExpectedToolExecutionFailed {
 		t.Fatalf("attempt status = %s, want failed", got)
 	}
-	if result.ValidationStatus != ValidationStatusFailed {
-		t.Fatalf("validation status = %s, want failed", result.ValidationStatus)
+	if result.ValidationStatus != ValidationStatusErrored {
+		t.Fatalf("validation status = %s, want errored", result.ValidationStatus)
 	}
 }
 
@@ -390,8 +446,8 @@ func TestExecuteValidationExpectedToolsPanicBecomesErrorArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ValidationStatus != ValidationStatusFailed {
-		t.Fatalf("validation status = %s, want failed", result.ValidationStatus)
+	if result.ValidationStatus != ValidationStatusErrored {
+		t.Fatalf("validation status = %s, want errored", result.ValidationStatus)
 	}
 	artifact, ok := board.CloneArtifact(result.Attempts[0].ErrorArtifactID)
 	if !ok {

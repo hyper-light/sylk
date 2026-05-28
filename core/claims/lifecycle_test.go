@@ -17,6 +17,7 @@ func TestClaimLifecycleTransitionGraph(t *testing.T) {
 		{ClaimLifecycleGenerated, ClaimLifecyclePosted},
 		{ClaimLifecycleGenerated, ClaimLifecyclePostFailed},
 		{ClaimLifecyclePosted, ClaimLifecycleReceived},
+		{ClaimLifecyclePosted, ClaimLifecycleValidating},
 		{ClaimLifecycleReceived, ClaimLifecycleProgressed},
 		{ClaimLifecycleProgressed, ClaimLifecycleTestamentGenerated},
 		{ClaimLifecycleTestamentGenerated, ClaimLifecycleTestamentAcknowledged},
@@ -36,7 +37,7 @@ func TestClaimLifecycleTransitionGraph(t *testing.T) {
 		to   ClaimLifecycleStatus
 	}{
 		{ClaimLifecycleGenerated, ClaimLifecycleReceived},
-		{ClaimLifecyclePosted, ClaimLifecycleSatisfied},
+		{ClaimLifecycleGenerated, ClaimLifecycleSatisfied},
 		{ClaimLifecycleSatisfied, ClaimLifecycleProgressed},
 		{ClaimLifecycleValidationFailed, ClaimLifecycleProgressed},
 	}

@@ -338,13 +338,29 @@ const (
 	ValidationStatusPending    ValidationStatus = "pending"     // not yet evaluated
 	ValidationStatusInProgress ValidationStatus = "in_progress" // evaluator working
 	ValidationStatusPassed     ValidationStatus = "passed"      // meets quality bar (terminal)
+	ValidationStatusIncomplete ValidationStatus = "incomplete"  // required evidence was missing (terminal)
 	ValidationStatusFailed     ValidationStatus = "failed"      // does not meet quality bar (terminal)
+	ValidationStatusErrored    ValidationStatus = "errored"     // evaluator infrastructure failed (terminal)
 	ValidationStatusSkipped    ValidationStatus = "skipped"     // explicitly waived (terminal)
 )
 
 // IsTerminal reports whether this validation status is a terminal state.
 func (s ValidationStatus) IsTerminal() bool {
-	return s == ValidationStatusPassed || s == ValidationStatusFailed || s == ValidationStatusSkipped
+	switch s {
+	case ValidationStatusPassed, ValidationStatusIncomplete, ValidationStatusFailed, ValidationStatusErrored, ValidationStatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s ValidationStatus) IsNegativeTerminal() bool {
+	switch s {
+	case ValidationStatusIncomplete, ValidationStatusFailed, ValidationStatusErrored:
+		return true
+	default:
+		return false
+	}
 }
 
 // ValidationType classifies what kind of check a validation performs.
@@ -770,10 +786,12 @@ type ClaimsBoardProjection struct {
 	RejectedCount   int `json:"rejected_count"`
 
 	// Validation status counts.
-	TotalValidations   int `json:"total_validations"`
-	PassedValidations  int `json:"passed_validations"`
-	FailedValidations  int `json:"failed_validations"`
-	SkippedValidations int `json:"skipped_validations"`
+	TotalValidations      int `json:"total_validations"`
+	PassedValidations     int `json:"passed_validations"`
+	IncompleteValidations int `json:"incomplete_validations"`
+	FailedValidations     int `json:"failed_validations"`
+	ErroredValidations    int `json:"errored_validations"`
+	SkippedValidations    int `json:"skipped_validations"`
 
 	// Action counts.
 	TotalClaimActions     int `json:"total_claim_actions"`

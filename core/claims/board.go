@@ -1102,6 +1102,10 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	change.Changed = now
 	change.From = string(v.Status)
 	toStatus := ValidationStatus(change.To)
+	if !isKnownValidationStatus(toStatus) {
+		b.mu.Unlock()
+		return fmt.Errorf("validation %q on claim %q cannot transition to unknown status %q", validationID, claimID, change.To)
+	}
 	if v.Status.IsTerminal() {
 		if v.Status == toStatus {
 			b.mu.Unlock()
@@ -1111,12 +1115,16 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		return fmt.Errorf("validation %q on claim %q is already terminal (%s)", validationID, claimID, v.Status)
 	}
 	accepted := claimAcceptedAfterValidation(c, validationID, toStatus)
-	acceptedFromStatus := c.Status
+	claimOutcomeStatus, claimOutcomeLifecycle, hasClaimOutcome := validationClaimOutcome(c, v, toStatus, accepted)
+	claimOutcomeFromStatus := c.Status
 	outboxRecords := []ClaimsOutboxRecord{
 		b.outboxRecordLocked(v.Sequence, "validation", v.ID, walEventValidationEvaluated, now),
 	}
 	if accepted {
 		outboxRecords = append(outboxRecords, b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimAccepted, now))
+	}
+	if hasClaimOutcome && claimOutcomeStatus == ClaimStatusRejected {
+		outboxRecords = append(outboxRecords, b.outboxRecordLocked(c.Sequence, "claim", c.ID, walEventClaimRejected, now))
 	}
 	if err := b.appendDurableEventLocked(walEventValidationEvaluated, change.AgentID, map[string]any{
 		"claim_id": claimID, "validation_id": validationID, "status": change.To, "change": change,
@@ -1131,20 +1139,21 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		b.transitionClaimLifecycleLocked(c, ClaimLifecycleValidating, change.AgentID, "validation started", now)
 	}
 
-	if accepted {
+	if hasClaimOutcome {
 		prevStatus := c.Status
+		reason := validationClaimOutcomeReason(claimOutcomeStatus, claimOutcomeLifecycle, change.Reason)
 		c.StatusHistory = append(c.StatusHistory, StatusChange{
 			From:    string(c.Status),
-			To:      string(ClaimStatusAccepted),
-			Reason:  "all required validations passed",
+			To:      string(claimOutcomeStatus),
+			Reason:  reason,
 			AgentID: change.AgentID,
 			Changed: now,
 		})
-		c.Status = ClaimStatusAccepted
+		c.Status = claimOutcomeStatus
 		c.Accessed = now
-		b.adjustStatusCounter(prevStatus, ClaimStatusAccepted)
-		if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleSatisfied) {
-			b.transitionClaimLifecycleLocked(c, ClaimLifecycleSatisfied, change.AgentID, "all required validations passed", now)
+		b.adjustStatusCounter(prevStatus, claimOutcomeStatus)
+		if CanTransitionClaimLifecycle(c.LifecycleStatus, claimOutcomeLifecycle) {
+			b.transitionClaimLifecycleLocked(c, claimOutcomeLifecycle, change.AgentID, reason, now)
 		}
 	}
 
@@ -1153,12 +1162,12 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	if len(v.ExpectedToolCalls) > 0 {
 		validationSnapshot.ExpectedToolCalls = append([]ExpectedToolCall(nil), v.ExpectedToolCalls...)
 	}
-	var acceptedTransition *claimStatusTransition
-	if accepted {
-		acceptedTransition = &claimStatusTransition{
-			from:    acceptedFromStatus,
-			to:      ClaimStatusAccepted,
-			reason:  "all required validations passed",
+	var claimTransition *claimStatusTransition
+	if hasClaimOutcome {
+		claimTransition = &claimStatusTransition{
+			from:    claimOutcomeFromStatus,
+			to:      claimOutcomeStatus,
+			reason:  validationClaimOutcomeReason(claimOutcomeStatus, claimOutcomeLifecycle, change.Reason),
 			agentID: change.AgentID,
 			changed: now,
 		}
@@ -1173,9 +1182,12 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		if accepted {
 			b.amplifier.EmitClaimAccepted(ctx, c)
 		}
+		if hasClaimOutcome && claimOutcomeStatus == ClaimStatusRejected {
+			b.amplifier.EmitClaimRejected(ctx, c)
+		}
 	}
 	b.amplifier.PublishCanonicalValidationEvaluated(ctx, claimSnapshot, &validationSnapshot, change, accepted, now)
-	if acceptedTransition != nil {
+	if claimTransition != nil {
 		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
 			SessionID:      b.sessionID,
 			BoardID:        b.boardID,
@@ -1183,22 +1195,22 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 			Sequence:       claimSnapshot.Sequence,
 			EmittedAt:      now,
 			ActionKind:     claimSnapshot.ActionType,
-			FromStatus:     acceptedTransition.from,
-			ToStatus:       acceptedTransition.to,
-			Reason:         acceptedTransition.reason,
-			AgentID:        acceptedTransition.agentID,
+			FromStatus:     claimTransition.from,
+			ToStatus:       claimTransition.to,
+			Reason:         claimTransition.reason,
+			AgentID:        claimTransition.agentID,
 			SubjectAgentID: SubjectAgentID(claimSnapshot.Relations),
 			IssuerAgentID:  IssuerAgentID(claimSnapshot.Relations),
 		})
 	}
-	claimToStatus := ClaimStatus(change.To)
-	if accepted {
-		claimToStatus = ClaimStatusAccepted
+	claimToStatus := claimSnapshot.Status
+	if hasClaimOutcome {
+		claimToStatus = claimOutcomeStatus
 	}
 	b.notifyDelta(BoardMutationDelta{
 		Kind:       "validation_evaluated",
 		ClaimID:    claimID,
-		FromStatus: ClaimStatus(change.From),
+		FromStatus: claimOutcomeFromStatus,
 		ToStatus:   claimToStatus,
 		AgentID:    change.AgentID,
 	})
@@ -1717,8 +1729,12 @@ func incrementValidationCounts(p *ClaimsBoardProjection, validations []*Validati
 		switch v.Status {
 		case ValidationStatusPassed:
 			p.PassedValidations++
+		case ValidationStatusIncomplete:
+			p.IncompleteValidations++
 		case ValidationStatusFailed:
 			p.FailedValidations++
+		case ValidationStatusErrored:
+			p.ErroredValidations++
 		case ValidationStatusSkipped:
 			p.SkippedValidations++
 		}
@@ -2481,6 +2497,69 @@ func claimAcceptedAfterValidation(c *Claim, validationID string, next Validation
 		}
 	}
 	return true
+}
+
+func isKnownValidationStatus(status ValidationStatus) bool {
+	switch status {
+	case ValidationStatusPending,
+		ValidationStatusInProgress,
+		ValidationStatusPassed,
+		ValidationStatusIncomplete,
+		ValidationStatusFailed,
+		ValidationStatusErrored,
+		ValidationStatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+func validationClaimOutcome(c *Claim, v *Validation, status ValidationStatus, accepted bool) (ClaimStatus, ClaimLifecycleStatus, bool) {
+	if accepted {
+		return ClaimStatusAccepted, ClaimLifecycleSatisfied, true
+	}
+	if c != nil && c.Status.IsTerminal() {
+		return "", "", false
+	}
+	if c == nil || v == nil || !v.Required {
+		return "", "", false
+	}
+	switch status {
+	case ValidationStatusIncomplete:
+		return ClaimStatusRejected, ClaimLifecycleValidationIncomplete, true
+	case ValidationStatusFailed:
+		return ClaimStatusRejected, ClaimLifecycleValidationFailed, true
+	case ValidationStatusErrored:
+		return ClaimStatusRejected, ClaimLifecycleValidationErrored, true
+	default:
+		return "", "", false
+	}
+}
+
+func validationStatusOf(v *Validation) ValidationStatus {
+	if v == nil {
+		return ""
+	}
+	return v.Status
+}
+
+func validationClaimOutcomeReason(status ClaimStatus, lifecycle ClaimLifecycleStatus, fallback string) string {
+	if reason := strings.TrimSpace(fallback); reason != "" {
+		return reason
+	}
+	if status == ClaimStatusAccepted {
+		return "all required validations passed"
+	}
+	switch lifecycle {
+	case ClaimLifecycleValidationIncomplete:
+		return "required validation incomplete"
+	case ClaimLifecycleValidationFailed:
+		return "required validation failed"
+	case ClaimLifecycleValidationErrored:
+		return "required validation errored"
+	default:
+		return string(lifecycle)
+	}
 }
 
 func firstNonEmpty(values ...string) string {

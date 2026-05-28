@@ -887,6 +887,7 @@ func newGuideDomainClassifier(cfg *DomainClassifierConfig) (*DomainClassifier, e
 // 4. LLM classification - cache miss (~250 tokens)
 func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedRequest, error) {
 	g.ensureRequestDefaults(request)
+	request.CorrelationID = g.resolveCorrelationID(request)
 	g.prepareSkillsForRouting(request)
 
 	classStart := time.Now()
@@ -903,25 +904,12 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		Model:       classification.ClassificationMethod,
 	})
 
-	// Classification testament: every routing decision is auditable.
-	g.guideSubmitTestamentAsync(request.SessionID, guideTestament(
-		request.SessionID,
-		"Classified: intent="+string(classification.Intent)+" target="+targetAgentID+" confidence="+formatConfidence(classification.Confidence),
-		"committed", targetAgentID,
-		[]*claims.Artifact{
-			guideArtifact(request.SessionID, "intent", string(classification.Intent)),
-			guideArtifact(request.SessionID, "domain", string(classification.Domain)),
-			guideArtifact(request.SessionID, "target_agent", targetAgentID),
-			guideArtifact(request.SessionID, "confidence", formatConfidence(classification.Confidence)),
-			guideArtifact(request.SessionID, "method", classification.ClassificationMethod),
-		},
-	))
-
 	g.applyPendingPlanMetadata(request.SessionID, request.Input, classification)
 
-	corrID := g.resolveCorrelationID(request)
+	corrID := request.CorrelationID
 	if !request.FireAndForget || metadataHasNestedInterAgentBranch(request.Metadata) {
 		corrID = g.pending.Add(request, classification, targetAgentID)
+		request.CorrelationID = corrID
 		if pending := g.pending.Get(corrID); pending != nil {
 			g.applyDeferredStreamReroute(pending)
 		}
@@ -946,6 +934,10 @@ func (g *Guide) RouteAndForward(ctx context.Context, request *RouteRequest) (*Fo
 		return forwarded, nil
 	}
 	if g.isGuideTarget(pending.TargetAgentID) {
+		return forwarded, nil
+	}
+	if shouldSuppressForwardedExecution(forwarded) {
+		g.pending.Remove(forwarded.CorrelationID)
 		return forwarded, nil
 	}
 	if err := g.publishForwardedRequest(pending.TargetAgentID, forwarded, nil); err != nil {
@@ -2186,38 +2178,17 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
 	)
 
-	// Post the user prompt on the session claims board synchronously
-	// so we can stamp the resulting claim ID onto the forwarded
-	// envelope's metadata as parent_claim_id. Without this stamp the
-	// receiver's BeginForwardedRequestCycle falls back to
-	// correlationID-as-claim, the bridge resolver never sees that
-	// fake ID, and every artifact emitted under the prompt cycle is
-	// silently dropped from the UI plane. See docs/CLAIMS_UI.md
-	// "Forwarded-request claim binding". The metadata key matches
-	// shared.MetadataKeyParentClaimID — inlined here to avoid a
-	// guide → shared import cycle.
-	//
-	// Only TUI-originated user prompts mint a new ActionTypePrompt
-	// claim. Agent-originated routes (consult_peer, challenge_peer,
-	// direct protocol exchanges, archivalist briefs, fire-and-forget
-	// sub-requests, control-plane coordination) MUST NOT mint a
-	// prompt cycle: their parent claim is the agent's own
-	// in-progress work, already stamped on request.Metadata's
-	// parent_claim_id by the dispatching skill. Minting a fresh
-	// prompt claim here would (a) produce a phantom top-level user
-	// prompt cycle owned by the target agent and (b) overwrite the
-	// real parent_claim_id, severing the responder's testament
-	// from the originating consultation/challenge claim and breaking
-	// the bridge's nested-row attribution. See the diagnosis in
-	// docs/CLAIMS_UI.md "Guide route semantics".
 	if board := g.sessionClaimsBoard(request.SessionID); board != nil {
 		metadata = mergeForwardMetadata(metadata, map[string]any{
 			"session_board_id": board.BoardID(),
 		})
-		if shouldPostPromptClaim(request, metadata) {
-			if promptClaimID := g.dispatchPromptAction(board, request, classification); promptClaimID != "" {
+		if shouldPostRoutedWorkClaim(request, metadata) {
+			if routeClaimID := g.dispatchRoutedWorkClaim(board, request, classification); routeClaimID != "" {
 				metadata = mergeForwardMetadata(metadata, map[string]any{
-					"parent_claim_id": promptClaimID,
+					"parent_claim_id":        routeClaimID,
+					"routed_work_claim_id":   routeClaimID,
+					"claim_native_routing":   true,
+					"forwarded_execution_ok": false,
 				})
 			}
 		}
@@ -2282,9 +2253,9 @@ func (g *Guide) sessionClaimsBoard(sessionID string) *claims.ClaimsBoard {
 	return g.conversation.SessionClaimsBoard(sessionID, adaptScope(g.scope))
 }
 
-// shouldPostPromptClaim reports whether buildForwardedRequest
-// should mint a fresh ActionTypePrompt claim for this route. Only
-// TUI-originated user prompts qualify:
+// shouldPostRoutedWorkClaim reports whether buildForwardedRequest
+// should mint and post the claim that wakes the selected target. Only
+// TUI-originated top-level prompts qualify:
 //
 //   - SourceAgentID == "tui": user typed it; the prompt cycle is
 //     the user's top-level intent.
@@ -2300,9 +2271,9 @@ func (g *Guide) sessionClaimsBoard(sessionID string) *claims.ClaimsBoard {
 //     reconciliation) is invisible system traffic that must never
 //     open a visible cycle.
 //
-// All other routes preserve their existing parent_claim_id (or
-// remain unstamped if the dispatcher chose not to stamp one).
-func shouldPostPromptClaim(request *RouteRequest, metadata map[string]any) bool {
+// All other routes preserve their existing parent_claim_id and continue
+// under their originating claim.
+func shouldPostRoutedWorkClaim(request *RouteRequest, metadata map[string]any) bool {
 	if request == nil {
 		return false
 	}
@@ -2340,23 +2311,42 @@ func metadataHasNonEmptyString(metadata map[string]any, key string) bool {
 	return strings.TrimSpace(str) != ""
 }
 
+func shouldSuppressForwardedExecution(forwarded *ForwardedRequest) bool {
+	if forwarded == nil {
+		return false
+	}
+	if strings.TrimSpace(forwarded.SourceAgentID) != sourceAgentTUI {
+		return false
+	}
+	if !metadataBool(forwarded.Metadata, "claim_native_routing") {
+		return false
+	}
+	return metadataHasNonEmptyString(forwarded.Metadata, "routed_work_claim_id")
+}
+
+func metadataBool(metadata map[string]any, key string) bool {
+	if len(metadata) == 0 {
+		return false
+	}
+	value, ok := metadata[key]
+	if !ok {
+		return false
+	}
+	typed, ok := value.(bool)
+	return ok && typed
+}
+
 // sourceAgentTUI mirrors the constant in ui/app.go so the guide
 // can identify TUI-originated requests without a UI import. The
 // canonical value is the same string ("tui"); the duplicated
 // constant exists only to break the import cycle.
 const sourceAgentTUI = "tui"
 
-// dispatchPromptAction posts the user prompt to the session board
-// SYNCHRONOUSLY and returns the resulting claim ID so the caller can
-// stamp it onto the outgoing forwarded-request envelope as
-// parent_claim_id. Posting inline (board.PostAction is fast) is the
-// only way to guarantee the receiver sees a real claim ID — the prior
-// async dispatch raced the envelope and the receiver fell back to
-// using correlationID as a fake claim anchor (UI artifacts then
-// stranded forever, never rendered). Returns "" if the post failed
-// or the input was empty; callers must tolerate empty by NOT stamping.
-func (g *Guide) dispatchPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) string {
-	claimID, err := postUserPromptAction(board, request, classification)
+// dispatchRoutedWorkClaim generates and posts the target work claim
+// synchronously. claim.generated is an audit fact only; claim.posted is
+// the event that wakes the target agent's inbox.
+func (g *Guide) dispatchRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) string {
+	claimID, err := postRoutedWorkClaim(board, request, classification)
 	if err != nil {
 		recordPromptActionFailure(context.Background(), board, request.SessionID, err)
 		return ""
@@ -2399,15 +2389,10 @@ func recordPromptActionFailure(ctx context.Context, board *claims.ClaimsBoard, s
 	}
 }
 
-// postUserPromptAction records the user's input on the session claims
-// board as a prompt action. Returns the posted claim's ID and the
-// error from the board write. Callers stamp the returned ID onto the
-// outgoing ForwardedRequest's Metadata as parent_claim_id so the
-// receiver's BeginForwardedRequestCycle binds its accumulator to the
-// REAL claim — never to a synthetic correlation-as-claim fallback,
-// which the bridge resolver doesn't recognize and which strands every
-// downstream artifact.
-func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) (string, error) {
+// postRoutedWorkClaim records the user's input as the target's work
+// claim. It uses lifecycle generation before posting so replay can
+// distinguish "claim exists" from "claim is deliverable".
+func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) (string, error) {
 	input := strings.TrimSpace(request.Input)
 	if input == "" {
 		return "", nil
@@ -2422,40 +2407,77 @@ func postUserPromptAction(board *claims.ClaimsBoard, request *RouteRequest, clas
 		confidence = classification.Confidence
 	}
 
-	action := claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt}
-	promptClaim := claims.Claim{
+	targetAgent = strings.TrimSpace(targetAgent)
+	if targetAgent == "" {
+		return "", fmt.Errorf("routed work claim target agent is required")
+	}
+
+	action := claims.Action{AgentID: "guide", Type: claims.ActionTypeTask}
+	workClaim := claims.Claim{
 		Title:       truncateForClaim(input, 80),
 		Description: input,
-		ActionType:  claims.ActionTypePrompt,
+		ActionType:  claims.ActionTypeTask,
+		Context:     "Route accepted by Guide; awaiting target work",
+		Scope: []claims.ClaimScopeEntry{
+			{Kind: "session", Key: request.SessionID},
+			{Kind: "correlation", Key: request.CorrelationID},
+		},
 		Relations: []claims.Relation{
 			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: targetAgent, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 		},
-		Tags: streamCorrelationTagsFor(request),
-	}
-	if targetAgent != "" {
-		promptClaim.Relations = append(promptClaim.Relations, claims.Relation{
-			Related: targetAgent, RelatedType: claims.RelatedTypeAgent,
-			Relationship: claims.RelationshipSubject,
-		})
+		Tags: routedWorkTagsFor(request),
+		Validations: []*claims.Validation{{
+			ID:          routedWorkValidationID("receipt", request),
+			Description: "Target agent submitted a testament for the routed work",
+			QualityBar:  "A related testament exists with response artifacts or error artifacts",
+			Type:        claims.ValidationTypeReceipt,
+			Status:      claims.ValidationStatusPending,
+			Required:    true,
+		}},
 	}
 	if intent != "" {
-		promptClaim.Validations = append(promptClaim.Validations, &claims.Validation{
+		workClaim.Validations = append(workClaim.Validations, &claims.Validation{
+			ID:          routedWorkValidationID("classification", request),
 			Description: fmt.Sprintf("Classified as intent=%s target=%s confidence=%.2f", intent, targetAgent, confidence),
 			QualityBar:  "Classification recorded for auditability",
-			Type:        claims.ValidationType("receipt"),
+			Type:        claims.ValidationTypeReceipt,
 			Status:      claims.ValidationStatusPassed,
 			Required:    false,
 		})
 	}
+	if classificationClaimID := metadataString(request.Metadata, "guide_classification_claim_id"); classificationClaimID != "" {
+		workClaim.Relations = append(workClaim.Relations, claims.Relation{
+			Related: classificationClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim,
+		})
+	}
 
-	posted := []claims.Claim{promptClaim}
-	if err := board.PostAction(context.Background(), action, posted); err != nil {
+	generated, err := board.GenerateClaimAction(context.Background(), action, []claims.Claim{workClaim}, claims.GenerateClaimActionOptions{
+		IdempotencyKey: "guide:routed_work:" + request.SessionID + ":" + request.CorrelationID,
+		Reason:         "guide generated routed work claim",
+	})
+	if err != nil {
 		return "", err
 	}
-	if len(posted) > 0 {
-		return strings.TrimSpace(posted[0].ID), nil
+	if generated == nil || len(generated.Claims) == 0 {
+		return "", nil
 	}
-	return "", nil
+	claimID := strings.TrimSpace(generated.Claims[0].ID)
+	if claimID == "" {
+		return "", nil
+	}
+	if err := board.PostGeneratedClaim(context.Background(), claimID, "guide", claims.ClaimPostOptions{Reason: "guide posted routed work claim"}); err != nil {
+		return "", err
+	}
+	return claimID, nil
+}
+
+func routedWorkValidationID(kind string, request *RouteRequest) string {
+	correlationID := "unknown"
+	if request != nil && strings.TrimSpace(request.CorrelationID) != "" {
+		correlationID = strings.TrimSpace(request.CorrelationID)
+	}
+	return "route_" + strings.TrimSpace(kind) + "_" + correlationID
 }
 
 func truncateForClaim(s string, max int) string {
@@ -2486,6 +2508,20 @@ func streamCorrelationTagsFor(request *RouteRequest) []string {
 	}
 	if cid := strings.TrimSpace(request.CorrelationID); cid != "" {
 		tags = append(tags, streamCorrelationTagPrefix+cid)
+	}
+	return tags
+}
+
+func routedWorkTagsFor(request *RouteRequest) []string {
+	tags := []string{"routed_work"}
+	if request == nil {
+		return tags
+	}
+	if cid := strings.TrimSpace(request.CorrelationID); cid != "" {
+		tags = append(tags, streamCorrelationTagPrefix+cid)
+	}
+	if classificationClaimID := metadataString(request.Metadata, "guide_classification_claim_id"); classificationClaimID != "" {
+		tags = append(tags, "guide_classification_claim_id:"+classificationClaimID)
 	}
 	return tags
 }
@@ -3587,6 +3623,14 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 			return fmt.Errorf("fire-and-forget guide-target requests require explicit handling: %s", forwarded.CorrelationID)
 		}
 		return g.respondToGuideRequest(reqCtx, pending, req)
+	}
+	if shouldSuppressForwardedExecution(forwarded) {
+		guideFileLog().Info("guide: claim-native route posted; suppressing forwarded execution",
+			"correlation_id", forwarded.CorrelationID,
+			"target", resolvedTarget,
+			"claim_id", metadataString(forwarded.Metadata, "routed_work_claim_id"))
+		g.pending.Remove(forwarded.CorrelationID)
+		return nil
 	}
 	g.publishRouteHandoffProgress(forwarded.CorrelationID, resolvedSource, resolvedTarget, vis)
 	return g.publishForwardedRequest(resolvedTarget, forwarded, msg.ReplyTo)

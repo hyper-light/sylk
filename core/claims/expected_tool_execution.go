@@ -24,6 +24,8 @@ const (
 	ExpectedToolMetadataOutput               = "expected_tool_output"
 	ExpectedToolMetadataStatus               = "expected_tool_status"
 	ExpectedToolMetadataPolicyDecision       = "expected_tool_policy_decision"
+	ExpectedToolMetadataValidationStatus     = "expected_tool_validation_status"
+	ExpectedToolMetadataValidationReason     = "expected_tool_validation_reason"
 )
 
 type ExpectedToolExecutionStatus string
@@ -105,10 +107,13 @@ type ExpectedToolAttemptResult struct {
 	Status               ExpectedToolExecutionStatus `json:"status"`
 	InvocationArtifactID string                      `json:"invocation_artifact_id,omitempty"`
 	OutputArtifactIDs    []string                    `json:"output_artifact_ids,omitempty"`
+	OutputArtifactKinds  []string                    `json:"output_artifact_kinds,omitempty"`
 	ErrorArtifactID      string                      `json:"error_artifact_id,omitempty"`
 	ErrorKind            string                      `json:"error_kind,omitempty"`
 	Error                string                      `json:"error,omitempty"`
 	PolicyReason         string                      `json:"policy_reason,omitempty"`
+	ValidationStatus     ValidationStatus            `json:"validation_status,omitempty"`
+	ValidationReason     string                      `json:"validation_reason,omitempty"`
 }
 
 type ValidationExpectedToolExecutionResult struct {
@@ -206,10 +211,7 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 	}
 	result.TestamentID = testaments[0].ID
 
-	status := ValidationStatusPassed
-	if validationExpectedToolHasRequiredFailure(result.Attempts) {
-		status = ValidationStatusFailed
-	}
+	status := validationExpectedToolStatus(result.Attempts)
 	reason := validationExpectedToolValidationReason(status, result)
 	latestClaim, ok := board.CloneClaim(claimID)
 	if !ok {
@@ -235,7 +237,7 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 	result.ValidationStatus = status
 	result.ValidationReason = reason
 
-	if status == ValidationStatusFailed && opts.RemediationPoster != nil {
+	if status.IsNegativeTerminal() && opts.RemediationPoster != nil {
 		ids, err := opts.RemediationPoster.PostValidationExpectedToolRemediation(contextWithoutCancellation(ctx), board, claim, validation, result)
 		result.RemediationClaimIDs = append([]string(nil), ids...)
 		if err != nil {
@@ -260,6 +262,8 @@ func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *V
 		attempt.ErrorKind = artifact.Kind
 		attempt.Error = artifact.Reference
 		attempt.ErrorArtifactID = artifact.ID
+		attempt.ValidationStatus = ValidationStatusErrored
+		attempt.ValidationReason = "expected tool argument redaction failed"
 		return attempt, []*Artifact{artifact}
 	}
 
@@ -275,6 +279,8 @@ func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *V
 		attempt.ErrorKind = artifact.Kind
 		attempt.Error = artifact.Reference
 		attempt.ErrorArtifactID = artifact.ID
+		attempt.ValidationStatus = ValidationStatusErrored
+		attempt.ValidationReason = reason
 		return attempt, []*Artifact{artifact}
 	}
 
@@ -293,6 +299,8 @@ func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *V
 		attempt.Status = ExpectedToolExecutionSkipped
 		if call.Required {
 			attempt.Status = ExpectedToolExecutionFailed
+			attempt.ValidationStatus = ValidationStatusErrored
+			attempt.ValidationReason = "expected tool executor is not configured"
 		}
 		attempt.ErrorKind = artifact.Kind
 		attempt.Error = artifact.Reference
@@ -319,6 +327,8 @@ func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *V
 		attempt.ErrorKind = artifact.Kind
 		attempt.Error = artifact.Reference
 		attempt.ErrorArtifactID = artifact.ID
+		attempt.ValidationStatus = ValidationStatusErrored
+		attempt.ValidationReason = execErr.Error()
 		return attempt, append(artifacts, artifact)
 	}
 
@@ -328,8 +338,17 @@ func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *V
 			continue
 		}
 		attempt.OutputArtifactIDs = append(attempt.OutputArtifactIDs, artifact.ID)
+		attempt.OutputArtifactKinds = append(attempt.OutputArtifactKinds, strings.TrimSpace(artifact.Kind))
 	}
 	attempt.Status = ExpectedToolExecutionSucceeded
+	attempt.ValidationStatus, attempt.ValidationReason = expectedToolOutputValidationStatus(call, output, outArtifacts)
+	if attempt.ValidationStatus == ValidationStatusIncomplete {
+		missing := expectedToolMissingEvidenceArtifact(call, agentID, validation.ID, invocation.ID, attempt.ValidationReason)
+		attempt.ErrorArtifactID = missing.ID
+		attempt.ErrorKind = missing.Kind
+		attempt.Error = missing.Reference
+		return attempt, append(artifacts, append(outArtifacts, missing)...)
+	}
 	return attempt, append(artifacts, outArtifacts...)
 }
 
@@ -446,6 +465,147 @@ func expectedToolOutputArtifacts(call ExpectedToolCall, agentID, validationID, i
 		out = append(out, artifact)
 	}
 	return out
+}
+
+func expectedToolOutputValidationStatus(call ExpectedToolCall, output ExpectedToolExecutionOutput, artifacts []*Artifact) (ValidationStatus, string) {
+	explicit := explicitExpectedToolValidationStatus(output)
+	if explicit == ValidationStatusErrored {
+		return explicit, explicitExpectedToolValidationReason(output, "expected tool output reported validator error")
+	}
+	if missing := expectedToolMissingEvidenceKinds(call, artifacts); len(missing) > 0 {
+		return ValidationStatusIncomplete, "expected tool did not produce required artifact kinds: " + strings.Join(missing, ",")
+	}
+	if explicit.IsTerminal() {
+		return explicit, explicitExpectedToolValidationReason(output, "expected tool output reported "+string(explicit))
+	}
+	return ValidationStatusPassed, ""
+}
+
+func explicitExpectedToolValidationStatus(output ExpectedToolExecutionOutput) ValidationStatus {
+	if status, ok := parseValidationStatus(output.Metadata[ExpectedToolMetadataValidationStatus]); ok {
+		return status
+	}
+	if status, ok := parseValidationStatus(output.Metadata["validation_status"]); ok {
+		return status
+	}
+	if status, ok := outputMapValidationStatus(output.Output); ok {
+		return status
+	}
+	return ""
+}
+
+func outputMapValidationStatus(output any) (ValidationStatus, bool) {
+	values, ok := output.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	if status, ok := parseValidationStatus(values["validation_status"]); ok {
+		return status, true
+	}
+	if passed, ok := anyBool(values["passed"]); ok && !passed {
+		return ValidationStatusFailed, true
+	}
+	if success, ok := anyBool(values["success"]); ok && !success {
+		return ValidationStatusFailed, true
+	}
+	return "", false
+}
+
+func parseValidationStatus(value any) (ValidationStatus, bool) {
+	raw, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	status := ValidationStatus(strings.TrimSpace(raw))
+	if status.IsTerminal() {
+		return status, true
+	}
+	return "", false
+}
+
+func explicitExpectedToolValidationReason(output ExpectedToolExecutionOutput, fallback string) string {
+	if reason, ok := output.Metadata[ExpectedToolMetadataValidationReason].(string); ok && strings.TrimSpace(reason) != "" {
+		return strings.TrimSpace(reason)
+	}
+	if reason, ok := output.Metadata["validation_reason"].(string); ok && strings.TrimSpace(reason) != "" {
+		return strings.TrimSpace(reason)
+	}
+	if values, ok := output.Output.(map[string]any); ok {
+		if reason, ok := values["validation_reason"].(string); ok && strings.TrimSpace(reason) != "" {
+			return strings.TrimSpace(reason)
+		}
+	}
+	return fallback
+}
+
+func expectedToolMissingEvidenceKinds(call ExpectedToolCall, artifacts []*Artifact) []string {
+	required := normalizedProducedArtifactKinds(call.ProducesArtifacts)
+	if len(required) == 0 {
+		return nil
+	}
+	seen := artifactKindSet(artifacts)
+	missing := make([]string, 0, len(required))
+	for _, kind := range required {
+		if !seen[kind] {
+			missing = append(missing, kind)
+		}
+	}
+	return missing
+}
+
+func normalizedProducedArtifactKinds(kinds []string) []string {
+	seen := make(map[string]bool, len(kinds))
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		kind = strings.TrimSpace(kind)
+		if kind == "" || seen[kind] {
+			continue
+		}
+		seen[kind] = true
+		out = append(out, kind)
+	}
+	return out
+}
+
+func artifactKindSet(artifacts []*Artifact) map[string]bool {
+	seen := make(map[string]bool, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact == nil {
+			continue
+		}
+		if kind := strings.TrimSpace(artifact.Kind); kind != "" {
+			seen[kind] = true
+		}
+	}
+	return seen
+}
+
+func expectedToolMissingEvidenceArtifact(call ExpectedToolCall, agentID, validationID, invocationArtifactID, reason string) *Artifact {
+	artifact := &Artifact{
+		ID:        uuid.NewString(),
+		AgentID:   strings.TrimSpace(agentID),
+		Kind:      ArtifactKindMissingEvidence,
+		Reference: firstNonEmpty(reason, "expected tool did not produce required evidence"),
+		Metadata: map[string]any{
+			ExpectedToolMetadataID:               strings.TrimSpace(call.ID),
+			ExpectedToolMetadataTool:             strings.TrimSpace(call.Tool),
+			ExpectedToolMetadataRequired:         call.Required,
+			ExpectedToolMetadataValidationID:     validationID,
+			ExpectedToolMetadataStatus:           string(ExpectedToolExecutionSucceeded),
+			ExpectedToolMetadataValidationStatus: string(ValidationStatusIncomplete),
+		},
+	}
+	linkExpectedToolArtifactToInvocation(artifact, invocationArtifactID)
+	return artifact
+}
+
+func anyBool(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	default:
+		return false, false
+	}
 }
 
 func expectedToolOutputReference(output ExpectedToolExecutionOutput) string {
@@ -569,13 +729,34 @@ func validationExpectedToolSummary(attempts []ExpectedToolAttemptResult) string 
 	return "Validation expected tools completed successfully."
 }
 
-func validationExpectedToolHasRequiredFailure(attempts []ExpectedToolAttemptResult) bool {
+func validationExpectedToolStatus(attempts []ExpectedToolAttemptResult) ValidationStatus {
+	status := ValidationStatusPassed
 	for _, attempt := range attempts {
-		if attempt.Required && attempt.Status != ExpectedToolExecutionSucceeded {
-			return true
+		if !attempt.Required {
+			continue
+		}
+		switch expectedToolAttemptValidationStatus(attempt) {
+		case ValidationStatusErrored:
+			return ValidationStatusErrored
+		case ValidationStatusIncomplete:
+			status = ValidationStatusIncomplete
+		case ValidationStatusFailed:
+			if status != ValidationStatusIncomplete {
+				status = ValidationStatusFailed
+			}
 		}
 	}
-	return false
+	return status
+}
+
+func expectedToolAttemptValidationStatus(attempt ExpectedToolAttemptResult) ValidationStatus {
+	if attempt.ValidationStatus.IsTerminal() {
+		return attempt.ValidationStatus
+	}
+	if attempt.Status != ExpectedToolExecutionSucceeded {
+		return ValidationStatusErrored
+	}
+	return ValidationStatusPassed
 }
 
 func validationExpectedToolValidationReason(status ValidationStatus, result *ValidationExpectedToolExecutionResult) string {
@@ -583,10 +764,16 @@ func validationExpectedToolValidationReason(status ValidationStatus, result *Val
 	if evidence == "" {
 		evidence = "none"
 	}
-	if status == ValidationStatusPassed {
+	switch status {
+	case ValidationStatusPassed:
 		return "expected validation tools passed; evidence_artifacts=" + evidence
+	case ValidationStatusIncomplete:
+		return "expected validation tools incomplete: required evidence is missing; evidence_artifacts=" + evidence
+	case ValidationStatusErrored:
+		return "expected validation tools errored: validator infrastructure did not complete cleanly; evidence_artifacts=" + evidence
+	default:
+		return "expected validation tools failed: present evidence did not satisfy the validation; evidence_artifacts=" + evidence
 	}
-	return "expected validation tools failed; evidence_artifacts=" + evidence
 }
 
 func redactExpectedToolValue(value any) any {

@@ -367,6 +367,7 @@ const (
 	ArtifactKindPermissionDenied        = "permission_denied"
 	ArtifactKindPolicyDenied            = "policy_denied"
 	ArtifactKindMissingDependency       = "missing_dependency"
+	ArtifactKindMissingEvidence         = "missing_evidence"
 	ArtifactKindInterrupted             = "interrupted"
 	ArtifactKindInvalidExpectedToolCall = "invalid_expected_tool_call"
 

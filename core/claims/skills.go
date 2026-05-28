@@ -488,13 +488,13 @@ func UpdateClaimProgressSkill(bp BoardProvider) *skills.Skill {
 
 func EvaluateValidationSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("evaluate_validation").
-		Description("Evaluate a testament's artifacts against a claim validation's quality bar. Records pass/fail with reason. When the testament contains error artifacts, evaluate whether the error is recoverable — if so, post remediation claims; if not, fail the validation with the error details.").
+		Description("Evaluate a testament's artifacts against a claim validation's quality bar. Use passed for satisfied evidence, incomplete for missing required evidence, failed for present evidence that does not meet the bar, errored for validator infrastructure errors, and skipped only for explicit waivers.").
 		Domain("claims").
-		Keywords("validate", "evaluate", "quality", "bar", "pass", "fail").
+		Keywords("validate", "evaluate", "quality", "bar", "pass", "fail", "incomplete", "errored").
 		Priority(100).
 		StringParam("claim_id", "ID of the claim owning the validation", true).
 		StringParam("validation_id", "ID of the validation to evaluate", true).
-		StringParam("status", "Verdict: passed, failed, or skipped", true).
+		StringParam("status", "Verdict: passed, incomplete, failed, errored, or skipped", true).
 		StringParam("reason", "Explanation", true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := bp()
@@ -514,7 +514,7 @@ func EvaluateValidationSkill(bp BoardProvider) *skills.Skill {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
 			}
 			status := ValidationStatus(strings.TrimSpace(params.Status))
-			if status != ValidationStatusPassed && status != ValidationStatusFailed && status != ValidationStatusSkipped {
+			if !status.IsTerminal() {
 				return nil, fmt.Errorf("invalid status %q", params.Status)
 			}
 			return nil, board.EvaluateValidation(ctx, params.ClaimID, params.ValidationID, StatusChange{

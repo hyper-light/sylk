@@ -169,6 +169,7 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		},
 		Relations: []claims.Relation{
 			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 		},
 		Tags: append(streamCorrelationTagsFor(request), guideClassificationClaimTag),
 		Validations: []*claims.Validation{{
@@ -180,8 +181,11 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		}},
 	}
 	action := claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt}
-	posted := []claims.Claim{claim}
-	if err := board.PostAction(ctx, action, posted); err != nil {
+	generated, err := board.GenerateClaimAction(ctx, action, []claims.Claim{claim}, claims.GenerateClaimActionOptions{
+		IdempotencyKey: "guide:classification:" + request.SessionID + ":" + request.CorrelationID,
+		Reason:         "guide generated classification claim",
+	})
+	if err != nil {
 		slog.Error("guide_classification_claim_post_failed",
 			"session", request.SessionID,
 			"error", err.Error(),
@@ -195,7 +199,7 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		board.RecordNotificationError("guide classification claim post: " + err.Error())
 		return nil
 	}
-	if len(posted) == 0 || strings.TrimSpace(posted[0].ID) == "" {
+	if generated == nil || len(generated.Claims) == 0 || strings.TrimSpace(generated.Claims[0].ID) == "" {
 		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_post_empty",
 			"session_id", request.SessionID,
 			"correlation_id", request.CorrelationID,
@@ -203,7 +207,26 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		)
 		return nil
 	}
-	claimID := strings.TrimSpace(posted[0].ID)
+	claimID := strings.TrimSpace(generated.Claims[0].ID)
+	if err := board.PostGeneratedClaim(ctx, claimID, "guide", claims.ClaimPostOptions{Reason: "guide posted classification claim"}); err != nil {
+		slog.Error("guide_classification_claim_post_failed",
+			"session", request.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
+		board.RecordNotificationError("guide classification claim post: " + err.Error())
+		return nil
+	}
+	if err := board.AcknowledgeClaimReceipt(ctx, claimID, "guide"); err != nil {
+		slog.Warn("guide_classification_claim_receipt_failed",
+			"session", request.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
+	}
+	request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
+		"guide_classification_claim_id": claimID,
+	})
 	guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_posted",
 		"session_id", request.SessionID,
 		"correlation_id", request.CorrelationID,
@@ -264,13 +287,13 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 	}
 }
 
-func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) {
+func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) string {
 	if h == nil || h.board == nil || strings.TrimSpace(h.claimID) == "" {
 		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_complete_skipped",
 			"handle_nil", h == nil,
 			"board_nil", h == nil || h.board == nil,
 		)
-		return
+		return ""
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -285,7 +308,8 @@ func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideCl
 		)
 		_ = h.board.SetClaimContext(ctx, h.claimID, "Classification failed")
 		testament := guideClassificationTestament(h, nil, "", classifyErr)
-		if err := h.board.SubmitTestaments(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}, []claims.Testament{testament}); err != nil {
+		testamentID, err := g.postGuideClassificationTestament(ctx, h, testament, "guide posted classification failure testament")
+		if err != nil {
 			slog.Warn("guide_classification_failure_testament_failed",
 				"session", h.sessionID,
 				"claim_id", h.claimID,
@@ -298,29 +322,32 @@ func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideCl
 				"error", err.Error(),
 			)
 		}
-		if err := h.board.RejectClaim(ctx, h.claimID, claims.StatusChange{
+		g.beginGuideClassificationTestamentValidation(ctx, h, testamentID)
+		if err := h.board.EvaluateValidation(ctx, h.claimID, h.validationID, claims.StatusChange{
 			AgentID: "guide",
+			To:      string(claims.ValidationStatusErrored),
 			Reason:  classifyErr.Error(),
-		}, nil, nil); err != nil {
-			slog.Warn("guide_classification_claim_reject_failed",
+		}); err != nil {
+			slog.Warn("guide_classification_claim_validation_error_failed",
 				"session", h.sessionID,
 				"claim_id", h.claimID,
 				"error", err.Error(),
 			)
-			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_reject_failed",
+			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_validation_error_failed",
 				"session_id", h.sessionID,
 				"board_id", h.board.BoardID(),
 				"claim_id", h.claimID,
 				"error", err.Error(),
 			)
 		} else {
-			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_rejected",
+			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_validation_errored",
 				"session_id", h.sessionID,
 				"board_id", h.board.BoardID(),
 				"claim_id", h.claimID,
 			)
 		}
-		return
+		g.completeGuideClassificationTestamentValidation(ctx, h, testamentID, claims.TestamentLifecycleValidationErrored, classifyErr.Error())
+		return testamentID
 	}
 
 	target := strings.TrimSpace(targetAgentID)
@@ -341,7 +368,8 @@ func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideCl
 	)
 	_ = h.board.SetClaimContext(ctx, h.claimID, "Request forwarded")
 	testament := guideClassificationTestament(h, result, target, nil)
-	if err := h.board.SubmitTestaments(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}, []claims.Testament{testament}); err != nil {
+	testamentID, err := g.postGuideClassificationTestament(ctx, h, testament, "guide posted classification testament")
+	if err != nil {
 		slog.Warn("guide_classification_testament_failed",
 			"session", h.sessionID,
 			"claim_id", h.claimID,
@@ -353,12 +381,13 @@ func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideCl
 			"claim_id", h.claimID,
 			"error", err.Error(),
 		)
-		_ = h.board.RejectClaim(ctx, h.claimID, claims.StatusChange{
-			AgentID: "guide",
-			Reason:  "classification testament failed: " + err.Error(),
-		}, nil, nil)
-		return
+		_ = h.board.RecordClaimTestamentGenerationFailure(ctx, h.claimID, "guide", claims.LifecycleFailureOptions{
+			Reason:       "classification testament failed: " + err.Error(),
+			ArtifactKind: claims.ArtifactKindErrorDiagnostic,
+		})
+		return ""
 	}
+	g.beginGuideClassificationTestamentValidation(ctx, h, testamentID)
 	if err := h.board.EvaluateValidation(ctx, h.claimID, h.validationID, claims.StatusChange{
 		AgentID: "guide",
 		To:      string(claims.ValidationStatusPassed),
@@ -389,6 +418,8 @@ func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideCl
 			"validation_id", h.validationID,
 		)
 	}
+	g.completeGuideClassificationTestamentValidation(ctx, h, testamentID, claims.TestamentLifecycleValidated, "classification artifacts validated")
+	return testamentID
 }
 
 func guideRouteIntent(result *RouteResult) string {
@@ -403,6 +434,53 @@ func guideRouteDomain(result *RouteResult) string {
 		return ""
 	}
 	return string(result.Domain)
+}
+
+func (g *Guide) postGuideClassificationTestament(ctx context.Context, h *guideClassificationClaim, testament claims.Testament, reason string) (string, error) {
+	if h == nil || h.board == nil {
+		return "", fmt.Errorf("guide classification claim handle is not available")
+	}
+	generated, err := h.board.GenerateTestamentAction(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}, []claims.Testament{testament}, claims.GenerateTestamentActionOptions{
+		IdempotencyKey: "guide:classification:testament:" + h.claimID + ":" + reason,
+		Reason:         reason,
+	})
+	if err != nil {
+		return "", err
+	}
+	if generated == nil || len(generated.Testaments) == 0 {
+		return "", fmt.Errorf("guide classification testament generation returned no testaments")
+	}
+	testamentID := strings.TrimSpace(generated.Testaments[0].ID)
+	if testamentID == "" {
+		return "", fmt.Errorf("guide classification testament generation returned empty testament id")
+	}
+	if err := h.board.PostGeneratedTestament(ctx, testamentID, "guide", claims.TestamentPostOptions{Reason: reason}); err != nil {
+		return testamentID, err
+	}
+	return testamentID, nil
+}
+
+func (g *Guide) beginGuideClassificationTestamentValidation(ctx context.Context, h *guideClassificationClaim, testamentID string) {
+	testamentID = strings.TrimSpace(testamentID)
+	if h == nil || h.board == nil || testamentID == "" {
+		return
+	}
+	if err := h.board.AcknowledgeTestamentReceipt(ctx, testamentID, "guide"); err != nil {
+		slog.Warn("guide_classification_testament_receipt_failed", "session", h.sessionID, "testament_id", testamentID, "error", err.Error())
+	}
+	if err := h.board.BeginTestamentValidation(ctx, testamentID, "guide"); err != nil {
+		slog.Warn("guide_classification_testament_validation_begin_failed", "session", h.sessionID, "testament_id", testamentID, "error", err.Error())
+	}
+}
+
+func (g *Guide) completeGuideClassificationTestamentValidation(ctx context.Context, h *guideClassificationClaim, testamentID string, status claims.TestamentLifecycleStatus, reason string) {
+	testamentID = strings.TrimSpace(testamentID)
+	if h == nil || h.board == nil || testamentID == "" {
+		return
+	}
+	if err := h.board.CompleteTestamentValidation(ctx, testamentID, "guide", status, reason); err != nil {
+		slog.Warn("guide_classification_testament_validation_complete_failed", "session", h.sessionID, "testament_id", testamentID, "status", status, "error", err.Error())
+	}
 }
 
 func guideClassificationTestament(h *guideClassificationClaim, result *RouteResult, target string, classifyErr error) claims.Testament {
@@ -686,6 +764,9 @@ func (g *Guide) processClaimsEntry(ctx context.Context, entry *claims.GraphEntry
 	if entry == nil {
 		return nil
 	}
+	if guideShouldSuppressClaimsEntry(entry) {
+		return nil
+	}
 
 	// Bind to the entry's parent claim so any artifacts the guide
 	// emits during claim-driven processing nest under the issuer's
@@ -726,6 +807,18 @@ func (g *Guide) processClaimsEntry(ctx context.Context, entry *claims.GraphEntry
 	acc.Record("routed_to", target)
 	acc.Note("Claims entry routed successfully")
 	return nil
+}
+
+func guideShouldSuppressClaimsEntry(entry *claims.GraphEntryPoint) bool {
+	if entry == nil || entry.Node.Claim == nil {
+		return false
+	}
+	for _, tag := range entry.Node.Claim.Tags {
+		if strings.TrimSpace(tag) == guideClassificationClaimTag {
+			return true
+		}
+	}
+	return false
 }
 
 // composeGuideClaimsEntryPrompt formats a GraphEntryPoint into a routing

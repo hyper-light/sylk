@@ -192,20 +192,23 @@ func ValidatePlanMarkdownEvidenceAndMaybeRemediate(ctx context.Context, board *C
 		Evidence: ValidatePlanMarkdownEvidence(board, req.Check),
 	}
 
-	if req.ValidationID != "" {
+	if result.Evidence.Passed {
 		status, evaluated, err := evaluatePlanMarkdownEvidenceValidation(ctx, board, claim, req.ValidationID, evaluator, result.Evidence)
 		if err != nil {
 			return result, err
 		}
 		result.ValidationStatus = status
 		result.ValidationEvaluated = evaluated
-	}
-
-	if result.Evidence.Passed {
 		return result, nil
 	}
 
 	if ids := existingEvidenceRemediationClaimIDs(board, claimID); len(ids) > 0 {
+		status, evaluated, err := evaluatePlanMarkdownEvidenceValidation(ctx, board, claim, req.ValidationID, evaluator, result.Evidence)
+		if err != nil {
+			return result, err
+		}
+		result.ValidationStatus = status
+		result.ValidationEvaluated = evaluated
 		result.ExistingRemediation = true
 		result.RemediationClaimIDs = ids
 		return result, nil
@@ -235,6 +238,12 @@ func ValidatePlanMarkdownEvidenceAndMaybeRemediate(ctx context.Context, board *C
 	}, replacementAction, replacementClaims); err != nil {
 		return result, err
 	}
+	status, evaluated, err := evaluatePlanMarkdownEvidenceValidation(ctx, board, claim, req.ValidationID, evaluator, result.Evidence)
+	if err != nil {
+		return result, err
+	}
+	result.ValidationStatus = status
+	result.ValidationEvaluated = evaluated
 
 	result.RemediationPosted = true
 	result.RemediationActionID = replacementAction.ID
