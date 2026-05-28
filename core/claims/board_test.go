@@ -197,7 +197,7 @@ func TestSubmitTestaments(t *testing.T) {
 	}
 }
 
-func TestSubmitErrorTestamentFailsReceiptAndRejectsClaim(t *testing.T) {
+func TestSubmitErrorTestamentPostsFailureEvidenceWithoutAutoResolvingReceipt(t *testing.T) {
 	b := testBoard()
 	ctx := context.Background()
 	claim := testClaim("c1", "claim")
@@ -231,11 +231,14 @@ func TestSubmitErrorTestamentFailsReceiptAndRejectsClaim(t *testing.T) {
 	if !ok {
 		t.Fatal("claim not found")
 	}
-	if got.Status != ClaimStatusRejected {
-		t.Fatalf("claim status = %s, want %s", got.Status, ClaimStatusRejected)
+	if got.Status != ClaimStatusTestified {
+		t.Fatalf("claim status = %s, want %s", got.Status, ClaimStatusTestified)
 	}
-	if len(got.Validations) != 1 || got.Validations[0].Status != ValidationStatusFailed {
-		t.Fatalf("receipt validation not failed: %+v", got.Validations)
+	if got.LifecycleStatus != ClaimLifecycleTestamentGenerated {
+		t.Fatalf("claim lifecycle = %s, want %s", got.LifecycleStatus, ClaimLifecycleTestamentGenerated)
+	}
+	if len(got.Validations) != 1 || got.Validations[0].Status != ValidationStatusPending {
+		t.Fatalf("receipt validation should await evaluator acknowledgment: %+v", got.Validations)
 	}
 }
 

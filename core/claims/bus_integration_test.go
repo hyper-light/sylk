@@ -455,6 +455,13 @@ func TestIntegration_SubmitTestamentsEmitsCanonicalTestamentValidationAndTransit
 		}
 	}
 	validationID := board.Projection().Claims[0].Validations[0].ID
+	if err := board.EvaluateValidation(context.Background(), claimID, validationID, StatusChange{
+		To:      string(ValidationStatusPassed),
+		AgentID: "architect",
+		Reason:  "receipt validation acknowledged",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if got := bus.filterPublishedByTopic(CanonicalValidationTopic("sess", validationID, DeltaActionValidationEvaluated)); len(got) != 1 {
 		t.Fatalf("canonical validation topic count = %d", len(got))
 	}

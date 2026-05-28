@@ -354,7 +354,7 @@ func TestQueryBoardArtifactReturnsPresentation(t *testing.T) {
 		},
 	})
 
-	result, err := dispatchBoardQuery(board, "artifact", "", "", "", artifactID, "", "")
+	result, err := dispatchBoardQuery(board, "artifact", "", "", "", artifactID, "", "", "")
 	if err != nil {
 		t.Fatalf("dispatchBoardQuery artifact: %v", err)
 	}

@@ -10,9 +10,10 @@ import (
 )
 
 type GenerateClaimActionOptions struct {
-	IdempotencyKey      string
-	AllowMissingSubject bool
-	Reason              string
+	IdempotencyKey                 string
+	AllowMissingSubject            bool
+	Reason                         string
+	SuppressGeneratedNotifications bool
 }
 
 type ClaimPostOptions struct {
@@ -48,9 +49,11 @@ func (f ClaimPostPolicyFunc) DecideClaimPost(ctx context.Context, req ClaimPostP
 }
 
 type GenerateTestamentActionOptions struct {
-	IdempotencyKey  string
-	AllowStandalone bool
-	Reason          string
+	IdempotencyKey                 string
+	AllowStandalone                bool
+	AllowEmptyArtifactReference    bool
+	Reason                         string
+	SuppressGeneratedNotifications bool
 }
 
 type TestamentPostOptions struct {
@@ -131,14 +134,16 @@ func (b *ClaimsBoard) GenerateClaimAction(ctx context.Context, action Action, in
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
 	b.projectDurableOutbox(ctx)
-	if b.shouldEmitCanonicalDirect() {
+	if !opts.SuppressGeneratedNotifications && b.shouldEmitCanonicalDirect() {
 		for i := range result.Claims {
 			claim := &result.Claims[i]
 			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, &result.Action, claim, ClaimLifecycleGenerated, result.Action.AgentID, now))
 		}
 	}
-	b.notifyLifecycleGenerated(inputClaims)
-	b.notifySubscribers()
+	if !opts.SuppressGeneratedNotifications {
+		b.notifyLifecycleGenerated(inputClaims)
+		b.notifySubscribers()
+	}
 	return result, nil
 }
 
@@ -183,11 +188,13 @@ func (b *ClaimsBoard) GenerateClaim(ctx context.Context, actionID string, claim 
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
 	b.projectDurableOutbox(ctx)
-	if b.shouldEmitCanonicalDirect() {
+	if !opts.SuppressGeneratedNotifications && b.shouldEmitCanonicalDirect() {
 		b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, &actionSnapshot, result, ClaimLifecycleGenerated, actionSnapshot.AgentID, now))
 	}
-	b.notifyLifecycleGenerated([]Claim{claim})
-	b.notifySubscribers()
+	if !opts.SuppressGeneratedNotifications {
+		b.notifyLifecycleGenerated([]Claim{claim})
+		b.notifySubscribers()
+	}
 	return result, nil
 }
 
@@ -257,7 +264,9 @@ func (b *ClaimsBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string
 		if b.shouldEmitFabricDirect() {
 			b.amplifier.EmitClaimIssued(ctx, snapshots[i])
 		}
-		b.amplifier.PublishInboxDeltas(ctx, action, snapshots[i])
+		if b.amplifier != nil {
+			b.amplifier.PublishInboxDeltas(ctx, action, snapshots[i])
+		}
 		b.notifyDelta(BoardMutationDelta{
 			Kind:    "claim_posted",
 			ClaimID: snapshots[i].ID,
@@ -305,14 +314,16 @@ func (b *ClaimsBoard) GenerateTestamentAction(ctx context.Context, action Action
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
 	b.projectDurableOutbox(ctx)
-	if b.shouldEmitCanonicalDirect() {
+	if !opts.SuppressGeneratedNotifications && b.shouldEmitCanonicalDirect() {
 		for i := range result.Testaments {
 			testament := &result.Testaments[i]
 			claim, _ := b.CloneClaim(ClaimIDFromRelations(testament.Relations))
 			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecycleGenerated, result.Action.AgentID, now))
 		}
 	}
-	b.notifySubscribers()
+	if !opts.SuppressGeneratedNotifications {
+		b.notifySubscribers()
+	}
 	return result, nil
 }
 
@@ -512,7 +523,45 @@ func (b *ClaimsBoard) CompleteTestamentValidation(ctx context.Context, testament
 	if !isTerminalTestamentValidationStatus(to) {
 		return fmt.Errorf("testament lifecycle target %q is not a terminal validation status", to)
 	}
+	if to == TestamentLifecycleValidationErrored {
+		return b.CompleteTestamentValidationError(ctx, testamentID, actorID, LifecycleFailureOptions{
+			Reason:       lifecycleReason(reason, string(to)),
+			ArtifactKind: ArtifactKindErrorDiagnostic,
+		})
+	}
 	return b.transitionTestamentValidation(ctx, testamentID, actorID, to, lifecycleReason(reason, string(to)))
+}
+
+func (b *ClaimsBoard) CompleteTestamentValidationError(ctx context.Context, testamentID, actorID string, opts LifecycleFailureOptions) error {
+	claimID, err := b.claimIDForReachableTestamentValidation(ctx, testamentID, TestamentLifecycleValidationErrored)
+	if err != nil {
+		return err
+	}
+	if claimID != "" {
+		if err := b.RecordClaimValidationError(ctx, claimID, actorID, opts); err != nil {
+			return err
+		}
+	}
+	return b.transitionTestamentValidation(ctx, testamentID, actorID, TestamentLifecycleValidationErrored, lifecycleReason(opts.Reason, string(TestamentLifecycleValidationErrored)))
+}
+
+func (b *ClaimsBoard) claimIDForReachableTestamentValidation(ctx context.Context, testamentID string, to TestamentLifecycleStatus) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	testament, ok := b.testaments[strings.TrimSpace(testamentID)]
+	if !ok {
+		return "", fmt.Errorf("testament %q not found", testamentID)
+	}
+	if testament.LifecycleStatus != to && !CanTransitionTestamentLifecycle(testament.LifecycleStatus, to) {
+		return "", newTestamentLifecycleTransitionError(testament.ID, testament.LifecycleStatus, to, "testament validation target is not reachable")
+	}
+	return ClaimIDFromRelations(testament.Relations), nil
 }
 
 func completeReceiptOnlyTestamentValidation(ctx context.Context, board *ClaimsBoard, testamentID, actorID, reason string) error {
@@ -765,6 +814,11 @@ func (b *ClaimsBoard) validateClaimPostableLocked(ctx context.Context, claim *Cl
 	if !opts.AllowSelfTarget && isPeerDirectedActionType(claim.ActionType) && identity.selfTargeted() {
 		return lifecyclePostError{reason: fmt.Sprintf("claim %q invalid self-target for peer-directed action %q", claim.ID, claim.ActionType), artifactKind: ArtifactKindPolicyDenied}
 	}
+	if claim.ActionType == ActionTypeHandoff {
+		if err := b.handoffEligibleForPostLocked(strings.TrimSpace(actorID), claim.ID); err != nil {
+			return lifecyclePostError{reason: err.Error(), artifactKind: ArtifactKindPolicyDenied, cause: err}
+		}
+	}
 	return b.applyClaimPostPolicy(ctx, claim, actorID, identity)
 }
 
@@ -1003,14 +1057,14 @@ func (b *ClaimsBoard) validateGenerateTestamentActionLocked(action Action, testa
 				}
 			}
 		}
-		if err := validateGeneratedTestamentArtifacts(testament); err != nil {
+		if err := validateGeneratedTestamentArtifacts(testament, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateGeneratedTestamentArtifacts(testament *Testament) error {
+func validateGeneratedTestamentArtifacts(testament *Testament, opts GenerateTestamentActionOptions) error {
 	for _, artifact := range testament.Artifacts {
 		if artifact == nil {
 			return fmt.Errorf("generated testament %q has nil artifact", firstNonEmpty(testament.ID, testament.Summary))
@@ -1018,7 +1072,7 @@ func validateGeneratedTestamentArtifacts(testament *Testament) error {
 		if strings.TrimSpace(artifact.Kind) == "" {
 			return fmt.Errorf("generated testament %q artifact kind is required", firstNonEmpty(testament.ID, testament.Summary))
 		}
-		if strings.TrimSpace(artifact.Reference) == "" && strings.TrimSpace(artifact.ContentHash) == "" {
+		if !opts.AllowEmptyArtifactReference && strings.TrimSpace(artifact.Reference) == "" && strings.TrimSpace(artifact.ContentHash) == "" {
 			return fmt.Errorf("generated testament %q artifact %q requires reference or content hash", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(artifact.ID, artifact.Kind))
 		}
 		if artifact.Size < 0 {
@@ -1543,6 +1597,9 @@ func lifecycleBoardMutationKind(action DeltaAction) string {
 
 func (b *ClaimsBoard) publishTestamentResolution(ctx context.Context, testament *Testament, resolution claimResolution) {
 	if resolution.claim == nil {
+		return
+	}
+	if b.amplifier == nil {
 		return
 	}
 	b.amplifier.PublishTestamentDelta(ctx, testament, resolution.claim)

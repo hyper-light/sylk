@@ -56,16 +56,20 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 			"- testament: Single testament by ID with its artifacts\n"+
 			"- artifact: Single artifact by ID with reference, metadata, and presentation\n"+
 			"- scope: Claims overlapping a scope entry (kind + key)\n"+
+			"- claims_by_lifecycle: Claims with exact lifecycle_status\n"+
+			"- testaments_by_lifecycle: Testaments with exact lifecycle_status\n"+
+			"- my_claims_by_lifecycle: Subject claims for agent_id with exact lifecycle_status\n"+
 			"- pending_validations: Pending validations on a specific claim\n"+
 			"- testaments: Testaments linked to a specific claim").
 		Domain("claims").
 		Keywords("claims", "board", "query", "status", "my_claims", "scope", "validations").
 		Priority(98).
-		EnumParam("op", "Query operation", []string{"summary", "my_claims", "my_evaluations", "claim", "testament", "artifact", "scope", "pending_validations", "testaments"}, true).
+		EnumParam("op", "Query operation", []string{"summary", "my_claims", "my_evaluations", "claim", "testament", "artifact", "scope", "claims_by_lifecycle", "testaments_by_lifecycle", "my_claims_by_lifecycle", "pending_validations", "testaments"}, true).
 		StringParam("claim_id", "Claim ID (for claim, pending_validations, testaments ops)", false).
 		StringParam("testament_id", "Testament ID (for testament op)", false).
 		StringParam("artifact_id", "Artifact ID (for artifact op)", false).
 		StringParam("agent_id", "Agent ID override (for my_claims, my_evaluations). Defaults to calling agent.", false).
+		StringParam("lifecycle_status", "Exact lifecycle status for lifecycle filter ops", false).
 		StringParam("kind", "Scope kind (for scope op)", false).
 		StringParam("key", "Scope key (for scope op)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -82,6 +86,7 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 				TestamentID string `json:"testament_id"`
 				ArtifactID  string `json:"artifact_id"`
 				AgentID     string `json:"agent_id"`
+				Lifecycle   string `json:"lifecycle_status"`
 				Kind        string `json:"kind"`
 				Key         string `json:"key"`
 			}
@@ -92,12 +97,12 @@ func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 			if agentID == "" {
 				agentID = defaultAgentID
 			}
-			return dispatchBoardQuery(board, params.Op, agentID, params.ClaimID, params.TestamentID, params.ArtifactID, params.Kind, params.Key)
+			return dispatchBoardQuery(board, params.Op, agentID, params.ClaimID, params.TestamentID, params.ArtifactID, params.Lifecycle, params.Kind, params.Key)
 		}).
 		Build()
 }
 
-func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, artifactID, scopeKind, scopeKey string) (any, error) {
+func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, artifactID, lifecycleStatus, scopeKind, scopeKey string) (any, error) {
 	switch strings.TrimSpace(op) {
 	case "summary":
 		return board.Summary(), nil
@@ -132,6 +137,24 @@ func dispatchBoardQuery(board *ClaimsBoard, op, agentID, claimID, testamentID, a
 			}
 		}
 		return result, nil
+	case "claims_by_lifecycle":
+		status := ClaimLifecycleStatus(strings.TrimSpace(lifecycleStatus))
+		if !status.Valid() {
+			return nil, fmt.Errorf("unknown claim lifecycle status %q", lifecycleStatus)
+		}
+		return board.ClaimsByLifecycleStatus(status), nil
+	case "testaments_by_lifecycle":
+		status := TestamentLifecycleStatus(strings.TrimSpace(lifecycleStatus))
+		if !status.Valid() {
+			return nil, fmt.Errorf("unknown testament lifecycle status %q", lifecycleStatus)
+		}
+		return board.TestamentsByLifecycleStatus(status), nil
+	case "my_claims_by_lifecycle":
+		status := ClaimLifecycleStatus(strings.TrimSpace(lifecycleStatus))
+		if !status.Valid() {
+			return nil, fmt.Errorf("unknown claim lifecycle status %q", lifecycleStatus)
+		}
+		return board.ClaimsForAgentByLifecycleStatus(agentID, RelationshipSubject, status), nil
 	case "pending_validations":
 		return board.PendingValidationsForClaim(strings.TrimSpace(claimID)), nil
 	case "testaments":

@@ -65,10 +65,22 @@ func HandoffEligible(board *ClaimsBoard, agentID string) error {
 // check is atomic with the post — preventing TOCTOU between snapshot
 // and stamp.
 func (b *ClaimsBoard) handoffEligibleLocked(agentID string) error {
+	return b.handoffEligibleExcludingLocked(agentID, nil)
+}
+
+func (b *ClaimsBoard) handoffEligibleForPostLocked(agentID string, claimID string) error {
+	exclude := map[string]struct{}{strings.TrimSpace(claimID): {}}
+	return b.handoffEligibleExcludingLocked(agentID, exclude)
+}
+
+func (b *ClaimsBoard) handoffEligibleExcludingLocked(agentID string, exclude map[string]struct{}) error {
 	rejection := &HandoffNotEligibleError{AgentID: agentID}
 
 	openClaimIDs := make(map[string]struct{}, len(b.claims))
 	for id, c := range b.claims {
+		if _, skipped := exclude[id]; skipped {
+			continue
+		}
 		if c == nil || c.Status.IsTerminal() {
 			continue
 		}

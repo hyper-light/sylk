@@ -79,6 +79,130 @@ func TestTestamentLifecycleTransitionGraph(t *testing.T) {
 	}
 }
 
+func TestClaimLifecycleTransitionGraphExhaustive(t *testing.T) {
+	statuses := append([]ClaimLifecycleStatus{""}, KnownClaimLifecycleStatuses()...)
+	allowed := map[ClaimLifecycleStatus]map[ClaimLifecycleStatus]bool{
+		"": {ClaimLifecycleGenerated: true, ClaimLifecycleGenerationFailed: true},
+		ClaimLifecycleGenerated: {
+			ClaimLifecyclePosted:           true,
+			ClaimLifecyclePostFailed:       true,
+			ClaimLifecycleGenerationFailed: true,
+		},
+		ClaimLifecyclePosted: {
+			ClaimLifecycleReceived:                  true,
+			ClaimLifecycleReceiptFailed:             true,
+			ClaimLifecycleProgressed:                true,
+			ClaimLifecycleProgressFailed:            true,
+			ClaimLifecycleTestamentGenerated:        true,
+			ClaimLifecycleTestamentGenerationFailed: true,
+			ClaimLifecycleValidating:                true,
+			ClaimLifecycleSatisfied:                 true,
+			ClaimLifecycleValidationIncomplete:      true,
+			ClaimLifecycleValidationFailed:          true,
+			ClaimLifecycleValidationErrored:         true,
+		},
+		ClaimLifecycleReceived: {
+			ClaimLifecycleProgressed:                true,
+			ClaimLifecycleProgressFailed:            true,
+			ClaimLifecycleTestamentGenerated:        true,
+			ClaimLifecycleTestamentGenerationFailed: true,
+			ClaimLifecycleValidating:                true,
+			ClaimLifecycleSatisfied:                 true,
+			ClaimLifecycleValidationIncomplete:      true,
+			ClaimLifecycleValidationFailed:          true,
+			ClaimLifecycleValidationErrored:         true,
+		},
+		ClaimLifecycleProgressed: {
+			ClaimLifecycleProgressed:                true,
+			ClaimLifecycleProgressFailed:            true,
+			ClaimLifecycleTestamentGenerated:        true,
+			ClaimLifecycleTestamentGenerationFailed: true,
+			ClaimLifecycleValidating:                true,
+			ClaimLifecycleSatisfied:                 true,
+			ClaimLifecycleValidationIncomplete:      true,
+			ClaimLifecycleValidationFailed:          true,
+			ClaimLifecycleValidationErrored:         true,
+		},
+		ClaimLifecycleTestamentGenerated: {
+			ClaimLifecycleTestamentAcknowledged:          true,
+			ClaimLifecycleTestamentAcknowledgementFailed: true,
+			ClaimLifecycleValidating:                     true,
+			ClaimLifecycleSatisfied:                      true,
+			ClaimLifecycleValidationIncomplete:           true,
+			ClaimLifecycleValidationFailed:               true,
+			ClaimLifecycleValidationErrored:              true,
+		},
+		ClaimLifecycleTestamentAcknowledged: {
+			ClaimLifecycleValidating:        true,
+			ClaimLifecycleValidationErrored: true,
+		},
+		ClaimLifecycleValidating: {
+			ClaimLifecycleSatisfied:            true,
+			ClaimLifecycleValidationIncomplete: true,
+			ClaimLifecycleValidationFailed:     true,
+			ClaimLifecycleValidationErrored:    true,
+		},
+	}
+	for _, from := range statuses {
+		for _, to := range statuses {
+			want := allowed[from][to] || (from != "" && from == to)
+			if got := CanTransitionClaimLifecycle(from, to); got != want {
+				t.Fatalf("claim transition %q -> %q = %v, want %v", from, to, got, want)
+			}
+		}
+	}
+}
+
+func TestTestamentLifecycleTransitionGraphExhaustive(t *testing.T) {
+	statuses := append([]TestamentLifecycleStatus{""}, KnownTestamentLifecycleStatuses()...)
+	allowed := map[TestamentLifecycleStatus]map[TestamentLifecycleStatus]bool{
+		"": {TestamentLifecycleGenerated: true},
+		TestamentLifecycleGenerated: {
+			TestamentLifecyclePosted: true,
+		},
+		TestamentLifecyclePosted: {
+			TestamentLifecycleReceived:   true,
+			TestamentLifecycleValidating: true,
+		},
+		TestamentLifecycleReceived: {
+			TestamentLifecycleValidating: true,
+		},
+		TestamentLifecycleValidating: {
+			TestamentLifecycleValidated:            true,
+			TestamentLifecycleValidationIncomplete: true,
+			TestamentLifecycleValidationFailed:     true,
+			TestamentLifecycleValidationErrored:    true,
+		},
+	}
+	for _, from := range statuses {
+		for _, to := range statuses {
+			want := allowed[from][to] || (from != "" && from == to)
+			if got := CanTransitionTestamentLifecycle(from, to); got != want {
+				t.Fatalf("testament transition %q -> %q = %v, want %v", from, to, got, want)
+			}
+		}
+	}
+}
+
+func TestLifecycleHelperClassificationsCoverAllStatuses(t *testing.T) {
+	for _, status := range KnownClaimLifecycleStatuses() {
+		if !status.Valid() {
+			t.Fatalf("known claim lifecycle status is invalid: %q", status)
+		}
+		if status.IsTerminal() && IsClaimLifecycleActionable(status) {
+			t.Fatalf("terminal claim status %q cannot be actionable", status)
+		}
+	}
+	for _, status := range KnownTestamentLifecycleStatuses() {
+		if !status.Valid() {
+			t.Fatalf("known testament lifecycle status is invalid: %q", status)
+		}
+		if status.IsTerminal() && status == TestamentLifecycleValidating {
+			t.Fatalf("terminal testament status %q cannot be validating", status)
+		}
+	}
+}
+
 func TestLifecycleJSONRejectsUnknownStatus(t *testing.T) {
 	var claim struct {
 		Status ClaimLifecycleStatus `json:"status"`
@@ -155,6 +279,29 @@ func TestGenerateClaimActionDoesNotWakeTargetUntilPosted(t *testing.T) {
 	env = PullWork(PullWorkConfig{AgentID: "engineer-b", Board: board})
 	if len(env.DirectedClaims) != 1 {
 		t.Fatalf("posted claim directed work count = %d, want 1", len(env.DirectedClaims))
+	}
+}
+
+func TestBoardLifecycleStatusQueriesUseFirstClassLifecycleData(t *testing.T) {
+	board := testBoard()
+	ctx := context.Background()
+	generated, err := board.GenerateClaimAction(ctx, Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{
+		lifecycleTestClaim("query-generated", "Generated"),
+		lifecycleTestClaim("query-posted", "Posted"),
+	}, GenerateClaimActionOptions{Reason: "query setup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := board.PostGeneratedClaim(ctx, generated.Claims[1].ID, "architect", ClaimPostOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	generatedClaims := board.ClaimsByLifecycleStatus(ClaimLifecycleGenerated)
+	if len(generatedClaims) != 1 || generatedClaims[0].ID != "query-generated" {
+		t.Fatalf("generated lifecycle query = %+v", generatedClaims)
+	}
+	postedForEngineer := board.ClaimsForAgentByLifecycleStatus("engineer-b", RelationshipSubject, ClaimLifecyclePosted)
+	if len(postedForEngineer) != 1 || postedForEngineer[0].ID != "query-posted" {
+		t.Fatalf("posted subject lifecycle query = %+v", postedForEngineer)
 	}
 }
 
@@ -712,6 +859,9 @@ func TestTestamentValidationLifecycleUpdatesParentClaim(t *testing.T) {
 			}
 			if stored.Status != tc.coarseStatus {
 				t.Fatalf("claim status = %q, want %q", stored.Status, tc.coarseStatus)
+			}
+			if tc.to == TestamentLifecycleValidationErrored && !boardHasErrorArtifactForClaim(board, claim.ID) {
+				t.Fatalf("validation_errored missing structured error artifact for claim %q", claim.ID)
 			}
 		})
 	}

@@ -191,7 +191,7 @@ func assertExpectedToolTestamentLifecycle(t *testing.T, board *ClaimsBoard, resu
 	}
 }
 
-func TestReceiptAutoPassDoesNotAutoPassInspectionValidation(t *testing.T) {
+func TestPostedTestamentDoesNotAutoPassReceiptOrInspectionValidation(t *testing.T) {
 	board := NewClaimsBoard(ClaimsBoardConfig{SessionID: "sess", TaskID: "task"})
 	if err := board.PostAction(context.Background(), Action{Type: ActionTypeConsultation, AgentID: "architect"}, []Claim{{
 		Title: "Consult librarian",
@@ -217,8 +217,8 @@ func TestReceiptAutoPassDoesNotAutoPassInspectionValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, _ := board.CloneClaim(claimID)
-	if claim.Validations[0].Status != ValidationStatusPassed {
-		t.Fatalf("receipt status = %s, want passed", claim.Validations[0].Status)
+	if claim.Validations[0].Status != ValidationStatusPending {
+		t.Fatalf("receipt status = %s, want pending until evaluator receipt", claim.Validations[0].Status)
 	}
 	if claim.Validations[1].Status != ValidationStatusPending {
 		t.Fatalf("inspection status = %s, want pending", claim.Validations[1].Status)

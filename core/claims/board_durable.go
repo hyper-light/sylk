@@ -359,8 +359,64 @@ func (db *DurableBoard) PostAction(ctx context.Context, action Action, claims []
 	return db.board.PostAction(ctx, action, claims)
 }
 
+func (db *DurableBoard) GenerateClaimAction(ctx context.Context, action Action, claims []Claim, opts GenerateClaimActionOptions) (*GeneratedClaimAction, error) {
+	return db.board.GenerateClaimAction(ctx, action, claims, opts)
+}
+
+func (db *DurableBoard) GenerateClaim(ctx context.Context, actionID string, claim Claim, opts GenerateClaimActionOptions) (*Claim, error) {
+	return db.board.GenerateClaim(ctx, actionID, claim, opts)
+}
+
+func (db *DurableBoard) PostGeneratedClaim(ctx context.Context, claimID, actorID string, opts ClaimPostOptions) error {
+	return db.board.PostGeneratedClaim(ctx, claimID, actorID, opts)
+}
+
+func (db *DurableBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string, actorID string, opts ClaimPostOptions) error {
+	return db.board.PostGeneratedClaims(ctx, claimIDs, actorID, opts)
+}
+
 func (db *DurableBoard) SubmitTestaments(ctx context.Context, action Action, testaments []Testament) error {
 	return db.board.SubmitTestaments(ctx, action, testaments)
+}
+
+func (db *DurableBoard) GenerateTestamentAction(ctx context.Context, action Action, testaments []Testament, opts GenerateTestamentActionOptions) (*GeneratedTestamentAction, error) {
+	return db.board.GenerateTestamentAction(ctx, action, testaments, opts)
+}
+
+func (db *DurableBoard) PostGeneratedTestament(ctx context.Context, testamentID, actorID string, opts TestamentPostOptions) error {
+	return db.board.PostGeneratedTestament(ctx, testamentID, actorID, opts)
+}
+
+func (db *DurableBoard) PostGeneratedTestaments(ctx context.Context, testamentIDs []string, actorID string, opts TestamentPostOptions) error {
+	return db.board.PostGeneratedTestaments(ctx, testamentIDs, actorID, opts)
+}
+
+func (db *DurableBoard) AcknowledgeClaimReceipt(ctx context.Context, claimID, receiverID string) error {
+	return db.board.AcknowledgeClaimReceipt(ctx, claimID, receiverID)
+}
+
+func (db *DurableBoard) AcknowledgeTestamentReceipt(ctx context.Context, testamentID, receiverID string) error {
+	return db.board.AcknowledgeTestamentReceipt(ctx, testamentID, receiverID)
+}
+
+func (db *DurableBoard) AcknowledgeClaimTestament(ctx context.Context, claimID, testamentID, receiverID string) error {
+	return db.board.AcknowledgeClaimTestament(ctx, claimID, testamentID, receiverID)
+}
+
+func (db *DurableBoard) RecordClaimLifecycleFailure(ctx context.Context, claimID, actorID string, to ClaimLifecycleStatus, opts LifecycleFailureOptions) error {
+	return db.board.RecordClaimLifecycleFailure(ctx, claimID, actorID, to, opts)
+}
+
+func (db *DurableBoard) BeginTestamentValidation(ctx context.Context, testamentID, actorID string) error {
+	return db.board.BeginTestamentValidation(ctx, testamentID, actorID)
+}
+
+func (db *DurableBoard) CompleteTestamentValidation(ctx context.Context, testamentID, actorID string, to TestamentLifecycleStatus, reason string) error {
+	return db.board.CompleteTestamentValidation(ctx, testamentID, actorID, to, reason)
+}
+
+func (db *DurableBoard) CompleteTestamentValidationError(ctx context.Context, testamentID, actorID string, opts LifecycleFailureOptions) error {
+	return db.board.CompleteTestamentValidationError(ctx, testamentID, actorID, opts)
 }
 
 func (db *DurableBoard) EvaluateValidation(ctx context.Context, claimID, validationID string, change StatusChange) error {
@@ -825,9 +881,11 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 			if change.To == "" {
 				change = StatusChange{From: string(v.Status), To: payload.Status, Changed: event.CreatedAt, AgentID: event.AgentID}
 			}
+			changed := firstNonZeroTime(change.Changed, event.CreatedAt)
+			change.Changed = changed
 			v.StatusHistory = append(v.StatusHistory, change)
 			v.Status = ValidationStatus(change.To)
-			v.Accessed = event.CreatedAt
+			v.Accessed = changed
 			validation = v
 			break
 		}
@@ -837,12 +895,22 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 	}
 	accepted := c.AllValidationsPassed()
 	nextStatus, nextLifecycle, hasOutcome := validationClaimOutcome(c, validation, validationStatusOf(validation), accepted)
-	if hasOutcome && c.Status != nextStatus {
+	reason := validationClaimOutcomeReason(nextStatus, nextLifecycle, payload.Change.Reason)
+	changed := firstNonZeroTime(payload.Change.Changed, event.CreatedAt)
+	if hasOutcome && (c.Status != nextStatus || !claimStatusHistoryContainsTo(c.StatusHistory, nextStatus)) {
+		fromStatus := replayClaimStatusHistoryFrom(c.StatusHistory, c.Status)
+		c.StatusHistory = append(c.StatusHistory, StatusChange{
+			From:    string(fromStatus),
+			To:      string(nextStatus),
+			Reason:  reason,
+			AgentID: firstNonEmpty(payload.Change.AgentID, event.AgentID),
+			Changed: changed,
+		})
 		c.Status = nextStatus
-		c.Accessed = event.CreatedAt
+		c.Accessed = changed
 	}
 	if hasOutcome && CanTransitionClaimLifecycle(c.LifecycleStatus, nextLifecycle) {
-		db.board.transitionClaimLifecycleLocked(c, nextLifecycle, event.AgentID, validationClaimOutcomeReason(nextStatus, nextLifecycle, ""), event.CreatedAt)
+		db.board.transitionClaimLifecycleLocked(c, nextLifecycle, firstNonEmpty(payload.Change.AgentID, event.AgentID), reason, changed)
 	}
 	records := []ClaimsOutboxRecord{
 		db.board.outboxRecordLocked(event.Sequence, "validation", payload.ValidationID, walEventValidationEvaluated, event.CreatedAt),
@@ -924,6 +992,24 @@ func (db *DurableBoard) applyPhaseTransition(event *walEvent) error {
 
 func replayMissingReference(entityType, id string) error {
 	return fmt.Errorf("missing %s %q for replay event", entityType, id)
+}
+
+func claimStatusHistoryContainsTo(history []StatusChange, status ClaimStatus) bool {
+	for _, change := range history {
+		if ClaimStatus(change.To) == status {
+			return true
+		}
+	}
+	return false
+}
+
+func replayClaimStatusHistoryFrom(history []StatusChange, fallback ClaimStatus) ClaimStatus {
+	for i := len(history) - 1; i >= 0; i-- {
+		if to := ClaimStatus(history[i].To); to != "" {
+			return to
+		}
+	}
+	return fallback
 }
 
 func (db *DurableBoard) snapshotPath() string {

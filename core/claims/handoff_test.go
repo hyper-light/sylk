@@ -191,10 +191,20 @@ func TestBoard_PostAction_RejectsHandoffWhenIneligible(t *testing.T) {
 	if !errors.As(err, &nee) {
 		t.Fatalf("error not *HandoffNotEligibleError: %T", err)
 	}
-	// Verify the handoff claim was NOT persisted.
+	// Phase 1/2 lifecycle records failed posts durably with a failure
+	// artifact instead of dropping the generated claim.
 	proj := b.Projection()
-	if proj.TotalClaims != 1 {
-		t.Fatalf("expected only the seed claim to persist, got %d total claims", proj.TotalClaims)
+	if proj.TotalClaims != 2 {
+		t.Fatalf("expected seed plus failed generated handoff claim, got %d total claims", proj.TotalClaims)
+	}
+	var failed *Claim
+	for i := range proj.Claims {
+		if proj.Claims[i].LifecycleStatus == ClaimLifecyclePostFailed {
+			failed = &proj.Claims[i]
+		}
+	}
+	if failed == nil {
+		t.Fatalf("failed handoff claim missing from projection: %+v", proj.Claims)
 	}
 }
 

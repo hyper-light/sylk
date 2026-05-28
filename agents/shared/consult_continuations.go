@@ -62,6 +62,7 @@ const (
 	continuationOrphanPerCoreFloor = 32
 	continuationOrphanLimitMin     = 64
 	continuationOrphanLimitMax     = 2048
+	awaitedClaimResultSummaryMax   = 240
 )
 
 // ErrConsultYielded is the continuation-store's internal slow-path
@@ -468,6 +469,8 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	}
 	deadline = now.Add(idleWindow)
 
+	boardResolved := s.resolveClaimRefsFromBoard(claimRefs)
+
 	s.mu.Lock()
 
 	// Fast path: collect already-resolved consults that arrived before
@@ -475,6 +478,10 @@ func (s *ContinuationStore) AwaitConsultsOrYield(
 	preResolved := make(map[string]*AwaitedClaimResult, len(claimRefs))
 	stillAwaiting := make(map[string]struct{}, len(claimRefs))
 	for _, id := range claimRefs {
+		if result := boardResolved[id]; result != nil {
+			preResolved[id] = result
+			continue
+		}
 		// We pre-stage the index: AwaitedClaimResult arrival
 		// stores into pending[contID].resolved, but only after the
 		// continuation exists. Pre-await resolutions therefore have
@@ -571,10 +578,16 @@ func (s *ContinuationStore) AwaitClaimResults(ctx context.Context, claimRefs []s
 	waitID := "wait_" + uuid.NewString()
 	waitCh := make(chan map[string]*AwaitedClaimResult, 1)
 
+	boardResolved := s.resolveClaimRefsFromBoard(claimRefs)
+
 	s.mu.Lock()
 	preResolved := make(map[string]*AwaitedClaimResult, len(claimRefs))
 	stillAwaiting := make(map[string]struct{}, len(claimRefs))
 	for _, id := range claimRefs {
+		if result := boardResolved[id]; result != nil {
+			preResolved[id] = result
+			continue
+		}
 		if result := s.takeOrphanResolutionLocked(id); result != nil {
 			preResolved[id] = result
 			continue
@@ -1016,6 +1029,167 @@ func (s *ContinuationStore) consultActivitySnapshot(consultIDs []string) map[str
 		}
 	}
 	return out
+}
+
+func (s *ContinuationStore) resolveClaimRefsFromBoard(claimRefs []string) map[string]*AwaitedClaimResult {
+	if s == nil || s.board == nil || len(claimRefs) == 0 {
+		return nil
+	}
+	out := make(map[string]*AwaitedClaimResult, len(claimRefs))
+	for _, claimRef := range claimRefs {
+		if result := s.resolveClaimRefFromBoard(claimRef); result != nil {
+			out[result.ClaimID] = result
+		}
+	}
+	return out
+}
+
+func (s *ContinuationStore) resolveClaimRefFromBoard(claimRef string) *AwaitedClaimResult {
+	claimRef = strings.TrimSpace(claimRef)
+	if claimRef == "" {
+		return nil
+	}
+	if testament := latestResolvingTestamentForClaim(s.board, claimRef); testament != nil {
+		return s.awaitedClaimResultFromBoardTestament(claimRef, testament)
+	}
+	if claim, ok := s.board.CloneClaim(claimRef); ok {
+		return s.awaitedClaimResultFromBoardClaim(claim)
+	}
+	return nil
+}
+
+func latestResolvingTestamentForClaim(board *claims.ClaimsBoard, claimID string) *claims.Testament {
+	if board == nil {
+		return nil
+	}
+	var latest *claims.Testament
+	for _, testament := range board.TestamentsByClaim(claimID) {
+		if !testamentResolvesAwait(testament) {
+			continue
+		}
+		if latest == nil || latestTestamentActivityTime(*testament).After(latestTestamentActivityTime(*latest)) {
+			latest = testament
+		}
+	}
+	return latest
+}
+
+func testamentResolvesAwait(testament *claims.Testament) bool {
+	if testament == nil {
+		return false
+	}
+	switch testament.LifecycleStatus {
+	case "", claims.TestamentLifecyclePosted, claims.TestamentLifecycleReceived,
+		claims.TestamentLifecycleValidating, claims.TestamentLifecycleValidationIncomplete,
+		claims.TestamentLifecycleValidationFailed, claims.TestamentLifecycleValidationErrored,
+		claims.TestamentLifecycleValidated:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *ContinuationStore) awaitedClaimResultFromBoardTestament(claimID string, testament *claims.Testament) *AwaitedClaimResult {
+	summary := firstNonEmptyIntakeString(testament.Context, testament.Summary)
+	status, errText := consultStatusForBoardTestament(testament, summary)
+	payload := boardTestamentResponsePayload(claimID, testament, summary)
+	return (&AwaitedClaimResult{
+		SessionID:        firstNonEmptyIntakeString(testament.SessionID, s.sessionID),
+		BoardID:          s.board.BoardID(),
+		ClaimID:          strings.TrimSpace(claimID),
+		TestamentID:      strings.TrimSpace(testament.ID),
+		Action:           claims.DeltaActionTestamentPosted,
+		Verdict:          claims.DeriveTestamentVerdict(testament.Artifacts),
+		Context:          summary,
+		ResponderAgentID: strings.TrimSpace(testament.AgentID),
+		Status:           status,
+		ResponsePayload:  payload,
+		ResponseSummary:  truncatePromptString(summary, awaitedClaimResultSummaryMax),
+		ErrorMessage:     errText,
+		EmittedAt:        latestTestamentActivityTime(*testament),
+	}).normalized()
+}
+
+func consultStatusForBoardTestament(testament *claims.Testament, summary string) (string, string) {
+	if testament.LifecycleStatus.IsFailure() || claims.DeriveTestamentVerdict(testament.Artifacts) == claims.TestamentVerdictError {
+		return claims.ConsultStatusError, firstNonEmptyIntakeString(summary, "peer testament reported an error")
+	}
+	return claims.ConsultStatusCompleted, ""
+}
+
+func boardTestamentResponsePayload(claimID string, testament *claims.Testament, summary string) json.RawMessage {
+	payload := map[string]any{
+		"claim_id":     strings.TrimSpace(claimID),
+		"response":     summary,
+		"summary":      summary,
+		"testament_id": strings.TrimSpace(testament.ID),
+		"agent_id":     strings.TrimSpace(testament.AgentID),
+		"confidence":   strings.TrimSpace(testament.Confidence),
+	}
+	if len(testament.Artifacts) > 0 {
+		payload["artifact_count"] = len(testament.Artifacts)
+		payload["artifacts"] = compactTestamentArtifacts(testament.Artifacts)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return json.RawMessage(`{"response":""}`)
+	}
+	return encoded
+}
+
+func (s *ContinuationStore) awaitedClaimResultFromBoardClaim(claim *claims.Claim) *AwaitedClaimResult {
+	if claim == nil || !claim.LifecycleStatus.IsTerminal() {
+		return nil
+	}
+	action, ok := claims.ClaimLifecycleDeltaAction(claim.LifecycleStatus)
+	if !ok {
+		return nil
+	}
+	summary := firstNonEmptyIntakeString(claim.Context, claim.Description, claim.Title)
+	status, errText := consultStatusForBoardClaim(claim.LifecycleStatus, summary)
+	payload := boardClaimResponsePayload(claim, summary)
+	return (&AwaitedClaimResult{
+		SessionID:        firstNonEmptyIntakeString(claim.SessionID, s.sessionID),
+		BoardID:          s.board.BoardID(),
+		ClaimID:          strings.TrimSpace(claim.ID),
+		Action:           action,
+		Context:          summary,
+		ResponderAgentID: latestClaimLifecycleAgent(claim),
+		Status:           status,
+		ResponsePayload:  payload,
+		ResponseSummary:  truncatePromptString(summary, awaitedClaimResultSummaryMax),
+		ErrorMessage:     errText,
+		EmittedAt:        latestClaimActivityTime(*claim),
+	}).normalized()
+}
+
+func consultStatusForBoardClaim(status claims.ClaimLifecycleStatus, summary string) (string, string) {
+	if status.IsFailure() {
+		return claims.ConsultStatusError, firstNonEmptyIntakeString(summary, "peer claim transitioned to "+string(status))
+	}
+	return claims.ConsultStatusCompleted, ""
+}
+
+func boardClaimResponsePayload(claim *claims.Claim, summary string) json.RawMessage {
+	payload, err := json.Marshal(map[string]any{
+		"claim_id":         strings.TrimSpace(claim.ID),
+		"claim_status":     string(claim.Status),
+		"lifecycle_status": string(claim.LifecycleStatus),
+		"summary":          summary,
+	})
+	if err != nil {
+		return json.RawMessage(`{"summary":""}`)
+	}
+	return payload
+}
+
+func latestClaimLifecycleAgent(claim *claims.Claim) string {
+	for i := len(claim.LifecycleHistory) - 1; i >= 0; i-- {
+		if agentID := strings.TrimSpace(claim.LifecycleHistory[i].AgentID); agentID != "" {
+			return agentID
+		}
+	}
+	return firstNonEmptyIntakeString(claims.SubjectAgentID(claim.Relations), claim.AgentID)
 }
 
 func continuationAwaitMatchesClaim(awaitID string, claim claims.Claim) bool {
@@ -1478,20 +1652,31 @@ func (s *ContinuationStore) RecoverPendingContinuations(ctx context.Context) int
 			continue
 		}
 
-		s.mu.Lock()
+		boardResolved := s.resolveClaimRefsFromBoard(awaitedIDs)
+		resolved := make(map[string]*AwaitedClaimResult, len(awaitedIDs))
 		awaiting := make(map[string]struct{}, len(awaitedIDs))
 		for _, id := range awaitedIDs {
+			if result := boardResolved[id]; result != nil {
+				resolved[id] = result
+				continue
+			}
 			awaiting[id] = struct{}{}
 		}
 		pending := &pendingContinuation{
 			id:         c.ID,
 			snapshot:   snapshot,
 			awaiting:   awaiting,
-			resolved:   make(map[string]*AwaitedClaimResult),
+			resolved:   resolved,
 			deadline:   deadline,
 			idleWindow: idleWindow,
 			activity:   s.recoveredConsultActivity(awaitedIDs, snapshot.YieldedAt),
 		}
+		if len(awaiting) == 0 {
+			s.dispatchResume(ctx, pending)
+			recovered++
+			continue
+		}
+		s.mu.Lock()
 		s.pending[c.ID] = pending
 		for id := range awaiting {
 			s.claimIndex[id] = c.ID

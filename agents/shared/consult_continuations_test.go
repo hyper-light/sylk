@@ -158,6 +158,80 @@ func TestAwaitClaimResultsSynchronouslyResolvesCanonicalResult(t *testing.T) {
 	}
 }
 
+func TestAwaitClaimResultsSynchronouslyReconcilesPostedTestamentFromBoard(t *testing.T) {
+	board := testContinuationBoard("board-cont-sync-replay")
+	postContinuationConsultClaim(t, board, "claim-sync-replay")
+	submitContinuationConsultTestament(t, board, "claim-sync-replay", "librarian", "peer already answered")
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-sync-replay",
+		Board:     board,
+	})
+
+	results, err := store.AwaitClaimResults(context.Background(), []string{"claim-sync-replay"}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("AwaitClaimResults returned error: %v", err)
+	}
+	got := results["claim-sync-replay"]
+	if got == nil || got.ResponseSummary != "peer already answered" {
+		t.Fatalf("results = %#v, want posted board testament", results)
+	}
+	if got.Status != claims.ConsultStatusCompleted {
+		t.Fatalf("status = %q, want completed", got.Status)
+	}
+}
+
+func TestRecoverPendingContinuationsReconcilesPostedTestamentFromBoard(t *testing.T) {
+	board := testContinuationBoard("board-cont-recover-replay")
+	postContinuationConsultClaim(t, board, "claim-recover-replay")
+	crashStore := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-recover-replay",
+		Board:     board,
+	})
+	crashStore.mu.Lock()
+	continuationID, err := crashStore.persistContinuationLocked(
+		context.Background(),
+		&TurnSnapshot{Request: &providers.Request{}},
+		[]string{"claim-recover-replay"},
+		time.Now().Add(time.Hour),
+		time.Hour,
+		nil,
+	)
+	crashStore.mu.Unlock()
+	if err != nil {
+		t.Fatalf("persistContinuationLocked: %v", err)
+	}
+	submitContinuationConsultTestament(t, board, "claim-recover-replay", "librarian", "answer survived restart")
+
+	resumed := make(chan map[string]*AwaitedClaimResult, 1)
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-recover-replay",
+		Board:     board,
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
+			resumed <- results
+			return nil
+		},
+	})
+	if got := store.RecoverPendingContinuations(context.Background()); got != 1 {
+		t.Fatalf("recovered continuations = %d, want 1", got)
+	}
+
+	select {
+	case results := <-resumed:
+		got := results["claim-recover-replay"]
+		if got == nil || got.ResponseSummary != "answer survived restart" {
+			t.Fatalf("results = %#v, want posted board testament", results)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not resume from posted board testament")
+	}
+	if claim, ok := board.CloneClaim(continuationID); !ok || claimHasPendingReceipt(*claim) {
+		t.Fatalf("continuation %q still has pending receipt validation after replay resume", continuationID)
+	}
+}
+
 func TestContinuationStore_StopReleasesSynchronousWait(t *testing.T) {
 	board := testContinuationBoard("board-cont-stop-sync")
 	store := NewContinuationStore(ContinuationStoreConfig{
@@ -270,5 +344,31 @@ func postContinuationConsultClaim(t *testing.T, board *claims.ClaimsBoard, id st
 	}})
 	if err != nil {
 		t.Fatalf("PostAction: %v", err)
+	}
+}
+
+func submitContinuationConsultTestament(t *testing.T, board *claims.ClaimsBoard, claimID, agentID, summary string) {
+	t.Helper()
+	err := board.SubmitTestaments(context.Background(), claims.Action{
+		AgentID: agentID,
+		Type:    claims.ActionTypeTestament,
+	}, []claims.Testament{{
+		ID:      "testament-" + claimID,
+		AgentID: agentID,
+		Summary: summary,
+		Relations: []claims.Relation{{
+			Related:      claimID,
+			RelatedType:  claims.RelatedTypeClaim,
+			Relationship: claims.RelationshipClaim,
+		}},
+		Artifacts: []*claims.Artifact{{
+			ID:        "artifact-" + claimID,
+			AgentID:   agentID,
+			Kind:      claims.ArtifactKindResponseText,
+			Reference: summary,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("SubmitTestaments: %v", err)
 	}
 }

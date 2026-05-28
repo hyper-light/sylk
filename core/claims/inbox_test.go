@@ -1088,3 +1088,68 @@ func TestInbox_OverflowCount_AggregatesAcrossSubscriptions(t *testing.T) {
 		t.Fatalf("OverflowCount = %d, want %d", got, want)
 	}
 }
+
+func TestInbox_ReplayedPostedDeltaStartsWorkOnlyWhenReceiptAbsent(t *testing.T) {
+	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "board-inbox-replay", SessionID: "sess", TaskID: "task"})
+	if err := board.PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeConsultation}, []Claim{{
+		ID:          "claim-replay",
+		Title:       "Ask librarian",
+		Description: "inspect project",
+		ActionType:  ActionTypeConsultation,
+		Relations: []Relation{
+			{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: "librarian", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var resolved atomic.Uint64
+	inbox, err := NewClaimsInbox(InboxConfig{
+		AgentID:    "librarian",
+		SessionID:  "sess",
+		Role:       RoleSubject,
+		Board:      board,
+		OnResolved: func(_ *GraphEntryPoint) { resolved.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox.Ingest(canonicalClaimPostedForInboxTest("claim-replay", "librarian", ActionTypeConsultation, 1))
+	if got := resolved.Load(); got != 1 {
+		t.Fatalf("initial posted delta resolutions = %d, want 1", got)
+	}
+
+	if err := board.AcknowledgeClaimReceipt(context.Background(), "claim-replay", "librarian"); err != nil {
+		t.Fatal(err)
+	}
+	inbox.Ingest(canonicalClaimPostedForInboxTest("claim-replay", "librarian", ActionTypeConsultation, 2))
+	if got := resolved.Load(); got != 1 {
+		t.Fatalf("replayed posted delta after receipt resolutions = %d, want 1", got)
+	}
+}
+
+func TestInbox_ConsultBudgetSaturatesWhenSubscriptionDropsOccur(t *testing.T) {
+	bus := &droppingBus{recordingBus: newRecordingBus()}
+	inbox, err := NewClaimsInbox(InboxConfig{
+		AgentID:    "librarian",
+		SessionID:  "sess",
+		Role:       RoleSubject,
+		Subscriber: bus,
+		OnResolved: func(_ *GraphEntryPoint) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inbox.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(bus.subs) == 0 {
+		t.Fatal("expected at least one subscription")
+	}
+	bus.subs[0].drops.Store(1)
+	budget := inbox.ConsultBudget()
+	if !budget.Saturated || budget.Drops != 1 {
+		t.Fatalf("budget = %+v, want saturated with one drop", budget)
+	}
+}

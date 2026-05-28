@@ -1115,7 +1115,7 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 		if role.Has(RoleObserver) {
 			return true
 		}
-		return role.Has(RoleSubject) && delta.DeliveredTo(i.agentID)
+		return role.Has(RoleSubject) && delta.DeliveredTo(i.agentID) && i.postedClaimNeedsSubjectWork(delta)
 	case DeltaActionTestamentPosted:
 		if IsSystemInternalAction(delta.ClaimActionType()) {
 			return false
@@ -1151,6 +1151,17 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 	default:
 		return false
 	}
+}
+
+func (i *ClaimsInbox) postedClaimNeedsSubjectWork(delta CanonicalDelta) bool {
+	if i == nil || i.board == nil {
+		return true
+	}
+	claim, ok := i.board.CloneClaim(delta.ClaimID())
+	if !ok {
+		return true
+	}
+	return IsClaimLifecycleActionable(claim.LifecycleStatus)
 }
 
 func claimStatusMatchesRole(role ClaimsRole, status ClaimStatus) bool {

@@ -689,12 +689,24 @@ func BackfillLegacyPlanMarkdownArtifacts(ctx context.Context, board *ClaimsBoard
 	if len(testaments) == 0 {
 		return nil, nil
 	}
-	if err := board.SubmitTestaments(ctx, Action{AgentID: agentID, Type: ActionTypeTestament}, testaments); err != nil {
+	generated, err := board.GenerateTestamentAction(ctx, Action{AgentID: agentID, Type: ActionTypeTestament}, testaments, GenerateTestamentActionOptions{
+		AllowStandalone:                true,
+		Reason:                         "legacy plan markdown backfill generated",
+		SuppressGeneratedNotifications: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	testamentIDs := make([]string, 0, len(generated.Testaments))
+	for i := range generated.Testaments {
+		testamentIDs = append(testamentIDs, generated.Testaments[i].ID)
+	}
+	if err := board.PostGeneratedTestaments(ctx, testamentIDs, agentID, TestamentPostOptions{Reason: "legacy plan markdown backfill posted"}); err != nil {
 		return nil, err
 	}
 	for i := range records {
-		if i < len(testaments) && len(testaments[i].Artifacts) > 0 && testaments[i].Artifacts[0] != nil {
-			records[i].PlanArtifactID = testaments[i].Artifacts[0].ID
+		if i < len(generated.Testaments) && len(generated.Testaments[i].Artifacts) > 0 && generated.Testaments[i].Artifacts[0] != nil {
+			records[i].PlanArtifactID = generated.Testaments[i].Artifacts[0].ID
 		}
 	}
 	return records, nil

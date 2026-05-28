@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +21,11 @@ const (
 	phase9TestBoardID   = "board-phase-9"
 	phase9TestSessionID = "session-phase-9"
 	phase9TestTaskID    = "task-phase-9"
+
+	phase9ConcurrentLifecycleWorkers   = 8
+	phase9ConcurrentLifecyclePerWorker = 12
+	phase9LongReplayLifecycleCount     = 128
+	phase9LongReplayMemoryBudgetBytes  = 64 << 20
 )
 
 func TestDurableBoard_ReplayRejectsLifecycleTransitionBeforeClaim(t *testing.T) {
@@ -195,6 +204,121 @@ func TestClaimsBoard_BlockedDeltaPublishDoesNotHoldBoardLock(t *testing.T) {
 	}
 }
 
+func TestDurableBoard_ReplayMatchesLifecycleProjectionAtEveryBoundary(t *testing.T) {
+	steps := phase9LifecycleReplaySteps()
+	for boundary := range steps {
+		t.Run(steps[boundary].name, func(t *testing.T) {
+			sessionDir := filepath.Join(t.TempDir(), "session")
+			cfg := ClaimsBoardConfig{
+				BoardID:    phase9TestBoardID,
+				SessionID:  phase9TestSessionID,
+				TaskID:     phase9TestTaskID,
+				SessionDir: sessionDir,
+			}
+			db, err := OpenDurableBoard(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i <= boundary; i++ {
+				if err := steps[i].apply(context.Background(), db.Board()); err != nil {
+					t.Fatalf("apply %s: %v", steps[i].name, err)
+				}
+			}
+			before := normalizedReplayProjection(t, db.Board().Projection())
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := OpenDurableBoard(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			after := normalizedReplayProjection(t, reopened.Board().Projection())
+			if before != after {
+				t.Fatalf("projection mismatch after replay at %s\nbefore=%s\nafter=%s", steps[boundary].name, before, after)
+			}
+		})
+	}
+}
+
+func TestClaimsBoard_HighConcurrencyLifecycleNoDuplicateTerminalStates(t *testing.T) {
+	board := newBenchmarkLifecycleBoard(nil)
+	var wg sync.WaitGroup
+	errs := make(chan error, phase9ConcurrentLifecycleWorkers*phase9ConcurrentLifecyclePerWorker)
+	for worker := range phase9ConcurrentLifecycleWorkers {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for item := range phase9ConcurrentLifecyclePerWorker {
+				id := strings.Join([]string{phase9TestSessionID, "worker", stringID(worker), "item", stringID(item)}, "-")
+				if err := runBenchmarkLifecycleRoundTrip(context.Background(), board, id); err != nil {
+					errs <- err
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	want := phase9ConcurrentLifecycleWorkers * phase9ConcurrentLifecyclePerWorker
+	proj := board.Projection()
+	if proj.TotalClaims != want || proj.TotalTestaments != want {
+		t.Fatalf("projection totals claims=%d testaments=%d, want %d each", proj.TotalClaims, proj.TotalTestaments, want)
+	}
+	for _, claim := range proj.Claims {
+		if claim.LifecycleStatus != ClaimLifecycleSatisfied {
+			t.Fatalf("claim %q lifecycle = %q, want satisfied", claim.ID, claim.LifecycleStatus)
+		}
+	}
+}
+
+func TestDurableBoard_LongReplayStaysWithinMemoryBudget(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "session")
+	cfg := ClaimsBoardConfig{
+		BoardID:    phase9TestBoardID,
+		SessionID:  phase9TestSessionID,
+		TaskID:     phase9TestTaskID,
+		SessionDir: sessionDir,
+	}
+	db, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range phase9LongReplayLifecycleCount {
+		if err := runBenchmarkLifecycleRoundTrip(context.Background(), db.Board(), "long-replay-"+stringID(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	reopened, err := OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	var got uint64
+	if after.Alloc > before.Alloc {
+		got = after.Alloc - before.Alloc
+	}
+	if got > phase9LongReplayMemoryBudgetBytes {
+		t.Fatalf("replay allocated %d bytes, budget %d", got, phase9LongReplayMemoryBudgetBytes)
+	}
+	if got := reopened.Board().Projection().TotalClaims; got != phase9LongReplayLifecycleCount {
+		t.Fatalf("replayed claims = %d, want %d", got, phase9LongReplayLifecycleCount)
+	}
+}
+
 type blockingDeltaBus struct {
 	started chan struct{}
 	release chan struct{}
@@ -223,6 +347,114 @@ func (b *blockingDeltaBus) PublishDelta(ctx context.Context, _ string, _ Delta) 
 
 func (b *blockingDeltaBus) SubscribeDelta(pattern string, _ DeltaHandler) (DeltaSubscription, error) {
 	return noopSubscription{topic: pattern}, nil
+}
+
+type phase9LifecycleReplayStep struct {
+	name  string
+	apply func(context.Context, *ClaimsBoard) error
+}
+
+func phase9LifecycleReplaySteps() []phase9LifecycleReplayStep {
+	return []phase9LifecycleReplayStep{
+		{name: "claim_generated", apply: phase9GenerateClaim},
+		{name: "claim_posted", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.PostGeneratedClaim(ctx, phase9ReplayClaimID(), "architect", ClaimPostOptions{})
+		}},
+		{name: "claim_received", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.AcknowledgeClaimReceipt(ctx, phase9ReplayClaimID(), "engineer-b")
+		}},
+		{name: "claim_progressed", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.UpdateClaimProgress(ctx, phase9ReplayClaimID(), ClaimProgressUpdate{WorkSummary: "work started"}, "engineer-b")
+		}},
+		{name: "testament_generated", apply: phase9GenerateTestament},
+		{name: "testament_posted", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.PostGeneratedTestament(ctx, phase9ReplayTestamentID(), "engineer-b", TestamentPostOptions{})
+		}},
+		{name: "testament_acknowledged", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.AcknowledgeTestamentReceipt(ctx, phase9ReplayTestamentID(), "architect")
+		}},
+		{name: "testament_validating", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.BeginTestamentValidation(ctx, phase9ReplayTestamentID(), "architect")
+		}},
+		{name: "validation_evaluated", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.EvaluateValidation(ctx, phase9ReplayClaimID(), phase9ReplayValidationID(), StatusChange{AgentID: "architect", To: string(ValidationStatusPassed), Reason: "response received"})
+		}},
+		{name: "testament_validated", apply: func(ctx context.Context, board *ClaimsBoard) error {
+			return board.CompleteTestamentValidation(ctx, phase9ReplayTestamentID(), "architect", TestamentLifecycleValidated, "validated")
+		}},
+	}
+}
+
+func phase9GenerateClaim(ctx context.Context, board *ClaimsBoard) error {
+	claim := Claim{
+		ID:          phase9ReplayClaimID(),
+		Title:       "Replay claim",
+		Description: "Exercise durable lifecycle replay",
+		Relations: []Relation{
+			{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: "engineer-b", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+		Validations: []*Validation{{
+			ID:          phase9ReplayValidationID(),
+			Description: "Receive response",
+			QualityBar:  "response.received",
+			Type:        ValidationTypeReceipt,
+			Required:    true,
+		}},
+	}
+	_, err := board.GenerateClaimAction(ctx, Action{ID: "phase9-replay-action", AgentID: "architect", Type: ActionTypeTask}, []Claim{claim}, GenerateClaimActionOptions{IdempotencyKey: "phase9-replay-action"})
+	return err
+}
+
+func phase9GenerateTestament(ctx context.Context, board *ClaimsBoard) error {
+	testament := Testament{
+		ID:      phase9ReplayTestamentID(),
+		AgentID: "engineer-b",
+		Summary: "Replay response complete",
+		Relations: []Relation{{
+			Related:      phase9ReplayClaimID(),
+			RelatedType:  RelatedTypeClaim,
+			Relationship: RelationshipClaim,
+		}},
+		Artifacts: []*Artifact{{
+			ID:        "phase9-replay-artifact",
+			AgentID:   "engineer-b",
+			Kind:      ArtifactKindResponseText,
+			Reference: "Replay response complete",
+		}},
+	}
+	_, err := board.GenerateTestamentAction(ctx, Action{ID: "phase9-replay-testament-action", AgentID: "engineer-b", Type: ActionTypeTestament}, []Testament{testament}, GenerateTestamentActionOptions{IdempotencyKey: "phase9-replay-testament-action"})
+	return err
+}
+
+func phase9ReplayClaimID() string      { return "phase9-replay-claim" }
+func phase9ReplayTestamentID() string  { return "phase9-replay-testament" }
+func phase9ReplayValidationID() string { return "phase9-replay-validation" }
+
+func normalizedReplayProjection(t *testing.T, projection *ClaimsBoardProjection) string {
+	t.Helper()
+	data, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone ClaimsBoardProjection
+	if err := json.Unmarshal(data, &clone); err != nil {
+		t.Fatal(err)
+	}
+	clone.Updated = time.Time{}
+	clone.NotificationErrors = nil
+	sort.Slice(clone.Actions, func(i, j int) bool { return clone.Actions[i].ID < clone.Actions[j].ID })
+	sort.Slice(clone.Claims, func(i, j int) bool { return clone.Claims[i].ID < clone.Claims[j].ID })
+	sort.Slice(clone.Testaments, func(i, j int) bool { return clone.Testaments[i].ID < clone.Testaments[j].ID })
+	normalized, err := json.Marshal(clone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(normalized)
+}
+
+func stringID(value int) string {
+	return strconv.Itoa(value)
 }
 
 func writeTestWALEvent(t *testing.T, walDir string, event walEvent) {

@@ -10,7 +10,23 @@ import (
 const (
 	benchmarkLifecycleBoardResetInterval = 1024
 	benchmarkLifecycleIntegrationBatch   = 1000
+	lifecycleRoundTripAllocationRuns     = 4
+	lifecycleRoundTripAllocationBudget   = 8192
 )
+
+func TestClaimLifecycleRoundTripAllocationBudget(t *testing.T) {
+	var suffix atomic.Uint64
+	allocs := testing.AllocsPerRun(lifecycleRoundTripAllocationRuns, func() {
+		board := newBenchmarkLifecycleBoard(nil)
+		id := strconv.FormatUint(suffix.Add(1), 10)
+		if err := runBenchmarkLifecycleRoundTrip(context.Background(), board, "alloc-"+id); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs > lifecycleRoundTripAllocationBudget {
+		t.Fatalf("allocs = %.0f, budget %d", allocs, lifecycleRoundTripAllocationBudget)
+	}
+}
 
 func BenchmarkClaimLifecycleGeneratePostReceiveValidate(b *testing.B) {
 	ctx := context.Background()
