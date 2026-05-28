@@ -136,6 +136,10 @@ func TestOperationsPhase2ParticipantFailureFailsPhase(t *testing.T) {
 	assertClaimLifecycle(t, db.Board(), result.ClaimID, claims.ClaimLifecycleValidationFailed)
 	assertTestamentLifecycle(t, db.Board(), result.TestamentID, claims.TestamentLifecycleValidationFailed, "boot.phase_2_failed")
 	assertClaimLifecycle(t, db.Board(), result.ParticipantClaimIDs[len(result.ParticipantClaimIDs)-1], claims.ClaimLifecycleValidationFailed)
+	health := bootPhaseHealthByPhase(t, seq.BootHealth(), BootPhaseSystemParticipants)
+	if health.FailureCount == 0 || len(health.Warnings) == 0 {
+		t.Fatalf("phase 2 health = %+v, want failure count and warnings", health)
+	}
 	assertProjectionCounts(t, db.Board(), 5, 5)
 }
 
@@ -345,6 +349,17 @@ func assertProjectionCounts(t *testing.T, board *claims.ClaimsBoard, claimsCount
 	if proj.TotalClaims != claimsCount || proj.TotalTestaments != testamentCount {
 		t.Fatalf("projection counts = claims:%d testaments:%d, want claims:%d testaments:%d", proj.TotalClaims, proj.TotalTestaments, claimsCount, testamentCount)
 	}
+}
+
+func bootPhaseHealthByPhase(t *testing.T, health BootHealth, phase BootOperationPhase) BootPhaseHealth {
+	t.Helper()
+	for _, candidate := range health.Phases {
+		if candidate.Phase == phase {
+			return candidate
+		}
+	}
+	t.Fatalf("boot health missing phase %s: %+v", phase, health.Phases)
+	return BootPhaseHealth{}
 }
 
 func assertActivationClaimSatisfied(t *testing.T, board *claims.ClaimsBoard, claimID string) {

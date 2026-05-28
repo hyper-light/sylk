@@ -1399,6 +1399,9 @@ strings:
 | `ArtifactKindSessionCursor` | `sylk.carry_forward.session_cursor.v1` |
 | Presentation evidence helper output | `sylk.presentation_evidence.v1` |
 | `ArtifactKindReadiness` | `sylk.knowledge_readiness.v1` |
+| Identity allocation evidence | `sylk.identity_allocation.v1` |
+| Identity lineage evidence | `sylk.identity_lineage.v1` |
+| Activation readiness record | `sylk.activation_record.v1` |
 
 Registration of a typed validator via `RegisterValidator[T, R]`
 implicitly registers `T` and `R` with the type registry if not

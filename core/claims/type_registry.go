@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -22,6 +23,9 @@ const (
 	ArtifactDataTypeCarryForwardSessionCursor  = "sylk.carry_forward.session_cursor.v1"
 	ArtifactDataTypePresentationEvidence       = "sylk.presentation_evidence.v1"
 	ArtifactDataTypeKnowledgeReadiness         = "sylk.knowledge_readiness.v1"
+	ArtifactDataTypeIdentityAllocation         = "sylk.identity_allocation.v1"
+	ArtifactDataTypeIdentityLineage            = "sylk.identity_lineage.v1"
+	ArtifactDataTypeActivationRecord           = "sylk.activation_record.v1"
 )
 
 var (
@@ -257,6 +261,32 @@ type KnowledgeReadinessArtifactData struct {
 	Metadata   map[string]any `json:"metadata,omitempty"`
 }
 
+type IdentityAllocationArtifactData struct {
+	UID             string              `json:"uid"`
+	Category        ParticipantCategory `json:"category"`
+	RouteKey        string              `json:"route_key"`
+	ParticipantType string              `json:"participant_type,omitempty"`
+	Scope           map[string]string   `json:"scope,omitempty"`
+	Generation      int                 `json:"generation,omitempty"`
+	ParentUID       string              `json:"parent_uid,omitempty"`
+}
+
+type IdentityLineageArtifactData struct {
+	UID      string   `json:"uid"`
+	Lineage  []string `json:"lineage,omitempty"`
+	Terminal bool     `json:"terminal"`
+}
+
+type ActivationRecordArtifactData struct {
+	ParticipantID   string        `json:"participant_id"`
+	ParticipantType string        `json:"participant_type,omitempty"`
+	Tier            string        `json:"tier,omitempty"`
+	ReplicaCount    int           `json:"replica_count,omitempty"`
+	Ready           bool          `json:"ready"`
+	FailureReason   string        `json:"failure_reason,omitempty"`
+	Duration        time.Duration `json:"duration,omitempty"`
+}
+
 func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 	if registry == nil {
 		return fmt.Errorf("type registry is required")
@@ -277,6 +307,9 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeCarryForwardSessionCursor, CarryForwardSessionCursorData{}},
 		{ArtifactDataTypePresentationEvidence, PresentationEvidenceArtifactData{}},
 		{ArtifactDataTypeKnowledgeReadiness, KnowledgeReadinessArtifactData{}},
+		{ArtifactDataTypeIdentityAllocation, IdentityAllocationArtifactData{}},
+		{ArtifactDataTypeIdentityLineage, IdentityLineageArtifactData{}},
+		{ArtifactDataTypeActivationRecord, ActivationRecordArtifactData{}},
 	}
 	for _, entry := range entries {
 		if err := registry.Register(entry.dataType, entry.sample, codec); err != nil {

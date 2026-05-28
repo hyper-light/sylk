@@ -1165,16 +1165,19 @@ func bootPhaseHealthForClaim(phase BootOperationPhase, claim *claims.Claim, test
 	health := BootPhaseHealth{Phase: phase, Outcome: "pending"}
 	if claim == nil {
 		health.Outcome = "missing"
+		health.Warnings = []string{"phase claim missing"}
 		return health
 	}
 	health.ClaimID = claim.ID
 	health.Outcome = string(claim.LifecycleStatus)
 	if testament == nil {
+		health.Warnings = []string{"phase testament missing"}
 		return health
 	}
 	health.TestamentID = testament.ID
 	health.Duration = testament.Duration
 	health.ReadinessCount, health.FailureCount = countBootArtifacts(testament.Artifacts)
+	health.Warnings = bootPhaseWarnings(testament.Artifacts)
 	return health
 }
 
@@ -1189,6 +1192,37 @@ func countBootArtifacts(artifacts []*claims.Artifact) (int, int) {
 		failures += boolToInt(artifact.Kind == artifactKindBootFailure || artifact.Kind == claims.ArtifactKindErrorDiagnostic || artifact.Kind == claims.ArtifactKindError)
 	}
 	return readiness, failures
+}
+
+func bootPhaseWarnings(artifacts []*claims.Artifact) []string {
+	warnings := make([]string, 0)
+	for _, artifact := range artifacts {
+		if artifact == nil {
+			continue
+		}
+		if bootArtifactReadyFalse(artifact) {
+			warnings = append(warnings, bootArtifactName(artifact)+" ready=false")
+		}
+		if artifact.Kind == artifactKindBootFailure || artifact.Kind == claims.ArtifactKindErrorDiagnostic || artifact.Kind == claims.ArtifactKindError {
+			warnings = append(warnings, firstNonEmptyString(artifact.Reference, "boot failure"))
+		}
+	}
+	return warnings
+}
+
+func bootArtifactReadyFalse(artifact *claims.Artifact) bool {
+	ready, ok := artifact.Metadata["ready"].(bool)
+	return ok && !ready
+}
+
+func bootArtifactName(artifact *claims.Artifact) string {
+	if artifact == nil {
+		return "unknown"
+	}
+	if name, ok := artifact.Metadata["name"].(string); ok {
+		return firstNonEmptyString(name, artifact.ArtifactName, artifact.Kind, "unknown")
+	}
+	return firstNonEmptyString(artifact.ArtifactName, artifact.Kind, "unknown")
 }
 
 func boolToInt(value bool) int {

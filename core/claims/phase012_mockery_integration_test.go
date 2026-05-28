@@ -228,6 +228,184 @@ func TestPhase012E2EMockeryServiceTypedArtifactAndValidator(t *testing.T) {
 	validatorHandler.AssertExpectations(t)
 }
 
+func TestPhase345IntegrationMockerySideEffectValidatorUsesPolicyAndRedactor(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase345-mockery-policy", SessionID: "sess", TaskID: "task"})
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}, []claims.Claim{{
+		Title:       "Plan",
+		Description: "Produce a plan.",
+		ActionType:  claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: []*claims.Validation{{
+			ID:                 "side-effect-validation",
+			Type:               claims.ValidationTypeInspection,
+			Description:        "plan side-effect validator",
+			QualityBar:         "plan is validated",
+			Required:           true,
+			ValidatorID:        "plan.side_effect.validator",
+			TargetArtifactName: "plan",
+			ArtifactDataType:   claims.ArtifactDataTypePlanMarkdown,
+			ResultDataType:     claims.ArtifactDataTypePresentationEvidence,
+		}},
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "phase345-mockery-policy"})
+	if err != nil {
+		t.Fatalf("GenerateClaimAction: %v", err)
+	}
+	claimID := generated.Claims[0].ID
+	planArtifact := &claims.Artifact{ArtifactName: "plan", Kind: claims.ArtifactKindPlanMarkdown, Reference: "# Plan"}
+	if err := claims.SetArtifactData(planArtifact, claims.PlanMarkdownArtifactData{Markdown: "# Plan", Title: "Plan"}); err != nil {
+		t.Fatalf("SetArtifactData plan: %v", err)
+	}
+	if _, err := board.GenerateTestamentAction(context.Background(), claims.Action{AgentID: "engineer", Type: claims.ActionTypeTestament}, []claims.Testament{{
+		AgentID:   "engineer",
+		Summary:   "plan ready",
+		Relations: []claims.Relation{{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim}},
+		Artifacts: []*claims.Artifact{planArtifact},
+	}}, claims.GenerateTestamentActionOptions{}); err != nil {
+		t.Fatalf("GenerateTestamentAction: %v", err)
+	}
+	claim, ok := board.CloneClaim(claimID)
+	if !ok || len(claim.Validations) != 1 {
+		t.Fatalf("claim %q not found with validation", claimID)
+	}
+
+	policy := &claimsmocks.ExpectedToolPolicy{}
+	policy.On("DecideExpectedTool", mock.Anything, mock.MatchedBy(func(req claims.ExpectedToolPolicyRequest) bool {
+		return req.AgentID == "plan.side_effect.validator" &&
+			req.Call.Tool == "plan.side_effect.validator" &&
+			req.Claim != nil && req.Claim.ID == claimID &&
+			req.Validation != nil && req.Validation.ID == "side-effect-validation"
+	})).Return(claims.ExpectedToolPolicyDecision{Allowed: true}).Once()
+	redactor := &claimsmocks.ExpectedToolArgumentRedactor{}
+	redactor.On("RedactExpectedToolArguments", mock.Anything, "plan.side_effect.validator", mock.MatchedBy(func(args map[string]any) bool {
+		return args["validator_id"] == "plan.side_effect.validator" &&
+			args["artifact_id"] == planArtifact.ID &&
+			args["data_type"] == claims.ArtifactDataTypePlanMarkdown
+	})).Return(map[string]any{"validator_id": "plan.side_effect.validator", "artifact_id": "redacted"}, nil).Once()
+	handler := &claimsmocks.ValidatorHandler{}
+	resultArtifact := &claims.Artifact{ArtifactName: "plan_validation", Kind: claims.ArtifactKindReadiness, Reference: "validated"}
+	if err := claims.SetArtifactData(resultArtifact, claims.PresentationEvidenceArtifactData{Kind: "validation", Reference: "validated"}); err != nil {
+		t.Fatalf("SetArtifactData result: %v", err)
+	}
+	handler.On("ValidateArtifact", mock.Anything, mock.MatchedBy(func(req claims.ValidatorHandlerRequest) bool {
+		return req.Artifact != nil && req.Artifact.ID == planArtifact.ID &&
+			req.Validation != nil && req.Validation.ID == "side-effect-validation"
+	})).Return(claims.ValidatorHandlerResult{ResultArtifact: resultArtifact}, nil).Once()
+
+	registry := claims.NewValidatorRegistry()
+	if _, err := registry.Register(claims.ValidatorRegistration{
+		ValidatorID:        "plan.side_effect.validator",
+		ValidationType:     claims.ValidationTypeInspection,
+		ActionType:         claims.ActionTypeTask,
+		Determinism:        claims.HandlerDeterminismSideEffect,
+		Timeout:            time.Second,
+		ConcurrencyBudget:  1,
+		TargetArtifactName: "plan",
+		ArtifactDataType:   claims.ArtifactDataTypePlanMarkdown,
+		ResultDataType:     claims.ArtifactDataTypePresentationEvidence,
+		Handler:            handler,
+	}); err != nil {
+		t.Fatalf("Register validator: %v", err)
+	}
+	dispatcher, err := claims.NewBoardValidatorDispatcher(claims.BoardValidatorDispatcherConfig{
+		Board:                board,
+		Registry:             registry,
+		Policy:               policy,
+		Redactor:             redactor,
+		MaxInputBytes:        int64(len(planArtifact.Data)),
+		MaxOutputBytes:       1024,
+		ApprovedValidatorIDs: map[string]bool{"plan.side_effect.validator": true},
+	})
+	if err != nil {
+		t.Fatalf("NewBoardValidatorDispatcher: %v", err)
+	}
+	result, err := dispatcher.DispatchValidationByID(context.Background(), claimID, "side-effect-validation")
+	if err != nil {
+		t.Fatalf("DispatchValidationByID: %v", err)
+	}
+	if result.Status != claims.ValidationStatusValidated {
+		t.Fatalf("result status = %s, want validated", result.Status)
+	}
+	policy.AssertExpectations(t)
+	redactor.AssertExpectations(t)
+	handler.AssertExpectations(t)
+}
+
+func TestPhase345E2EMockeryIdentityRegistryServiceDispatch(t *testing.T) {
+	participant, err := claims.NewServiceParticipantRegistration("identity_registry", map[string]string{"session": "sess"}, 4, 1, time.Second, []claims.ActionType{claims.ActionTypeActivation})
+	if err != nil {
+		t.Fatalf("identity participant: %v", err)
+	}
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "identity-board", SessionID: "sess", TaskID: "task"})
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: "sys:boot_sequencer", Type: claims.ActionTypeActivation}, []claims.Claim{{
+		Title:       "Allocate identity",
+		Description: "Allocate a deterministic identity registry participant UID.",
+		ActionType:  claims.ActionTypeActivation,
+		Relations: []claims.Relation{
+			{Related: "sys:boot_sequencer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "identity_registry", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		ExpectedToolCalls: []claims.ExpectedToolCall{{
+			Tool: claims.IdentityRegistryToolAllocate,
+			Arguments: map[string]any{
+				"category":   string(claims.ParticipantCategoryService),
+				"route_key":  "provider_gateway",
+				"scope":      map[string]any{"session": "sess"},
+				"generation": 1,
+			},
+		}},
+		Validations: []*claims.Validation{{ID: "receipt", Type: claims.ValidationTypeReceipt, Required: true, Description: "receipt", QualityBar: "received"}},
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "phase345-identity-service"})
+	if err != nil {
+		t.Fatalf("GenerateClaimAction: %v", err)
+	}
+	claimID := generated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), claimID, "sys:boot_sequencer", claims.ClaimPostOptions{Reason: "identity allocation"}); err != nil {
+		t.Fatalf("PostGeneratedClaim: %v", err)
+	}
+	scope := &claimsmocks.ScopeProvider{}
+	scope.On("Go", mock.Anything, participant.HandlerTimeout, mock.Anything).Run(func(args mock.Arguments) {
+		fn := args.Get(2).(func(context.Context) error)
+		if err := fn(context.Background()); err != nil {
+			t.Fatalf("identity scoped fn: %v", err)
+		}
+	}).Return(nil).Once()
+	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{
+		Board:       board,
+		Scope:       scope,
+		Participant: participant,
+		Handler:     claims.NewIdentityRegistryService(claims.IdentityRegistryServiceConfig{}),
+	})
+	if err != nil {
+		t.Fatalf("NewServiceDispatcher: %v", err)
+	}
+	delta := claims.NewCanonicalDelta(
+		claims.DeltaActionClaimPosted,
+		board.SessionID(),
+		board.BoardID(),
+		board.HighWaterSequence(),
+		time.Now(),
+		claims.DegradedAgentRef("sys:boot_sequencer", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: claimID}},
+		&claims.DeltaDelivery{To: []claims.AgentRef{participant.AgentRef()}, Relationship: claims.RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(claims.ActionTypeActivation)}},
+	)
+	if err := dispatcher.DispatchDelta(context.Background(), delta); err != nil {
+		t.Fatalf("DispatchDelta: %v", err)
+	}
+	artifact := findArtifactByName(t, board, claimID, "identity_allocation")
+	data, err := claims.ArtifactData[claims.IdentityAllocationArtifactData](artifact)
+	if err != nil {
+		t.Fatalf("identity allocation artifact decode: %v", err)
+	}
+	if data.RouteKey != "provider_gateway" || data.UID == "" {
+		t.Fatalf("identity allocation data = %+v, want provider gateway uid", data)
+	}
+	scope.AssertExpectations(t)
+}
+
 func phase012ParticipantRegistration(t *testing.T, category claims.ParticipantCategory, routeKey string) claims.ParticipantRegistration {
 	t.Helper()
 	scope := map[string]string{"session": "sess", "participant": routeKey}

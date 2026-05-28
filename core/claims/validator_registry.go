@@ -15,6 +15,7 @@ var (
 	ErrValidatorRegistrationConflict = errors.New("validator registration conflicts with existing immutable metadata")
 	ErrValidatorNotRegistered        = errors.New("validator is not registered")
 	ErrValidatorConcurrencyExhausted = errors.New("validator concurrency budget exhausted")
+	ErrValidatorDispatchInvalid      = errors.New("validator dispatch invalid")
 )
 
 type ValidatorRegistration struct {
@@ -58,6 +59,7 @@ type ProgrammaticValidatorDispatcher struct {
 	mu       sync.Mutex
 	limits   map[string]chan struct{}
 	clock    ClaimsClock
+	scope    ScopeProvider
 }
 
 func NewValidatorRegistry() *ValidatorRegistry {
@@ -81,16 +83,11 @@ func (r *ValidatorRegistry) Register(reg ValidatorRegistration) (ValidatorRegist
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	key := validatorRegistrationKey(normalized)
-	existing, ok := r.records[key]
-	if !ok {
-		r.records[key] = normalized
-		return normalized, nil
-	}
-	if !validatorImmutableFieldsEqual(existing, normalized) {
+	if existing, ok := r.registrationWithValidatorIDLocked(normalized.ValidatorID); ok {
 		return existing, ErrValidatorRegistrationConflict
 	}
-	return existing, nil
+	r.records[validatorRegistrationKey(normalized)] = normalized
+	return normalized, nil
 }
 
 func RegisterValidator[T, R any](registry *ValidatorRegistry, config ValidatorConfig, handler Validator[T, R]) (ValidatorRegistration, error) {
@@ -126,10 +123,15 @@ func (r *ValidatorRegistry) Lookup(claim *Claim, validation *Validation) (Valida
 }
 
 func NewProgrammaticValidatorDispatcher(registry *ValidatorRegistry, clock ClaimsClock) *ProgrammaticValidatorDispatcher {
+	return newProgrammaticValidatorDispatcher(registry, clock, nil)
+}
+
+func newProgrammaticValidatorDispatcher(registry *ValidatorRegistry, clock ClaimsClock, scope ScopeProvider) *ProgrammaticValidatorDispatcher {
 	return &ProgrammaticValidatorDispatcher{
 		registry: registry,
 		limits:   make(map[string]chan struct{}),
 		clock:    firstNonNilClock(clock),
+		scope:    scope,
 	}
 }
 
@@ -152,24 +154,74 @@ func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context
 	return d.invoke(ctx, types, reg, req)
 }
 
-func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) (out ValidationDispatchResult, err error) {
+func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
 	started := firstNonZeroTime(req.StartedAt, d.clock.Now())
+	if d.scope != nil {
+		return d.invokeTracked(ctx, types, reg, req, started)
+	}
+	return d.invokeDirect(ctx, types, reg, req, started)
+}
+
+func (d *ProgrammaticValidatorDispatcher) invokeDirect(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time) (ValidationDispatchResult, error) {
 	runCtx, cancel := context.WithTimeout(ctxOrBackground(ctx), reg.Timeout)
 	defer cancel()
+	outcome := d.callValidatorHandler(runCtx, reg, req, started)
+	return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
+}
+
+func (d *ProgrammaticValidatorDispatcher) invokeTracked(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time) (ValidationDispatchResult, error) {
+	runCtx, cancel := context.WithTimeout(ctxOrBackground(ctx), reg.Timeout)
+	defer cancel()
+	done := make(chan validatorHandlerOutcome, 1)
+	if err := d.scope.Go("claims_validator_handler", reg.Timeout, func(scopeCtx context.Context) error {
+		outcome := d.callValidatorHandler(runCtx, reg, req, started)
+		select {
+		case done <- outcome:
+		case <-scopeCtx.Done():
+		}
+		return nil
+	}); err != nil {
+		return validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.clock.Now()), nil
+	}
+	select {
+	case outcome := <-done:
+		return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
+	case <-runCtx.Done():
+		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
+	}
+}
+
+type validatorHandlerOutcome struct {
+	result    ValidatorHandlerResult
+	err       error
+	recovered any
+	stack     []byte
+}
+
+func (d *ProgrammaticValidatorDispatcher) callValidatorHandler(ctx context.Context, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time) (out validatorHandlerOutcome) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			out = validationDispatchError(req, ValidationErrorCategoryPanic, fmt.Sprintf("%v", recovered), d.clock.Now())
-			out.ResultArtifact = validatorErrorArtifact(reg, req, out.Error, debug.Stack())
-			err = nil
+			out.recovered = recovered
+			out.stack = debug.Stack()
 		}
 	}()
-	result, callErr := reg.Handler.ValidateArtifact(runCtx, ValidatorHandlerRequest{Artifact: req.Artifact, Validation: req.Validation, StartedAt: started})
-	if callErr != nil {
-		return validationDispatchError(req, ValidationErrorCategoryHandler, callErr.Error(), d.clock.Now()), nil
+	out.result, out.err = reg.Handler.ValidateArtifact(ctx, ValidatorHandlerRequest{Artifact: req.Artifact, Validation: req.Validation, StartedAt: started})
+	return out
+}
+
+func (d *ProgrammaticValidatorDispatcher) resultFromValidatorOutcome(types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, runCtx context.Context, outcome validatorHandlerOutcome) (ValidationDispatchResult, error) {
+	if outcome.recovered != nil {
+		result := validationDispatchError(req, ValidationErrorCategoryPanic, fmt.Sprintf("%v", outcome.recovered), d.clock.Now())
+		result.ResultArtifact = validatorErrorArtifact(reg, req, result.Error, outcome.stack)
+		return result, nil
 	}
 	if runCtx.Err() != nil {
 		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
 	}
+	if outcome.err != nil {
+		return validationDispatchError(req, ValidationErrorCategoryHandler, outcome.err.Error(), d.clock.Now()), nil
+	}
+	result := outcome.result
 	if err := validateDispatchResult(types, reg, req, result); err != nil {
 		return validationDispatchError(req, ValidationErrorCategoryArtifactType, err.Error(), d.clock.Now()), nil
 	}
@@ -206,11 +258,18 @@ func (r *ValidatorRegistry) lookupLocked(claim *Claim, validation *Validation) (
 	candidates := []string{
 		validatorRegistrationKeyFor(validation.ValidatorID, validation.Type, claimActionType(claim)),
 		validatorRegistrationKeyFor(validation.ValidatorID, validation.Type, ""),
-		validatorRegistrationKeyFor("", validation.Type, claimActionType(claim)),
-		validatorRegistrationKeyFor("", validation.Type, ""),
 	}
 	for _, key := range candidates {
 		if reg, ok := r.records[key]; ok {
+			return reg, true
+		}
+	}
+	return ValidatorRegistration{}, false
+}
+
+func (r *ValidatorRegistry) registrationWithValidatorIDLocked(validatorID string) (ValidatorRegistration, bool) {
+	for _, reg := range r.records {
+		if reg.ValidatorID == validatorID {
 			return reg, true
 		}
 	}
@@ -236,8 +295,8 @@ func normalizeValidatorRegistration(reg ValidatorRegistration, types *TypeRegist
 }
 
 func validateValidatorRegistration(reg ValidatorRegistration, types *TypeRegistry) error {
-	if reg.ValidatorID == "" || !reg.Determinism.valid() || reg.Handler == nil {
-		return fmt.Errorf("%w: validator id, determinism, and handler are required", ErrValidatorRegistrationInvalid)
+	if reg.ValidatorID == "" || reg.ValidationType == "" || !reg.Determinism.valid() || reg.Handler == nil {
+		return fmt.Errorf("%w: validator id, validation type, determinism, and handler are required", ErrValidatorRegistrationInvalid)
 	}
 	if reg.Timeout <= 0 || reg.ConcurrencyBudget <= 0 {
 		return fmt.Errorf("%w: timeout and concurrency budget must be bounded positive values", ErrValidatorRegistrationInvalid)
@@ -293,18 +352,6 @@ func (h typedValidatorHandler[T, R]) ValidateArtifact(ctx context.Context, req V
 		return ValidatorHandlerResult{}, err
 	}
 	return ValidatorHandlerResult{ResultArtifact: result}, err
-}
-
-func validatorImmutableFieldsEqual(a, b ValidatorRegistration) bool {
-	return a.ValidatorID == b.ValidatorID &&
-		a.ValidationType == b.ValidationType &&
-		a.ActionType == b.ActionType &&
-		a.Determinism == b.Determinism &&
-		a.Timeout == b.Timeout &&
-		a.ConcurrencyBudget == b.ConcurrencyBudget &&
-		a.TargetArtifactName == b.TargetArtifactName &&
-		a.ArtifactDataType == b.ArtifactDataType &&
-		a.ResultDataType == b.ResultDataType
 }
 
 func validateDispatchInput(types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) error {
@@ -425,7 +472,7 @@ func validationStatusForValidationError(validation *Validation, err *ValidationE
 		category = err.Category
 	}
 	switch category {
-	case ValidationErrorCategoryArtifactType:
+	case ValidationErrorCategoryHandler, ValidationErrorCategoryTimeout:
 		if validation != nil && !validation.Required {
 			return ValidationStatusValidationFailedNotRequired
 		}
@@ -505,6 +552,308 @@ func ctxOrBackground(ctx context.Context) context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+type BoardValidatorDispatcherConfig struct {
+	Board                *ClaimsBoard
+	Registry             *ValidatorRegistry
+	Scope                ScopeProvider
+	Clock                ClaimsClock
+	Policy               ExpectedToolPolicy
+	Redactor             ExpectedToolArgumentRedactor
+	MaxInputBytes        int64
+	MaxOutputBytes       int64
+	ApprovedValidatorIDs map[string]bool
+}
+
+type BoardValidatorDispatcher struct {
+	board                *ClaimsBoard
+	registry             *ValidatorRegistry
+	programmatic         *ProgrammaticValidatorDispatcher
+	clock                ClaimsClock
+	policy               ExpectedToolPolicy
+	redactor             ExpectedToolArgumentRedactor
+	maxInputBytes        int64
+	maxOutputBytes       int64
+	approvedValidatorIDs map[string]bool
+	mu                   sync.Mutex
+	inFlight             map[string]struct{}
+}
+
+func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardValidatorDispatcher, error) {
+	if cfg.Board == nil || cfg.Registry == nil {
+		return nil, fmt.Errorf("%w: board and registry are required", ErrValidatorDispatchInvalid)
+	}
+	if cfg.MaxInputBytes <= 0 || cfg.MaxOutputBytes <= 0 {
+		return nil, fmt.Errorf("%w: input and output byte limits must be bounded positive values", ErrValidatorDispatchInvalid)
+	}
+	clock := firstNonNilClock(cfg.Clock)
+	scope := cfg.Scope
+	if scope == nil && cfg.Board != nil {
+		scope = cfg.Board.scope
+	}
+	return &BoardValidatorDispatcher{
+		board:                cfg.Board,
+		registry:             cfg.Registry,
+		programmatic:         newProgrammaticValidatorDispatcher(cfg.Registry, clock, scope),
+		clock:                clock,
+		policy:               cfg.Policy,
+		redactor:             cfg.Redactor,
+		maxInputBytes:        cfg.MaxInputBytes,
+		maxOutputBytes:       cfg.MaxOutputBytes,
+		approvedValidatorIDs: copyBoolMap(cfg.ApprovedValidatorIDs),
+		inFlight:             make(map[string]struct{}),
+	}, nil
+}
+
+func (d *BoardValidatorDispatcher) DispatchValidationByID(ctx context.Context, claimID, validationID string) (ValidationDispatchResult, error) {
+	req, err := d.requestForValidation(claimID, validationID)
+	if err == nil {
+		return d.DispatchValidation(ctx, req)
+	}
+	if req.Claim != nil && req.Validation != nil {
+		return d.dispatchMissingTarget(ctxOrBackground(ctx), req, err.Error())
+	}
+	fallback := ValidationDispatchRequest{Validation: &Validation{ID: validationID, Required: true}}
+	return validationDispatchError(fallback, ValidationErrorCategoryDispatcher, err.Error(), d.now()), err
+}
+
+func (d *BoardValidatorDispatcher) DispatchValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
+	if err := d.validateRequest(req); err != nil {
+		return validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now()), err
+	}
+	if !d.acquire(req.Validation.ID) {
+		result := validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.now())
+		return result, ErrValidatorConcurrencyExhausted
+	}
+	defer d.release(req.Validation.ID)
+	return d.dispatchAcquiredValidation(ctxOrBackground(ctx), req)
+}
+
+func (d *BoardValidatorDispatcher) dispatchAcquiredValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
+	reg, ok := d.registry.Lookup(req.Claim, req.Validation)
+	if !ok {
+		if err := d.board.BeginValidation(ctx, req.Claim.ID, req.Validation.ID, validationAgentID(req.Validation), req.Artifact.ID); err != nil {
+			return validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now()), err
+		}
+		return d.commitDispatchError(ctx, req, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error())
+	}
+	if err := d.board.BeginValidation(ctx, req.Claim.ID, req.Validation.ID, reg.ValidatorID, req.Artifact.ID); err != nil {
+		return validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now()), err
+	}
+	if err := d.validateBoundedInput(req.Artifact); err != nil {
+		return d.commitDispatchError(ctx, req, ValidationErrorCategoryDispatcher, err.Error())
+	}
+	if result, denied := d.enforcePolicy(ctx, reg, req); denied {
+		return d.commitDispatchResult(ctx, req, reg, result)
+	}
+	handlerCtx, cancel := d.handlerContext(ctx, req.Validation)
+	defer cancel()
+	result, err := d.programmatic.DispatchValidation(handlerCtx, req)
+	if err != nil {
+		result = validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now())
+	}
+	result = d.enforceOutputLimit(reg, req, result)
+	return d.commitDispatchResult(ctx, req, reg, result)
+}
+
+func (d *BoardValidatorDispatcher) dispatchMissingTarget(ctx context.Context, req ValidationDispatchRequest, reason string) (ValidationDispatchResult, error) {
+	if !d.acquire(req.Validation.ID) {
+		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.now()), ErrValidatorConcurrencyExhausted
+	}
+	defer d.release(req.Validation.ID)
+	_ = d.board.BeginValidation(ctx, req.Claim.ID, req.Validation.ID, validationAgentID(req.Validation), "")
+	return d.commitDispatchError(ctx, req, ValidationErrorCategoryDispatcher, reason)
+}
+
+func (d *BoardValidatorDispatcher) requestForValidation(claimID, validationID string) (ValidationDispatchRequest, error) {
+	validation, claim, ok := d.board.CloneValidation(strings.TrimSpace(validationID))
+	if !ok || claim.ID != strings.TrimSpace(claimID) {
+		return ValidationDispatchRequest{}, fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
+	}
+	artifact, ok := d.board.cloneValidationTargetArtifact(claim.ID, validation)
+	if !ok {
+		return ValidationDispatchRequest{Claim: claim, Validation: validation}, fmt.Errorf("target artifact %q not found", validation.TargetArtifactName)
+	}
+	return ValidationDispatchRequest{Claim: claim, Validation: validation, Artifact: artifact, StartedAt: d.now()}, nil
+}
+
+func (d *BoardValidatorDispatcher) validateRequest(req ValidationDispatchRequest) error {
+	if d == nil || d.board == nil || d.registry == nil || d.programmatic == nil {
+		return fmt.Errorf("%w: dispatcher is not initialized", ErrValidatorDispatchInvalid)
+	}
+	if req.Claim == nil || req.Validation == nil || req.Artifact == nil {
+		return fmt.Errorf("%w: claim, validation, and artifact are required", ErrValidatorDispatchInvalid)
+	}
+	if req.Validation.Status != ValidationStatusReady {
+		return fmt.Errorf("%w: validation %q is %q, want %q", ErrValidatorDispatchInvalid, req.Validation.ID, req.Validation.Status, ValidationStatusReady)
+	}
+	return nil
+}
+
+func (d *BoardValidatorDispatcher) validateBoundedInput(artifact *Artifact) error {
+	if artifact == nil {
+		return fmt.Errorf("artifact is required")
+	}
+	if int64(len(artifact.Data)) > d.maxInputBytes {
+		return fmt.Errorf("artifact data exceeds validator input limit")
+	}
+	return nil
+}
+
+func (d *BoardValidatorDispatcher) enforcePolicy(ctx context.Context, reg ValidatorRegistration, req ValidationDispatchRequest) (ValidationDispatchResult, bool) {
+	if reg.Determinism != HandlerDeterminismSideEffect && reg.Determinism != HandlerDeterminismNondeterministic {
+		return ValidationDispatchResult{}, false
+	}
+	payload := d.validatorPolicyPayload(ctx, reg, req)
+	if !d.approvedValidatorIDs[reg.ValidatorID] {
+		return d.policyDenied(req, "validator requires explicit approval", payload), true
+	}
+	if d.policy == nil {
+		return d.policyDenied(req, "validator policy is required", payload), true
+	}
+	decision := d.policy.DecideExpectedTool(ctx, ExpectedToolPolicyRequest{Claim: req.Claim, Validation: req.Validation, Call: validatorPolicyCall(reg, req), AgentID: reg.ValidatorID})
+	if decision.Allowed {
+		return ValidationDispatchResult{}, false
+	}
+	return d.policyDenied(req, firstNonEmpty(decision.Reason, "validator policy denied execution"), payload), true
+}
+
+func (d *BoardValidatorDispatcher) validatorPolicyPayload(ctx context.Context, reg ValidatorRegistration, req ValidationDispatchRequest) map[string]any {
+	args := map[string]any{
+		"validator_id": reg.ValidatorID,
+		"artifact_id":  req.Artifact.ID,
+		"data_type":    req.Artifact.DataType,
+		"content_hash": req.Artifact.ContentHash,
+	}
+	if d.redactor == nil {
+		return args
+	}
+	redacted, err := d.redactor.RedactExpectedToolArguments(ctx, reg.ValidatorID, args)
+	if err != nil {
+		return map[string]any{"redaction_error": err.Error()}
+	}
+	return redacted
+}
+
+func (d *BoardValidatorDispatcher) policyDenied(req ValidationDispatchRequest, reason string, payload map[string]any) ValidationDispatchResult {
+	err := &ValidationError{
+		Category:    ValidationErrorCategoryDispatcher,
+		Description: reason,
+		Payload:     payload,
+		Source:      validationErrorSource(req),
+		OccurredAt:  d.now(),
+	}
+	return ValidationDispatchResult{
+		ValidationID:     validationIDFromRequest(req),
+		Status:           validationStatusForValidationError(req.Validation, err),
+		ResultArtifact:   validatorErrorArtifact(ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, req, err, nil),
+		Error:            err,
+		CompletedAt:      err.OccurredAt,
+		ShortCircuitRest: req.Validation.Required,
+	}
+}
+
+func (d *BoardValidatorDispatcher) enforceOutputLimit(reg ValidatorRegistration, req ValidationDispatchRequest, result ValidationDispatchResult) ValidationDispatchResult {
+	if result.ResultArtifact == nil || artifactSize(result.ResultArtifact) <= d.maxOutputBytes {
+		return result
+	}
+	err := &ValidationError{
+		Category:    ValidationErrorCategoryHandler,
+		Description: "validator result artifact exceeds output limit",
+		Source:      validationErrorSource(req),
+		OccurredAt:  d.now(),
+	}
+	result.Status = validationStatusForValidationError(req.Validation, err)
+	result.Error = err
+	result.ResultArtifact = validatorErrorArtifact(reg, req, err, nil)
+	result.CompletedAt = err.OccurredAt
+	return result
+}
+
+func (d *BoardValidatorDispatcher) commitDispatchError(ctx context.Context, req ValidationDispatchRequest, category ValidationErrorCategory, description string) (ValidationDispatchResult, error) {
+	return d.commitDispatchResult(ctx, req, ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, validationDispatchError(req, category, description, d.now()))
+}
+
+func (d *BoardValidatorDispatcher) commitDispatchResult(ctx context.Context, req ValidationDispatchRequest, reg ValidatorRegistration, result ValidationDispatchResult) (ValidationDispatchResult, error) {
+	if result.Error != nil && result.ResultArtifact == nil {
+		result.ResultArtifact = validatorErrorArtifact(reg, req, result.Error, nil)
+	}
+	err := d.board.CompleteValidationLifecycle(ctx, req.Claim.ID, req.Validation.ID, firstNonEmpty(reg.ValidatorID, validationAgentID(req.Validation)), result.Status, ValidationLifecycleOptions{
+		Reason:           validationResultReason(result),
+		TargetArtifactID: dispatchArtifactID(req.Artifact),
+		ResultArtifact:   result.ResultArtifact,
+		Error:            result.Error,
+	})
+	return result, err
+}
+
+func (d *BoardValidatorDispatcher) handlerContext(ctx context.Context, validation *Validation) (context.Context, context.CancelFunc) {
+	if validation == nil || validation.Timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, validation.Timeout)
+}
+
+func (d *BoardValidatorDispatcher) acquire(validationID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, exists := d.inFlight[validationID]; exists {
+		return false
+	}
+	d.inFlight[validationID] = struct{}{}
+	return true
+}
+
+func (d *BoardValidatorDispatcher) release(validationID string) {
+	d.mu.Lock()
+	delete(d.inFlight, validationID)
+	d.mu.Unlock()
+}
+
+func (d *BoardValidatorDispatcher) now() time.Time {
+	if d == nil || d.clock == nil {
+		return time.Now().UTC()
+	}
+	return d.clock.Now()
+}
+
+func validatorPolicyCall(reg ValidatorRegistration, req ValidationDispatchRequest) ExpectedToolCall {
+	return ExpectedToolCall{
+		ID:       strings.TrimSpace(req.Validation.ID) + ".validator_policy",
+		Tool:     strings.TrimSpace(reg.ValidatorID),
+		Purpose:  "validator side-effect policy",
+		Required: req.Validation.Required,
+		Policy:   ExpectedToolCallPolicy{RequiresUserApproval: true},
+	}
+}
+
+func validationResultReason(result ValidationDispatchResult) string {
+	if result.Error != nil {
+		return result.Error.Description
+	}
+	if result.Status == ValidationStatusValidated {
+		return "validation passed"
+	}
+	return string(result.Status)
+}
+
+func dispatchArtifactID(artifact *Artifact) string {
+	if artifact == nil {
+		return ""
+	}
+	return artifact.ID
+}
+
+func copyBoolMap(in map[string]bool) map[string]bool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func firstNonNilClock(clock ClaimsClock) ClaimsClock {

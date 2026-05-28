@@ -117,10 +117,15 @@ func (b *ClaimsBoard) TransitionValidationLifecycle(ctx context.Context, claimID
 	now := time.Now().UTC()
 	prevSeq := b.seq.Load()
 	opts = b.prepareValidationLifecycleOptionsLocked(claim, validation, actorID, opts, now)
+	accepted := claimAcceptedAfterValidation(claim, validation.ID, to)
+	claimStatus, claimLifecycle, hasClaimOutcome := validationClaimOutcome(claim, validation, to, accepted)
 	payload := validationLifecyclePayload(claim.ID, validation.ID, to, actorID, opts, now)
 	outboxRecords := validationLifecycleOutboxRecordsLocked(b, validation, to, now)
 	if opts.ResultArtifact != nil {
 		outboxRecords = append(outboxRecords, b.outboxRecordLocked(opts.ResultArtifact.Sequence, RelatedTypeArtifact, opts.ResultArtifact.ID, string(DeltaActionArtifactGenerated), now))
+	}
+	if hasClaimOutcome {
+		outboxRecords = append(outboxRecords, validationClaimOutcomeOutboxRecordLocked(b, claim, claimStatus, now))
 	}
 	if err := b.appendDurableEventLocked(walEventValidationLifecycleTransition, actorID, payload, outboxRecords); err != nil {
 		b.seq.Store(prevSeq)
@@ -128,6 +133,7 @@ func (b *ClaimsBoard) TransitionValidationLifecycle(ctx context.Context, claimID
 		return err
 	}
 	resultArtifactID := b.recordValidationLifecycleMutationLocked(claim, validation, to, actorID, opts, now)
+	b.recordValidationClaimOutcomeLocked(claim, claimStatus, claimLifecycle, hasClaimOutcome, actorID, opts.Reason, now)
 	validationSnapshot := cloneValidationEntity(validation)
 	claimSnapshot := CloneClaimEntity(claim)
 	artifactSnapshot, _ := b.findArtifactSnapshotLocked(firstNonEmpty(opts.TargetArtifactID, resultArtifactID))
@@ -153,6 +159,37 @@ func (b *ClaimsBoard) BeginValidationQualityBar(ctx context.Context, claimID, va
 
 func (b *ClaimsBoard) CompleteValidationLifecycle(ctx context.Context, claimID, validationID, actorID string, status ValidationStatus, opts ValidationLifecycleOptions) error {
 	return b.TransitionValidationLifecycle(ctx, claimID, validationID, status, actorID, opts)
+}
+
+func validationClaimOutcomeOutboxRecordLocked(b *ClaimsBoard, claim *Claim, status ClaimStatus, now time.Time) ClaimsOutboxRecord {
+	action := walEventClaimAccepted
+	if status == ClaimStatusRejected {
+		action = walEventClaimRejected
+	}
+	return b.outboxRecordLocked(claim.Sequence, RelatedTypeClaim, claim.ID, action, now)
+}
+
+func (b *ClaimsBoard) recordValidationClaimOutcomeLocked(claim *Claim, status ClaimStatus, lifecycle ClaimLifecycleStatus, ok bool, actorID, reason string, now time.Time) {
+	if !ok || claim == nil {
+		return
+	}
+	if claim.Status == status && claim.LifecycleStatus == lifecycle {
+		return
+	}
+	prev := claim.Status
+	claim.StatusHistory = append(claim.StatusHistory, StatusChange{
+		From:    string(prev),
+		To:      string(status),
+		Reason:  validationClaimOutcomeReason(status, lifecycle, reason),
+		AgentID: actorID,
+		Changed: now,
+	})
+	claim.Status = status
+	claim.Accessed = now
+	b.adjustStatusCounter(prev, status)
+	if CanTransitionClaimLifecycle(claim.LifecycleStatus, lifecycle) {
+		b.transitionClaimLifecycleLocked(claim, lifecycle, actorID, validationClaimOutcomeReason(status, lifecycle, reason), now)
+	}
 }
 
 func (b *ClaimsBoard) findArtifactForMutationLocked(id string) (*Artifact, *Testament, *Claim, bool) {

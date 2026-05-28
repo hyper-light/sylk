@@ -16,6 +16,8 @@ var (
 	ErrServiceDispatchOverflow  = errors.New("service dispatcher concurrency budget exhausted")
 )
 
+const serviceFailureStackLimitBytes = 64 * 1024
+
 type ServiceClaimRequest struct {
 	Board       *ClaimsBoard
 	Claim       *Claim
@@ -56,6 +58,8 @@ type ServiceDispatcher struct {
 	seenOrder     []string
 	inflight      chan struct{}
 	subscriptions []DeltaSubscription
+	started       bool
+	closed        bool
 }
 
 func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, error) {
@@ -79,29 +83,46 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 }
 
 func (d *ServiceDispatcher) Start(ctx context.Context) error {
+	if d == nil {
+		return fmt.Errorf("%w: dispatcher is nil", ErrServiceDispatcherInvalid)
+	}
+	shouldStart, err := d.markStarting()
+	if err != nil {
+		return err
+	}
+	if !shouldStart {
+		return nil
+	}
+	subs := make([]DeltaSubscription, 0, len(d.subscriptionTopics()))
 	for _, topic := range d.subscriptionTopics() {
 		sub, err := d.subscriber.SubscribeDelta(topic, func(delta Delta) { d.ingest(ctx, delta) })
 		if err != nil {
+			_ = unsubscribeAll(subs)
+			d.resetStart()
 			return err
 		}
-		d.subscriptions = append(d.subscriptions, sub)
+		subs = append(subs, sub)
+	}
+	if err := d.installSubscriptions(subs); err != nil {
+		_ = unsubscribeAll(subs)
+		return err
 	}
 	return nil
 }
 
 func (d *ServiceDispatcher) Close() error {
-	var out error
-	for _, sub := range d.subscriptions {
-		if sub != nil {
-			out = errors.Join(out, sub.Unsubscribe())
-		}
+	if d == nil {
+		return nil
 	}
-	return out
+	return unsubscribeAll(d.closeSubscriptions())
 }
 
 func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDelta) error {
 	if err := d.acceptDelta(delta); err != nil {
 		return err
+	}
+	if d.isClosed() {
+		return fmt.Errorf("%w: dispatcher is closed", ErrServiceDispatcherInvalid)
 	}
 	if !d.remember(delta.Key) {
 		return nil
@@ -219,7 +240,7 @@ func (d *ServiceDispatcher) recordFailure(ctx context.Context, delta CanonicalDe
 		"category":        string(category),
 	}
 	if len(stack) != 0 {
-		metadata["stack"] = string(stack)
+		metadata["stack"] = boundedServiceFailureStack(stack)
 	}
 	return d.board.RecordClaimValidationError(ctx, delta.ClaimID(), d.participant.RouteKey, LifecycleFailureOptions{
 		Reason:       firstNonEmpty(reason, "service handler failed"),
@@ -235,10 +256,75 @@ func (d *ServiceDispatcher) acceptDelta(delta CanonicalDelta) error {
 	if delta.Action != DeltaActionClaimPosted || delta.ClaimID() == "" {
 		return fmt.Errorf("%w: unsupported delta %s", ErrServiceDispatcherInvalid, delta.Action)
 	}
+	if !deltaTargetsParticipant(delta, d.participant.AgentRef()) {
+		return fmt.Errorf("%w: delta is not addressed to %s", ErrServiceDispatcherInvalid, d.participant.UID)
+	}
 	if !actionTypeAllowed(delta.ClaimActionType(), d.participant.Actions) {
 		return fmt.Errorf("%w: action %s not registered", ErrServiceDispatcherInvalid, delta.ClaimActionType())
 	}
 	return nil
+}
+
+func (d *ServiceDispatcher) markStarting() (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return false, fmt.Errorf("%w: dispatcher is closed", ErrServiceDispatcherInvalid)
+	}
+	if d.started {
+		return false, nil
+	}
+	d.started = true
+	return true, nil
+}
+
+func (d *ServiceDispatcher) resetStart() {
+	d.mu.Lock()
+	d.started = false
+	d.mu.Unlock()
+}
+
+func (d *ServiceDispatcher) installSubscriptions(subs []DeltaSubscription) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return fmt.Errorf("%w: dispatcher is closed", ErrServiceDispatcherInvalid)
+	}
+	if len(d.subscriptions) == 0 {
+		d.subscriptions = append([]DeltaSubscription(nil), subs...)
+	}
+	return nil
+}
+
+func (d *ServiceDispatcher) closeSubscriptions() []DeltaSubscription {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
+	subs := append([]DeltaSubscription(nil), d.subscriptions...)
+	d.subscriptions = nil
+	return subs
+}
+
+func (d *ServiceDispatcher) isClosed() bool {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.closed
+}
+
+func unsubscribeAll(subs []DeltaSubscription) error {
+	var out error
+	for _, sub := range subs {
+		if sub != nil {
+			out = errors.Join(out, sub.Unsubscribe())
+		}
+	}
+	return out
 }
 
 func (d *ServiceDispatcher) acquire(delta CanonicalDelta) bool {
@@ -301,7 +387,7 @@ func normalizeServiceArtifacts(artifacts []*Artifact, agentID string) []*Artifac
 		out = append(out, &copy)
 	}
 	if len(out) == 0 {
-		out = append(out, &Artifact{AgentID: agentID, ParticipantID: agentID, Kind: ArtifactKindReadiness, Reference: "service completed"})
+		out = append(out, &Artifact{AgentID: agentID, ParticipantID: agentID, ArtifactName: "service_readiness", Kind: ArtifactKindReadiness, Reference: "service completed"})
 	}
 	return out
 }
@@ -339,4 +425,26 @@ func actionTypeAllowed(action ActionType, allowed []ActionType) bool {
 		}
 	}
 	return false
+}
+
+func deltaTargetsParticipant(delta CanonicalDelta, ref AgentRef) bool {
+	if delta.Delivery == nil || len(delta.Delivery.To) == 0 {
+		return true
+	}
+	for _, target := range delta.Delivery.To {
+		if target.UID != "" && target.UID == ref.UID {
+			return true
+		}
+		if target.Type != "" && target.Type == ref.Type && target.Category == ref.Category {
+			return true
+		}
+	}
+	return false
+}
+
+func boundedServiceFailureStack(stack []byte) string {
+	if len(stack) <= serviceFailureStackLimitBytes {
+		return string(stack)
+	}
+	return string(stack[:serviceFailureStackLimitBytes]) + "\n...truncated"
 }

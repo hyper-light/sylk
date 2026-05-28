@@ -43,6 +43,7 @@ type FabricLogger struct {
 	done chan struct{}
 
 	drops     atomic.Int64
+	dropMarks atomic.Int64
 	closed    atomic.Bool
 	emitted   atomic.Int64 // records successfully enqueued
 	written   atomic.Int64 // records successfully written to disk
@@ -476,26 +477,7 @@ func (l *FabricLogger) enqueue(r FabricLogRecord) {
 	case l.ch <- r:
 		l.emitted.Add(1)
 	default:
-		dropped := l.drops.Add(1)
-		if l.dropReportEvery > 0 && dropped%l.dropReportEvery == 0 {
-			drop := FabricLogRecord{
-				Kind:      KindDrop,
-				SessionID: l.sessionID,
-				Seq:       l.nextSeq(),
-				Timestamp: time.Now(),
-				MonoNano:  monoDelta(l.mono0),
-				Drop: &DropBody{
-					Reason:       "buffer_full",
-					DroppedCount: dropped,
-				},
-			}
-			select {
-			case l.ch <- drop:
-				l.emitted.Add(1)
-			default:
-				// drop-the-drop — counter already reflects the loss.
-			}
-		}
+		l.drops.Add(1)
 	}
 }
 
@@ -507,15 +489,51 @@ func (l *FabricLogger) enqueue(r FabricLogRecord) {
 func (l *FabricLogger) drain() {
 	defer close(l.done)
 	for r := range l.ch {
-		if err := l.writer.Write(r); err != nil {
-			l.writeErrs.Add(1)
-			continue
+		if l.writeRecord(r) {
+			l.flushPendingDrop("buffer_full", false)
 		}
-		l.written.Add(1)
-		l.fanoutLocked(r)
 	}
 	// Final flush on shutdown.
+	l.flushPendingDrop("buffer_full", true)
 	_ = l.writer.Flush()
+}
+
+func (l *FabricLogger) writeRecord(r FabricLogRecord) bool {
+	if err := l.writer.Write(r); err != nil {
+		l.writeErrs.Add(1)
+		return false
+	}
+	l.written.Add(1)
+	l.fanoutLocked(r)
+	return true
+}
+
+func (l *FabricLogger) flushPendingDrop(reason string, force bool) {
+	for {
+		dropped := l.drops.Load()
+		reported := l.dropMarks.Load()
+		if dropped <= reported {
+			return
+		}
+		if !force && dropped-reported < l.dropReportEvery {
+			return
+		}
+		if !l.dropMarks.CompareAndSwap(reported, dropped) {
+			continue
+		}
+		l.writeRecord(FabricLogRecord{
+			Kind:      KindDrop,
+			SessionID: l.sessionID,
+			Seq:       l.nextSeq(),
+			Timestamp: time.Now(),
+			MonoNano:  monoDelta(l.mono0),
+			Drop: &DropBody{
+				Reason:       reason,
+				DroppedCount: dropped,
+			},
+		})
+		return
+	}
 }
 
 // fanoutLocked dispatches r to every registered subscriber. Runs on

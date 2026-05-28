@@ -45,6 +45,9 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeCarryForwardSessionCursor,
 		ArtifactDataTypePresentationEvidence,
 		ArtifactDataTypeKnowledgeReadiness,
+		ArtifactDataTypeIdentityAllocation,
+		ArtifactDataTypeIdentityLineage,
+		ArtifactDataTypeActivationRecord,
 	} {
 		if !strings.Contains(body, dataType) {
 			t.Fatalf("ARTIFACTS_AND_VALIDATIONS.md missing data type %s", dataType)
