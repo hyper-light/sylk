@@ -22,6 +22,22 @@ func newChatForClaimsTest(t *testing.T) *Model {
 	return New(theme.DefaultDark(), 256)
 }
 
+func addPeerInteractionForClaimsTest(m *Model, cycleID, claimID, issuer, subject string) string {
+	rowID := "claim-peer:" + claimID
+	m.Update(msg.ClaimPeerInteractionMsg{
+		SessionID:      "ses-1",
+		CycleID:        cycleID,
+		ClaimID:        claimID,
+		ActionType:     "consultation",
+		IssuerAgentID:  issuer,
+		SubjectAgentID: subject,
+		Title:          "Consult peer " + subject,
+		Status:         "pending",
+		OccurredAt:     time.Now(),
+	})
+	return rowID
+}
+
 // Test 1: claim artifact start creates a visible chat row without any
 // legacy stream event. No StreamStartMsg, no ToolCallEventMsg — the
 // ClaimArtifactAddedMsg alone must materialize an ArtifactRow keyed
@@ -157,30 +173,17 @@ func TestClaimsNative_ToolArtifactCompletionUsesOutputMetadata(t *testing.T) {
 }
 
 // Test 2: nested consult child tool renders under ParentRowID. The
-// architect's consult_started artifact is the parent; the librarian's
-// later tool_started artifact carries ParentRowID = consult_started's
-// artifact ID and must nest under it.
+// architect's consult row is claim-backed; the librarian's later
+// tool_started artifact carries ParentRowID = claim-peer:<claimID>.
 func TestClaimsNative_NestedConsultChildToolRendersUnderParentRowID(t *testing.T) {
 	m := newChatForClaimsTest(t)
 
-	consult := msg.ClaimArtifactAddedMsg{
-		ArtifactID:     "art-consult-1",
-		CycleID:        "cycle-arch-1",
-		ParentRowID:    "",
-		ClaimID:        "claim-arch-1",
-		OwnerAgentID:   "architect",
-		OwnerAgentType: "architect",
-		AgentID:        "architect",
-		Kind:           "consult_started",
-		Reference:      "librarian",
-		CreatedAt:      time.Now(),
-	}
-	m.Update(consult)
+	parentRowID := addPeerInteractionForClaimsTest(m, "cycle-arch-1", "claim-libr-1", "architect", "librarian")
 
 	childTool := msg.ClaimArtifactAddedMsg{
 		ArtifactID:     "art-libtool-1",
 		CycleID:        "cycle-arch-1",
-		ParentRowID:    "art-consult-1",
+		ParentRowID:    parentRowID,
 		ClaimID:        "claim-libr-1",
 		OwnerAgentID:   "librarian",
 		OwnerAgentType: "librarian",
@@ -191,20 +194,21 @@ func TestClaimsNative_NestedConsultChildToolRendersUnderParentRowID(t *testing.T
 	}
 	m.Update(childTool)
 
-	parent := m.ArtifactRowByID("art-consult-1")
-	if parent == nil {
-		t.Fatal("parent consult_started row missing")
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 1 || entry.ToolCalls[0].InterAgent == nil {
+		t.Fatalf("parent consult row missing: %+v", entry)
 	}
-	if len(parent.Children) != 1 || parent.Children[0] != "art-libtool-1" {
-		t.Fatalf("parent.Children = %v, want [art-libtool-1] — nested child not linked under ParentRowID", parent.Children)
+	children := entry.ToolCalls[0].InterAgent.Children
+	if len(children) != 1 || len(children[0].ToolCalls) != 1 || children[0].ToolCalls[0].ToolCallKey != "art-libtool-1" {
+		t.Fatalf("nested child not linked under ParentRowID: %+v", entry.ToolCalls[0].InterAgent)
 	}
 
 	child := m.ArtifactRowByID("art-libtool-1")
 	if child == nil {
 		t.Fatal("child librarian tool row missing")
 	}
-	if child.ParentRowID != "art-consult-1" {
-		t.Errorf("child.ParentRowID = %q, want art-consult-1", child.ParentRowID)
+	if child.ParentRowID != parentRowID {
+		t.Errorf("child.ParentRowID = %q, want %s", child.ParentRowID, parentRowID)
 	}
 	if child.AgentID != "librarian" {
 		t.Errorf("child.AgentID = %q, want librarian", child.AgentID)
@@ -530,21 +534,11 @@ func TestClaimsNative_ChildResponseTextDoesNotBecomeCycleAnswer(t *testing.T) {
 		ActionType: "prompt",
 		Reason:     "Plan the CLI",
 	})
-	m.Update(msg.ClaimArtifactAddedMsg{
-		ArtifactID:     "consult-start",
-		CycleID:        "claim-architect",
-		ClaimID:        "claim-architect",
-		OwnerAgentID:   "architect",
-		OwnerAgentType: "architect",
-		AgentID:        "architect",
-		Kind:           "consult_started",
-		Reference:      "librarian",
-		CreatedAt:      time.Now(),
-	})
+	parentRowID := addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian", "architect", "librarian")
 	m.Update(msg.ClaimArtifactAddedMsg{
 		ArtifactID:     "librarian-tool",
 		CycleID:        "claim-architect",
-		ParentRowID:    "consult-start",
+		ParentRowID:    parentRowID,
 		ClaimID:        "claim-librarian",
 		OwnerAgentID:   "librarian",
 		OwnerAgentType: "librarian",
@@ -558,7 +552,7 @@ func TestClaimsNative_ChildResponseTextDoesNotBecomeCycleAnswer(t *testing.T) {
 		SessionID:   "ses-1",
 		CycleID:     "claim-architect",
 		ClaimID:     "claim-librarian",
-		ParentRowID: "consult-start",
+		ParentRowID: parentRowID,
 		AgentID:     "librarian",
 		Content:     "Consultation response intended for the architect only.",
 		CreatedAt:   time.Now(),
@@ -921,26 +915,14 @@ func TestClaimsNative_ChildClaimContextTargetsExactParentRow(t *testing.T) {
 		ActionType: "prompt",
 		Reason:     "Planning",
 	})
-	for _, artifactID := range []string{"consult-one", "consult-two"} {
-		m.Update(msg.ClaimArtifactAddedMsg{
-			ArtifactID:     artifactID,
-			CycleID:        "claim-architect",
-			ClaimID:        "claim-architect",
-			OwnerAgentID:   "architect",
-			OwnerAgentType: "architect",
-			AgentID:        "architect",
-			Kind:           "consult_started",
-			Reference:      "librarian",
-			TargetAgentID:  "librarian",
-			CreatedAt:      time.Now(),
-		})
-	}
+	addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian-one", "architect", "librarian")
+	secondRowID := addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian-two", "architect", "librarian")
 
 	m.Update(msg.ClaimContextMsg{
 		SessionID:    "ses-1",
 		CycleID:      "claim-architect",
 		ClaimID:      "claim-librarian-two",
-		ParentRowID:  "consult-two",
+		ParentRowID:  secondRowID,
 		OwnerAgentID: "librarian",
 		Context:      "Running workspace_read",
 		State:        "tool_executing",
@@ -977,26 +959,14 @@ func TestClaimsNative_ChildResponseTextTargetsExactParentRow(t *testing.T) {
 		ActionType: "prompt",
 		Reason:     "Planning",
 	})
-	for _, artifactID := range []string{"consult-one", "consult-two"} {
-		m.Update(msg.ClaimArtifactAddedMsg{
-			ArtifactID:     artifactID,
-			CycleID:        "claim-architect",
-			ClaimID:        "claim-architect",
-			OwnerAgentID:   "architect",
-			OwnerAgentType: "architect",
-			AgentID:        "architect",
-			Kind:           "consult_started",
-			Reference:      "librarian",
-			TargetAgentID:  "librarian",
-			CreatedAt:      time.Now(),
-		})
-	}
+	addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian-one", "architect", "librarian")
+	secondRowID := addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian-two", "architect", "librarian")
 
 	m.Update(msg.ClaimResponseTextMsg{
 		SessionID:   "ses-1",
 		CycleID:     "claim-architect",
 		ClaimID:     "claim-librarian-two",
-		ParentRowID: "consult-two",
+		ParentRowID: secondRowID,
 		AgentID:     "librarian",
 		Content:     "Second consult response.",
 		CreatedAt:   time.Now(),
@@ -1032,21 +1002,11 @@ func TestClaimsNative_TestamentContextUpdatesNestedChildStatus(t *testing.T) {
 		ActionType: "prompt",
 		Reason:     "Planning",
 	})
-	m.Update(msg.ClaimArtifactAddedMsg{
-		ArtifactID:     "consult-start",
-		CycleID:        "claim-architect",
-		ClaimID:        "claim-architect",
-		OwnerAgentID:   "architect",
-		OwnerAgentType: "architect",
-		AgentID:        "architect",
-		Kind:           "consult_started",
-		Reference:      "librarian",
-		CreatedAt:      time.Now(),
-	})
+	parentRowID := addPeerInteractionForClaimsTest(m, "claim-architect", "claim-librarian", "architect", "librarian")
 	m.Update(msg.ClaimArtifactAddedMsg{
 		ArtifactID:     "librarian-tool",
 		CycleID:        "claim-architect",
-		ParentRowID:    "consult-start",
+		ParentRowID:    parentRowID,
 		ClaimID:        "claim-librarian",
 		OwnerAgentID:   "librarian",
 		OwnerAgentType: "librarian",
@@ -1061,7 +1021,7 @@ func TestClaimsNative_TestamentContextUpdatesNestedChildStatus(t *testing.T) {
 		ClaimID:           "claim-librarian",
 		AgentID:           "librarian",
 		CycleID:           "claim-architect",
-		ParentRowID:       "consult-start",
+		ParentRowID:       parentRowID,
 		Context:           "Building repository inventory",
 		ContextTransition: 1,
 	})
@@ -1100,21 +1060,10 @@ func TestClaimsNative_InterruptTargetPrefersRouteCorrelationForClaimCycle(t *tes
 		Reason:              "Building a plan",
 		StreamCorrelationID: "route-architect",
 	})
-	m.Update(msg.ClaimArtifactAddedMsg{
-		ArtifactID:     "consult-librarian",
-		CycleID:        "cycle-architect",
-		ClaimID:        "cycle-architect",
-		OwnerAgentID:   "architect",
-		OwnerAgentType: "architect",
-		AgentID:        "architect",
-		Kind:           "consult_started",
-		Reference:      "librarian",
-		TargetAgentID:  "librarian",
-		CreatedAt:      time.Now(),
-	})
+	parentRowID := addPeerInteractionForClaimsTest(m, "cycle-architect", "claim-librarian", "architect", "librarian")
 	m.Update(msg.ClaimArtifactAddedMsg{
 		ArtifactID:     "workspace-read",
-		ParentRowID:    "consult-librarian",
+		ParentRowID:    parentRowID,
 		CycleID:        "cycle-architect",
 		ClaimID:        "claim-librarian",
 		OwnerAgentID:   "librarian",

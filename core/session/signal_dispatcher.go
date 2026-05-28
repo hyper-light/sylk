@@ -269,17 +269,19 @@ func (d *CrossSessionSignalDispatcher) processSignalFile(path string) {
 		return
 	}
 
-	// Always attempt to remove the file after reading to prevent reprocessing
-	if removeErr := os.Remove(path); removeErr != nil {
-		// W3L.12: Capture removal error context (non-fatal, signal still processed)
-		_ = fmt.Errorf("signal dispatcher: failed to remove signal file %q: %w", path, removeErr)
-	}
-
 	var signal CrossSessionSignal
 	if err := json.Unmarshal(data, &signal); err != nil {
 		// W3L.12: Log unmarshal error with context instead of silently ignoring
+		// Do not remove the file: fsnotify can deliver Create before the
+		// writer closes the file, and the sweep path will retry once the
+		// JSON write is complete.
 		_ = fmt.Errorf("signal dispatcher: failed to unmarshal signal from %q: %w", path, err)
 		return
+	}
+
+	if removeErr := os.Remove(path); removeErr != nil {
+		// W3L.12: Capture removal error context (non-fatal, signal still processed)
+		_ = fmt.Errorf("signal dispatcher: failed to remove signal file %q: %w", path, removeErr)
 	}
 
 	d.dispatchSignal(signal)

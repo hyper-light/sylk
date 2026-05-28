@@ -800,7 +800,7 @@ func (l *Librarian) handleBusRequest(msg *guide.Message) error {
 	// stamps parent_claim_id on the envelope so this binds to the
 	// consultation/challenge claim, not the guide's route claim.
 	// Bridge can then nest this agent's artifact tree under the
-	// issuer's consult_started/challenge_started row. UI_DESIGN.md
+	// issuer's claim-backed consult/challenge row. UI_DESIGN.md
 	// §4.7.3 — Layer 3 cycle-context propagation.
 	var flushAccumulator func()
 	var beginErr error

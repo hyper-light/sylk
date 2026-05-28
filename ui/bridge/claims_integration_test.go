@@ -881,54 +881,56 @@ func TestBridgeIntegration_PresentableTestamentEmitsClaimPresentation(t *testing
 	}
 }
 
-func TestBridgeIntegration_ReplayLegacyResponseTextWithoutPresentation(t *testing.T) {
-	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-legacy-response-replay")
+func TestBridgeIntegration_ReplayPostedResponseTextWithoutPresentation(t *testing.T) {
+	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-response-replay")
 	defer cleanup()
 
 	proj := &claims.ClaimsBoardProjection{
 		Claims: []claims.Claim{{
-			ID:         "legacy-claim",
-			Title:      "answer user",
-			Status:     claims.ClaimStatusTestified,
-			ActionType: claims.ActionTypeTask,
+			ID:              "response-claim",
+			Title:           "answer user",
+			Status:          claims.ClaimStatusTestified,
+			LifecycleStatus: claims.ClaimLifecycleTestamentGenerated,
+			ActionType:      claims.ActionTypeTask,
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 			},
 		}},
 		Testaments: []claims.Testament{{
-			ID:      "legacy-testament",
-			AgentID: "architect",
+			ID:              "response-testament",
+			AgentID:         "architect",
+			LifecycleStatus: claims.TestamentLifecyclePosted,
 			Relations: []claims.Relation{
-				{Related: "legacy-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+				{Related: "response-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
 			},
 			Artifacts: []*claims.Artifact{{
-				ID:        "legacy-response",
+				ID:        "posted-response",
 				Kind:      claims.ArtifactKindResponseText,
-				Reference: "legacy answer",
+				Reference: "posted answer",
 			}},
 		}},
 	}
 	before := len(prog.Snapshot())
-	br.replayProjection("ses-legacy-response-replay", proj)
-	drainBridge(t, prog, "legacy response replay")
+	br.replayProjection("ses-response-replay", proj)
+	drainBridge(t, prog, "posted response replay")
 
 	var responses, presentations int
 	for _, m := range prog.Snapshot()[before:] {
 		switch typed := m.(type) {
 		case msg.ClaimResponseTextMsg:
-			if typed.Content == "legacy answer" {
+			if typed.Content == "posted answer" {
 				responses++
 			}
 		case msg.ClaimPresentationMsg:
-			if typed.SourceID == "legacy-response" {
+			if typed.SourceID == "posted-response" {
 				presentations++
 			}
 		}
 	}
 	if responses != 1 || presentations != 0 {
-		debugSnapshot(t, prog, "legacy response replay")
-		t.Fatalf("legacy response replay responses=%d presentations=%d, want 1/0", responses, presentations)
+		debugSnapshot(t, prog, "posted response replay")
+		t.Fatalf("posted response replay responses=%d presentations=%d, want 1/0", responses, presentations)
 	}
 }
 
@@ -1445,29 +1447,31 @@ func metadataContainsString(value any, needle string) bool {
 	return false
 }
 
-func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentation(t *testing.T) {
-	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-legacy-plan-replay")
+func TestBridgeIntegration_ReplayPlanHandoffWithoutPlanMarkdownDoesNotSynthesizePresentation(t *testing.T) {
+	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-plan-no-synthetic-replay")
 	defer cleanup()
 
 	proj := &claims.ClaimsBoardProjection{
 		Claims: []claims.Claim{{
-			ID:         "legacy-plan-claim",
-			Title:      "plan",
-			Status:     claims.ClaimStatusTestified,
-			ActionType: claims.ActionTypeTask,
+			ID:              "plan-claim",
+			Title:           "plan",
+			Status:          claims.ClaimStatusTestified,
+			LifecycleStatus: claims.ClaimLifecycleTestamentGenerated,
+			ActionType:      claims.ActionTypeTask,
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 			},
 		}},
 		Testaments: []claims.Testament{{
-			ID:      "legacy-plan-testament",
-			AgentID: "architect",
+			ID:              "plan-testament",
+			AgentID:         "architect",
+			LifecycleStatus: claims.TestamentLifecyclePosted,
 			Relations: []claims.Relation{
-				{Related: "legacy-plan-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+				{Related: "plan-claim", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
 			},
 			Artifacts: []*claims.Artifact{{
-				ID:   "legacy-handoff",
+				ID:   "plan-handoff-only",
 				Kind: claims.ArtifactKindPlanHandoffPayload,
 				Metadata: map[string]any{
 					"plan_id":       "legacy-p1",
@@ -1478,26 +1482,13 @@ func TestBridgeIntegration_ReplayLegacyPlanHandoffSynthesizesTransientPresentati
 		}},
 	}
 	before := len(prog.Snapshot())
-	br.replayProjection("ses-legacy-plan-replay", proj)
-	drainBridge(t, prog, "legacy plan replay")
+	br.replayProjection("ses-plan-no-synthetic-replay", proj)
+	drainBridge(t, prog, "plan no synthetic replay")
 
-	var got *msg.ClaimPresentationMsg
 	for _, m := range prog.Snapshot()[before:] {
-		if p, ok := m.(msg.ClaimPresentationMsg); ok && p.SourceType == "synthetic" {
-			copy := p
-			got = &copy
-			break
+		if p, ok := m.(msg.ClaimPresentationMsg); ok {
+			t.Fatalf("unexpected synthetic presentation from non-presented handoff payload: %+v", p)
 		}
-	}
-	if got == nil {
-		debugSnapshot(t, prog, "legacy plan replay")
-		t.Fatal("expected synthetic presentation")
-	}
-	if got.Content != "### Plan\n\n- Legacy task" || got.Metadata["synthetic"] != true {
-		t.Fatalf("unexpected synthetic presentation: %+v", got)
-	}
-	if _, ok := board.CloneArtifact(got.SourceID); ok {
-		t.Fatalf("synthetic source %q must not be a durable artifact", got.SourceID)
 	}
 }
 
@@ -1511,115 +1502,125 @@ func debugSnapshot(t *testing.T, prog *integrationProgram, label string) {
 
 func postArchitectConsultClaim(t *testing.T, board *claims.ClaimsBoard) (parentClaimID, consultClaimID string) {
 	t.Helper()
-	if err := board.PostAction(context.Background(),
-		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+	parentAction := claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}
+	parentGenerated, err := board.GenerateClaimAction(context.Background(),
+		parentAction,
 		[]claims.Claim{{
-			Title: "architect plan",
+			Title:       "architect plan",
+			Description: "Architect plans the user request",
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 			},
-			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+			Validations: []*claims.Validation{{ID: "architect-plan.validation", Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
 		}},
-	); err != nil {
-		t.Fatalf("PostAction parent claim: %v", err)
+		claims.GenerateClaimActionOptions{},
+	)
+	if err != nil {
+		t.Fatalf("GenerateClaimAction parent claim: %v", err)
 	}
-	parentClaimID = board.Projection().Claims[0].ID
-	if err := board.PostAction(context.Background(),
-		claims.Action{AgentID: "architect", Type: claims.ActionTypeConsultation},
+	if len(parentGenerated.Claims) == 0 {
+		t.Fatal("GenerateClaimAction parent returned no claims")
+	}
+	parentClaimID = parentGenerated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), parentClaimID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim parent claim: %v", err)
+	}
+
+	consultAction := claims.Action{AgentID: "architect", Type: claims.ActionTypeConsultation}
+	consultGenerated, err := board.GenerateClaimAction(context.Background(),
+		consultAction,
 		[]claims.Claim{{
-			Title: "consult librarian",
+			Title:       "consult librarian",
+			Description: "Architect consults librarian",
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "librarian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 				{Related: parentClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy},
 			},
 			ActionType:  claims.ActionTypeConsultation,
-			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+			Validations: []*claims.Validation{{ID: "consult-librarian.receipt", Description: "v", QualityBar: "x", Type: claims.ValidationTypeReceipt, Required: true}},
 		}},
-	); err != nil {
-		t.Fatalf("PostAction consult claim: %v", err)
+		claims.GenerateClaimActionOptions{},
+	)
+	if err != nil {
+		t.Fatalf("GenerateClaimAction consult claim: %v", err)
 	}
-	for _, c := range board.Projection().Claims {
-		if c.Title == "consult librarian" {
-			consultClaimID = c.ID
-			break
-		}
+	if len(consultGenerated.Claims) == 0 {
+		t.Fatal("GenerateClaimAction consult returned no claims")
 	}
-	if parentClaimID == "" || consultClaimID == "" {
-		t.Fatalf("missing test claims: parent=%q consult=%q", parentClaimID, consultClaimID)
+	consultClaimID = consultGenerated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), consultClaimID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim consult claim: %v", err)
 	}
 	return parentClaimID, consultClaimID
 }
 
-// Cross-claim nesting test (UI_DESIGN.md §3.4 ParentRowID). When
-// agent A consults agent B, B's tool calls (emitted on B's
-// testament responding to the consult claim) must carry
-// ParentRowID equal to A's consult_started artifact ID, so the
+// Cross-claim nesting test. When agent A consults agent B, B's tool
+// calls (emitted on B's testament responding to the consult claim)
+// must carry ParentRowID equal to the claim-backed peer row so the
 // chat panel nests B's tools beneath A's consult row.
 func TestBridgeIntegration_CrossClaimNestingViaParentRowID(t *testing.T) {
 	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest")
 	defer cleanup()
 
 	// 1. A's top-level claim (cycle root for A).
-	if err := board.PostAction(context.Background(),
+	parentGenerated, err := board.GenerateClaimAction(context.Background(),
 		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
 		[]claims.Claim{{
-			Title: "architect plan",
+			Title:       "architect plan",
+			Description: "Architect plans the user request",
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 			},
-			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+			Validations: []*claims.Validation{{ID: "architect-plan.validation", Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
 		}},
-	); err != nil {
-		t.Fatalf("PostAction A's claim: %v", err)
+		claims.GenerateClaimActionOptions{},
+	)
+	if err != nil {
+		t.Fatalf("GenerateClaimAction A's claim: %v", err)
 	}
-	parentClaimID := board.Projection().Claims[0].ID
+	if len(parentGenerated.Claims) == 0 {
+		t.Fatal("GenerateClaimAction A's claim returned no claims")
+	}
+	parentClaimID := parentGenerated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), parentClaimID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim A's claim: %v", err)
+	}
 
 	// 2. A posts a consult claim against B (engineer). The consult
 	//    claim has caused_by → A's parent claim, so the resolver
 	//    attaches it to A's cycle.
-	if err := board.PostAction(context.Background(),
+	consultGenerated, err := board.GenerateClaimAction(context.Background(),
 		claims.Action{AgentID: "architect", Type: claims.ActionTypeConsultation},
 		[]claims.Claim{{
-			Title: "consult engineer",
+			Title:       "consult engineer",
+			Description: "Architect consults engineer",
 			Relations: []claims.Relation{
 				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
 				{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 				{Related: parentClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy},
 			},
 			ActionType:  claims.ActionTypeConsultation,
-			Validations: []*claims.Validation{{Description: "v", QualityBar: "x", Type: claims.ValidationTypeInspection, Required: true}},
+			Validations: []*claims.Validation{{ID: "consult-engineer.receipt", Description: "v", QualityBar: "x", Type: claims.ValidationTypeReceipt, Required: true}},
 		}},
-	); err != nil {
-		t.Fatalf("PostAction consult: %v", err)
+		claims.GenerateClaimActionOptions{},
+	)
+	if err != nil {
+		t.Fatalf("GenerateClaimAction consult: %v", err)
 	}
-	var consultClaimID string
-	for _, c := range board.Projection().Claims {
-		if c.Title == "consult engineer" {
-			consultClaimID = c.ID
-		}
+	if len(consultGenerated.Claims) == 0 {
+		t.Fatal("GenerateClaimAction consult returned no claims")
 	}
-	if consultClaimID == "" {
-		t.Fatal("consult claim not on board")
+	consultClaimID := consultGenerated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), consultClaimID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim consult: %v", err)
 	}
 
-	// 3. A emits a consult_started artifact (originating side) with
-	//    Metadata["claim_id"] = consult claim ID.
-	consultStartedID := "consult-started-A"
-	br.OnArtifactAdded(parentClaimID, "architect", "ses-nest", &claims.Artifact{
-		ID:        consultStartedID,
-		AgentID:   "architect",
-		Kind:      "consult_started",
-		Reference: "engineer",
-		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "engineer"},
-		Created:   time.Now(),
-	})
-
-	// 4. B (engineer) handles the consult and emits a tool_started
+	// 3. B (engineer) handles the consult and emits a tool_started
 	//    on its testament responding to the consult claim. The
-	//    bridge must set ParentRowID = consultStartedID.
+	//    bridge must set ParentRowID to the claim-backed peer row.
 	bToolStartedID := "tool-started-B"
 	br.OnArtifactAdded(consultClaimID, "engineer", "ses-nest", &claims.Artifact{
 		ID:        bToolStartedID,
@@ -1670,16 +1671,7 @@ func TestBridgeIntegration_ChildArtifactFallbackActorIsClaimSubject(t *testing.T
 	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest-actor")
 	defer cleanup()
 
-	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
-	consultStartedID := "consult-started-actor"
-	br.OnArtifactAdded(parentClaimID, "architect", "ses-nest-actor", &claims.Artifact{
-		ID:        consultStartedID,
-		AgentID:   "architect",
-		Kind:      "consult_started",
-		Reference: "librarian",
-		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
-		Created:   time.Now(),
-	})
+	_, consultClaimID := postArchitectConsultClaim(t, board)
 	br.OnArtifactAdded(consultClaimID, "", "ses-nest-actor", &claims.Artifact{
 		ID:        "tool-started-without-agent",
 		Kind:      "tool_started",
@@ -1710,19 +1702,10 @@ func TestBridgeIntegration_ChildArtifactFallbackActorIsClaimSubject(t *testing.T
 }
 
 func TestBridgeIntegration_TestamentSummaryEmitsNestedChildResponse(t *testing.T) {
-	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest-response")
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-nest-response")
 	defer cleanup()
 
-	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
-	consultStartedID := "consult-started-response"
-	br.OnArtifactAdded(parentClaimID, "architect", "ses-nest-response", &claims.Artifact{
-		ID:        consultStartedID,
-		AgentID:   "architect",
-		Kind:      "consult_started",
-		Reference: "librarian",
-		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
-		Created:   time.Now(),
-	})
+	_, consultClaimID := postArchitectConsultClaim(t, board)
 	if err := board.SubmitTestaments(context.Background(),
 		claims.Action{AgentID: "librarian", Type: claims.ActionTypeTestament},
 		[]claims.Testament{{
@@ -1775,16 +1758,7 @@ func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing
 	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-terminal-peer")
 	defer cleanup()
 
-	parentClaimID, consultClaimID := postArchitectConsultClaim(t, board)
-	consultStartedID := "consult-started-terminal"
-	br.OnArtifactAdded(parentClaimID, "architect", "ses-canonical-terminal-peer", &claims.Artifact{
-		ID:        consultStartedID,
-		AgentID:   "architect",
-		Kind:      "consult_started",
-		Reference: "librarian",
-		Metadata:  map[string]any{"claim_id": consultClaimID, "target": "librarian"},
-		Created:   time.Now(),
-	})
+	_, consultClaimID := postArchitectConsultClaim(t, board)
 	drainBridge(t, prog, "canonical terminal setup")
 
 	delta := claims.NewCanonicalDelta(

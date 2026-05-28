@@ -2267,34 +2267,6 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 		m.pushClaimsAgentEvent(agent.ID, ev.ArtifactID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
 		m.claimArtifactEvents[ev.ArtifactID] = []claimArtifactEventRef{{AgentID: agent.ID, EventID: ev.ArtifactID}}
 		m.rowsDirty = true
-	case "consult_started", "challenge_started", "guardian_check_started":
-		owner := m.ensureClaimsAgent(ev.OwnerAgentID)
-		targetID := firstNonBlankAgent(claimArtifactMetadataString(ev.Metadata, "target", "target_agent_id", "subject_agent_id"), ev.Reference, ev.TargetAgentID)
-		target := m.ensureClaimsAgent(targetID)
-		refs := make([]claimArtifactEventRef, 0, 2)
-		if owner != nil {
-			owner.ActivityState = interAgentUIState(ev.Kind)
-			summary := interAgentSummary(ev.Kind, targetID)
-			if targetID != "" {
-				owner.TaskSummary = summary
-			}
-			m.pushClaimsAgentEvent(owner.ID, ev.ArtifactID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
-			refs = append(refs, claimArtifactEventRef{AgentID: owner.ID, EventID: ev.ArtifactID})
-		}
-		if target != nil {
-			target.ActivityState = events.AgentUIStateThinking
-			targetEventID := ev.ArtifactID + ":target"
-			summary := "responding to " + ev.OwnerAgentID
-			if ev.OwnerAgentID != "" {
-				target.TaskSummary = summary
-			}
-			m.pushClaimsAgentEvent(target.ID, targetEventID, claimArtifactEventType(ev.Kind), summary, ev.CreatedAt, events.OutcomePending)
-			refs = append(refs, claimArtifactEventRef{AgentID: target.ID, EventID: targetEventID})
-		}
-		if len(refs) > 0 {
-			m.claimArtifactEvents[ev.ArtifactID] = refs
-		}
-		m.rowsDirty = true
 	}
 	return nil
 }
@@ -2432,26 +2404,6 @@ func claimStateUIState(state string) events.AgentUIState {
 		return events.AgentUIStateFailed
 	default:
 		return events.NormalizeAgentUIState(events.AgentUIState(state))
-	}
-}
-
-func interAgentUIState(kind string) events.AgentUIState {
-	switch strings.TrimSpace(kind) {
-	case "guardian_check_started":
-		return events.AgentUIStateBlocked
-	default:
-		return events.AgentUIStateRouting
-	}
-}
-
-func interAgentSummary(kind, target string) string {
-	switch strings.TrimSpace(kind) {
-	case "challenge_started":
-		return "challenging " + target
-	case "guardian_check_started":
-		return "awaiting guardian"
-	default:
-		return "consulting " + target
 	}
 }
 

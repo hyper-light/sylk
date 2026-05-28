@@ -29,20 +29,41 @@ func EnsureKnowledgeBackendReadyClaim(ctx context.Context, board *ClaimsBoard) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); ok {
+	if existing, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); ok {
+		if existing != nil && existing.LifecycleStatus == ClaimLifecycleGenerated {
+			return board.PostGeneratedClaim(ctx, KnowledgeBackendReadyClaimID, KnowledgeBackendAgentID, ClaimPostOptions{Reason: "knowledge readiness claim posted"})
+		}
 		return nil
 	}
-	err := board.PostAction(ctx, knowledgeBackendReadyAction(), []Claim{knowledgeBackendReadyClaim()})
+	generated, err := board.GenerateClaimAction(ctx, knowledgeBackendReadyAction(), []Claim{knowledgeBackendReadyClaim()}, GenerateClaimActionOptions{
+		IdempotencyKey: KnowledgeBackendReadyClaimID,
+		Reason:         "knowledge readiness claim generated",
+	})
 	if isDuplicateKnowledgeReadyClaim(err) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if len(generated.Claims) == 0 {
+		return fmt.Errorf("claims: knowledge readiness claim generation returned no claims")
+	}
+	if err := board.PostGeneratedClaim(ctx, generated.Claims[0].ID, KnowledgeBackendAgentID, ClaimPostOptions{Reason: "knowledge readiness claim posted"}); err != nil {
+		if isDuplicateKnowledgeReadyClaim(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // KnowledgeBackendReadyTestament returns the first readiness testament linked
 // to the deterministic knowledge-backend readiness claim.
 func KnowledgeBackendReadyTestament(board *ClaimsBoard) (*Testament, bool) {
 	if board == nil {
+		return nil, false
+	}
+	if claim, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); !ok || claim == nil || claim.LifecycleStatus != ClaimLifecycleSatisfied {
 		return nil, false
 	}
 	for _, testament := range board.TestamentsByClaim(KnowledgeBackendReadyClaimID) {
@@ -67,7 +88,17 @@ func SubmitKnowledgeBackendReadyTestament(ctx context.Context, board *ClaimsBoar
 		return nil, err
 	}
 	testament := knowledgeBackendReadyTestament(metadata)
-	if err := board.SubmitTestaments(ctx, knowledgeBackendReadyTestamentAction(), []Testament{testament}); err != nil {
+	generated, err := board.GenerateTestamentAction(ctx, knowledgeBackendReadyTestamentAction(), []Testament{testament}, GenerateTestamentActionOptions{
+		IdempotencyKey: "knowledge_backend.ready.testament",
+		Reason:         "knowledge readiness testament generated",
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(generated.Testaments) == 0 {
+		return nil, fmt.Errorf("claims: knowledge readiness testament generation returned no testaments")
+	}
+	if err := board.PostGeneratedTestament(ctx, generated.Testaments[0].ID, KnowledgeBackendAgentID, TestamentPostOptions{Reason: "knowledge readiness testament posted"}); err != nil {
 		return nil, err
 	}
 	if submitted, ok := KnowledgeBackendReadyTestament(board); ok {
@@ -92,7 +123,7 @@ func WaitForKnowledgeBackendReady(ctx context.Context, board *ClaimsBoard) (*Tes
 
 	ready := make(chan struct{}, 1)
 	unsubscribe := board.SubscribeDelta(func(delta BoardMutationDelta) error {
-		if delta.Kind == "testament_submitted" && delta.ClaimID == KnowledgeBackendReadyClaimID {
+		if (delta.Kind == "testament_posted" || delta.Kind == "testament_submitted") && delta.ClaimID == KnowledgeBackendReadyClaimID {
 			select {
 			case ready <- struct{}{}:
 			default:

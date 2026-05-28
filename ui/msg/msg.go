@@ -966,7 +966,7 @@ type ClaimArtifactAddedMsg struct {
 	OwnerAgentType string         // type label rendered in child-agent blocks ("guardian", "tester-pipeline", ...)
 	TargetAgentID  string         // target of the parent claim (subject)
 	AgentID        string         // record-issuing agent (Artifact.AgentID — replica/instance)
-	Kind           string         // "tool_started" | "consult_started" | "challenge_started" | "guardian_check_started" | "llm_started" | "cycle_root"
+	Kind           string         // "tool_started" | "llm_started" | "cycle_root" | diagnostic artifact kind
 	Reference      string         // tool name, consult title, etc.
 	Metadata       map[string]any // kind-specific structured detail
 	CreatedAt      time.Time

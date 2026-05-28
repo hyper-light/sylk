@@ -94,10 +94,10 @@ func TestWaitForKnowledgeBackendReadyWaitsOnDelta(t *testing.T) {
 	defer cancel()
 
 	var once sync.Once
-	claimCreated := make(chan struct{})
+	claimPosted := make(chan struct{})
 	unsubscribe := board.SubscribeDelta(func(delta BoardMutationDelta) error {
-		if delta.Kind == "claim_created" && delta.ClaimID == KnowledgeBackendReadyClaimID {
-			once.Do(func() { close(claimCreated) })
+		if delta.Kind == "claim_posted" && delta.ClaimID == KnowledgeBackendReadyClaimID {
+			once.Do(func() { close(claimPosted) })
 		}
 		return nil
 	})
@@ -114,11 +114,11 @@ func TestWaitForKnowledgeBackendReadyWaitsOnDelta(t *testing.T) {
 	}()
 
 	select {
-	case <-claimCreated:
+	case <-claimPosted:
 	case result := <-waited:
-		t.Fatalf("wait returned before creating readiness claim: testament=%v err=%v", result.testament, result.err)
+		t.Fatalf("wait returned before posting readiness claim: testament=%v err=%v", result.testament, result.err)
 	case <-ctx.Done():
-		t.Fatalf("readiness claim was not created: %v", ctx.Err())
+		t.Fatalf("readiness claim was not posted: %v", ctx.Err())
 	}
 
 	select {

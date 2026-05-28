@@ -257,7 +257,7 @@ func CycleOptsToMetadata(meta map[string]string, opts ForwardedRequestCycleOpts)
 // (issuer=A, subject=B, ActionType=Challenge) wakes B's inbox; B's
 // processClaimsEntry runs an LLM tool loop that emits artifacts;
 // without this binding the testament is free-floating and B's
-// artifacts never nest under A's challenge_started row. Same shape
+// artifacts never nest under A's claim-backed challenge row. Same shape
 // for consult-via-claims and any other directed-work claim that
 // reaches an agent through its standing subscription.
 func NewClaimsEntryAccumulator(agentID, sessionID string, entry *claims.GraphEntryPoint) *claims.TestamentAccumulator {

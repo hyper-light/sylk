@@ -887,13 +887,16 @@ func postGuardianCheckClaim(ctx context.Context, inv Invocation) string {
 			Related: parent, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy,
 		})
 	}
+	claimID := uuid.NewString()
 	claim := claims.Claim{
+		ID:          claimID,
 		Title:       "Guardian review: " + toolName,
 		Description: "Approval gate for " + toolName + " requested by " + callerAgentID,
 		Scope:       []claims.ClaimScopeEntry{{Kind: "tool", Key: toolName}},
 		ActionType:  claims.ActionTypeGuardianCheck,
 		Relations:   relations,
 		Validations: []*claims.Validation{{
+			ID:          claimID + ".inspection",
 			Type:        claims.ValidationTypeInspection,
 			Required:    true,
 			Description: "Guardian renders a grant verdict (allow / deny)",
@@ -901,15 +904,18 @@ func postGuardianCheckClaim(ctx context.Context, inv Invocation) string {
 			Status:      claims.ValidationStatusPending,
 		}},
 	}
-	posted := []claims.Claim{claim}
-	action := claims.Action{AgentID: callerAgentID, Type: claims.ActionTypeGuardianCheck}
-	if err := board.PostAction(ctx, action, posted); err != nil {
+	action := claims.Action{ID: claimID + ".action", AgentID: callerAgentID, Type: claims.ActionTypeGuardianCheck}
+	generated, err := board.GenerateClaimAction(ctx, action, []claims.Claim{claim}, claims.GenerateClaimActionOptions{
+		IdempotencyKey: "guardian_check:" + claimID,
+		Reason:         "guardian check generated",
+	})
+	if err != nil || len(generated.Claims) == 0 {
 		return ""
 	}
-	if len(posted) > 0 {
-		return strings.TrimSpace(posted[0].ID)
+	if err := board.PostGeneratedClaim(ctx, generated.Claims[0].ID, callerAgentID, claims.ClaimPostOptions{Reason: "guardian check posted"}); err != nil {
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(generated.Claims[0].ID)
 }
 
 // recordGuardianWaitContext narrates the AwaitingGuardian transition
@@ -954,6 +960,7 @@ func recordGuardianWaitContext(ctx context.Context, inv Invocation, guardianClai
 // artifact with its eventual completed artifact.
 type guardianCheckTrace struct {
 	startedArtifactID string
+	guardianClaimID   string
 }
 
 func recordGuardianCheckStart(ctx context.Context, inv Invocation, guardianClaimID string) guardianCheckTrace {
@@ -983,7 +990,7 @@ func recordGuardianCheckStart(ctx context.Context, inv Invocation, guardianClaim
 		Metadata:  metadata,
 		Ephemeral: true,
 	})
-	return guardianCheckTrace{startedArtifactID: startedID}
+	return guardianCheckTrace{startedArtifactID: startedID, guardianClaimID: guardianClaimID}
 }
 
 func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianCheckTrace, started time.Time, grantErr error) {
@@ -1032,6 +1039,90 @@ func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianC
 		}
 	}
 	acc.RecordArtifact(artifact)
+	submitGuardianCheckTestament(ctx, acc, inv, trace.guardianClaimID, started, now, outcome, grantErr)
+}
+
+func submitGuardianCheckTestament(ctx context.Context, acc *claims.TestamentAccumulator, inv Invocation, guardianClaimID string, started, ended time.Time, outcome string, grantErr error) {
+	guardianClaimID = strings.TrimSpace(guardianClaimID)
+	if acc == nil || guardianClaimID == "" || acc.Board() == nil {
+		return
+	}
+	artifactKind := claims.ArtifactKindReadiness
+	if grantErr != nil {
+		artifactKind = guardianFailureArtifactKind(grantErr)
+	}
+	reference := "guardian " + outcome + ": " + strings.TrimSpace(inv.ToolCall.Name)
+	metadata := map[string]any{
+		"outcome":      outcome,
+		"tool_name":    strings.TrimSpace(inv.ToolCall.Name),
+		"tool_call_id": strings.TrimSpace(inv.ToolCall.ID),
+		"started_at":   started.UTC().Format(time.RFC3339Nano),
+		"ended_at":     ended.UTC().Format(time.RFC3339Nano),
+		"duration_ms":  ended.Sub(started).Milliseconds(),
+	}
+	if grantErr != nil {
+		metadata["error"] = grantErr.Error()
+	}
+	testament := claims.Testament{
+		AgentID:    "guardian",
+		SessionID:  acc.SessionID(),
+		Summary:    reference,
+		Confidence: "committed",
+		Relations: []claims.Relation{
+			{Related: guardianClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			{Related: "guardian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: strings.TrimSpace(inv.AgentID), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Artifacts: []*claims.Artifact{{
+			AgentID:   "guardian",
+			SessionID: acc.SessionID(),
+			Kind:      artifactKind,
+			Reference: reference,
+			Metadata:  metadata,
+		}},
+	}
+	board := acc.Board()
+	action := claims.Action{AgentID: "guardian", Type: claims.ActionTypeTestament}
+	generated, err := board.GenerateTestamentAction(ctx, action, []claims.Testament{testament}, claims.GenerateTestamentActionOptions{
+		IdempotencyKey:  "guardian_check:testament:" + guardianClaimID,
+		Reason:          "guardian verdict generated",
+		AllowStandalone: false,
+	})
+	if err != nil || len(generated.Testaments) == 0 {
+		return
+	}
+	testamentID := strings.TrimSpace(generated.Testaments[0].ID)
+	if err := board.PostGeneratedTestament(ctx, testamentID, "guardian", claims.TestamentPostOptions{Reason: "guardian verdict posted"}); err != nil {
+		return
+	}
+	receiverID := strings.TrimSpace(inv.AgentID)
+	if receiverID == "" {
+		receiverID = acc.AgentID()
+	}
+	if receiverID != "" {
+		_ = board.AcknowledgeTestamentReceipt(ctx, testamentID, receiverID)
+	}
+	if err := board.BeginTestamentValidation(ctx, testamentID, receiverID); err != nil {
+		return
+	}
+	targetStatus := claims.TestamentLifecycleValidated
+	reason := "guardian verdict received"
+	if grantErr != nil {
+		targetStatus = claims.TestamentLifecycleValidationFailed
+		reason = grantErr.Error()
+	}
+	_ = board.CompleteTestamentValidation(ctx, testamentID, receiverID, targetStatus, reason)
+}
+
+func guardianFailureArtifactKind(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return claims.ArtifactKindToolTimeout
+	case errors.Is(err, context.Canceled):
+		return claims.ArtifactKindInterrupted
+	default:
+		return claims.ArtifactKindPolicyDenied
+	}
 }
 
 func (r *Runtime) executeSearch(input map[string]any, transientActive map[string]struct{}, restricted bool) (map[string]any, []string, error) {

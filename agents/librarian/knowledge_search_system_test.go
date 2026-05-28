@@ -160,10 +160,10 @@ func TestCommittedKnowledgeSearchSystem_WaitsForReadinessTestament(t *testing.T)
 	system := NewCommittedKnowledgeSearchSystem(backend)
 
 	var once sync.Once
-	claimCreated := make(chan struct{})
+	claimPosted := make(chan struct{})
 	unsubscribe := board.SubscribeDelta(func(delta claims.BoardMutationDelta) error {
-		if delta.Kind == "claim_created" && delta.ClaimID == claims.KnowledgeBackendReadyClaimID {
-			once.Do(func() { close(claimCreated) })
+		if delta.Kind == "claim_posted" && delta.ClaimID == claims.KnowledgeBackendReadyClaimID {
+			once.Do(func() { close(claimPosted) })
 		}
 		return nil
 	})
@@ -183,11 +183,11 @@ func TestCommittedKnowledgeSearchSystem_WaitsForReadinessTestament(t *testing.T)
 	}()
 
 	select {
-	case <-claimCreated:
+	case <-claimPosted:
 	case result := <-done:
 		t.Fatalf("search returned before posting readiness claim: result=%v err=%v", result.result, result.err)
 	case <-ctx.Done():
-		t.Fatalf("readiness claim was not created: %v", ctx.Err())
+		t.Fatalf("readiness claim was not posted: %v", ctx.Err())
 	}
 
 	select {

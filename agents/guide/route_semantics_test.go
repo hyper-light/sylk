@@ -17,7 +17,7 @@ import (
 // plane coordination. That produced phantom top-level user-prompt
 // cycles owned by the target agent (so e.g. the librarian became a
 // top-level chat row instead of nesting under the architect's
-// consult_started row), and overwrote the real parent_claim_id —
+// claim-backed consult row), and overwrote the real parent_claim_id —
 // severing the responder's testament from the originating
 // consultation/challenge claim and breaking the bridge's nested
 // row attribution.

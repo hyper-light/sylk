@@ -160,10 +160,11 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			callerType := safeCallString(cfg.AgentType)
 			ownPipelineID := safeCallString(cfg.PipelineID)
 			if explicit := strings.TrimSpace(params.TargetAgentType); explicit != "" {
-				if peerTargetIsCaller(callerID, callerType, ownPipelineID, "", explicit, "") {
+				explicitSelf := peerTargetIsCaller(callerID, callerType, ownPipelineID, "", explicit, "")
+				if explicitSelf && claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)) == nil {
 					return nil, selfPeerTargetError("challenge_peer", callerID, callerType, explicit, explicit)
 				}
-				if !authority.CanChallenge(callerType, explicit) {
+				if !explicitSelf && !authority.CanChallenge(callerType, explicit) {
 					return nil, unauthorizedChallengeError(callerType, explicit, permittedTargets)
 				}
 			}
@@ -195,11 +196,12 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			// of the challenged activity must still be a permitted
 			// target. Prevents silent hops into a disallowed scope
 			// via an opaque target_activity_id.
-			if resolvedAgentType != "" && !authority.CanChallenge(callerType, resolvedAgentType) {
-				return nil, unauthorizedChallengeError(callerType, resolvedAgentType, permittedTargets)
-			}
-			if peerTargetIsCaller(callerID, callerType, ownPipelineID, resolvedAgentID, resolvedAgentType, resolvedPipelineID) {
+			selfTargeted := peerTargetIsCaller(callerID, callerType, ownPipelineID, resolvedAgentID, resolvedAgentType, resolvedPipelineID)
+			if selfTargeted && claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)) == nil {
 				return nil, selfPeerTargetError("challenge_peer", callerID, callerType, resolvedAgentID, resolvedAgentType)
+			}
+			if resolvedAgentType != "" && !selfTargeted && !authority.CanChallenge(callerType, resolvedAgentType) {
+				return nil, unauthorizedChallengeError(callerType, resolvedAgentType, permittedTargets)
 			}
 
 			payload, _ := json.Marshal(map[string]any{
@@ -259,17 +261,18 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 						ActionType: claims.ActionTypeChallenge,
 						Relations:  challengeRelations,
 						Validations: []*claims.Validation{{
+							ID:   challengeID + ".inspection",
 							Type: claims.ValidationTypeInspection, Required: true,
 							Description: "Challenged peer responds (defend/yield/scope-split/escalate)", QualityBar: "resolution.received",
 							Status: claims.ValidationStatusPending,
 						}},
 					}}
 					challengeAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeChallenge}
-					if err := board.PostAction(ctx, challengeAction, challengeClaims); err != nil {
+					if err := postGeneratedPeerClaim(ctx, board, challengeAction, challengeClaims, agentType, "challenge_peer"); err != nil {
 						slog.Error("challenge_peer_issuing_claim_failed", "error", err.Error())
+						return nil, err
 					} else {
 						challengeClaimID = challengeClaims[0].ID
-						EmitPeerInteractionStarted(ctx, PeerInteractionKindChallenge, agentType, challengeClaimID, challengeTarget, params.Evidence)
 						if cfg.Inbox != nil {
 							claims.RegisterPostActionExpectations(cfg.Inbox(), challengeAction, challengeClaims)
 						}
@@ -367,6 +370,34 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 		Build()
 }
 
+func postGeneratedPeerClaim(ctx context.Context, board *claims.ClaimsBoard, action claims.Action, claimSet []claims.Claim, actorID, skillName string) error {
+	if board == nil {
+		return fmt.Errorf("%s: claims board is required", skillName)
+	}
+	if len(claimSet) == 0 {
+		return fmt.Errorf("%s: no claims to post", skillName)
+	}
+	idempotencyKey := skillName + ":" + strings.TrimSpace(claimSet[0].ID)
+	generated, err := board.GenerateClaimAction(ctx, action, claimSet, claims.GenerateClaimActionOptions{
+		IdempotencyKey: idempotencyKey,
+		Reason:         skillName + " generated peer claim",
+	})
+	if err != nil {
+		return err
+	}
+	if len(generated.Claims) == 0 {
+		return fmt.Errorf("%s: generated peer claim action returned no claims", skillName)
+	}
+	for i := range generated.Claims {
+		if i < len(claimSet) {
+			claimSet[i].ID = generated.Claims[i].ID
+		}
+	}
+	return board.PostGeneratedClaim(ctx, generated.Claims[0].ID, actorID, claims.ClaimPostOptions{
+		Reason: skillName + " posted peer claim",
+	})
+}
+
 // lookupTargetActivity resolves the challenged activity from the
 // ambient activity source. Returns nil when the source is unavailable,
 // when the ID doesn't parse, when the activity isn't present, or when
@@ -433,10 +464,11 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			callerType := safeCallString(cfg.AgentType)
 			targetType := strings.TrimSpace(params.TargetAgentType)
 			targetPipelineID := strings.TrimSpace(params.TargetPipelineID)
-			if peerTargetIsCaller(callerID, callerType, safeCallString(cfg.PipelineID), "", targetType, targetPipelineID) {
+			selfTargeted := peerTargetIsCaller(callerID, callerType, safeCallString(cfg.PipelineID), "", targetType, targetPipelineID)
+			if selfTargeted && claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)) == nil {
 				return nil, selfPeerTargetError("consult_peer", callerID, callerType, targetType, targetType)
 			}
-			if !authority.CanConsult(callerType, targetType) {
+			if !selfTargeted && !authority.CanConsult(callerType, targetType) {
 				return nil, unauthorizedConsultError(callerType, targetType, permittedTargets)
 			}
 			// Cross-pipeline gate: if the caller names a specific
@@ -490,11 +522,9 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			activity.Append(ctx, act)
 
 			// Issuing-side claim: the consulting agent posts a consultation
-			// claim against the target agent. Capture the claim ID so it
-			// can travel on the dispatched envelope as parent_claim_id —
-			// the consultee binds its testament to this claim, and the
-			// bridge nests its artifact tree under the issuer's
-			// consult_started row via claimToInvocationArtifact lookup.
+			// claim against the target agent. The consultee binds its
+			// testament and artifacts to this claim, and the bridge projects
+			// the exchange from the claim graph.
 			consultationClaimID := ""
 			if board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)); board != nil {
 				agentType := safeCallString(cfg.AgentType)
@@ -513,17 +543,18 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 					ActionType: claims.ActionTypeConsultation,
 					Relations:  consultRelations,
 					Validations: []*claims.Validation{{
+						ID:   consultID + ".receipt",
 						Type: claims.ValidationTypeReceipt, Required: true,
 						Description: "Peer responds to consultation", QualityBar: "response.received",
 						Status: claims.ValidationStatusPending,
 					}},
 				}}
 				consultAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeConsultation}
-				if err := board.PostAction(ctx, consultAction, consultClaims); err != nil {
+				if err := postGeneratedPeerClaim(ctx, board, consultAction, consultClaims, agentType, "consult_peer"); err != nil {
 					slog.Error("consult_peer_issuing_claim_failed", "error", err.Error())
+					return nil, err
 				} else {
 					consultationClaimID = consultClaims[0].ID
-					EmitPeerInteractionStarted(ctx, PeerInteractionKindConsult, agentType, consultationClaimID, targetAddress, params.Query)
 					if cfg.Inbox != nil {
 						claims.RegisterPostActionExpectations(cfg.Inbox(), consultAction, consultClaims)
 					}
@@ -613,7 +644,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				// this, the issuer's claim testifies mid-cycle, the
 				// bridge's cycle resolver closes the cycle, and the
 				// peer's nested artifacts can no longer attach to the
-				// issuer's consult_started row in the chat tree.
+				// claim-backed peer row in the chat tree.
 				if acc := claims.AccumulatorFromContext(ctx); acc != nil {
 					acc.SuppressFlush()
 				}

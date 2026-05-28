@@ -69,8 +69,8 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 		t.Fatalf("forest tool not flipped to success: %+v", r)
 	}
 
-	// 4. Architect dispatches a consult to the librarian. consult_started
-	// row appears under the architect's cycle.
+	// 4. Architect dispatches a consult to the librarian. The peer row is
+	// projected from the consultation claim, not a consult_started artifact.
 	m.Update(msg.ClaimContextMsg{
 		ClaimID:           "claim-arch",
 		OwnerAgentID:      "architect",
@@ -79,21 +79,23 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 		ContextTransition: 2,
 		State:             "dispatching_to_peer",
 	})
-	m.Update(msg.ClaimArtifactAddedMsg{
-		ArtifactID:     "art-consult",
+	m.Update(msg.ClaimPeerInteractionMsg{
+		SessionID:      "ses-1",
 		CycleID:        "cycle-arch",
-		ClaimID:        "claim-arch",
-		OwnerAgentID:   "architect",
-		OwnerAgentType: "architect",
-		AgentID:        "architect",
-		TargetAgentID:  "librarian",
-		Kind:           "consult_started",
-		Reference:      "librarian",
-		CreatedAt:      now.Add(50 * time.Millisecond),
-		Metadata:       map[string]any{"claim_id": "claim-libr"},
+		ClaimID:        "claim-libr",
+		ActionType:     "consultation",
+		IssuerAgentID:  "architect",
+		SubjectAgentID: "librarian",
+		Title:          "Consult peer librarian",
+		Status:         "pending",
+		OccurredAt:     now.Add(50 * time.Millisecond),
 	})
-	if r := m.ArtifactRowByID("art-consult"); r == nil || r.TargetAgent != "librarian" {
-		t.Fatalf("consult_started row missing or wrong target: %+v", r)
+	entry := m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 2 || entry.ToolCalls[1].InterAgent == nil {
+		t.Fatalf("consult peer row missing: %+v", entry)
+	}
+	if got := entry.ToolCalls[1].InterAgent.SubjectAgentID; got != "librarian" {
+		t.Fatalf("consult peer subject = %q, want librarian", got)
 	}
 
 	// 5. Architect yields awaiting the librarian. Context flips.
@@ -107,11 +109,11 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 	})
 
 	// 6. Librarian processes its claim. Its tool calls nest under the
-	// architect's consult_started via ParentRowID = art-consult.
+	// architect's claim-backed consult row via ParentRowID.
 	m.Update(msg.ClaimArtifactAddedMsg{
 		ArtifactID:     "art-libr-search",
 		CycleID:        "cycle-arch",
-		ParentRowID:    "art-consult",
+		ParentRowID:    "claim-peer:claim-libr",
 		ClaimID:        "claim-libr",
 		OwnerAgentID:   "librarian",
 		OwnerAgentType: "librarian",
@@ -120,12 +122,13 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 		Reference:      "search_kb",
 		CreatedAt:      now.Add(70 * time.Millisecond),
 	})
-	if r := m.ArtifactRowByID("art-libr-search"); r == nil || r.ParentRowID != "art-consult" {
+	if r := m.ArtifactRowByID("art-libr-search"); r == nil || r.ParentRowID != "claim-peer:claim-libr" {
 		t.Fatalf("librarian search tool didn't nest under consult: %+v", r)
 	}
-	parent := m.ArtifactRowByID("art-consult")
-	if parent == nil || len(parent.Children) != 1 || parent.Children[0] != "art-libr-search" {
-		t.Fatalf("consult parent missing librarian child: %+v", parent)
+	entry = m.history.Get(0)
+	children := entry.ToolCalls[1].InterAgent.Children
+	if len(children) != 1 || len(children[0].ToolCalls) != 1 || children[0].ToolCalls[0].ToolCallKey != "art-libr-search" {
+		t.Fatalf("consult parent missing librarian child: %+v", entry.ToolCalls[1].InterAgent)
 	}
 
 	// 7. Librarian's tool completes.
@@ -179,13 +182,17 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 
 	// 10. Architect resumes — consult completes, architect synthesizes,
 	// then cycle reaches terminal.
-	m.Update(msg.ClaimArtifactCompletedMsg{
-		StartArtifactID: "art-consult",
-		CycleID:         "cycle-arch",
-		Outcome:         "success",
-		Duration:        100 * time.Millisecond,
-		Summary:         "Received from librarian",
-		CompletedAt:     now.Add(150 * time.Millisecond),
+	m.Update(msg.ClaimPeerInteractionMsg{
+		SessionID:      "ses-1",
+		CycleID:        "cycle-arch",
+		ClaimID:        "claim-libr",
+		ActionType:     "consultation",
+		IssuerAgentID:  "architect",
+		SubjectAgentID: "librarian",
+		Context:        "Received from librarian",
+		Status:         "done",
+		TestamentID:    "test-libr",
+		OccurredAt:     now.Add(150 * time.Millisecond),
 	})
 	m.Update(msg.ClaimContextMsg{
 		ClaimID:           "claim-arch",
@@ -196,9 +203,9 @@ func TestClaimsNative_ReplayPromptConsultNestedToolResume(t *testing.T) {
 		State:             "synthesizing",
 	})
 
-	consultRow := m.ArtifactRowByID("art-consult")
-	if consultRow == nil || consultRow.Status != ArtifactRowStatusSuccess {
-		t.Fatalf("consult not flipped to success on resume: %+v", consultRow)
+	entry = m.history.Get(0)
+	if entry == nil || len(entry.ToolCalls) != 2 || !entry.ToolCalls[1].Completed || !entry.ToolCalls[1].Success {
+		t.Fatalf("consult not flipped to success on resume: %+v", entry)
 	}
 	finalCycle := m.ClaimRowByCycleID("cycle-arch")
 	if finalCycle == nil || finalCycle.Context != "Composing response" || finalCycle.ContextSequence != 4 {

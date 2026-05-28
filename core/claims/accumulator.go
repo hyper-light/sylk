@@ -237,8 +237,7 @@ func (a *TestamentAccumulator) Board() *ClaimsBoard {
 // premature testament with the partial pre-yield state, the board
 // sees the agent testify mid-cycle, the cycle resolver closes the
 // cycle, and downstream artifacts emitted by peers responding to the
-// (still in-flight) consult fail to nest under the issuer's
-// consult_started row. See docs/CLAIMS_UI.md.
+// still in-flight claim fail to nest under the claim-backed peer row.
 func (a *TestamentAccumulator) SuppressFlush() {
 	if a == nil {
 		return

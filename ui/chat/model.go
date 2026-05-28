@@ -7092,8 +7092,7 @@ func nonZeroChatTime(t time.Time) time.Time {
 // cannot revive the "fake claude-opus-4-6 tool row" bug class.
 func isVisibleArtifactKindForChat(kind string) bool {
 	switch kind {
-	case "tool_started", "consult_started", "challenge_started", "guardian_check_started",
-		"tool_completed", "consult_completed", "challenge_completed", "guardian_check_completed":
+	case "tool_started", "tool_completed":
 		return true
 	}
 	return false

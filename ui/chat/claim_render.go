@@ -10,18 +10,9 @@ import (
 )
 
 // projectClaimArtifactToHistory renders a claim artifact onto the
-// cycle's ChatEntry as a ToolCallRecord. Routing rules
-// (UI_DESIGN.md §3.4):
-//
-//   - tool_started → flat ToolCallRecord on the cycle entry.
-//   - consult_started / challenge_started / guardian_check_started →
-//     ToolCallRecord with InterAgent populated (the chat tree's
-//     "child agent" block).
-//   - any artifact carrying ParentRowID → nested under the parent
-//     InterAgent's Children entry for the responding agent. A
-//     consult dispatching to the librarian followed by the
-//     librarian's tool call lands the librarian's tool inside the
-//     consult's child block, not flat under the cycle.
+// cycle's ChatEntry as a ToolCallRecord. Peer branches are projected
+// from claim lifecycle; artifacts only create ordinary tool rows or
+// nested child rows when the bridge supplies a claim-backed ParentRowID.
 //
 // Idempotent: a duplicate artifact ID re-finds the existing record
 // (anywhere in the tree) instead of creating a sibling.
@@ -180,6 +171,9 @@ func upsertClaimPeerInteractionRecord(e *ChatEntry, next ToolCallRecord) bool {
 		if current.InterAgent != nil && next.InterAgent.Sequence > 0 && current.InterAgent.Sequence > next.InterAgent.Sequence {
 			return false
 		}
+		if claimPeerInteractionRecordTerminal(current) && !next.Completed {
+			return false
+		}
 		mergeClaimPeerInteractionRecord(current, next)
 		return true
 	}
@@ -243,6 +237,19 @@ func mergeClaimPeerInteractionRecord(current *ToolCallRecord, next ToolCallRecor
 	if current.InterAgent != nil {
 		current.InterAgent.Children = children
 	}
+}
+
+func claimPeerInteractionRecordTerminal(record *ToolCallRecord) bool {
+	if record == nil {
+		return false
+	}
+	if record.Completed {
+		return true
+	}
+	if record.InterAgent == nil {
+		return false
+	}
+	return record.InterAgent.Status == InterAgentToolDone || record.InterAgent.Status == InterAgentToolFailed
 }
 
 func claimPeerInteractionRowID(claimID string) string {
@@ -751,37 +758,22 @@ func claimArtifactDisplayName(art *ArtifactRow) string {
 
 func claimArtifactDisplayNameFallback(kind string) string {
 	switch kind {
-	case "consult_started":
-		return "consult_peer"
-	case "challenge_started":
-		return "challenge_peer"
-	case "guardian_check_started":
-		return "guardian_check"
 	case "tool_started":
 		return "tool"
 	}
 	return kind
 }
 
-// interAgentKindForClaimArtifact maps a claim artifact kind to the
-// chat panel's InterAgentToolKind. Empty return means the artifact
-// is a plain tool call, not an inter-agent invocation.
+// interAgentKindForClaimArtifact is intentionally closed. Peer
+// interactions are lifecycle claim projections, never inferred from
+// artifact kind or tool metadata.
 func interAgentKindForClaimArtifact(kind string) InterAgentToolKind {
-	switch kind {
-	case "consult_started":
-		return InterAgentToolConsult
-	case "challenge_started":
-		return InterAgentToolChallenge
-	case "guardian_check_started":
-		return InterAgentToolApproval
-	}
 	return ""
 }
 
 // buildClaimToolCallRecord constructs a ToolCallRecord from an
-// ArtifactRow. Peer-interaction kinds get an InterAgent payload
-// pre-populated with the invocation target — that's what the
-// renderer keys on to draw the child-agent block.
+// ArtifactRow. Inter-agent branches are claim lifecycle projections,
+// so visible artifacts always render as ordinary tool rows here.
 func buildClaimToolCallRecord(art *ArtifactRow) ToolCallRecord {
 	rec := ToolCallRecord{
 		ToolCallKey: art.ArtifactID,

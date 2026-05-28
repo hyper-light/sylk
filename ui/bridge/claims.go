@@ -360,28 +360,51 @@ func (b *ClaimsBridge) startBoardDeltaWatch(sessionID string, board *claims.Clai
 }
 
 func (b *ClaimsBridge) processBoardMutationDelta(sessionID string, board *claims.ClaimsBoard, delta claims.BoardMutationDelta) error {
-	if delta.Kind != "testament_submitted" || strings.TrimSpace(delta.TestamentID) == "" {
-		return nil
-	}
-	// Claim-scoped testaments also arrive via the claims bus as
-	// TestamentDelta. Free-floating presentation testaments do not, so
-	// this in-process board subscription closes that visibility gap
-	// without duplicating ordinary claim response rows.
-	if strings.TrimSpace(delta.ClaimID) != "" {
-		return nil
-	}
 	activeBoard, activeSession := b.currentBoard()
 	if activeBoard != board || activeSession != sessionID {
 		return nil
 	}
+
+	switch strings.TrimSpace(delta.Kind) {
+	case "claim_created", "claim_posted":
+		b.handleBoardMutationClaimPosted(sessionID, board, strings.TrimSpace(delta.ClaimID))
+	case "testament_submitted", "testament_posted":
+		b.handleBoardMutationTestamentPosted(sessionID, board, delta)
+	}
+	return nil
+}
+
+func (b *ClaimsBridge) handleBoardMutationClaimPosted(sessionID string, board *claims.ClaimsBoard, claimID string) {
+	if board == nil || claimID == "" {
+		return
+	}
+	if c, ok := board.CloneClaim(claimID); ok {
+		b.handleClaimCreated(sessionID, c)
+		return
+	}
+	if c := findClaim(board.Projection(), claimID); c != nil {
+		b.handleClaimCreated(sessionID, c)
+	}
+}
+
+func (b *ClaimsBridge) handleBoardMutationTestamentPosted(sessionID string, board *claims.ClaimsBoard, delta claims.BoardMutationDelta) {
+	if board == nil || strings.TrimSpace(delta.TestamentID) == "" {
+		return
+	}
+	// Claim-scoped testaments arrive through lifecycle deltas on the
+	// claims bus. Free-floating presentation testaments do not, so this
+	// in-process board subscription closes that visibility gap without
+	// duplicating ordinary claim response rows.
+	if strings.TrimSpace(delta.ClaimID) != "" {
+		return
+	}
 	if t, ok := board.CloneTestament(strings.TrimSpace(delta.TestamentID)); ok {
 		b.handleTestamentSubmitted(sessionID, t)
-		return nil
+		return
 	}
 	if t := findTestament(board.Projection(), delta.TestamentID); t != nil {
 		b.handleTestamentSubmitted(sessionID, t)
 	}
-	return nil
 }
 
 func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.GraphEntryPoint) error {
@@ -926,6 +949,9 @@ func (b *ClaimsBridge) handleClaimClosed(claimID, outcome string) {
 
 func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Testament) {
 	if t == nil {
+		return
+	}
+	if !testamentLifecycleDisplayable(t.LifecycleStatus) {
 		return
 	}
 	claimID := claims.ClaimIDFromRelations(t.Relations)
@@ -1837,6 +1863,9 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 	completed := completedStartedArtifactsInProjection(proj)
 	testaments := testamentsBySequence(proj.Testaments)
 	for _, t := range testaments {
+		if !testamentLifecycleDisplayable(t.LifecycleStatus) {
+			continue
+		}
 		if m := b.claimPresentationMsgForTestament(sessionID, claims.ClaimIDFromRelations(t.Relations), t); m != nil {
 			b.enqueue(*m)
 		}
@@ -1850,13 +1879,9 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 			})
 		}
 		claimID := claims.ClaimIDFromRelations(t.Relations)
-		hasPlanMarkdown := false
 		for _, art := range artifactsBySequence(t.Artifacts) {
 			if art == nil {
 				continue
-			}
-			if strings.TrimSpace(art.Kind) == claims.ArtifactKindPlanMarkdown {
-				hasPlanMarkdown = true
 			}
 			if strings.TrimSpace(art.Kind) == claims.ArtifactKindResponseText {
 				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
@@ -1874,91 +1899,22 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 			}
 			b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 		}
-		if !hasPlanMarkdown {
-			if m := b.syntheticLegacyPlanPresentationMsg(sessionID, claimID, t); m != nil {
-				b.enqueue(*m)
-			}
-		}
 	}
 }
 
-func (b *ClaimsBridge) syntheticLegacyPlanPresentationMsg(sessionID, claimID string, t *claims.Testament) *msg.ClaimPresentationMsg {
-	if b == nil || t == nil {
-		return nil
+func testamentLifecycleDisplayable(status claims.TestamentLifecycleStatus) bool {
+	switch status {
+	case claims.TestamentLifecyclePosted,
+		claims.TestamentLifecycleReceived,
+		claims.TestamentLifecycleValidating,
+		claims.TestamentLifecycleValidated,
+		claims.TestamentLifecycleValidationIncomplete,
+		claims.TestamentLifecycleValidationFailed,
+		claims.TestamentLifecycleValidationErrored:
+		return true
+	default:
+		return false
 	}
-	for _, artifact := range artifactsBySequence(t.Artifacts) {
-		markdown, metadata, ok := claims.LegacyPlanMarkdownFromHandoffArtifact(artifact)
-		if !ok {
-			continue
-		}
-		claimID = strings.TrimSpace(claimID)
-		if claimID == "" {
-			claimID = claims.ClaimIDFromRelations(t.Relations)
-		}
-		planID := claimMetadataString(metadata, "plan_id")
-		presentation := claims.NormalizePresentation(claims.DefaultPlanMarkdownPresentation(planID))
-		sourceID := "synthetic-plan:" + strings.TrimSpace(t.ID)
-		if sourceID == "synthetic-plan:" {
-			sourceID = "synthetic-plan:" + strings.TrimSpace(artifact.ID)
-		}
-		metadata = cloneMetadata(metadata)
-		if metadata == nil {
-			metadata = make(map[string]any, 4)
-		}
-		metadata["synthetic"] = true
-		metadata["source_artifact_id"] = strings.TrimSpace(artifact.ID)
-		metadata["source_artifact_kind"] = strings.TrimSpace(artifact.Kind)
-		metadata["source_testament_id"] = strings.TrimSpace(t.ID)
-
-		b.mu.Lock()
-		meta := b.metaForClaimLocked(claimID)
-		if meta.SuppressChat {
-			b.recordPresentationDropLocked("synthetic", sourceID, presentation, "suppressed_chat")
-			b.mu.Unlock()
-			return nil
-		}
-		cycleID := firstNonBlank(
-			meta.CycleID,
-			claimID,
-			claimMetadataString(metadata, "stream_correlation_id", "correlation_id", "request_correlation_id", "cycle_id"),
-		)
-		if cycleID == "" {
-			if planID := claimMetadataString(metadata, "plan_id"); planID != "" {
-				cycleID = "plan:" + planID
-			}
-		}
-		if cycleID == "" {
-			b.recordPresentationDropLocked("synthetic", sourceID, presentation, "missing_cycle")
-			b.mu.Unlock()
-			return nil
-		}
-		if !b.shouldEmitPresentationLocked("synthetic", sourceID, presentationReplaceKey(presentation), artifact.Sequence, presentation) {
-			b.mu.Unlock()
-			return nil
-		}
-		content := safeClaimPresentationContent(sourceID, markdown, presentationFormat(presentation))
-		b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), presentationFormat(presentation), "")
-		out := &msg.ClaimPresentationMsg{
-			SessionID:   sessionID,
-			CycleID:     cycleID,
-			ClaimID:     claimID,
-			SourceType:  "synthetic",
-			SourceID:    sourceID,
-			TestamentID: strings.TrimSpace(t.ID),
-			AgentID:     firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-			Title:       presentationTitle(presentation, "Plan"),
-			Content:     content,
-			Format:      presentationFormat(presentation),
-			Placement:   presentationPlacement(presentation),
-			ReplaceKey:  presentationReplaceKey(presentation),
-			Metadata:    safePresentationMetadata(metadata),
-			CreatedAt:   nonZeroTime(t.Created),
-			Sequence:    artifact.Sequence,
-		}
-		b.mu.Unlock()
-		return out
-	}
-	return nil
 }
 
 func testamentsBySequence(in []claims.Testament) []*claims.Testament {

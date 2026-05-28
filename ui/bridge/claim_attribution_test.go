@@ -165,22 +165,9 @@ func TestBridgeIntegration_ConsultedAgentArtifactsRenderAsResponder(t *testing.T
 	consultClaimID := board.Projection().Claims[1].ID
 	drainBridge(t, prog, "consult registered")
 
-	// Architect emits the consult_started invocation artifact on its
-	// own claim — metadata["claim_id"] points at the librarian's
-	// child claim so the bridge indexes the cross-claim link.
-	br.OnArtifactAdded(architectClaimID, "architect", "ses-consult-attribution", &claims.Artifact{
-		ID:        "art-consult-started",
-		AgentID:   "architect",
-		Kind:      "consult_started",
-		Reference: "librarian",
-		Metadata: map[string]any{
-			"claim_id": consultClaimID,
-		},
-	})
-
 	// Librarian later emits a tool call on ITS claim. Bridge should
-	// nest it under the architect's consult_started row AND label
-	// the row with AgentID=librarian (the emitter), not architect.
+	// nest it under the claim-backed peer row AND label the row with
+	// AgentID=librarian (the emitter), not architect.
 	br.OnArtifactAdded(consultClaimID, "librarian", "ses-consult-attribution", &claims.Artifact{
 		ID:        "art-libtool",
 		AgentID:   "librarian",

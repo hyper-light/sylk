@@ -54,18 +54,16 @@ type ClaimRow struct {
 	Artifacts []string
 }
 
-// ArtifactRow models a single tool / consult / challenge /
-// guardian-check row. It's keyed by ArtifactID. ParentRowID is the
-// stable parent identity computed by the bridge's cycle resolver:
-// either another artifact ID (cross-claim nesting) or empty for
-// top-level cycle attachment.
+// ArtifactRow models a single artifact-backed tool row. Peer exchanges
+// are modeled by their claim rows; ParentRowID points at those
+// claim-backed rows when an artifact belongs under a peer exchange.
 type ArtifactRow struct {
 	ArtifactID  string
 	ParentRowID string
 	CycleID     string
 	ClaimID     string
-	Kind        string // "tool_started" | "consult_started" | "challenge_started" | "guardian_check_started" | "llm_started"
-	Reference   string // tool name / consult target / etc.
+	Kind        string // "tool_started" | "llm_started" | diagnostic artifact kind
+	Reference   string // tool name / artifact reference
 	ArgsSummary string
 	AgentID     string
 	AgentType   string
@@ -78,9 +76,9 @@ type ArtifactRow struct {
 	ErrorMsg    string
 	Metadata    map[string]any
 	// Children is the ordered list of child ArtifactIDs that nested
-	// under this artifact (e.g. a librarian's tool calls under an
-	// architect's consult_started row). Populated as child arrivals
-	// resolve their ParentRowID = this row's ArtifactID.
+	// under this artifact. Claim-backed peer rows own inter-agent
+	// nesting; artifact children are only for artifact-to-artifact
+	// relationships.
 	Children []string
 }
 

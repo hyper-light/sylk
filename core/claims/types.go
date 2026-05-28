@@ -164,10 +164,8 @@ const (
 	// ActionTypeGuardianCheck is the structured claim posted by the
 	// tool runtime when an approval-gated tool needs guardian review.
 	// Subject = "guardian"; the responding testament carries the
-	// grant verdict (allow/deny). The bridge nests guardian's
-	// processing artifacts under the calling tool's
-	// guardian_check_started row via the structured claim ID stamped
-	// on the artifact's metadata. See docs/CLAIMS_UI.md §5.3.
+	// grant verdict (allow/deny). The bridge projects the exchange
+	// from this structured claim and its testament lifecycle.
 	ActionTypeGuardianCheck ActionType = "guardian_check"
 	// ActionTypeConsultContinuation is a claim type that captures the
 	// serialized LLM turn state of an agent that yielded mid-tool-loop

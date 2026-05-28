@@ -395,7 +395,17 @@ func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOpti
 		Relations:  continuityRelations(claim.ID, priorID, result.Sources, opts.SupersedePrior),
 		Artifacts:  continuityArtifacts(agentID, topic, board, fromSeq, throughSeq, opts, result.Sources, workingContext, evidenceDigest, priorID, now),
 	}
-	if err := board.SubmitTestaments(ctx, Action{AgentID: agentID, Type: ActionTypeTestament}, []Testament{t}); err != nil {
+	generated, err := board.GenerateTestamentAction(ctx, Action{AgentID: agentID, Type: ActionTypeTestament}, []Testament{t}, GenerateTestamentActionOptions{
+		IdempotencyKey: fmt.Sprintf("carry_forward:%s:%s:%d", agentID, topic, throughSeq),
+		Reason:         "continuity testament generated",
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(generated.Testaments) == 0 {
+		return nil, fmt.Errorf("continuity testament generation returned no testaments")
+	}
+	if err := board.PostGeneratedTestament(ctx, generated.Testaments[0].ID, agentID, TestamentPostOptions{Reason: "continuity testament posted"}); err != nil {
 		return nil, err
 	}
 	result.Mutated = true
@@ -701,13 +711,26 @@ func recordRecallEnrichmentProjectionError(board *ClaimsBoard, query RecallForwa
 			"error":      err.Error(),
 		},
 	}
-	if submitErr := board.SubmitTestaments(context.Background(), Action{AgentID: projectionDiagnosticsAgentID, Type: ActionTypeTestament}, []Testament{{
+	generated, genErr := board.GenerateTestamentAction(context.Background(), Action{AgentID: projectionDiagnosticsAgentID, Type: ActionTypeTestament}, []Testament{{
 		AgentID:    projectionDiagnosticsAgentID,
 		SessionID:  board.SessionID(),
 		Summary:    reference,
 		Confidence: "committed",
 		Artifacts:  []*Artifact{artifact},
-	}}); submitErr != nil {
+	}}, GenerateTestamentActionOptions{
+		IdempotencyKey:  "recall_forward_enrichment_error:" + firstNonBlankString(query.AgentID, "unknown") + ":" + firstNonBlankString(query.Topic, "unknown") + ":" + truncateForDigest(err.Error(), 64),
+		AllowStandalone: true,
+		Reason:          "recall enrichment projection error generated",
+	})
+	if genErr != nil {
+		board.RecordNotificationError("recall enrichment projection error artifact: " + genErr.Error())
+		return
+	}
+	if len(generated.Testaments) == 0 {
+		board.RecordNotificationError("recall enrichment projection error artifact: no generated testament")
+		return
+	}
+	if submitErr := board.PostGeneratedTestament(context.Background(), generated.Testaments[0].ID, projectionDiagnosticsAgentID, TestamentPostOptions{Reason: "recall enrichment projection error posted"}); submitErr != nil {
 		board.RecordNotificationError("recall enrichment projection error artifact: " + submitErr.Error())
 	}
 }
@@ -759,6 +782,9 @@ func continuityRecordsFor(board *ClaimsBoard, agentID, topic string) []continuit
 		if !ok || c == nil {
 			continue
 		}
+		if !isRecallableClaimLifecycle(c.LifecycleStatus) {
+			continue
+		}
 		if !claimHasScope(c.Scope, carryForwardScopeKind, carryForwardScopeKey) ||
 			!claimHasScope(c.Scope, carryForwardAgentScopeKind, agentID) {
 			continue
@@ -806,6 +832,9 @@ func continuityFromTestament(t *Testament, agentID, topic string) (continuityRec
 	if t == nil {
 		return continuityRecord{}, false
 	}
+	if !isRecallableTestamentLifecycle(t.LifecycleStatus) {
+		return continuityRecord{}, false
+	}
 	if strings.TrimSpace(agentID) != "" && strings.TrimSpace(t.AgentID) != strings.TrimSpace(agentID) {
 		return continuityRecord{}, false
 	}
@@ -846,11 +875,47 @@ func continuityFromTestament(t *Testament, agentID, topic string) (continuityRec
 	return rec, true
 }
 
+func isRecallableClaimLifecycle(status ClaimLifecycleStatus) bool {
+	switch status {
+	case ClaimLifecyclePosted,
+		ClaimLifecycleReceived,
+		ClaimLifecycleProgressed,
+		ClaimLifecycleTestamentGenerated,
+		ClaimLifecycleTestamentAcknowledged,
+		ClaimLifecycleValidating,
+		ClaimLifecycleSatisfied,
+		ClaimLifecycleValidationIncomplete,
+		ClaimLifecycleValidationFailed,
+		ClaimLifecycleValidationErrored:
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecallableTestamentLifecycle(status TestamentLifecycleStatus) bool {
+	switch status {
+	case TestamentLifecyclePosted,
+		TestamentLifecycleReceived,
+		TestamentLifecycleValidating,
+		TestamentLifecycleValidated,
+		TestamentLifecycleValidationIncomplete,
+		TestamentLifecycleValidationFailed,
+		TestamentLifecycleValidationErrored:
+		return true
+	default:
+		return false
+	}
+}
+
 func ensureContinuityClaim(ctx context.Context, board *ClaimsBoard, agentID, topic, planID, correlationID string) (*Claim, bool, error) {
 	p := board.Projection()
 	for i := range p.Claims {
 		c := p.Claims[i]
 		if c.ActionType != ActionTypeArchival || c.Status == ClaimStatusSuperseded || c.Status == ClaimStatusRejected {
+			continue
+		}
+		if !isRecallableClaimLifecycle(c.LifecycleStatus) && c.LifecycleStatus != ClaimLifecycleGenerated {
 			continue
 		}
 		if !claimHasScope(c.Scope, carryForwardScopeKind, carryForwardScopeKey) ||
@@ -860,6 +925,14 @@ func ensureContinuityClaim(ctx context.Context, board *ClaimsBoard, agentID, top
 		}
 		clone, ok := board.CloneClaim(c.ID)
 		if ok {
+			if clone.LifecycleStatus == ClaimLifecycleGenerated {
+				if err := board.PostGeneratedClaim(ctx, clone.ID, agentID, ClaimPostOptions{Reason: "continuity claim posted"}); err != nil {
+					return nil, false, err
+				}
+				if posted, postedOK := board.CloneClaim(clone.ID); postedOK {
+					return posted, true, nil
+				}
+			}
 			return clone, true, nil
 		}
 	}
@@ -876,6 +949,7 @@ func ensureContinuityClaim(ctx context.Context, board *ClaimsBoard, agentID, top
 			{Related: agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
 		},
 		Validations: []*Validation{{
+			ID:          "continuity." + agentID + "." + topic + ".receipt",
 			Description: "Continuity testament submitted",
 			QualityBar:  "a continuity testament with working_context, evidence_digest, source_index, continuity_cursor, and session_cursor artifacts exists",
 			Type:        ValidationTypeReceipt,
@@ -889,7 +963,17 @@ func ensureContinuityClaim(ctx context.Context, board *ClaimsBoard, agentID, top
 		claim.Scope = append(claim.Scope, ClaimScopeEntry{Kind: "correlation", Key: strings.TrimSpace(correlationID)})
 	}
 	action := Action{AgentID: agentID, Type: ActionTypeArchival}
-	if err := board.PostAction(ctx, action, []Claim{claim}); err != nil {
+	generated, err := board.GenerateClaimAction(ctx, action, []Claim{claim}, GenerateClaimActionOptions{
+		IdempotencyKey: "carry_forward:claim:" + agentID + ":" + topic,
+		Reason:         "continuity claim generated",
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if len(generated.Claims) == 0 {
+		return nil, false, fmt.Errorf("continuity claim generation returned no claims")
+	}
+	if err := board.PostGeneratedClaim(ctx, generated.Claims[0].ID, agentID, ClaimPostOptions{Reason: "continuity claim posted"}); err != nil {
 		return nil, false, err
 	}
 	for _, id := range board.ClaimIDsWithScope(carryForwardTopicScopeKind, topic) {
@@ -909,6 +993,9 @@ func selectForwardSources(board *ClaimsBoard, agentID, topic string, fromSeq, th
 	for i := range p.Testaments {
 		t, ok := board.CloneTestament(p.Testaments[i].ID)
 		if !ok || t == nil || t.Sequence <= fromSeq || t.Sequence > throughSeq {
+			continue
+		}
+		if !isRecallableTestamentLifecycle(t.LifecycleStatus) {
 			continue
 		}
 		if horizon > 0 && !t.Created.IsZero() && now.Sub(t.Created) > horizon {

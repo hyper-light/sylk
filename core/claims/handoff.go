@@ -35,11 +35,11 @@ func (e *HandoffNotEligibleError) Error() string {
 // projection snapshot — no mutation, no goroutines.
 //
 // Three independent checks (UI_DESIGN.md §4.3 + §4.4):
-//   1. Open child work: any open claim where I am the issuer.
-//   2. In-flight as child: any open claim where I am the subject AND
-//      the issuer is another agent.
-//   3. In-flight artifacts: any *_started artifact on my testaments
-//      attached to an open claim, lacking a matching *_completed.
+//  1. Open child work: any open claim where I am the issuer.
+//  2. In-flight as child: any open claim where I am the subject AND
+//     the issuer is another agent.
+//  3. In-flight artifacts: any *_started artifact on my testaments
+//     attached to an open claim, lacking a matching *_completed.
 //
 // The board-level guard in PostAction calls handoffEligibleLocked
 // (the lock-aware variant of this function) for any action with
@@ -189,14 +189,12 @@ func BuildHandoffClaim(
 	}
 }
 
-// isStartedArtifactKind matches the *_started kinds emitted by the
-// centralized artifact-pair seams (tool runtime, LLM provider, peer
-// interaction, guardian check). Kept here (not exported) because the
-// canonical contract for these names lives in UI_DESIGN.md §2.4 and
-// the bridge's cycle resolver consumes the same set.
+// isStartedArtifactKind matches artifact-pair kinds still emitted by
+// local tool and model runtime seams. Peer exchanges are lifecycle
+// claims and are intentionally absent here.
 func isStartedArtifactKind(kind string) bool {
 	switch kind {
-	case "tool_started", "llm_started", "consult_started", "challenge_started", "guardian_check_started":
+	case "tool_started", "llm_started", "guardian_check_started":
 		return true
 	}
 	return false
@@ -204,7 +202,7 @@ func isStartedArtifactKind(kind string) bool {
 
 func isCompletedArtifactKind(kind string) bool {
 	switch kind {
-	case "tool_completed", "llm_completed", "consult_completed", "challenge_completed", "guardian_check_completed":
+	case "tool_completed", "llm_completed", "guardian_check_completed":
 		return true
 	}
 	return false
