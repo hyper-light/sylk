@@ -178,8 +178,8 @@ type ExpectedToolOutputArtifactData struct {
 	Status       ExpectedToolExecutionStatus `json:"status,omitempty"`
 	Summary      string                      `json:"summary,omitempty"`
 	Output       any                         `json:"output,omitempty"`
-	Metadata     map[string]any             `json:"metadata,omitempty"`
-	Artifacts    []*Artifact                `json:"artifacts,omitempty"`
+	Metadata     map[string]any              `json:"metadata,omitempty"`
+	Artifacts    []*Artifact                 `json:"artifacts,omitempty"`
 	ValidationID string                      `json:"validation_id,omitempty"`
 }
 

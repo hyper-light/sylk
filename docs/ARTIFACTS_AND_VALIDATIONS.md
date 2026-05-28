@@ -1381,6 +1381,22 @@ Unicode NFC normalization for strings, smallest-int encoding for
 integers, no whitespace. Replay produces bit-identical bytes for
 identical inputs.
 
+The Phase 2 built-in data catalog registers these stable `DataType`
+strings:
+
+| Artifact shape | DataType |
+|---|---|
+| `ArtifactKindPlanMarkdown` | `sylk.plan_markdown.v1` |
+| `ArtifactKindExpectedToolInvocation` | `sylk.expected_tool_invocation.v1` |
+| `ArtifactKindExpectedToolOutput` | `sylk.expected_tool_output.v1` |
+| `ArtifactKindExpectedToolSkipped` | `sylk.expected_tool_skipped.v1` |
+| `ArtifactKindWorkingContext` | `sylk.carry_forward.working_context.v1` |
+| `ArtifactKindEvidenceDigest` | `sylk.carry_forward.evidence_digest.v1` |
+| `ArtifactKindSourceIndex` | `sylk.carry_forward.source_index.v1` |
+| `ArtifactKindContinuityCursor` | `sylk.carry_forward.continuity_cursor.v1` |
+| `ArtifactKindSessionCursor` | `sylk.carry_forward.session_cursor.v1` |
+| Presentation evidence helper output | `sylk.presentation_evidence.v1` |
+
 Registration of a typed validator via `RegisterValidator[T, R]`
 implicitly registers `T` and `R` with the type registry if not
 already registered. The registration uses Go's reflection to inspect

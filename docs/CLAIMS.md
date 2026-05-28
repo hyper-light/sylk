@@ -604,6 +604,19 @@ type Testament struct {
 
 An Artifact is typed evidence attached to a testament. The artifact's content (Data, ContentHash, Kind, DataType) is immutable once committed; the artifact's lifecycle status mutates through eight states (generated, generation_failed, received, receipt_failed, attached, validating, validation_failed, validated). Updates to evidence content produce a new artifact with a `supersedes` relation via a new testament. See `docs/ARTIFACTS_AND_VALIDATIONS.md` for the complete artifact structure (typed Data field, ArtifactName, parent references, error capture, presentation hints) and lifecycle (state machine, commit ownership per transition, streaming-only model).
 
+Canonical artifact lifecycle delta names are `artifact.generated`,
+`artifact.generation_failed`, `artifact.received`,
+`artifact.receipt_failed`, `artifact.attached`, `artifact.validating`,
+`artifact.validation_failed`, and `artifact.validated`. Canonical typed
+validation lifecycle delta names are `validation.ready`,
+`validation.validating`, `validation.validation_failed`,
+`validation.validation_failed_not_required`, `validation.errored`,
+`validation.errored_not_required`, `validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`, and
+`validation.validated`. Legacy validation statuses are compatibility
+projections only.
+
 ```go
 // Artifact is evidence attached to a testament. Immutable — once
 // created, never modified. "Updating" evidence means the subject

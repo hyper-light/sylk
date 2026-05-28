@@ -19,20 +19,20 @@ func fixtureClock() time.Time {
 func fixtureTypedArtifact(t *testing.T, registry *TypeRegistry) *Artifact {
 	t.Helper()
 	artifact := &Artifact{
-		ID:             artifactFixtureArtifactID,
-		ClaimID:        artifactFixtureClaimID,
-		TestamentID:    artifactFixtureTestamentID,
-		ArtifactName:   "plan",
-		Kind:           ArtifactKindPlanMarkdown,
-		AgentID:        "architect",
-		ParticipantID:  "architect",
-		Status:         ArtifactStatusGenerated,
-		StatusHistory:  []StatusChange{{To: string(ArtifactStatusGenerated), AgentID: "architect", Changed: fixtureClock()}},
-		Presentation:   testUserChatPresentation(),
-		Reference:      "# Plan",
-		Metadata:       map[string]any{"fixture": true},
-		Created:        fixtureClock(),
-		Accessed:       fixtureClock(),
+		ID:            artifactFixtureArtifactID,
+		ClaimID:       artifactFixtureClaimID,
+		TestamentID:   artifactFixtureTestamentID,
+		ArtifactName:  "plan",
+		Kind:          ArtifactKindPlanMarkdown,
+		AgentID:       "architect",
+		ParticipantID: "architect",
+		Status:        ArtifactStatusGenerated,
+		StatusHistory: []StatusChange{{To: string(ArtifactStatusGenerated), AgentID: "architect", Changed: fixtureClock()}},
+		Presentation:  testUserChatPresentation(),
+		Reference:     "# Plan",
+		Metadata:      map[string]any{"fixture": true},
+		Created:       fixtureClock(),
+		Accessed:      fixtureClock(),
 	}
 	if err := SetArtifactDataWithRegistry(registry, artifact, PlanMarkdownArtifactData{Markdown: "# Plan", Title: "Plan"}); err != nil {
 		t.Fatalf("SetArtifactDataWithRegistry: %v", err)
