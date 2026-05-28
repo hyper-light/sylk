@@ -677,13 +677,13 @@ func (b *ClaimsBoard) transitionClaimLifecycle(ctx context.Context, claimID, act
 		b.mu.Unlock()
 		return fmt.Errorf("claim %q not found", claimID)
 	}
-	if c.LifecycleStatus == to {
-		b.mu.Unlock()
-		return nil
-	}
 	if err := b.validateLifecycleReceiver(ctx, c, actorID, to); err != nil {
 		b.mu.Unlock()
 		return err
+	}
+	if c.LifecycleStatus == to {
+		b.mu.Unlock()
+		return nil
 	}
 	now := time.Now().UTC()
 	if !CanTransitionClaimLifecycle(c.LifecycleStatus, to) {

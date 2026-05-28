@@ -67,6 +67,25 @@ func TestCanonicalPatterns(t *testing.T) {
 	}
 }
 
+func TestCanonicalTopicHelpersCoverEveryLifecycleAction(t *testing.T) {
+	for _, action := range KnownDeltaActions() {
+		for name, topic := range map[string]string{
+			"agent":      CanonicalAgentActionPattern("sess", "uid", action),
+			"agent_type": CanonicalAgentTypeActionPattern("sess", "architect", action),
+			"claim":      CanonicalClaimActionPattern("sess", "claim-1", action),
+			"board":      CanonicalBoardActionPattern("sess", "board-1", action),
+		} {
+			parts := strings.Split(topic, ".")
+			if len(parts) != 5 {
+				t.Fatalf("%s topic for %q has %d segments: %q", name, action, len(parts), topic)
+			}
+			if parts[4] != normalizeTopicSegment(string(action)) {
+				t.Fatalf("%s topic for %q final segment = %q", name, action, parts[4])
+			}
+		}
+	}
+}
+
 func TestAgentInboxPattern(t *testing.T) {
 	got := AgentInboxPattern("", "eng-a3f2")
 	// Empty session should wildcard.

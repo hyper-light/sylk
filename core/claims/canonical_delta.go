@@ -126,7 +126,7 @@ func NewCanonicalDelta(action DeltaAction, sessionID, boardID string, sequence u
 		Refs:       normalizeRefs(refs),
 		Context:    context,
 	}
-	d.Key = BuildCanonicalDeltaKey(d.Action, d.SessionID, d.BoardID, d.Refs, d.Delivery)
+	d.Key = BuildCanonicalDeltaKeyForSequence(d.Action, d.SessionID, d.BoardID, d.Sequence, d.Refs, d.Delivery)
 	return d
 }
 
@@ -335,6 +335,14 @@ func BuildCanonicalDeltaKey(action DeltaAction, sessionID, boardID string, refs 
 		if relationship := strings.TrimSpace(delivery.Relationship); relationship != "" {
 			parts = append(parts, "rel:"+relationship)
 		}
+	}
+	return strings.Join(parts, ":")
+}
+
+func BuildCanonicalDeltaKeyForSequence(action DeltaAction, sessionID, boardID string, sequence uint64, refs []DeltaRef, delivery *DeltaDelivery) string {
+	parts := []string{BuildCanonicalDeltaKey(action, sessionID, boardID, refs, delivery)}
+	if sequence != 0 {
+		parts = append(parts, "seq:"+strconv.FormatUint(sequence, 10))
 	}
 	return strings.Join(parts, ":")
 }

@@ -207,6 +207,67 @@ func TestBoardAmplifier_CrossAgentClaim_EmitsClaimPostedDelta(t *testing.T) {
 	}
 }
 
+func TestBoardAmplifier_ClaimReceivedCarriesReceiverTopic(t *testing.T) {
+	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
+		&Action{AgentID: "architect", Type: ActionTypeTask},
+		&Claim{
+			ID:       "received-claim",
+			Sequence: 7,
+			Relations: []Relation{
+				{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+				{Related: "engineer", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+			},
+			ActionType: ActionTypeTask,
+		},
+		ClaimLifecycleReceived,
+		"engineer",
+		nowForTest(),
+	)
+	if len(deltas) != 2 {
+		t.Fatalf("claim.received dispatches = %d, want claim topic + receiver topic", len(deltas))
+	}
+	if deltas[1].topic != CanonicalAgentTypeTopic("s", "engineer", DeltaActionClaimReceived) {
+		t.Fatalf("receiver topic = %q", deltas[1].topic)
+	}
+	if !deltas[1].delta.DeliveredTo("engineer") {
+		t.Fatalf("claim.received delivery = %#v, want engineer", deltas[1].delta.Delivery)
+	}
+}
+
+func TestBoardAmplifier_TestamentPostedRoutesToIssuerAndEvaluators(t *testing.T) {
+	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
+	claim := &Claim{
+		ID:         "claim-with-evaluator",
+		Sequence:   7,
+		ActionType: ActionTypeTask,
+		Relations: []Relation{
+			{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: "engineer", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+			{Related: "inspector", RelatedType: RelatedTypeAgent, Relationship: RelationshipEvaluator},
+		},
+	}
+	testament := &Testament{ID: "testament-1", AgentID: "engineer", Sequence: 9}
+	deltas := b.amplifier.buildTestamentLifecycleDeltas(context.Background(), testament, claim, TestamentLifecyclePosted, "engineer", nowForTest())
+	if len(deltas) != 3 {
+		t.Fatalf("testament.posted dispatches = %d, want claim topic + issuer + evaluator", len(deltas))
+	}
+	gotTopics := map[string]bool{}
+	for _, dispatch := range deltas {
+		gotTopics[dispatch.topic] = true
+	}
+	for _, want := range []string{
+		CanonicalClaimTopic("s", claim.ID, DeltaActionTestamentPosted),
+		CanonicalAgentTypeTopic("s", "architect", DeltaActionTestamentPosted),
+		CanonicalAgentTypeTopic("s", "inspector", DeltaActionTestamentPosted),
+	} {
+		if !gotTopics[want] {
+			t.Fatalf("missing topic %q in %#v", want, gotTopics)
+		}
+	}
+}
+
 // Mixed: claim with both self subject AND cross-agent evaluator must
 // emit ONLY the evaluator's claim.posted delta — self subject is filtered.
 func TestBoardAmplifier_SelfSubjectWithCrossEvaluator_EmitsOnlyEvaluator(t *testing.T) {

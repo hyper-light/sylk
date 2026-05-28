@@ -803,7 +803,20 @@ func deltaDedupKey(d Delta) string {
 	if d == nil {
 		return ""
 	}
+	switch delta := d.(type) {
+	case CanonicalDelta:
+		return canonicalDeltaLogicalDedupKey(delta)
+	case *CanonicalDelta:
+		if delta == nil {
+			return ""
+		}
+		return canonicalDeltaLogicalDedupKey(*delta)
+	}
 	return d.DeltaKey()
+}
+
+func canonicalDeltaLogicalDedupKey(delta CanonicalDelta) string {
+	return BuildCanonicalDeltaKey(delta.Action, delta.SessionID, delta.BoardID, delta.Refs, delta.Delivery)
 }
 
 func deltaMatchesExpectation(d Delta, expected string) bool {
@@ -841,7 +854,7 @@ func canonicalClaimLifecycleDeltaResolvesExpectation(d Delta) bool {
 }
 
 func claimLifecycleResolvesExpectation(delta CanonicalDelta) bool {
-	status, ok := delta.ClaimLifecycleStatus()
+	status, ok := DeltaActionClaimLifecycleStatus(delta.Action)
 	return ok && claimLifecycleStatusResolvesExpectation(status)
 }
 

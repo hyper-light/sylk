@@ -745,6 +745,9 @@ func TestReceiptAcknowledgementIsReceiverCommitted(t *testing.T) {
 	if err := board.AcknowledgeClaimReceipt(ctx, "receipt-claim", "engineer-b"); err != nil {
 		t.Fatal(err)
 	}
+	if err := board.AcknowledgeClaimReceipt(ctx, "receipt-claim", "architect"); err == nil {
+		t.Fatal("sender-side duplicate receipt after target acknowledgement must still fail")
+	}
 	stored, _ := board.CloneClaim("receipt-claim")
 	if stored.LifecycleStatus != ClaimLifecycleReceived {
 		t.Fatalf("claim lifecycle = %q, want received", stored.LifecycleStatus)
@@ -787,6 +790,9 @@ func TestTestamentReceiptIsSourceCommitted(t *testing.T) {
 	}
 	if err := board.AcknowledgeTestamentReceipt(ctx, "consult-testament", "architect"); err != nil {
 		t.Fatal(err)
+	}
+	if err := board.AcknowledgeTestamentReceipt(ctx, "consult-testament", "librarian"); err == nil {
+		t.Fatal("target-side duplicate testament receipt after source acknowledgement must still fail")
 	}
 	testament, _ := board.CloneTestament("consult-testament")
 	if testament.LifecycleStatus != TestamentLifecycleReceived {

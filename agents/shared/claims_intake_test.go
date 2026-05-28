@@ -437,6 +437,116 @@ func TestClaimsIntakeExpectedTerminalClaimDeliversContinuation(t *testing.T) {
 	}
 }
 
+func TestClaimsIntakeClaimValidationErroredDeliversContinuationButTestamentErroredDoesNot(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-intake-validation-errored",
+		SessionID: "sess-intake-validation-errored",
+		TaskID:    "task-intake-validation-errored",
+	})
+	var resumed map[string]*AwaitedClaimResult
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect-1",
+		SessionID: "sess-intake-validation-errored",
+		Board:     board,
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
+			resumed = results
+			return nil
+		},
+	})
+	_, yielded, err := store.AwaitConsultsOrYield(context.Background(), AwaitOptions{
+		ClaimRefs:       []string{"consult-errored"},
+		AwaitToolCallID: "tool-call-errored",
+		AwaitToolName:   "consult_peer",
+		Deadline:        time.Now().Add(time.Hour),
+		Snapshot:        &TurnSnapshot{Request: &providers.Request{}},
+	})
+	if !yielded || !IsConsultYielded(err) {
+		t.Fatalf("AwaitConsultsOrYield yielded=%v err=%v, want ErrConsultYielded", yielded, err)
+	}
+
+	testamentOnly := claims.NewCanonicalDelta(
+		claims.DeltaActionTestamentValidationErrored,
+		"sess-intake-validation-errored",
+		"board-intake-validation-errored",
+		4,
+		time.Now(),
+		claims.DegradedAgentRef("architect-1", "test"),
+		[]claims.DeltaRef{
+			{Role: "claim", Type: claims.RelatedTypeClaim, ID: "consult-errored"},
+			{Role: "testament", Type: claims.RelatedTypeTestament, ID: "testament-errored"},
+		},
+		nil,
+		map[string]any{
+			"claim":     map[string]any{"id": "consult-errored", "action": string(claims.ActionTypeConsultation), "status": string(claims.ClaimStatusRejected), "lifecycle_status": string(claims.ClaimLifecycleValidationErrored)},
+			"testament": map[string]any{"id": "testament-errored", "lifecycle_status": string(claims.TestamentLifecycleValidationErrored)},
+		},
+	)
+	if deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
+		AgentID:           "architect-1",
+		SessionID:         "sess-intake-validation-errored",
+		ContinuationStore: store,
+	}, &claims.GraphEntryPoint{
+		Delta: testamentOnly,
+		Node: claims.GraphNode{Claim: &claims.Claim{
+			ID:         "consult-errored",
+			ActionType: claims.ActionTypeConsultation,
+		}},
+		Expectation: &claims.Expectation{ClaimID: "consult-errored", ExpectedDelta: claims.DeltaKindTestament},
+	}) {
+		t.Fatal("testament.validation_errored alone must not resolve a claim-level continuation")
+	}
+	if resumed != nil {
+		t.Fatalf("resume invoked from testament-only error: %#v", resumed)
+	}
+
+	claimErrored := claims.NewCanonicalDelta(
+		claims.DeltaActionClaimValidationErrored,
+		"sess-intake-validation-errored",
+		"board-intake-validation-errored",
+		5,
+		time.Now(),
+		claims.DegradedAgentRef("architect-1", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "consult-errored"}},
+		nil,
+		map[string]any{
+			"claim": map[string]any{
+				"id":               "consult-errored",
+				"action":           string(claims.ActionTypeConsultation),
+				"status":           string(claims.ClaimStatusRejected),
+				"to_status":        string(claims.ClaimStatusRejected),
+				"lifecycle_status": string(claims.ClaimLifecycleValidationErrored),
+				"context":          "validator backend unavailable",
+			},
+		},
+	)
+	if !deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
+		AgentID:           "architect-1",
+		SessionID:         "sess-intake-validation-errored",
+		ContinuationStore: store,
+	}, &claims.GraphEntryPoint{
+		Delta: claimErrored,
+		Node: claims.GraphNode{Claim: &claims.Claim{
+			ID:          "consult-errored",
+			Title:       "Consult librarian",
+			Description: "validation errored",
+			ActionType:  claims.ActionTypeConsultation,
+		}},
+		Expectation: &claims.Expectation{ClaimID: "consult-errored", ExpectedDelta: claims.DeltaKindTestament},
+	}) {
+		t.Fatal("claim.validation_errored should resolve the claim-level continuation")
+	}
+	got := resumed["consult-errored"]
+	if got == nil {
+		t.Fatalf("results = %#v, want consult-errored", resumed)
+	}
+	if got.Action != claims.DeltaActionClaimValidationErrored || got.Status != claims.ConsultStatusError {
+		t.Fatalf("result = %#v", got)
+	}
+	if got.DeltaKey != claimErrored.DeltaKey() {
+		t.Fatalf("delta key = %q, want %q", got.DeltaKey, claimErrored.DeltaKey())
+	}
+}
+
 func TestClaimsIntakeExpectedConsultTestamentWithoutResolutionIDIsConsumed(t *testing.T) {
 	consumed := deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
 		AgentID:           "architect-1",
@@ -556,7 +666,7 @@ func TestClaimsIntakeExecutesOwnedExpectedValidationToolsFromTestament(t *testin
 		"done",
 	), claims.PriorityEvaluation, nil)
 	exec := &intakeExpectedToolExecutor{}
-	if !dispatchExpectedValidationTools(ClaimsIntakeConfig{
+	cfg := ClaimsIntakeConfig{
 		AgentID:              "architect",
 		SessionID:            "sess-expected-tools",
 		Board:                board,
@@ -564,7 +674,18 @@ func TestClaimsIntakeExecutesOwnedExpectedValidationToolsFromTestament(t *testin
 		ExpectedToolAllowlist: map[string]bool{
 			"workspace_read": true,
 		},
-	}, entry) {
+	}
+	if !acknowledgeLifecycleReceipt(cfg, claims.RoleAuditor, entry) {
+		t.Fatal("expected testament receipt acknowledgement before validation tools")
+	}
+	received, ok := board.CloneTestament(testamentID)
+	if !ok {
+		t.Fatalf("testament %q not found", testamentID)
+	}
+	if received.LifecycleStatus != claims.TestamentLifecycleReceived {
+		t.Fatalf("testament lifecycle before validation tools = %q, want received", received.LifecycleStatus)
+	}
+	if !dispatchExpectedValidationTools(cfg, entry) {
 		t.Fatal("expected validation tools to dispatch")
 	}
 	if len(exec.calls) != 1 || exec.calls[0].Tool != "workspace_read" {

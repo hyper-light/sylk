@@ -380,12 +380,13 @@ func awaitedClaimResultFromPeerTestament(entry *claims.GraphEntryPoint, signal p
 }
 
 type terminalClaimSignal struct {
-	SessionID string
-	BoardID   string
-	ClaimID   string
-	Status    claims.ClaimStatus
-	Context   string
-	ActorID   string
+	SessionID       string
+	BoardID         string
+	ClaimID         string
+	Status          claims.ClaimStatus
+	LifecycleStatus claims.ClaimLifecycleStatus
+	Context         string
+	ActorID         string
 }
 
 func terminalClaimSignalFromEntry(entry *claims.GraphEntryPoint) (terminalClaimSignal, bool) {
@@ -407,6 +408,7 @@ func terminalClaimSignalFromCanonical(delta claims.CanonicalDelta) (terminalClai
 	if !canonicalClaimLifecycleResolvesAwait(delta) {
 		return terminalClaimSignal{}, false
 	}
+	lifecycle, _ := claims.DeltaActionClaimLifecycleStatus(delta.Action)
 	status := delta.ClaimToStatus()
 	if !claimStatusResolvesAwait(status) {
 		return terminalClaimSignal{}, false
@@ -416,12 +418,13 @@ func terminalClaimSignalFromCanonical(delta claims.CanonicalDelta) (terminalClai
 		context = firstNonEmptyIntakeString(stringFromAny(claim["context"]), stringFromAny(claim["reason"]))
 	}
 	return terminalClaimSignal{
-		SessionID: delta.SessionID,
-		BoardID:   delta.BoardID,
-		ClaimID:   delta.ClaimID(),
-		Status:    status,
-		Context:   context,
-		ActorID:   delta.Actor.RouteKey(),
+		SessionID:       delta.SessionID,
+		BoardID:         delta.BoardID,
+		ClaimID:         delta.ClaimID(),
+		Status:          status,
+		LifecycleStatus: lifecycle,
+		Context:         context,
+		ActorID:         delta.Actor.RouteKey(),
 	}, true
 }
 
@@ -437,7 +440,7 @@ func claimStatusResolvesAwait(status claims.ClaimStatus) bool {
 }
 
 func canonicalClaimLifecycleResolvesAwait(delta claims.CanonicalDelta) bool {
-	status, ok := delta.ClaimLifecycleStatus()
+	status, ok := claims.DeltaActionClaimLifecycleStatus(delta.Action)
 	if !ok {
 		return false
 	}
@@ -455,8 +458,24 @@ func canonicalClaimLifecycleResolvesAwait(delta claims.CanonicalDelta) bool {
 	}
 }
 
-func claimStatusResultAction(status claims.ClaimStatus) claims.DeltaAction {
-	switch status {
+func claimStatusResultAction(signal terminalClaimSignal) claims.DeltaAction {
+	switch signal.LifecycleStatus {
+	case claims.ClaimLifecycleTestamentAcknowledged:
+		return claims.DeltaActionClaimTestamentAcknowledged
+	case claims.ClaimLifecycleSatisfied:
+		return claims.DeltaActionClaimSatisfied
+	case claims.ClaimLifecycleValidationIncomplete:
+		return claims.DeltaActionClaimValidationIncomplete
+	case claims.ClaimLifecycleValidationFailed:
+		return claims.DeltaActionClaimValidationFailed
+	case claims.ClaimLifecycleValidationErrored:
+		return claims.DeltaActionClaimValidationErrored
+	case claims.ClaimLifecycleTestamentGenerationFailed:
+		return claims.DeltaActionClaimTestamentGenerationFailed
+	case claims.ClaimLifecycleTestamentAcknowledgementFailed:
+		return claims.DeltaActionClaimTestamentAcknowledgementFailed
+	}
+	switch signal.Status {
 	case claims.ClaimStatusTestified:
 		return claims.DeltaActionClaimTestamentAcknowledged
 	case claims.ClaimStatusAccepted:
@@ -487,7 +506,7 @@ func awaitedClaimResultFromTerminalClaim(entry *claims.GraphEntryPoint, signal t
 		BoardID:          signal.BoardID,
 		ClaimID:          strings.TrimSpace(resolutionID),
 		DeltaKey:         entry.Delta.DeltaKey(),
-		Action:           claimStatusResultAction(signal.Status),
+		Action:           claimStatusResultAction(signal),
 		Context:          summary,
 		ResponderAgentID: signal.ActorID,
 		Status:           status,

@@ -401,6 +401,7 @@ type bootstrapPhase1 struct {
 	streamMgr      *guide.StreamManager
 	sessionMgr     *session.Manager
 	defaultSession *session.Session
+	bootOps        *boot.OperationsSequencer
 	descriptors    *handoff.DescriptorRegistry
 	budget         *concurrency.GoroutineBudget
 	containerReg   *container.ContainerRegistry
@@ -736,6 +737,48 @@ func phaseDefaultSessionID(phase1 *bootstrapPhase1) string {
 	return "default"
 }
 
+func sessionClaimsPath(s *session.Session) string {
+	if s == nil || s.ClaimsBoard() == nil {
+		return ""
+	}
+	return s.ClaimsBoard().SessionDir()
+}
+
+func bootstrapPhase1Status(phase1 *bootstrapPhase1) boot.Phase1Status {
+	status := boot.Phase1Status{GuideBusOpened: phase1 != nil && phase1.guideBus != nil}
+	if phase1 == nil || phase1.defaultSession == nil || phase1.defaultSession.ClaimsBoard() == nil {
+		return status
+	}
+	board := phase1.defaultSession.ClaimsBoard()
+	status.WALOpened = phase1.defaultSession.DurableClaimsBoard() != nil && !board.LegacySessionNoWAL()
+	status.WALReplayed = true
+	status.WALPath = sessionClaimsPath(phase1.defaultSession)
+	status.ReplaySequence = board.HighWaterSequence()
+	status.Context = map[string]any{"session_id": phase1.defaultSession.ID()}
+	return status
+}
+
+func bootstrapSystemParticipants(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) []boot.SystemParticipantActivation {
+	sessionID := phaseDefaultSessionID(phase1)
+	activationControllerReady := phase2.actResult.err == nil && phase2.actResult.ctrl != nil
+	return []boot.SystemParticipantActivation{
+		boot.NewSystemParticipantActivation(boot.SystemBusAdministratorAgentID, "bus_administrator", activationControllerReady && phase1 != nil && phase1.guideBus != nil, map[string]any{
+			"activation_controller_ready": activationControllerReady,
+			"transport":                   "guide_channel_bus",
+			"session_id":                  sessionID,
+		}),
+		boot.NewSystemParticipantActivation(boot.SystemSessionManagerAgentID, "session_manager", activationControllerReady && phase1 != nil && phase1.sessionMgr != nil && phase1.defaultSession != nil, map[string]any{
+			"activation_controller_ready": activationControllerReady,
+			"session_id":                  sessionID,
+		}),
+		boot.NewSystemParticipantActivation(boot.SystemFabricSubscriberAgentID, "fabric_subscriber", activationControllerReady && phase1 != nil && phase1.activityPub != nil && phase1.defaultSession != nil && phase1.defaultSession.ClaimsBoard() != nil, map[string]any{
+			"activation_controller_ready": activationControllerReady,
+			"claims_outbox":               claims.CurrentRolloutConfig().ClaimsOutbox,
+			"session_id":                  sessionID,
+		}),
+	}
+}
+
 func loadBootstrapDotenv(projectRoot string) {
 	if err := boot.LoadDotenv(projectRoot); err != nil && !os.IsNotExist(err) {
 		slog.Warn("failed to load .env.local", "error", err)
@@ -810,6 +853,17 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	}
 	phase1.defaultSession = defaultSession
 	_ = phase1.sessionMgr.Switch(defaultSession.ID())
+	bootOps, err := boot.NewOperationsSequencer(boot.OperationsConfig{
+		Board:      defaultSession.ClaimsBoard(),
+		ProcessUID: fmt.Sprintf("proc:%d", start.UnixNano()),
+	})
+	if err != nil {
+		return phase1, fmt.Errorf("claims operations boot sequencer: %w", err)
+	}
+	phase1.bootOps = bootOps
+	if _, err := phase1.bootOps.CommitPhase1(ctx, bootstrapPhase1Status(phase1)); err != nil {
+		return phase1, fmt.Errorf("claims operations phase 1: %w", err)
+	}
 	factory, err := buildIdentityFactory(phase1.descriptors, defaultSession.ID())
 	if err != nil {
 		return phase1, fmt.Errorf("identity factory: %w", err)
@@ -1174,6 +1228,15 @@ func runBootstrapPhase2(phase1 *bootstrapPhase1) (bootstrapPhase2, error) {
 			gitCh = nil
 		case <-hydrateCh:
 			hydrateCh = nil
+		}
+	}
+
+	if phase1.bootOps != nil {
+		if _, err := phase1.bootOps.CommitPhase2(phase1.ctx, boot.Phase2Status{
+			Participants: bootstrapSystemParticipants(phase1, phase2),
+			Context:      map[string]any{"session_id": phaseDefaultSessionID(phase1)},
+		}); err != nil {
+			return phase2, fmt.Errorf("claims operations phase 2: %w", err)
 		}
 	}
 

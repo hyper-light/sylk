@@ -65,6 +65,39 @@ func TestDeltaAction_PartitionedByCompletionSemantics(t *testing.T) {
 	}
 }
 
+func TestDeltaAction_LifecycleCoverageAndActionability(t *testing.T) {
+	for _, status := range KnownClaimLifecycleStatuses() {
+		action, ok := ClaimLifecycleDeltaAction(status)
+		if !ok {
+			t.Fatalf("claim lifecycle status %q has no canonical delta action", status)
+		}
+		if got, ok := DeltaActionClaimLifecycleStatus(action); !ok || got != status {
+			t.Fatalf("claim action %q maps back to (%q, %v), want %q", action, got, ok, status)
+		}
+	}
+	for _, status := range KnownTestamentLifecycleStatuses() {
+		action, ok := TestamentLifecycleDeltaAction(status)
+		if !ok {
+			t.Fatalf("testament lifecycle status %q has no canonical delta action", status)
+		}
+		if got, ok := DeltaActionTestamentLifecycleStatus(action); !ok || got != status {
+			t.Fatalf("testament action %q maps back to (%q, %v), want %q", action, got, ok, status)
+		}
+	}
+	if DeltaActionStartsClaimWork(DeltaActionClaimGenerated) {
+		t.Fatal("claim.generated must not start claim work")
+	}
+	if DeltaActionStartsClaimWork(DeltaActionTestamentGenerated) {
+		t.Fatal("testament.generated must not start claim work")
+	}
+	if !DeltaActionStartsClaimWork(DeltaActionClaimPosted) {
+		t.Fatal("claim.posted must be the only claim work-start action")
+	}
+	if !DeltaActionIsGenerated(DeltaActionClaimGenerated) || !DeltaActionIsGenerated(DeltaActionTestamentGenerated) {
+		t.Fatal("generated lifecycle actions were not classified as generated")
+	}
+}
+
 func TestCanonicalDelta_StrictValidation(t *testing.T) {
 	d := testCanonicalDelta(DeltaActionClaimPosted)
 	if err := ValidateCanonicalDeltaStrict(d); err != nil {
@@ -103,7 +136,7 @@ func TestCanonicalDelta_StrictValidationRequiresDeliveryForReceiverFacts(t *test
 func TestCanonicalDelta_TolerantUnmarshalAllowsUnknownAction(t *testing.T) {
 	d := testCanonicalDelta(DeltaActionClaimPosted)
 	d.Action = DeltaAction("future.action")
-	d.Key = BuildCanonicalDeltaKey(d.Action, d.SessionID, d.BoardID, d.Refs, d.Delivery)
+	d.Key = BuildCanonicalDeltaKeyForSequence(d.Action, d.SessionID, d.BoardID, d.Sequence, d.Refs, d.Delivery)
 	data, err := json.Marshal(d)
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +166,22 @@ func TestCanonicalDeltaKey_DeterministicAndDeliverySensitive(t *testing.T) {
 	}
 	if keyA1 == keyB {
 		t.Fatal("different recipients produced identical keys")
+	}
+}
+
+func TestCanonicalDeltaKey_SequenceSensitiveAndReplayStable(t *testing.T) {
+	refs := []DeltaRef{{Role: "claim", Type: RelatedTypeClaim, ID: "c1"}}
+	d1 := NewCanonicalDelta(DeltaActionClaimPosted, "s", "b", 7, time.Unix(1, 0), DegradedAgentRef("architect", "test"), refs, &DeltaDelivery{To: []AgentRef{DegradedAgentRef("librarian", "test")}, Relationship: RelationshipSubject}, nil)
+	replay := NewCanonicalDelta(DeltaActionClaimPosted, "s", "b", 7, time.Unix(2, 0), DegradedAgentRef("architect", "test"), refs, &DeltaDelivery{To: []AgentRef{DegradedAgentRef("librarian", "test")}, Relationship: RelationshipSubject}, nil)
+	next := NewCanonicalDelta(DeltaActionClaimPosted, "s", "b", 8, time.Unix(3, 0), DegradedAgentRef("architect", "test"), refs, &DeltaDelivery{To: []AgentRef{DegradedAgentRef("librarian", "test")}, Relationship: RelationshipSubject}, nil)
+	if d1.DeltaKey() != replay.DeltaKey() {
+		t.Fatalf("replayed committed fact key changed: %q != %q", d1.DeltaKey(), replay.DeltaKey())
+	}
+	if d1.DeltaKey() == next.DeltaKey() {
+		t.Fatalf("different committed sequence reused key %q", d1.DeltaKey())
+	}
+	if !strings.Contains(d1.DeltaKey(), "seq:7") {
+		t.Fatalf("delta key %q does not include committed sequence", d1.DeltaKey())
 	}
 }
 

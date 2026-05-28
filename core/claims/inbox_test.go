@@ -467,6 +467,45 @@ func TestInbox_CanonicalClaimProgressedDoesNotWakeSubject(t *testing.T) {
 	}
 }
 
+func TestInbox_GeneratedLifecycleDeltasAreObserverOnly(t *testing.T) {
+	var subjectCalled, observerCalled atomic.Bool
+	subject, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "librarian",
+		SessionID: "sess",
+		Role:      RoleSubject,
+		OnResolved: func(_ *GraphEntryPoint) {
+			subjectCalled.Store(true)
+		},
+	})
+	generated := NewCanonicalDelta(
+		DeltaActionClaimGenerated,
+		"sess",
+		"board",
+		4,
+		time.Now(),
+		DegradedAgentRef("architect", "test"),
+		claimRefs("claim-generated"),
+		nil,
+		map[string]any{"claim": map[string]any{"id": "claim-generated", "action": string(ActionTypeConsultation), "lifecycle_status": string(ClaimLifecycleGenerated)}},
+	)
+	subject.Ingest(generated)
+	if subjectCalled.Load() {
+		t.Fatal("claim.generated must not wake a subject inbox")
+	}
+	observer, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "ui",
+		SessionID: "sess",
+		Role:      RoleObserver,
+		OnResolved: func(_ *GraphEntryPoint) {
+			observerCalled.Store(true)
+		},
+	})
+	observer.Ingest(generated)
+	if !observerCalled.Load() {
+		t.Fatal("claim.generated should remain visible to observer projections")
+	}
+}
+
 func TestInbox_CanonicalClaimProgressedDoesNotResolveExpectation(t *testing.T) {
 	var called atomic.Bool
 	inbox, _ := NewClaimsInbox(InboxConfig{
@@ -523,6 +562,41 @@ func TestInbox_CanonicalClaimProgressedDoesNotResolveExpectation(t *testing.T) {
 		nil,
 	)) {
 		t.Fatal("claim.progressed was stashed as future response")
+	}
+}
+
+func TestInbox_TestamentValidationErroredDoesNotResolveClaimLevelWait(t *testing.T) {
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:   "architect",
+		SessionID: "sess",
+		OnResolved: func(_ *GraphEntryPoint) {
+			t.Fatal("testament.validation_errored alone must not resolve a claim-level wait")
+		},
+	})
+	inbox.Expect(&Expectation{
+		ClaimID:       "claim-42",
+		ExpectedDelta: DeltaKindTestament,
+		Priority:      PriorityResponse,
+	})
+	inbox.Ingest(NewCanonicalDelta(
+		DeltaActionTestamentValidationErrored,
+		"sess",
+		"board",
+		8,
+		time.Now(),
+		DegradedAgentRef("architect", "test"),
+		[]DeltaRef{
+			{Role: "claim", Type: RelatedTypeClaim, ID: "claim-42"},
+			{Role: "testament", Type: RelatedTypeTestament, ID: "testament-42"},
+		},
+		nil,
+		map[string]any{
+			"claim":     map[string]any{"id": "claim-42", "action": string(ActionTypeConsultation), "lifecycle_status": string(ClaimLifecycleValidationErrored)},
+			"testament": map[string]any{"id": "testament-42", "lifecycle_status": string(TestamentLifecycleValidationErrored)},
+		},
+	))
+	if inbox.Len() != 0 {
+		t.Fatalf("matches = %d, want 0", inbox.Len())
 	}
 }
 

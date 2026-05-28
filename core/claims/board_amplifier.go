@@ -478,10 +478,12 @@ func (a *BoardAmplifier) buildClaimLifecycleDeltas(ctx context.Context, action *
 	}
 	if status != ClaimLifecyclePosted {
 		delivery := a.claimLifecycleDelivery(ctx, claim, status, actorID)
-		return []canonicalDispatch{{
+		delta := a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, delivery)
+		out := []canonicalDispatch{{
 			topic: CanonicalClaimTopic(a.sessionID, claim.ID, deltaAction),
-			delta: a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, delivery),
+			delta: delta,
 		}}
+		return append(out, a.receiverDispatches(deltaAction, delta, delivery)...)
 	}
 	var out []canonicalDispatch
 	for _, r := range claim.Relations {
@@ -600,14 +602,18 @@ func (a *BoardAmplifier) buildTestamentLifecycleDeltas(ctx context.Context, test
 		return []canonicalDispatch{{topic: CanonicalBoardTopic(a.sessionID, a.boardID, action), delta: delta}}
 	}
 	out := []canonicalDispatch{{topic: CanonicalClaimTopic(a.sessionID, claim.ID, action), delta: delta}}
-	if status == TestamentLifecyclePosted || status == TestamentLifecycleReceived {
-		issuer := a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")
-		out = append(out, canonicalDispatch{topic: CanonicalAgentRefTopic(a.sessionID, issuer, action), delta: delta})
+	for _, delivery := range a.testamentLifecycleDeliveries(ctx, claim, status, actorID) {
+		receiverDelta := a.buildCanonicalTestamentLifecycleWithDelivery(ctx, testament, claim, action, status, actorID, occurredAt, delivery)
+		out = append(out, a.receiverDispatches(action, receiverDelta, delivery)...)
 	}
 	return out
 }
 
 func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, testament *Testament, claim *Claim, action DeltaAction, status TestamentLifecycleStatus, actorID string, occurredAt time.Time) CanonicalDelta {
+	return a.buildCanonicalTestamentLifecycleWithDelivery(ctx, testament, claim, action, status, actorID, occurredAt, a.testamentLifecycleDelivery(ctx, claim, status, actorID))
+}
+
+func (a *BoardAmplifier) buildCanonicalTestamentLifecycleWithDelivery(ctx context.Context, testament *Testament, claim *Claim, action DeltaAction, status TestamentLifecycleStatus, actorID string, occurredAt time.Time, delivery *DeltaDelivery) CanonicalDelta {
 	actor := a.resolveAgentRef(ctx, firstNonEmpty(actorID, testament.AgentID), "testament lifecycle actor")
 	if occurredAt.IsZero() {
 		occurredAt = time.Now().UTC()
@@ -640,7 +646,6 @@ func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, t
 		}
 	}
 	claimEntry := map[string]any{}
-	delivery := (*DeltaDelivery)(nil)
 	if claim != nil {
 		claimEntry = map[string]any{
 			"id":                  claim.ID,
@@ -649,19 +654,6 @@ func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, t
 			"lifecycle_status":    string(claim.LifecycleStatus),
 			"validations":         validationContext(claim.Validations),
 			"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
-		}
-		switch status {
-		case TestamentLifecyclePosted:
-			delivery = &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")}, Relationship: RelationshipIssuer}
-		case TestamentLifecycleReceived:
-			relationship := firstMatchingAgentRelationship(claim.Relations, actorID, RelationshipIssuer, RelationshipEvaluator)
-			if relationship == "" {
-				relationship = RelationshipIssuer
-			}
-			targetID := firstNonEmpty(actorID, firstAgentIDForRelationship(claim.Relations, relationship))
-			if targetID != "" {
-				delivery = &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, targetID, "testament lifecycle receiver")}, Relationship: relationship}
-			}
 		}
 	}
 	return NewCanonicalDelta(
@@ -679,6 +671,81 @@ func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, t
 			"testaments": []map[string]any{testamentEntry},
 		},
 	)
+}
+
+func (a *BoardAmplifier) testamentLifecycleDelivery(ctx context.Context, claim *Claim, status TestamentLifecycleStatus, actorID string) *DeltaDelivery {
+	deliveries := a.testamentLifecycleDeliveries(ctx, claim, status, actorID)
+	if len(deliveries) == 0 {
+		return nil
+	}
+	return deliveries[0]
+}
+
+func (a *BoardAmplifier) testamentLifecycleDeliveries(ctx context.Context, claim *Claim, status TestamentLifecycleStatus, actorID string) []*DeltaDelivery {
+	if claim == nil {
+		return nil
+	}
+	switch status {
+	case TestamentLifecyclePosted:
+		return a.testamentPostedDeliveries(ctx, claim)
+	case TestamentLifecycleReceived:
+		relationship := firstMatchingAgentRelationship(claim.Relations, actorID, RelationshipIssuer, RelationshipEvaluator)
+		if relationship == "" {
+			relationship = RelationshipIssuer
+		}
+		targetID := firstNonEmpty(actorID, firstAgentIDForRelationship(claim.Relations, relationship))
+		if targetID == "" {
+			return nil
+		}
+		return []*DeltaDelivery{{To: []AgentRef{a.resolveAgentRef(ctx, targetID, "testament lifecycle receiver")}, Relationship: relationship}}
+	default:
+		return nil
+	}
+}
+
+func (a *BoardAmplifier) testamentPostedDeliveries(ctx context.Context, claim *Claim) []*DeltaDelivery {
+	if claim == nil {
+		return nil
+	}
+	out := make([]*DeltaDelivery, 0, 1+len(claim.Relations))
+	seen := make(map[string]struct{}, 1+len(claim.Relations))
+	add := func(agentID, relationship string) {
+		agentID = strings.TrimSpace(agentID)
+		if agentID == "" {
+			return
+		}
+		ref := a.resolveAgentRef(ctx, agentID, "testament posted receiver")
+		key := ref.RouteKey()
+		if key == "" {
+			return
+		}
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, &DeltaDelivery{To: []AgentRef{ref}, Relationship: relationship})
+	}
+	add(IssuerAgentID(claim.Relations), RelationshipIssuer)
+	for _, relation := range claim.Relations {
+		if relation.RelatedType == RelatedTypeAgent && relation.Relationship == RelationshipEvaluator {
+			add(relation.Related, RelationshipEvaluator)
+		}
+	}
+	return out
+}
+
+func (a *BoardAmplifier) receiverDispatches(action DeltaAction, delta CanonicalDelta, delivery *DeltaDelivery) []canonicalDispatch {
+	if delivery == nil || len(delivery.To) == 0 {
+		return nil
+	}
+	out := make([]canonicalDispatch, 0, len(delivery.To))
+	for _, receiver := range delivery.To {
+		if receiver.RouteKey() == "" {
+			continue
+		}
+		out = append(out, canonicalDispatch{topic: CanonicalAgentRefTopic(a.sessionID, receiver, action), delta: delta})
+	}
+	return out
 }
 
 func (a *BoardAmplifier) buildCanonicalValidationEvaluated(ctx context.Context, claim *Claim, validation *Validation, change StatusChange, accepted bool, now time.Time) CanonicalDelta {
