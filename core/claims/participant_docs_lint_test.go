@@ -35,6 +35,13 @@ func TestParticipantDocsLintRejectsAgentOnlyLanguageForServiceParticipants(t *te
 	}
 }
 
+func TestParticipantDocsLintAllowsHistoricalMigrationNotes(t *testing.T) {
+	fixture := "Historical migration note: service participant sections previously said target agent while compatibility text was being reconciled."
+	if findings := lintParticipantLanguage(fixture); len(findings) != 0 {
+		t.Fatalf("expected migration note to pass, got %#v", findings)
+	}
+}
+
 func TestParticipantDocsCarryCompatibilityAndAgentSpecificMarkers(t *testing.T) {
 	root := claimsRepoRoot(t)
 	for _, rel := range []string{
@@ -47,6 +54,9 @@ func TestParticipantDocsCarryCompatibilityAndAgentSpecificMarkers(t *testing.T) 
 		body := readClaimsFile(t, filepath.Join(root, rel))
 		if !strings.Contains(body, "participant") {
 			t.Fatalf("%s does not contain participant terminology", rel)
+		}
+		if findings := lintParticipantLanguage(body); len(findings) != 0 {
+			t.Fatalf("%s participant wording findings: %s", rel, formatParticipantDocFindings(findings))
 		}
 	}
 	infrastructure := readClaimsFile(t, filepath.Join(root, "docs/CLAIMS_AND_INFRASTRUCTURE.md"))
@@ -79,6 +89,9 @@ func lintParticipantLanguage(body string) []participantDocLintFinding {
 			continue
 		}
 		normalized := strings.ToLower(stripBacktickSpans(line))
+		if participantDocLintAllowed(normalized) {
+			continue
+		}
 		if mentionsNonAgentParticipant(normalized) && mentionsAgentOnlyRuntime(normalized) {
 			findings = append(findings, participantDocLintFinding{
 				line:   idx + 1,
@@ -88,6 +101,13 @@ func lintParticipantLanguage(body string) []participantDocLintFinding {
 		}
 	}
 	return findings
+}
+
+func participantDocLintAllowed(line string) bool {
+	return strings.Contains(line, "historical migration note") ||
+		strings.Contains(line, "compatibility text") ||
+		strings.Contains(line, "previously said") ||
+		strings.Contains(line, "allowlisted excerpt")
 }
 
 func mentionsNonAgentParticipant(line string) bool {

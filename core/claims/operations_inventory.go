@@ -62,6 +62,7 @@ func ValidateOperationsInventory(entries []OperationsInventoryEntry) error {
 func baseOperationsInventory() []OperationsInventoryEntry {
 	return []OperationsInventoryEntry{
 		{"ops.semantic.participant_agnostic_claims", OperationsSurfaceImplemented, "core/claims", "ParticipantRef"},
+		{"ops.semantic.participant_agnostic_wire_format", OperationsSurfaceImplemented, "core/claims", "CanonicalDelta"},
 		{"ops.semantic.participant_categories", OperationsSurfaceImplemented, "core/claims", "ParticipantCategory"},
 		{"ops.semantic.programmatic_or_agentic_validation", OperationsSurfacePartial, "core/claims", "ValidatorRegistry"},
 		{"ops.semantic.infrastructure_outcomes_are_testaments", OperationsSurfacePartial, "core/claims", "ServiceDispatcher"},
@@ -94,20 +95,20 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.service.identity_registry", OperationsSurfacePlanned, "core/container", "identity registry service participant"},
 		{"ops.service.activation_controller", OperationsSurfacePlanned, "core/container", "activation controller service participant"},
 		{"ops.service.dag_processor", OperationsSurfacePlanned, "agents/orchestrator", "DAG processor service participant"},
-		{"ops.service.pipeline_vfs_provisioner", OperationsSurfacePlanned, "core/versioning", "pipeline VFS service participant"},
+		{"ops.service.vfs_provisioner", OperationsSurfacePlanned, "core/versioning", "pipeline VFS service participant"},
 		{"ops.service.tool_vfs_provisioner", OperationsSurfacePlanned, "agents/shared", "tool VFS service participant"},
 		{"ops.service.global_vfs_merger", OperationsSurfacePlanned, "core/versioning", "global VFS merger service participant"},
-		{"ops.service.knowledge_graph_writer", OperationsSurfacePlanned, "core/knowledge", "knowledge graph writer service participant"},
-		{"ops.service.knowledge_graph_reader", OperationsSurfacePlanned, "core/knowledge", "knowledge graph reader service participant"},
-		{"ops.service.document_db_writer", OperationsSurfacePlanned, "core/search", "document DB writer service participant"},
-		{"ops.service.document_db_reader", OperationsSurfacePlanned, "core/search", "document DB reader service participant"},
-		{"ops.service.guardian_subsystem", OperationsSurfacePlanned, "agents/guardian", "guardian service participant"},
+		{"ops.service.kg_writer", OperationsSurfacePlanned, "core/knowledge", "knowledge graph writer service participant"},
+		{"ops.service.kg_reader", OperationsSurfacePlanned, "core/knowledge", "knowledge graph reader service participant"},
+		{"ops.service.doc_db_writer", OperationsSurfacePlanned, "core/search", "document DB writer service participant"},
+		{"ops.service.doc_db_reader", OperationsSurfacePlanned, "core/search", "document DB reader service participant"},
+		{"ops.service.guardian", OperationsSurfacePlanned, "agents/guardian", "guardian service participant"},
 		{"ops.service.boot_sequencer", OperationsSurfacePartial, "core/boot", "OperationsSequencer"},
 		{"ops.service.tool_runtime", OperationsSurfacePlanned, "core/toolruntime", "tool runtime service participant"},
-		{"ops.service.llm_provider_gateway", OperationsSurfacePlanned, "core/providers", "provider gateway service participant"},
+		{"ops.service.provider_gateway", OperationsSurfacePlanned, "core/providers", "provider gateway service participant"},
 		{"ops.service.session_manager", OperationsSurfacePlanned, "core/claims", "session manager service participant"},
 		{"ops.service.fabric_subscriber", OperationsSurfacePlanned, "agents/orchestrator", "fabric subscriber service participant"},
-		{"ops.service.bus_transport", OperationsSurfacePartial, "core/claims", "DeltaBus"},
+		{"ops.service.bus_administrator", OperationsSurfacePartial, "core/claims", "DeltaBus"},
 	}
 }
 

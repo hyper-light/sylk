@@ -75,6 +75,45 @@ func TestPhase012IntegrationMockeryCanonicalParticipantDelivery(t *testing.T) {
 	resolver.AssertExpectations(t)
 }
 
+func TestPhase012E2EMockeryParticipantCategoriesRouteThroughUIDTopics(t *testing.T) {
+	participants := []claims.ParticipantRegistration{
+		phase012ParticipantRegistration(t, claims.ParticipantCategoryAgent, "architect"),
+		phase012ParticipantRegistration(t, claims.ParticipantCategoryService, "readiness_service"),
+		phase012ParticipantRegistration(t, claims.ParticipantCategorySystem, "boot_sequencer"),
+		phase012ParticipantRegistration(t, claims.ParticipantCategoryExternal, "ci_controller"),
+	}
+	issuer := phase012ParticipantRegistration(t, claims.ParticipantCategoryAgent, "guide")
+	resolver := &claimsmocks.AgentRefResolver{}
+	for _, participant := range append(participants, issuer) {
+		ref := participant.AgentRef()
+		resolver.On("ResolveAgentRef", mock.Anything, "sess", participant.RouteKey).Return(ref, true)
+	}
+	bus := &claimsmocks.DeltaBus{}
+	bus.On("PublishDelta", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:          "category-board",
+		SessionID:        "sess",
+		TaskID:           "task",
+		AgentRefResolver: resolver,
+		DeltaBus:         bus,
+	})
+	for _, target := range participants {
+		claimID := phase012PostClaimToParticipant(t, board, issuer.RouteKey, target.RouteKey)
+		topic := claims.CanonicalAgentRefTopic(board.SessionID(), target.AgentRef(), claims.DeltaActionClaimPosted)
+		delta := phase012PublishedDeltaForTopic(t, bus, topic)
+		if delta.ClaimID() != claimID {
+			t.Fatalf("published claim id = %s, want %s", delta.ClaimID(), claimID)
+		}
+		if len(delta.Delivery.To) != 1 || delta.Delivery.To[0].UID != target.UID {
+			t.Fatalf("delivery for %s = %+v, want uid %s", target.RouteKey, delta.Delivery, target.UID)
+		}
+		if delta.Delivery.To[0].Category != string(target.Category) {
+			t.Fatalf("delivery category = %s, want %s", delta.Delivery.To[0].Category, target.Category)
+		}
+	}
+	resolver.AssertExpectations(t)
+}
+
 func TestPhase012E2EMockeryServiceTypedArtifactAndValidator(t *testing.T) {
 	board, claimID := phase012ServiceBoard(t)
 	participant, err := claims.NewServiceParticipantRegistration("readiness_service", map[string]string{"session": "sess"}, 8, 1, time.Second, []claims.ActionType{claims.ActionTypeTask})
@@ -94,9 +133,13 @@ func TestPhase012E2EMockeryServiceTypedArtifactAndValidator(t *testing.T) {
 	if err := claims.SetArtifactData(serviceArtifact, claims.KnowledgeReadinessArtifactData{Component: "readiness_service", QualityBar: "ready", Reference: "ready"}); err != nil {
 		t.Fatalf("SetArtifactData service artifact: %v", err)
 	}
+	ignoredArtifact := &claims.Artifact{ArtifactName: "readiness_notes", Kind: claims.ArtifactKindPlanMarkdown, Reference: "# Notes"}
+	if err := claims.SetArtifactData(ignoredArtifact, claims.PlanMarkdownArtifactData{Markdown: "# Notes", Title: "Notes"}); err != nil {
+		t.Fatalf("SetArtifactData ignored artifact: %v", err)
+	}
 	serviceHandler.On("HandleServiceClaim", mock.Anything, mock.MatchedBy(func(req claims.ServiceClaimRequest) bool {
 		return req.Claim != nil && req.Claim.ID == claimID && req.Participant.UID == participant.UID
-	})).Return(claims.ServiceClaimResult{Summary: "ready", Artifacts: []*claims.Artifact{serviceArtifact}}, nil).Once()
+	})).Return(claims.ServiceClaimResult{Summary: "ready", Artifacts: []*claims.Artifact{serviceArtifact, ignoredArtifact}}, nil).Once()
 
 	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{
 		Board:       board,
@@ -127,6 +170,10 @@ func TestPhase012E2EMockeryServiceTypedArtifactAndValidator(t *testing.T) {
 	readinessArtifact := findArtifactByName(t, board, claimID, "readiness")
 	if _, err := claims.ArtifactData[claims.KnowledgeReadinessArtifactData](readinessArtifact); err != nil {
 		t.Fatalf("typed service artifact decode: %v", err)
+	}
+	notesArtifact := findArtifactByName(t, board, claimID, "readiness_notes")
+	if _, err := claims.ArtifactData[claims.PlanMarkdownArtifactData](notesArtifact); err != nil {
+		t.Fatalf("ignored typed artifact decode: %v", err)
 	}
 
 	validatorHandler := &claimsmocks.ValidatorHandler{}
@@ -179,6 +226,60 @@ func TestPhase012E2EMockeryServiceTypedArtifactAndValidator(t *testing.T) {
 		t.Fatalf("validation result = %#v, want validated result artifact", result)
 	}
 	validatorHandler.AssertExpectations(t)
+}
+
+func phase012ParticipantRegistration(t *testing.T, category claims.ParticipantCategory, routeKey string) claims.ParticipantRegistration {
+	t.Helper()
+	scope := map[string]string{"session": "sess", "participant": routeKey}
+	if category == claims.ParticipantCategoryAgent {
+		scope = nil
+	}
+	determinism := claims.HandlerDeterminismContent
+	if category == claims.ParticipantCategoryAgent {
+		determinism = claims.HandlerDeterminismNondeterministic
+	}
+	participant, err := claims.NewParticipantRegistration(category, routeKey, scope, 8, 2, time.Second, determinism, []claims.ActionType{claims.ActionTypeTask})
+	if err != nil {
+		t.Fatalf("NewParticipantRegistration(%s, %s): %v", category, routeKey, err)
+	}
+	return participant
+}
+
+func phase012PostClaimToParticipant(t *testing.T, board *claims.ClaimsBoard, issuer, subject string) string {
+	t.Helper()
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: issuer, Type: claims.ActionTypeTask}, []claims.Claim{{
+		Title:       "Route participant",
+		Description: "Route through canonical participant delivery.",
+		ActionType:  claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: issuer, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: subject, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: []*claims.Validation{{ID: "receipt", Type: claims.ValidationTypeReceipt, Required: true, Description: "receipt", QualityBar: "received"}},
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "phase012-category-" + subject})
+	if err != nil {
+		t.Fatalf("GenerateClaimAction(%s): %v", subject, err)
+	}
+	if err := board.PostGeneratedClaim(context.Background(), generated.Claims[0].ID, issuer, claims.ClaimPostOptions{Reason: "category integration"}); err != nil {
+		t.Fatalf("PostGeneratedClaim(%s): %v", subject, err)
+	}
+	return generated.Claims[0].ID
+}
+
+func phase012PublishedDeltaForTopic(t *testing.T, bus *claimsmocks.DeltaBus, topic string) claims.CanonicalDelta {
+	t.Helper()
+	for _, call := range bus.Calls {
+		gotTopic, _ := call.Arguments.Get(1).(string)
+		delta, _ := call.Arguments.Get(2).(claims.CanonicalDelta)
+		if gotTopic == topic {
+			if err := claims.ValidateCanonicalDeltaStrict(delta); err != nil {
+				t.Fatalf("published canonical delta on %s invalid: %v", topic, err)
+			}
+			return delta
+		}
+	}
+	t.Fatalf("mock bus did not receive topic %q; calls=%#v", topic, bus.Calls)
+	return claims.CanonicalDelta{}
 }
 
 func phase012ServiceBoard(t *testing.T) (*claims.ClaimsBoard, string) {

@@ -21,7 +21,7 @@ func TestParticipantUIDDerivationStableAcrossScopeKeyOrdering(t *testing.T) {
 	if left != right {
 		t.Fatalf("derived uid differs by map ordering: %s != %s", left, right)
 	}
-	const want = "participant:service:provider_gateway:3d85acd5aa1825597b0796158f735854db5341e76dcfae614840d40536651805"
+	const want = "participant:service:provider_gateway:3062309bab58979e6eee316058cb43ff853ac4e2454c1f1a58a0431c54acc0aa"
 	if left != want {
 		t.Fatalf("derived uid = %q, want stable golden %q", left, want)
 	}

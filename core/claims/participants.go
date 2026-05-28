@@ -247,7 +247,7 @@ func participantImmutableFieldsEqual(a, b ParticipantRegistration) bool {
 }
 
 func participantIdentityMaterial(category ParticipantCategory, routeKey string, scopeKeys map[string]string) string {
-	parts := []string{string(category), strings.TrimSpace(routeKey)}
+	parts := []string{ParticipantUIDDerivationVersion, string(category), strings.TrimSpace(routeKey)}
 	for _, key := range sortedStringKeys(scopeKeys) {
 		parts = append(parts, key+"="+strings.TrimSpace(scopeKeys[key]))
 	}

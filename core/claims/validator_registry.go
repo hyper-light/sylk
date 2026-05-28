@@ -141,17 +141,18 @@ func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context
 	if !ok {
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error(), d.clock.Now()), ErrValidatorNotRegistered
 	}
-	if err := validateDispatchInput(reg, req); err != nil {
+	types := d.registry.typeRegistry()
+	if err := validateDispatchInput(types, reg, req); err != nil {
 		return validationDispatchError(req, ValidationErrorCategoryArtifactType, err.Error(), d.clock.Now()), nil
 	}
 	if !d.acquire(reg) {
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.clock.Now()), nil
 	}
 	defer d.release(reg)
-	return d.invoke(ctx, reg, req)
+	return d.invoke(ctx, types, reg, req)
 }
 
-func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, reg ValidatorRegistration, req ValidationDispatchRequest) (out ValidationDispatchResult, err error) {
+func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) (out ValidationDispatchResult, err error) {
 	started := firstNonZeroTime(req.StartedAt, d.clock.Now())
 	runCtx, cancel := context.WithTimeout(ctxOrBackground(ctx), reg.Timeout)
 	defer cancel()
@@ -169,7 +170,7 @@ func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, reg Valida
 	if runCtx.Err() != nil {
 		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
 	}
-	if err := validateDispatchResult(reg, req, result); err != nil {
+	if err := validateDispatchResult(types, reg, req, result); err != nil {
 		return validationDispatchError(req, ValidationErrorCategoryArtifactType, err.Error(), d.clock.Now()), nil
 	}
 	return validationDispatchSuccess(req, result, d.clock.Now()), nil
@@ -306,7 +307,7 @@ func validatorImmutableFieldsEqual(a, b ValidatorRegistration) bool {
 		a.ResultDataType == b.ResultDataType
 }
 
-func validateDispatchInput(reg ValidatorRegistration, req ValidationDispatchRequest) error {
+func validateDispatchInput(types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) error {
 	if req.Validation == nil || req.Artifact == nil {
 		return fmt.Errorf("validation and artifact are required")
 	}
@@ -334,6 +335,9 @@ func validateDispatchInput(reg ValidatorRegistration, req ValidationDispatchRequ
 	if reg.ArtifactDataType != "" && req.Artifact.DataType != reg.ArtifactDataType {
 		return fmt.Errorf("artifact datatype %q does not match target %q", req.Artifact.DataType, reg.ArtifactDataType)
 	}
+	if err := validateDeclaredArtifactDataType(types, req.Validation.ResultDataType, "validation result datatype"); err != nil {
+		return err
+	}
 	if req.Artifact.DataType != "" {
 		if len(req.Artifact.Data) == 0 {
 			return ErrArtifactDataEmpty
@@ -345,10 +349,13 @@ func validateDispatchInput(reg ValidatorRegistration, req ValidationDispatchRequ
 	return nil
 }
 
-func validateDispatchResult(reg ValidatorRegistration, req ValidationDispatchRequest, result ValidatorHandlerResult) error {
+func validateDispatchResult(types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, result ValidatorHandlerResult) error {
 	declared := firstNonEmpty(req.Validation.ResultDataType, reg.ResultDataType)
+	if err := validateDeclaredArtifactDataType(types, declared, "declared result datatype"); err != nil {
+		return err
+	}
 	if declared == "" || result.ResultArtifact == nil {
-		return nil
+		return validateOptionalResultArtifact(types, result.ResultArtifact)
 	}
 	if result.ResultArtifact.DataType != declared {
 		return fmt.Errorf("result artifact datatype %q does not match declared %q", result.ResultArtifact.DataType, declared)
@@ -357,6 +364,30 @@ func validateDispatchResult(reg ValidatorRegistration, req ValidationDispatchReq
 		return ErrArtifactDataEmpty
 	}
 	return validateArtifactContentHash(result.ResultArtifact)
+}
+
+func validateOptionalResultArtifact(types *TypeRegistry, artifact *Artifact) error {
+	if artifact == nil || strings.TrimSpace(artifact.DataType) == "" {
+		return nil
+	}
+	if err := validateDeclaredArtifactDataType(types, artifact.DataType, "result artifact datatype"); err != nil {
+		return err
+	}
+	if len(artifact.Data) == 0 {
+		return ErrArtifactDataEmpty
+	}
+	return validateArtifactContentHash(artifact)
+}
+
+func validateDeclaredArtifactDataType(types *TypeRegistry, dataType, label string) error {
+	dataType = strings.TrimSpace(dataType)
+	if dataType == "" {
+		return nil
+	}
+	if _, err := types.LookupArtifactType(dataType); err != nil {
+		return fmt.Errorf("%s %q is not registered: %w", label, dataType, err)
+	}
+	return nil
 }
 
 func validationDispatchSuccess(req ValidationDispatchRequest, result ValidatorHandlerResult, completedAt time.Time) ValidationDispatchResult {

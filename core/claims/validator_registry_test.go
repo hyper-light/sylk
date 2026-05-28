@@ -63,6 +63,45 @@ func TestProgrammaticValidatorDispatcherOptionalErrorDoesNotBlockRequired(t *tes
 	}
 }
 
+func TestProgrammaticValidatorDispatcherRecoversPanicAsErrored(t *testing.T) {
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		panic("validator exploded")
+	}))
+	if _, err := registry.Register(reg); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	result, err := NewProgrammaticValidatorDispatcher(registry, SystemClock{}).DispatchValidation(context.Background(), testValidationDispatchRequest(true))
+	if err != nil {
+		t.Fatalf("DispatchValidation: %v", err)
+	}
+	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryPanic {
+		t.Fatalf("result = %#v, want panic errored result", result)
+	}
+	if result.ResultArtifact == nil || result.ResultArtifact.Kind != ArtifactKindErrorDiagnostic {
+		t.Fatalf("panic result artifact = %#v, want error diagnostic", result.ResultArtifact)
+	}
+}
+
+func TestProgrammaticValidatorDispatcherTimeoutBecomesErrored(t *testing.T) {
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(ctx context.Context, _ ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		<-ctx.Done()
+		return ValidatorHandlerResult{}, nil
+	}))
+	reg.Timeout = time.Nanosecond
+	if _, err := registry.Register(reg); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	result, err := NewProgrammaticValidatorDispatcher(registry, SystemClock{}).DispatchValidation(context.Background(), testValidationDispatchRequest(true))
+	if err != nil {
+		t.Fatalf("DispatchValidation: %v", err)
+	}
+	if result.Status != ValidationStatusErrored || result.Error == nil || result.Error.Category != ValidationErrorCategoryTimeout {
+		t.Fatalf("result = %#v, want timeout errored result", result)
+	}
+}
+
 func TestValidatorRegistryRejectsMissingDeterminismAndArtifactContract(t *testing.T) {
 	registry := NewValidatorRegistry()
 	_, err := registry.Register(ValidatorRegistration{
@@ -146,6 +185,31 @@ func TestProgrammaticValidatorDispatcherRejectsMismatchedResultDataType(t *testi
 	}
 }
 
+func TestProgrammaticValidatorDispatcherRejectsUnknownDeclaredResultDataTypeBeforeHandler(t *testing.T) {
+	called := false
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		called = true
+		return ValidatorHandlerResult{}, nil
+	}))
+	reg.ResultDataType = ""
+	if _, err := registry.Register(reg); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	req := testValidationDispatchRequest(true)
+	req.Validation.ResultDataType = "unknown.result.v1"
+	result, err := NewProgrammaticValidatorDispatcher(registry, SystemClock{}).DispatchValidation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DispatchValidation: %v", err)
+	}
+	if called {
+		t.Fatal("handler was invoked for unknown declared result datatype")
+	}
+	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	}
+}
+
 func TestValidatorRegistryRejectsUnknownRegisteredDataTypes(t *testing.T) {
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
 		return ValidatorHandlerResult{}, nil
@@ -154,6 +218,57 @@ func TestValidatorRegistryRejectsUnknownRegisteredDataTypes(t *testing.T) {
 	_, err := NewValidatorRegistry().Register(reg)
 	if !errors.Is(err, ErrValidatorRegistrationInvalid) {
 		t.Fatalf("Register unknown artifact datatype error = %v, want invalid", err)
+	}
+}
+
+func TestRegisterValidatorGenericRejectsDuplicateAndAllowsSameTypePairDifferentID(t *testing.T) {
+	registry := NewValidatorRegistry()
+	handler := func(context.Context, PlanMarkdownArtifactData) (*Artifact, error) {
+		artifact := &Artifact{Kind: ArtifactKindReadiness, Reference: "ok"}
+		if err := SetArtifactData(artifact, PresentationEvidenceArtifactData{Kind: "validation", Reference: "ok"}); err != nil {
+			return nil, err
+		}
+		return artifact, nil
+	}
+	cfg := ValidatorConfig{
+		ID:                 "plan.validator.one",
+		ValidationType:     ValidationTypeInspection,
+		ActionType:         ActionTypeTask,
+		Determinism:        HandlerDeterminismPure,
+		Timeout:            time.Second,
+		ConcurrencyBudget:  1,
+		TargetArtifactName: "evidence",
+	}
+	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil {
+		t.Fatalf("RegisterValidator first: %v", err)
+	}
+	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil {
+		t.Fatalf("duplicate RegisterValidator should be idempotent: %v", err)
+	}
+	cfg.ID = "plan.validator.two"
+	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, handler); err != nil {
+		t.Fatalf("same type pair different ID failed: %v", err)
+	}
+}
+
+func TestRegisterValidatorGenericRejectsUnknownTypeAndNilHandler(t *testing.T) {
+	registry := NewValidatorRegistry()
+	cfg := ValidatorConfig{
+		ID:                 "unknown.validator",
+		ValidationType:     ValidationTypeInspection,
+		ActionType:         ActionTypeTask,
+		Determinism:        HandlerDeterminismPure,
+		Timeout:            time.Second,
+		ConcurrencyBudget:  1,
+		TargetArtifactName: "evidence",
+	}
+	if _, err := RegisterValidator[struct{ Name string }, PresentationEvidenceArtifactData](registry, cfg, func(context.Context, struct{ Name string }) (*Artifact, error) {
+		return &Artifact{}, nil
+	}); !errors.Is(err, ErrValidatorRegistrationInvalid) {
+		t.Fatalf("unknown input type error = %v, want invalid", err)
+	}
+	if _, err := RegisterValidator[PlanMarkdownArtifactData, PresentationEvidenceArtifactData](registry, cfg, nil); !errors.Is(err, ErrValidatorRegistrationInvalid) {
+		t.Fatalf("nil handler error = %v, want invalid", err)
 	}
 }
 

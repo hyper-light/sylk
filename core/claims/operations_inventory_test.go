@@ -2,7 +2,11 @@ package claims
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -22,10 +26,36 @@ func TestOperationsInventoryCoversKnownDeltaActionsAndValidationTypes(t *testing
 	}
 }
 
+func TestOperationsInventoryIsSortedDeterministicAndConcurrentSafe(t *testing.T) {
+	want := OperationsInventory()
+	for i := 1; i < len(want); i++ {
+		if want[i-1].Requirement > want[i].Requirement {
+			t.Fatalf("inventory not sorted at %d: %s > %s", i, want[i-1].Requirement, want[i].Requirement)
+		}
+	}
+	errs := make(chan error, 16)
+	var wg sync.WaitGroup
+	for range cap(errs) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := OperationsInventory(); !reflect.DeepEqual(got, want) {
+				errs <- fmt.Errorf("inventory changed across calls")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
 func TestOperationsInventoryMarksCompatibilityAndPlannedGapsExplicitly(t *testing.T) {
 	inventory := OperationsInventory()
 	for _, requirement := range []string{
 		"ops.semantic.participant_agnostic_claims",
+		"ops.semantic.participant_agnostic_wire_format",
 		"ops.semantic.programmatic_or_agentic_validation",
 		"ops.semantic.infrastructure_outcomes_are_testaments",
 		"ops.semantic.board_source_of_truth",
@@ -49,29 +79,41 @@ func TestOperationsInventoryCoversInfrastructureServiceCatalog(t *testing.T) {
 		"ops.service.identity_registry",
 		"ops.service.activation_controller",
 		"ops.service.dag_processor",
-		"ops.service.pipeline_vfs_provisioner",
+		"ops.service.vfs_provisioner",
 		"ops.service.tool_vfs_provisioner",
 		"ops.service.global_vfs_merger",
-		"ops.service.knowledge_graph_writer",
-		"ops.service.knowledge_graph_reader",
-		"ops.service.document_db_writer",
-		"ops.service.document_db_reader",
-		"ops.service.guardian_subsystem",
+		"ops.service.kg_writer",
+		"ops.service.kg_reader",
+		"ops.service.doc_db_writer",
+		"ops.service.doc_db_reader",
+		"ops.service.guardian",
 		"ops.service.boot_sequencer",
 		"ops.service.tool_runtime",
-		"ops.service.llm_provider_gateway",
+		"ops.service.provider_gateway",
 		"ops.service.session_manager",
 		"ops.service.fabric_subscriber",
-		"ops.service.bus_transport",
+		"ops.service.bus_administrator",
 	} {
 		assertInventoryRequirement(t, inventory, requirement)
 	}
 }
 
-func TestOperationsInventorySyntheticMissingRequirementFailsLookup(t *testing.T) {
+func TestOperationsInventoryCoversServiceCatalogFromInfrastructureDoc(t *testing.T) {
 	inventory := OperationsInventory()
-	if entry, ok := findInventoryRequirement(inventory, "delta.action.synthetic_missing"); ok {
-		t.Fatalf("synthetic missing action unexpectedly found: %#v", entry)
+	participantTypes := documentedServiceParticipantTypes(t)
+	if len(participantTypes) == 0 {
+		t.Fatal("no service participant types parsed from docs/CLAIMS_AND_INFRASTRUCTURE.md §14")
+	}
+	for _, participantType := range participantTypes {
+		assertInventoryRequirement(t, inventory, "ops.service."+participantType)
+	}
+}
+
+func TestOperationsInventorySyntheticMissingRequirementFailsCoverage(t *testing.T) {
+	inventory := OperationsInventory()
+	err := validateInventoryRequirements(inventory, []string{"delta.action.synthetic_missing"})
+	if err == nil || !strings.Contains(err.Error(), "delta.action.synthetic_missing") {
+		t.Fatalf("coverage error = %v, want missing requirement named", err)
 	}
 }
 
@@ -104,4 +146,37 @@ func findInventoryRequirement(inventory []OperationsInventoryEntry, requirement 
 		}
 	}
 	return OperationsInventoryEntry{}, false
+}
+
+func validateInventoryRequirements(inventory []OperationsInventoryEntry, requirements []string) error {
+	for _, requirement := range requirements {
+		if _, ok := findInventoryRequirement(inventory, requirement); !ok {
+			return fmt.Errorf("inventory missing %s", requirement)
+		}
+	}
+	return nil
+}
+
+func documentedServiceParticipantTypes(t *testing.T) []string {
+	t.Helper()
+	body := readClaimsFile(t, claimsRepoRoot(t)+"/docs/CLAIMS_AND_INFRASTRUCTURE.md")
+	section := claimsInfrastructureSection(body, "## 14.", "## 15.")
+	matches := regexp.MustCompile("(?m)^\\| Participant type \\| `([^`]+)`").FindAllStringSubmatch(section, -1)
+	out := make([]string, 0, len(matches))
+	for _, match := range matches {
+		out = append(out, strings.TrimSpace(match[1]))
+	}
+	return out
+}
+
+func claimsInfrastructureSection(body, startMarker, endMarker string) string {
+	start := strings.Index(body, startMarker)
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(body[start+len(startMarker):], endMarker)
+	if end < 0 {
+		return body[start:]
+	}
+	return body[start : start+len(startMarker)+end]
 }
