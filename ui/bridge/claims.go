@@ -510,10 +510,10 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, delta claims.CanonicalDelta) {
 	claimID := strings.TrimSpace(delta.ClaimID())
 	switch delta.Action {
-	case claims.DeltaActionClaimDirected:
+	case claims.DeltaActionClaimPosted:
 		b.handleEntryClaim(sessionID, board, entry, claimID)
 		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", "", delta)
-	case claims.DeltaActionTestamentSubmitted:
+	case claims.DeltaActionTestamentPosted:
 		b.handleEntryTestament(sessionID, board, entry, delta.TestamentID())
 		b.emitPeerInteractionForDelta(sessionID, claimID, "done", canonicalTestamentContext(delta), delta)
 	case claims.DeltaActionValidationEvaluated:
@@ -524,7 +524,15 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 			}
 			b.handleClaimClosed(claimID, "success")
 		}
-	case claims.DeltaActionClaimTransitioned:
+	case claims.DeltaActionClaimSatisfied,
+		claims.DeltaActionClaimValidationIncomplete,
+		claims.DeltaActionClaimValidationFailed,
+		claims.DeltaActionClaimValidationErrored,
+		claims.DeltaActionClaimPostFailed,
+		claims.DeltaActionClaimReceiptFailed,
+		claims.DeltaActionClaimProgressFailed,
+		claims.DeltaActionClaimTestamentGenerationFailed,
+		claims.DeltaActionClaimTestamentAcknowledgementFailed:
 		toStatus := delta.ClaimToStatus()
 		if toStatus.IsTerminal() {
 			if !b.claimRegistered(claimID) {
@@ -536,7 +544,11 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 			b.handleEntryClaim(sessionID, board, entry, claimID)
 			b.emitPeerInteractionForDelta(sessionID, claimID, "pending", canonicalClaimTransitionReason(delta), delta)
 		}
-	case claims.DeltaActionClaimProgressed:
+	case claims.DeltaActionClaimProgressed,
+		claims.DeltaActionClaimReceived,
+		claims.DeltaActionClaimTestamentGenerated,
+		claims.DeltaActionClaimTestamentAcknowledged,
+		claims.DeltaActionClaimValidating:
 		b.handleClaimContext(sessionID, claimContextEvent{
 			ClaimID:           claimID,
 			AgentID:           delta.Actor.RouteKey(),

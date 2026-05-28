@@ -275,27 +275,20 @@ func (a *BoardAmplifier) emit(_ context.Context, kind activity.ActionKind, agent
 // Bus delta emissions
 // ────────────────────────────────────────────────────────────────────
 
-// PublishInboxDeltas emits one InboxDelta per directed-agent
-// Relation on the claim (subject, evaluator). Each delta is published
-// on the agent-specific inbox topic. The claim and action are the
-// authoritative inputs — the amplifier does no board lookup.
+// PublishInboxDeltas emits claim.posted lifecycle deltas for each
+// directed-agent relation on the claim. The retained method name is a
+// compatibility call site; it no longer publishes legacy InboxDelta
+// workflow inputs.
 func (a *BoardAmplifier) PublishInboxDeltas(ctx context.Context, action *Action, claim *Claim) {
 	if a == nil || action == nil || claim == nil {
 		return
 	}
-	a.dispatchCanonical(ctx, a.buildClaimDirectedDeltas(ctx, action, claim, time.Now().UTC()))
-	deltas := a.buildInboxDeltas(action, claim)
-	if len(deltas) == 0 {
-		return
-	}
-	a.dispatchInbox(ctx, deltas)
+	a.dispatchCanonical(ctx, a.buildClaimLifecycleDeltas(ctx, action, claim, ClaimLifecyclePosted, action.AgentID, time.Now().UTC()))
 }
 
-// PublishTestamentDelta emits a TestamentDelta on the claim's
-// status-testified topic. System-internal action types
-// (claims.IsSystemInternalAction) short-circuit here — no agent role
-// (Auditor / Archivist / Subject) should wake on a system claim's
-// testament. Same chokepoint as buildInboxDeltas for the inbox path.
+// PublishTestamentDelta emits testament.posted lifecycle deltas. The
+// retained method name is a compatibility call site; it no longer
+// publishes legacy TestamentDelta workflow inputs.
 func (a *BoardAmplifier) PublishTestamentDelta(ctx context.Context, testament *Testament, claim *Claim) {
 	if a == nil || testament == nil || claim == nil {
 		return
@@ -303,13 +296,7 @@ func (a *BoardAmplifier) PublishTestamentDelta(ctx context.Context, testament *T
 	if IsSystemInternalAction(claim.ActionType) {
 		return
 	}
-	delta := a.buildTestamentDelta(testament, claim)
-	a.dispatchCanonical(ctx, []canonicalDispatch{{
-		topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionTestamentSubmitted),
-		delta: a.buildCanonicalTestamentSubmitted(ctx, testament, claim, time.Now().UTC()),
-	}})
-	topic := ClaimStatusTopic(a.sessionID, claim.ID, ClaimStatusTestified)
-	a.dispatchSingle(ctx, topic, delta)
+	a.dispatchCanonical(ctx, a.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecyclePosted, testament.AgentID, time.Now().UTC()))
 }
 
 // PublishValidationDelta emits a ValidationDelta on the
@@ -372,9 +359,10 @@ func (a *BoardAmplifier) PublishCanonicalClaimProgressed(ctx context.Context, cl
 		nil,
 		map[string]any{
 			"claim": map[string]any{
-				"id":     claim.ID,
-				"action": string(claim.ActionType),
-				"status": string(claim.Status),
+				"id":               claim.ID,
+				"action":           string(claim.ActionType),
+				"status":           string(claim.Status),
+				"lifecycle_status": string(ClaimLifecycleProgressed),
 			},
 			"progress": map[string]any{
 				"state":      strings.TrimSpace(state),
@@ -401,12 +389,14 @@ func (a *BoardAmplifier) PublishClaimStatusDelta(ctx context.Context, delta Clai
 	if IsSystemInternalAction(delta.ActionKind) {
 		return
 	}
+	lifecycle := claimLifecycleForCoarseStatus(delta.ToStatus)
+	if lifecycle == "" {
+		return
+	}
 	a.dispatchCanonical(ctx, []canonicalDispatch{{
-		topic: CanonicalClaimTopic(a.sessionID, delta.ClaimID, DeltaActionClaimTransitioned),
-		delta: a.buildCanonicalClaimTransitioned(ctx, delta),
+		topic: CanonicalClaimTopic(a.sessionID, delta.ClaimID, mustClaimLifecycleDeltaAction(lifecycle)),
+		delta: a.buildCanonicalClaimLifecycleFromStatusDelta(ctx, delta, lifecycle),
 	}})
-	topic := ClaimStatusTopic(a.sessionID, delta.ClaimID, delta.ToStatus)
-	a.dispatchSingle(ctx, topic, delta)
 }
 
 // PublishPhaseDelta emits a PhaseDelta on the phase topic.
@@ -443,9 +433,10 @@ func (a *BoardAmplifier) PublishClaimContextDelta(ctx context.Context, delta Cla
 			nil,
 			map[string]any{
 				"claim": map[string]any{
-					"id":     delta.ClaimID,
-					"action": string(delta.ActionKind),
-					"status": "",
+					"id":               delta.ClaimID,
+					"action":           string(delta.ActionKind),
+					"status":           "",
+					"lifecycle_status": string(ClaimLifecycleProgressed),
 				},
 				"progress": map[string]any{
 					"state":      "context",
@@ -562,20 +553,37 @@ type canonicalDispatch struct {
 	delta CanonicalDelta
 }
 
-func (a *BoardAmplifier) buildClaimDirectedDeltas(ctx context.Context, action *Action, claim *Claim, occurredAt time.Time) []canonicalDispatch {
+func (a *BoardAmplifier) buildClaimLifecycleDeltas(ctx context.Context, action *Action, claim *Claim, status ClaimLifecycleStatus, actorID string, occurredAt time.Time) []canonicalDispatch {
 	if action != nil && IsSystemInternalAction(action.Type) {
 		return nil
 	}
 	if claim != nil && IsSystemInternalAction(claim.ActionType) {
 		return nil
 	}
-	issuerID := action.AgentID
+	deltaAction, ok := ClaimLifecycleDeltaAction(status)
+	if !ok {
+		return nil
+	}
+	issuerID := ""
+	if action != nil {
+		issuerID = action.AgentID
+	}
 	if issuerID == "" {
 		issuerID = IssuerAgentID(claim.Relations)
 	}
-	actor := a.resolveAgentRef(ctx, issuerID, "legacy action agent id")
+	actor := a.resolveAgentRef(ctx, firstNonEmpty(actorID, issuerID, claim.AgentID), "claim lifecycle actor")
 	if occurredAt.IsZero() {
 		occurredAt = time.Now().UTC()
+	}
+	refs := append(actionRefs(ClaimActionID(claim.Relations)), DeltaRef{Role: "claim", Type: RelatedTypeClaim, ID: claim.ID})
+	if action != nil && action.ID != "" {
+		refs = append(actionRefs(action.ID), DeltaRef{Role: "claim", Type: RelatedTypeClaim, ID: claim.ID})
+	}
+	if status != ClaimLifecyclePosted {
+		return []canonicalDispatch{{
+			topic: CanonicalClaimTopic(a.sessionID, claim.ID, deltaAction),
+			delta: a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, nil),
+		}}
 	}
 	var out []canonicalDispatch
 	for _, r := range claim.Relations {
@@ -590,34 +598,39 @@ func (a *BoardAmplifier) buildClaimDirectedDeltas(ctx context.Context, action *A
 			To:           []AgentRef{target},
 			Relationship: r.Relationship,
 		}
-		delta := NewCanonicalDelta(
-			DeltaActionClaimDirected,
-			a.sessionID,
-			a.boardID,
-			claim.Sequence,
-			occurredAt,
-			actor,
-			append(actionRefs(action.ID), DeltaRef{Role: "claim", Type: RelatedTypeClaim, ID: claim.ID}),
-			delivery,
-			map[string]any{
-				"claim": map[string]any{
-					"id":                  claim.ID,
-					"action":              string(claim.ActionType),
-					"title":               claim.Title,
-					"description":         claim.Description,
-					"status":              string(claim.Status),
-					"scope":               claimScopeContext(claim.Scope),
-					"validations":         validationContext(claim.Validations),
-					"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
-				},
-			},
-		)
+		delta := a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, delivery)
 		out = append(out, canonicalDispatch{
-			topic: CanonicalAgentRefTopic(a.sessionID, target, DeltaActionClaimDirected),
+			topic: CanonicalAgentRefTopic(a.sessionID, target, deltaAction),
 			delta: delta,
 		})
 	}
 	return out
+}
+
+func (a *BoardAmplifier) buildCanonicalClaimLifecycle(_ context.Context, claim *Claim, action DeltaAction, status ClaimLifecycleStatus, occurredAt time.Time, actor AgentRef, refs []DeltaRef, delivery *DeltaDelivery) CanonicalDelta {
+	return NewCanonicalDelta(
+		action,
+		a.sessionID,
+		a.boardID,
+		claim.Sequence,
+		occurredAt,
+		actor,
+		refs,
+		delivery,
+		map[string]any{
+			"claim": map[string]any{
+				"id":                  claim.ID,
+				"action":              string(claim.ActionType),
+				"title":               claim.Title,
+				"description":         claim.Description,
+				"status":              string(claim.Status),
+				"lifecycle_status":    string(status),
+				"scope":               claimScopeContext(claim.Scope),
+				"validations":         validationContext(claim.Validations),
+				"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
+			},
+		},
+	)
 }
 
 func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim) TestamentDelta {
@@ -643,12 +656,32 @@ func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim)
 	}
 }
 
-func (a *BoardAmplifier) buildCanonicalTestamentSubmitted(ctx context.Context, testament *Testament, claim *Claim, occurredAt time.Time) CanonicalDelta {
-	actor := a.resolveAgentRef(ctx, testament.AgentID, "legacy testament agent id")
+func (a *BoardAmplifier) buildTestamentLifecycleDeltas(ctx context.Context, testament *Testament, claim *Claim, status TestamentLifecycleStatus, actorID string, occurredAt time.Time) []canonicalDispatch {
+	action, ok := TestamentLifecycleDeltaAction(status)
+	if !ok || testament == nil {
+		return nil
+	}
+	delta := a.buildCanonicalTestamentLifecycle(ctx, testament, claim, action, status, actorID, occurredAt)
+	if claim == nil || strings.TrimSpace(claim.ID) == "" {
+		return []canonicalDispatch{{topic: CanonicalBoardTopic(a.sessionID, a.boardID, action), delta: delta}}
+	}
+	out := []canonicalDispatch{{topic: CanonicalClaimTopic(a.sessionID, claim.ID, action), delta: delta}}
+	if status == TestamentLifecyclePosted {
+		issuer := a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")
+		out = append(out, canonicalDispatch{topic: CanonicalAgentRefTopic(a.sessionID, issuer, action), delta: delta})
+	}
+	return out
+}
+
+func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, testament *Testament, claim *Claim, action DeltaAction, status TestamentLifecycleStatus, actorID string, occurredAt time.Time) CanonicalDelta {
+	actor := a.resolveAgentRef(ctx, firstNonEmpty(actorID, testament.AgentID), "testament lifecycle actor")
 	if occurredAt.IsZero() {
 		occurredAt = time.Now().UTC()
 	}
-	refs := claimRefs(claim.ID)
+	refs := claimRefs("")
+	if claim != nil {
+		refs = claimRefs(claim.ID)
+	}
 	refs = append(refs, DeltaRef{Role: "testament", Type: RelatedTypeTestament, ID: testament.ID})
 	for _, artifact := range testament.Artifacts {
 		if artifact == nil || strings.TrimSpace(artifact.ID) == "" {
@@ -658,11 +691,12 @@ func (a *BoardAmplifier) buildCanonicalTestamentSubmitted(ctx context.Context, t
 	}
 	testamentContext := compactTestamentDeltaContext(testament)
 	testamentEntry := map[string]any{
-		"id":         testament.ID,
-		"verdict":    DeriveTestamentVerdict(testament.Artifacts),
-		"confidence": testament.Confidence,
-		"context":    testamentContext.Value,
-		"artifacts":  artifactHeadersContext(testament.Artifacts),
+		"id":               testament.ID,
+		"verdict":          DeriveTestamentVerdict(testament.Artifacts),
+		"confidence":       testament.Confidence,
+		"context":          testamentContext.Value,
+		"lifecycle_status": string(status),
+		"artifacts":        artifactHeadersContext(testament.Artifacts),
 	}
 	if testamentContext.Truncated {
 		testamentEntry["context_truncated"] = true
@@ -671,23 +705,33 @@ func (a *BoardAmplifier) buildCanonicalTestamentSubmitted(ctx context.Context, t
 			testamentEntry["context_artifact_kind"] = testamentContext.ArtifactKind
 		}
 	}
+	claimEntry := map[string]any{}
+	delivery := (*DeltaDelivery)(nil)
+	if claim != nil {
+		claimEntry = map[string]any{
+			"id":                  claim.ID,
+			"action":              string(claim.ActionType),
+			"status":              string(claim.Status),
+			"lifecycle_status":    string(claim.LifecycleStatus),
+			"validations":         validationContext(claim.Validations),
+			"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
+		}
+		if status == TestamentLifecyclePosted {
+			delivery = &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")}, Relationship: RelationshipIssuer}
+		}
+	}
 	return NewCanonicalDelta(
-		DeltaActionTestamentSubmitted,
+		action,
 		a.sessionID,
 		a.boardID,
 		testament.Sequence,
 		occurredAt,
 		actor,
 		refs,
-		&DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "legacy claim issuer")}, Relationship: RelationshipIssuer},
+		delivery,
 		map[string]any{
-			"claim": map[string]any{
-				"id":                  claim.ID,
-				"action":              string(claim.ActionType),
-				"status":              string(claim.Status),
-				"validations":         validationContext(claim.Validations),
-				"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
-			},
+			"claim":      claimEntry,
+			"testament":  testamentEntry,
 			"testaments": []map[string]any{testamentEntry},
 		},
 	)
@@ -725,9 +769,10 @@ func (a *BoardAmplifier) buildCanonicalValidationEvaluated(ctx context.Context, 
 	)
 }
 
-func (a *BoardAmplifier) buildCanonicalClaimTransitioned(ctx context.Context, delta ClaimStatusDelta) CanonicalDelta {
+func (a *BoardAmplifier) buildCanonicalClaimLifecycleFromStatusDelta(ctx context.Context, delta ClaimStatusDelta, lifecycle ClaimLifecycleStatus) CanonicalDelta {
+	action := mustClaimLifecycleDeltaAction(lifecycle)
 	return NewCanonicalDelta(
-		DeltaActionClaimTransitioned,
+		action,
 		delta.SessionID,
 		delta.BoardID,
 		delta.Sequence,
@@ -737,11 +782,12 @@ func (a *BoardAmplifier) buildCanonicalClaimTransitioned(ctx context.Context, de
 		nil,
 		map[string]any{
 			"claim": map[string]any{
-				"id":          delta.ClaimID,
-				"action":      string(delta.ActionKind),
-				"from_status": string(delta.FromStatus),
-				"to_status":   string(delta.ToStatus),
-				"reason":      delta.Reason,
+				"id":               delta.ClaimID,
+				"action":           string(delta.ActionKind),
+				"from_status":      string(delta.FromStatus),
+				"to_status":        string(delta.ToStatus),
+				"lifecycle_status": string(lifecycle),
+				"reason":           delta.Reason,
 			},
 		},
 	)
@@ -878,6 +924,31 @@ func (a *BoardAmplifier) reportEmitError(event, topic string, err error) {
 // is the actor (not a recipient) and receives no delta.
 func isDirectedAgentRelationship(relationship string) bool {
 	return relationship == RelationshipSubject || relationship == RelationshipEvaluator
+}
+
+func claimLifecycleForCoarseStatus(status ClaimStatus) ClaimLifecycleStatus {
+	switch status {
+	case ClaimStatusPending:
+		return ClaimLifecyclePosted
+	case ClaimStatusInProgress:
+		return ClaimLifecycleProgressed
+	case ClaimStatusTestified:
+		return ClaimLifecycleTestamentGenerated
+	case ClaimStatusAccepted:
+		return ClaimLifecycleSatisfied
+	case ClaimStatusRejected:
+		return ClaimLifecycleValidationFailed
+	default:
+		return ""
+	}
+}
+
+func mustClaimLifecycleDeltaAction(status ClaimLifecycleStatus) DeltaAction {
+	action, ok := ClaimLifecycleDeltaAction(status)
+	if !ok {
+		return DeltaActionClaimProgressed
+	}
+	return action
 }
 
 func collectRelatedIDs(relations []Relation, relationship string) []string {

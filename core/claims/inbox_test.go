@@ -327,7 +327,7 @@ func TestInbox_ExpectAndMatch(t *testing.T) {
 	}
 }
 
-func TestInbox_ExpectMatchesCanonicalTestamentSubmitted(t *testing.T) {
+func TestInbox_ExpectMatchesCanonicalTestamentPosted(t *testing.T) {
 	var received atomic.Pointer[GraphEntryPoint]
 	inbox, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "architect",
@@ -343,7 +343,7 @@ func TestInbox_ExpectMatchesCanonicalTestamentSubmitted(t *testing.T) {
 	})
 
 	inbox.Ingest(NewCanonicalDelta(
-		DeltaActionTestamentSubmitted,
+		DeltaActionTestamentPosted,
 		"sess",
 		"board",
 		2,
@@ -353,7 +353,7 @@ func TestInbox_ExpectMatchesCanonicalTestamentSubmitted(t *testing.T) {
 			{Role: "claim", Type: RelatedTypeClaim, ID: "claim-42"},
 			{Role: "testament", Type: RelatedTypeTestament, ID: "testament-1"},
 		},
-		nil,
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef("architect", "test")}, Relationship: RelationshipIssuer},
 		map[string]any{
 			"claim": map[string]any{
 				"id":     "claim-42",
@@ -368,12 +368,12 @@ func TestInbox_ExpectMatchesCanonicalTestamentSubmitted(t *testing.T) {
 	if entry == nil || entry.Expectation == nil {
 		t.Fatalf("expected canonical testament to resolve expectation, got %#v", entry)
 	}
-	if entry.Delta.DeltaKind() != string(DeltaActionTestamentSubmitted) {
+	if entry.Delta.DeltaKind() != string(DeltaActionTestamentPosted) {
 		t.Fatalf("delta kind = %q", entry.Delta.DeltaKind())
 	}
 }
 
-func TestInbox_ExpectMatchesCanonicalClaimTransitioned(t *testing.T) {
+func TestInbox_ExpectMatchesCanonicalClaimSatisfied(t *testing.T) {
 	var received atomic.Pointer[GraphEntryPoint]
 	inbox, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "architect",
@@ -389,7 +389,7 @@ func TestInbox_ExpectMatchesCanonicalClaimTransitioned(t *testing.T) {
 	})
 
 	inbox.Ingest(NewCanonicalDelta(
-		DeltaActionClaimTransitioned,
+		DeltaActionClaimSatisfied,
 		"sess",
 		"board",
 		3,
@@ -399,10 +399,11 @@ func TestInbox_ExpectMatchesCanonicalClaimTransitioned(t *testing.T) {
 		nil,
 		map[string]any{
 			"claim": map[string]any{
-				"id":        "claim-42",
-				"action":    string(ActionTypeConsultation),
-				"status":    string(ClaimStatusAccepted),
-				"to_status": string(ClaimStatusAccepted),
+				"id":               "claim-42",
+				"action":           string(ActionTypeConsultation),
+				"status":           string(ClaimStatusAccepted),
+				"to_status":        string(ClaimStatusAccepted),
+				"lifecycle_status": string(ClaimLifecycleSatisfied),
 			},
 		},
 	))
@@ -688,7 +689,7 @@ func TestInbox_ExpectationReplaysEarlyCanonicalTestament(t *testing.T) {
 	}
 	claimID := "claim-consult-early"
 	delta := NewCanonicalDelta(
-		DeltaActionTestamentSubmitted,
+		DeltaActionTestamentPosted,
 		"sess",
 		"board",
 		1,
@@ -723,7 +724,7 @@ func TestInbox_ExpectationReplaysEarlyCanonicalTestament(t *testing.T) {
 	if got.Expectation == nil || got.Expectation.ClaimID != claimID {
 		t.Fatalf("expectation = %#v, want claim %q", got.Expectation, claimID)
 	}
-	if got.Delta.DeltaKind() != string(DeltaActionTestamentSubmitted) {
+	if got.Delta.DeltaKind() != string(DeltaActionTestamentPosted) {
 		t.Fatalf("delta kind = %q", got.Delta.DeltaKind())
 	}
 }
@@ -874,7 +875,7 @@ func TestInbox_Len_DoesNotMatchDuplicateCanonicalDelta(t *testing.T) {
 		Role:      RoleSubject,
 	})
 	d := NewCanonicalDelta(
-		DeltaActionClaimDirected,
+		DeltaActionClaimPosted,
 		"sess",
 		"board",
 		1,

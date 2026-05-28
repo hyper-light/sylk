@@ -253,9 +253,9 @@ func entryIsTestamentSubmitted(entry *claims.GraphEntryPoint) bool {
 	}
 	switch delta := entry.Delta.(type) {
 	case claims.CanonicalDelta:
-		return delta.Action == claims.DeltaActionTestamentSubmitted
+		return delta.Action == claims.DeltaActionTestamentPosted
 	case *claims.CanonicalDelta:
-		return delta != nil && delta.Action == claims.DeltaActionTestamentSubmitted
+		return delta != nil && delta.Action == claims.DeltaActionTestamentPosted
 	case claims.TestamentDelta, *claims.TestamentDelta:
 		return true
 	default:
@@ -368,7 +368,7 @@ func awaitedClaimResultFromPeerTestament(entry *claims.GraphEntryPoint, signal p
 		BoardID:          signal.BoardID,
 		ClaimID:          strings.TrimSpace(resolutionID),
 		TestamentID:      signal.TestamentID,
-		Action:           claims.DeltaActionTestamentSubmitted,
+		Action:           claims.DeltaActionTestamentPosted,
 		Verdict:          signal.Verdict,
 		Context:          summary,
 		ResponderAgentID: responder,
@@ -411,7 +411,7 @@ func terminalClaimSignalFromEntry(entry *claims.GraphEntryPoint) (terminalClaimS
 }
 
 func terminalClaimSignalFromCanonical(delta claims.CanonicalDelta) (terminalClaimSignal, bool) {
-	if delta.Action != claims.DeltaActionClaimTransitioned {
+	if !canonicalClaimLifecycleResolvesAwait(delta) {
 		return terminalClaimSignal{}, false
 	}
 	status := delta.ClaimToStatus()
@@ -457,6 +457,36 @@ func claimStatusResolvesAwait(status claims.ClaimStatus) bool {
 	}
 }
 
+func canonicalClaimLifecycleResolvesAwait(delta claims.CanonicalDelta) bool {
+	status, ok := delta.ClaimLifecycleStatus()
+	if !ok {
+		return false
+	}
+	switch status {
+	case claims.ClaimLifecycleTestamentAcknowledged,
+		claims.ClaimLifecycleSatisfied,
+		claims.ClaimLifecycleValidationIncomplete,
+		claims.ClaimLifecycleValidationFailed,
+		claims.ClaimLifecycleValidationErrored,
+		claims.ClaimLifecycleTestamentGenerationFailed,
+		claims.ClaimLifecycleTestamentAcknowledgementFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func claimStatusResultAction(status claims.ClaimStatus) claims.DeltaAction {
+	switch status {
+	case claims.ClaimStatusTestified:
+		return claims.DeltaActionClaimTestamentAcknowledged
+	case claims.ClaimStatusAccepted:
+		return claims.DeltaActionClaimSatisfied
+	default:
+		return claims.DeltaActionClaimValidationFailed
+	}
+}
+
 func awaitedClaimResultFromTerminalClaim(entry *claims.GraphEntryPoint, signal terminalClaimSignal, resolutionID string, cfg ClaimsIntakeConfig) *AwaitedClaimResult {
 	summary := strings.TrimSpace(signal.Context)
 	if summary == "" && entry.Node.Claim != nil {
@@ -477,7 +507,7 @@ func awaitedClaimResultFromTerminalClaim(entry *claims.GraphEntryPoint, signal t
 		SessionID:        firstNonEmptyIntakeString(signal.SessionID, cfg.SessionID),
 		BoardID:          signal.BoardID,
 		ClaimID:          strings.TrimSpace(resolutionID),
-		Action:           claims.DeltaActionClaimTransitioned,
+		Action:           claimStatusResultAction(signal.Status),
 		Context:          summary,
 		ResponderAgentID: signal.ActorID,
 		Status:           status,
@@ -585,7 +615,7 @@ func peerTestamentSignalFromLegacyDelta(delta claims.TestamentDelta) peerTestame
 }
 
 func peerTestamentSignalFromCanonicalDelta(delta claims.CanonicalDelta) (peerTestamentSignal, bool) {
-	if delta.Action != claims.DeltaActionTestamentSubmitted {
+	if delta.Action != claims.DeltaActionTestamentPosted {
 		return peerTestamentSignal{}, false
 	}
 	signal := peerTestamentSignal{
@@ -769,6 +799,9 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			if entry == nil {
 				return
 			}
+			if !acknowledgeLifecycleReceipt(cfg, role, entry) {
+				return
+			}
 			expectedValidationToolsScheduled := dispatchExpectedValidationTools(cfg, entry)
 			if deliverExpectedPeerResultToContinuation(cfg, entry) {
 				return
@@ -837,6 +870,81 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	// avoid stale entries surviving a restart.
 	claims.DefaultSessionInboxRegistry().Register(cfg.SessionID, cfg.AgentID, inbox)
 	return inbox
+}
+
+func acknowledgeLifecycleReceipt(cfg ClaimsIntakeConfig, role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {
+	if cfg.Board == nil || entry == nil || entry.Delta == nil || role.Has(claims.RoleObserver) {
+		return true
+	}
+	delta, ok := canonicalDeltaFromEntry(entry)
+	if !ok {
+		return true
+	}
+	switch delta.Action {
+	case claims.DeltaActionClaimPosted:
+		return acknowledgeClaimPosted(cfg, delta)
+	case claims.DeltaActionTestamentPosted:
+		return acknowledgeTestamentPosted(cfg, delta)
+	default:
+		return true
+	}
+}
+
+func canonicalDeltaFromEntry(entry *claims.GraphEntryPoint) (claims.CanonicalDelta, bool) {
+	switch delta := entry.Delta.(type) {
+	case claims.CanonicalDelta:
+		return delta, true
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			return *delta, true
+		}
+	}
+	return claims.CanonicalDelta{}, false
+}
+
+func acknowledgeClaimPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDelta) bool {
+	claimID := strings.TrimSpace(delta.ClaimID())
+	if claimID == "" {
+		return true
+	}
+	if err := cfg.Board.AcknowledgeClaimReceipt(context.Background(), claimID, cfg.AgentID); err != nil {
+		_ = cfg.Board.RecordClaimReceiptFailure(context.Background(), claimID, cfg.AgentID, claims.LifecycleFailureOptions{
+			Reason:       err.Error(),
+			ArtifactKind: claims.ArtifactKindErrorDiagnostic,
+		})
+		slog.Error("claims_intake_claim_receipt_failed",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
+		return false
+	}
+	return true
+}
+
+func acknowledgeTestamentPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDelta) bool {
+	testamentID := strings.TrimSpace(delta.TestamentID())
+	if testamentID == "" {
+		return true
+	}
+	if err := cfg.Board.AcknowledgeTestamentReceipt(context.Background(), testamentID, cfg.AgentID); err != nil {
+		claimID := strings.TrimSpace(delta.ClaimID())
+		if claimID != "" {
+			_ = cfg.Board.RecordClaimTestamentAcknowledgementFailure(context.Background(), claimID, cfg.AgentID, claims.LifecycleFailureOptions{
+				Reason:       err.Error(),
+				ArtifactKind: claims.ArtifactKindErrorDiagnostic,
+			})
+		}
+		slog.Error("claims_intake_testament_receipt_failed",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"testament_id", testamentID,
+			"error", err.Error(),
+		)
+		return false
+	}
+	return true
 }
 
 // stampClaimsIntakeContext attaches the agent's AgentIdentity, a

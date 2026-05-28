@@ -2476,7 +2476,7 @@ func (b *ClaimsBoard) outboxRecordsForPostActionLocked(action Action, claims []C
 	records := make([]ClaimsOutboxRecord, 0, 1+len(claims))
 	records = append(records, b.outboxRecordLocked(action.Sequence, "action", action.ID, walEventActionPosted, now))
 	for i := range claims {
-		records = append(records, b.outboxRecordLocked(claims[i].Sequence, "claim", claims[i].ID, "claim_issued", now))
+		records = append(records, b.outboxRecordLocked(claims[i].Sequence, "claim", claims[i].ID, string(DeltaActionClaimPosted), now))
 	}
 	return records
 }
@@ -2486,7 +2486,7 @@ func (b *ClaimsBoard) outboxRecordsForSubmitTestamentsLocked(action Action, test
 	records = append(records, b.outboxRecordLocked(action.Sequence, "action", action.ID, walEventActionPosted, now))
 	for i := range testaments {
 		t := testaments[i]
-		records = append(records, b.outboxRecordLocked(t.Sequence, "testament", t.ID, walEventTestamentSubmitted, now))
+		records = append(records, b.outboxRecordLocked(t.Sequence, "testament", t.ID, string(DeltaActionTestamentPosted), now))
 		for _, a := range t.Artifacts {
 			if a == nil {
 				continue

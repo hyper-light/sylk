@@ -137,7 +137,7 @@ func newBusBackedBoard(t *testing.T, bus DeltaBus) *ClaimsBoard {
 	})
 }
 
-func TestIntegration_PostActionEmitsInboxDelta(t *testing.T) {
+func TestIntegration_PostActionEmitsClaimPostedDelta(t *testing.T) {
 	bus := newCaptureBus()
 	board := newBusBackedBoard(t, bus)
 	err := board.PostAction(context.Background(),
@@ -153,24 +153,24 @@ func TestIntegration_PostActionEmitsInboxDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inbox := bus.filterPublishedByKind(DeltaKindInbox)
-	if len(inbox) != 1 {
-		t.Fatalf("expected 1 inbox delta, got %d", len(inbox))
+	topic := CanonicalAgentTypeTopic("sess", "eng", DeltaActionClaimPosted)
+	published := bus.filterPublishedByTopic(topic)
+	if len(published) != 1 {
+		t.Fatalf("expected 1 claim.posted delta, got %d", len(published))
 	}
-	d := inbox[0].delta.(InboxDelta)
-	if d.AgentID != "eng" {
-		t.Errorf("expected AgentID=eng, got %q", d.AgentID)
+	d := published[0].delta.(CanonicalDelta)
+	if !d.DeliveredTo("eng") {
+		t.Errorf("delivery missing eng: %+v", d.Delivery)
 	}
-	if d.IssuerAgentID != "inspector" {
-		t.Errorf("expected issuer=inspector, got %q", d.IssuerAgentID)
+	if d.Actor.RouteKey() != "inspector" {
+		t.Errorf("expected issuer=inspector, got %q", d.Actor.RouteKey())
 	}
-	wantTopic := InboxTopic("sess", "eng", RelationshipSubject, ActionTypeTask)
-	if inbox[0].topic != wantTopic {
-		t.Errorf("topic: got %q want %q", inbox[0].topic, wantTopic)
+	if published[0].topic != topic {
+		t.Errorf("topic: got %q want %q", published[0].topic, topic)
 	}
 }
 
-func TestIntegration_PostActionEmitsCanonicalClaimDirected(t *testing.T) {
+func TestIntegration_PostActionEmitsCanonicalClaimPosted(t *testing.T) {
 	bus := newCaptureBus()
 	board := newBusBackedBoard(t, bus)
 	err := board.PostAction(context.Background(),
@@ -195,13 +195,13 @@ func TestIntegration_PostActionEmitsCanonicalClaimDirected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agentTopic := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimDirected)
+	agentTopic := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimPosted)
 	published := bus.filterPublishedByTopic(agentTopic)
 	if len(published) != 1 {
-		t.Fatalf("expected 1 canonical directed delta on %s, got %d", agentTopic, len(published))
+		t.Fatalf("expected 1 canonical posted delta on %s, got %d", agentTopic, len(published))
 	}
 	d := published[0].delta.(CanonicalDelta)
-	if d.Action != DeltaActionClaimDirected {
+	if d.Action != DeltaActionClaimPosted {
 		t.Fatalf("action: %s", d.Action)
 	}
 	if d.RefID("claim", RelatedTypeClaim) == "" {
@@ -210,7 +210,7 @@ func TestIntegration_PostActionEmitsCanonicalClaimDirected(t *testing.T) {
 	if !d.DeliveredTo("librarian") {
 		t.Fatalf("delivery missing librarian: %+v", d.Delivery)
 	}
-	boardTopic := CanonicalBoardTopic("sess", board.BoardID(), DeltaActionClaimDirected)
+	boardTopic := CanonicalBoardTopic("sess", board.BoardID(), DeltaActionClaimPosted)
 	if got := bus.filterPublishedByTopic(boardTopic); len(got) != 1 {
 		t.Fatalf("expected board topic mirror on %s, got %d", boardTopic, len(got))
 	}
@@ -224,7 +224,7 @@ func TestIntegration_PostActionEmitsCanonicalClaimDirected(t *testing.T) {
 	}
 }
 
-func TestIntegration_PostActionRoutesCanonicalDirectedByResolvedUID(t *testing.T) {
+func TestIntegration_PostActionRoutesCanonicalPostedByResolvedUID(t *testing.T) {
 	bus := newCaptureBus()
 	resolver := AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (AgentRef, bool) {
 		if sessionID == "sess" && agentID == "librarian" {
@@ -274,7 +274,7 @@ func TestIntegration_PostActionRoutesCanonicalDirectedByResolvedUID(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	uidTopic := CanonicalAgentTopic("sess", "uid-librarian", DeltaActionClaimDirected)
+	uidTopic := CanonicalAgentTopic("sess", "uid-librarian", DeltaActionClaimPosted)
 	published := bus.filterPublishedByTopic(uidTopic)
 	if len(published) != 1 {
 		t.Fatalf("expected UID topic %s, got %d", uidTopic, len(published))
@@ -286,12 +286,12 @@ func TestIntegration_PostActionRoutesCanonicalDirectedByResolvedUID(t *testing.T
 	if d.Delivery == nil || len(d.Delivery.To) != 1 || d.Delivery.To[0].UID != "uid-librarian" {
 		t.Fatalf("delivery not resolved: %+v", d.Delivery)
 	}
-	if got := bus.filterPublishedByTopic(CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimDirected)); len(got) != 0 {
+	if got := bus.filterPublishedByTopic(CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimPosted)); len(got) != 0 {
 		t.Fatalf("resolved route also emitted degraded type topic: %d", len(got))
 	}
 }
 
-func TestCanonicalDeltaProjector_ReplaysClaimDirectedWithStableKey(t *testing.T) {
+func TestCanonicalDeltaProjector_ReplaysClaimPostedWithStableKey(t *testing.T) {
 	directBus := newCaptureBus()
 	board := newBusBackedBoard(t, directBus)
 	err := board.PostAction(context.Background(),
@@ -308,7 +308,7 @@ func TestCanonicalDeltaProjector_ReplaysClaimDirectedWithStableKey(t *testing.T)
 		t.Fatal(err)
 	}
 	claim := board.Projection().Claims[0]
-	topic := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimDirected)
+	topic := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimPosted)
 	direct := directBus.filterPublishedByTopic(topic)
 	if len(direct) != 1 {
 		t.Fatalf("direct canonical delta missing on %s", topic)
@@ -321,7 +321,7 @@ func TestCanonicalDeltaProjector_ReplaysClaimDirectedWithStableKey(t *testing.T)
 		Sequence:     claim.Sequence,
 		EntityType:   "claim",
 		EntityID:     claim.ID,
-		MutationKind: "claim_issued",
+		MutationKind: string(DeltaActionClaimPosted),
 		CreatedAt:    claim.Created,
 	}
 	if err := NewCanonicalDeltaProjector(replayBus, nil).Project(context.Background(), &record, board); err != nil {
@@ -341,7 +341,7 @@ func TestCanonicalDeltaProjector_ReplaysClaimDirectedWithStableKey(t *testing.T)
 	}
 }
 
-func TestIntegration_SystemInternalActionDoesNotEmitCanonicalDirected(t *testing.T) {
+func TestIntegration_SystemInternalActionDoesNotEmitCanonicalPosted(t *testing.T) {
 	bus := newCaptureBus()
 	board := newBusBackedBoard(t, bus)
 	err := board.PostAction(context.Background(),
@@ -356,8 +356,8 @@ func TestIntegration_SystemInternalActionDoesNotEmitCanonicalDirected(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := bus.filterPublishedByKind(string(DeltaActionClaimDirected)); len(got) != 0 {
-		t.Fatalf("system internal emitted canonical directed deltas: %d", len(got))
+	if got := bus.filterPublishedByKind(string(DeltaActionClaimPosted)); len(got) != 0 {
+		t.Fatalf("system internal emitted canonical posted deltas: %d", len(got))
 	}
 }
 
@@ -394,16 +394,16 @@ func TestIntegration_SubmitTestamentsEmitsTestamentDelta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	testaments := bus.filterPublishedByKind(DeltaKindTestament)
+	testaments := bus.filterPublishedByTopic(CanonicalClaimTopic("sess", claimID, DeltaActionTestamentPosted))
 	if len(testaments) != 1 {
-		t.Fatalf("expected 1 testament delta, got %d", len(testaments))
+		t.Fatalf("expected 1 testament posted delta, got %d", len(testaments))
 	}
-	d := testaments[0].delta.(TestamentDelta)
-	if d.Verdict != TestamentVerdictWorkComplete {
-		t.Errorf("expected work_complete, got %q", d.Verdict)
+	d := testaments[0].delta.(CanonicalDelta)
+	if d.Action != DeltaActionTestamentPosted {
+		t.Errorf("expected testament.posted, got %q", d.Action)
 	}
-	if d.IssuerAgentID != "inspector" {
-		t.Errorf("issuer: %q", d.IssuerAgentID)
+	if !d.DeliveredTo("inspector") {
+		t.Errorf("issuer delivery missing: %+v", d.Delivery)
 	}
 }
 
@@ -443,7 +443,7 @@ func TestIntegration_SubmitTestamentsEmitsCanonicalTestamentValidationAndTransit
 	if err != nil {
 		t.Fatal(err)
 	}
-	testamentTopic := CanonicalClaimTopic("sess", claimID, DeltaActionTestamentSubmitted)
+	testamentTopic := CanonicalClaimTopic("sess", claimID, DeltaActionTestamentPosted)
 	if got := bus.filterPublishedByTopic(testamentTopic); len(got) != 1 {
 		t.Fatalf("canonical testament on claim topic count = %d", len(got))
 	} else {
@@ -461,9 +461,9 @@ func TestIntegration_SubmitTestamentsEmitsCanonicalTestamentValidationAndTransit
 	if got := bus.filterPublishedByTopic(CanonicalClaimTopic("sess", claimID, DeltaActionValidationEvaluated)); len(got) != 1 {
 		t.Fatalf("canonical claim validation topic count = %d", len(got))
 	}
-	transitions := bus.filterPublishedByKind(string(DeltaActionClaimTransitioned))
-	if len(transitions) != 4 {
-		t.Fatalf("expected testified and accepted transitions on claim+board topics, got %d", len(transitions))
+	transitions := bus.filterPublishedByKind(string(DeltaActionClaimSatisfied))
+	if len(transitions) != 2 {
+		t.Fatalf("expected satisfied transition on claim+board topics, got %d", len(transitions))
 	}
 	var accepted bool
 	for _, transition := range transitions {
@@ -533,13 +533,13 @@ func TestIntegration_RejectClaimEmitsStatusDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statuses := bus.filterPublishedByKind(DeltaKindClaimStatus)
-	if len(statuses) != 1 {
-		t.Fatalf("expected 1 claim_status delta, got %d", len(statuses))
+	statuses := bus.filterPublishedByKind(string(DeltaActionClaimValidationFailed))
+	if len(statuses) != 2 {
+		t.Fatalf("expected claim.validation_failed on claim+board topics, got %d", len(statuses))
 	}
-	d := statuses[0].delta.(ClaimStatusDelta)
-	if d.ToStatus != ClaimStatusRejected {
-		t.Errorf("to_status: %q", d.ToStatus)
+	d := statuses[0].delta.(CanonicalDelta)
+	if d.ClaimToStatus() != ClaimStatusRejected {
+		t.Errorf("to_status: %q", d.ClaimToStatus())
 	}
 }
 

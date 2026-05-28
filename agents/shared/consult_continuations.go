@@ -854,7 +854,7 @@ func (s *ContinuationStore) fireDeadline(continuationID string) bool {
 		}
 		pending.resolved[id] = (&AwaitedClaimResult{
 			ClaimID:      id,
-			Action:       claims.DeltaActionTestamentSubmitted,
+			Action:       claims.DeltaActionClaimValidationErrored,
 			Status:       claims.ConsultStatusTimeout,
 			ErrorMessage: "consult deadline elapsed",
 			EmittedAt:    now,

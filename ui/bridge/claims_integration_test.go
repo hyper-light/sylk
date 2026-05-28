@@ -1788,7 +1788,7 @@ func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing
 	drainBridge(t, prog, "canonical terminal setup")
 
 	delta := claims.NewCanonicalDelta(
-		claims.DeltaActionClaimTransitioned,
+		claims.DeltaActionClaimSatisfied,
 		"ses-canonical-terminal-peer",
 		board.BoardID(),
 		board.HighWaterSequence()+1,
@@ -1797,11 +1797,12 @@ func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing
 		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: consultClaimID}},
 		nil,
 		map[string]any{"claim": map[string]any{
-			"id":          consultClaimID,
-			"action":      string(claims.ActionTypeConsultation),
-			"from_status": string(claims.ClaimStatusTestified),
-			"to_status":   string(claims.ClaimStatusAccepted),
-			"reason":      "canonical terminal",
+			"id":               consultClaimID,
+			"action":           string(claims.ActionTypeConsultation),
+			"from_status":      string(claims.ClaimStatusTestified),
+			"to_status":        string(claims.ClaimStatusAccepted),
+			"lifecycle_status": string(claims.ClaimLifecycleSatisfied),
+			"reason":           "canonical terminal",
 		}},
 	)
 	br.handleCanonicalClaimsEntry("ses-canonical-terminal-peer", board, nil, delta)

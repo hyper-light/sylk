@@ -131,11 +131,18 @@ func DeltaClass(d Delta) InboxClass {
 
 func canonicalDeltaClass(delta CanonicalDelta) InboxClass {
 	switch delta.Action {
-	case DeltaActionClaimDirected:
+	case DeltaActionClaimPosted:
 		return inboxDeltaClass(delta.ClaimActionType())
-	case DeltaActionClaimTransitioned:
+	case DeltaActionClaimValidationFailed,
+		DeltaActionClaimValidationIncomplete,
+		DeltaActionClaimValidationErrored,
+		DeltaActionClaimPostFailed,
+		DeltaActionClaimReceiptFailed,
+		DeltaActionClaimProgressFailed,
+		DeltaActionClaimTestamentGenerationFailed,
+		DeltaActionClaimTestamentAcknowledgementFailed:
 		return claimStatusClass(delta.ClaimToStatus())
-	case DeltaActionTestamentSubmitted, DeltaActionValidationEvaluated, DeltaActionClaimProgressed:
+	case DeltaActionTestamentPosted, DeltaActionValidationEvaluated, DeltaActionClaimProgressed:
 		return InboxClassObservation
 	default:
 		return InboxClassObservation
@@ -237,8 +244,8 @@ func InboxPatternsFor(role ClaimsRole, sessionID, agentID string) []string {
 	out := make([]string, 0, len(activationTypes)+4)
 	if role.Has(RoleSubject) {
 		out = append(out,
-			CanonicalAgentActionPattern(sessionID, agentID, DeltaActionClaimDirected),
-			CanonicalAgentTypeActionPattern(sessionID, agentID, DeltaActionClaimDirected),
+			CanonicalAgentActionPattern(sessionID, agentID, DeltaActionClaimPosted),
+			CanonicalAgentTypeActionPattern(sessionID, agentID, DeltaActionClaimPosted),
 		)
 		// RoleSubject subscribes to N narrow patterns — one per
 		// legitimate activation action type — instead of the broad
@@ -254,18 +261,20 @@ func InboxPatternsFor(role ClaimsRole, sessionID, agentID string) []string {
 		}
 	}
 	if role.Has(RoleAuditor) {
-		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentSubmitted))
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentPosted))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusTestified))
 	}
 	if role.Has(RolePhaseObserver) {
 		out = append(out, PhasePattern(sessionID))
 	}
 	if role.Has(RoleRemediator) {
-		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionClaimTransitioned))
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionClaimValidationFailed))
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionClaimValidationIncomplete))
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionClaimValidationErrored))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusRejected))
 	}
 	if role.Has(RoleArchivist) {
-		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentSubmitted))
+		out = append(out, CanonicalClaimActionPattern(sessionID, "*", DeltaActionTestamentPosted))
 		out = append(out, ClaimStatusPattern(sessionID, ClaimStatusTestified))
 	}
 	if role.Has(RoleObserver) {
@@ -655,8 +664,12 @@ func expectationTopics(sessionID string, e *Expectation) []string {
 	switch strings.TrimSpace(e.ExpectedDelta) {
 	case DeltaKindTestament:
 		return []string{
-			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionTestamentSubmitted),
-			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimTransitioned),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionTestamentPosted),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimTestamentAcknowledged),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimSatisfied),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationIncomplete),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationFailed),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationErrored),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusAccepted),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusRejected),
@@ -670,7 +683,10 @@ func expectationTopics(sessionID string, e *Expectation) []string {
 		}
 	case DeltaKindClaimStatus:
 		return []string{
-			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimTransitioned),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimSatisfied),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationIncomplete),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationFailed),
+			CanonicalClaimTopic(sessionID, e.ClaimID, DeltaActionClaimValidationErrored),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusTestified),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusAccepted),
 			ClaimStatusTopic(sessionID, e.ClaimID, ClaimStatusRejected),
@@ -866,7 +882,7 @@ func deltaDedupKey(d Delta) string {
 func canonicalSemanticDedupKey(delta CanonicalDelta) string {
 	claimID := delta.ClaimID()
 	switch delta.Action {
-	case DeltaActionClaimDirected:
+	case DeltaActionClaimPosted:
 		directed := ""
 		relationship := ""
 		if delta.Delivery != nil {
@@ -876,12 +892,10 @@ func canonicalSemanticDedupKey(delta CanonicalDelta) string {
 			}
 		}
 		return inboxDeltaKey(claimID, directed, relationship)
-	case DeltaActionTestamentSubmitted:
+	case DeltaActionTestamentPosted, DeltaActionTestamentReceived, DeltaActionTestamentValidated, DeltaActionTestamentValidationIncomplete, DeltaActionTestamentValidationFailed:
 		return DeltaKindTestament + "|" + delta.TestamentID()
 	case DeltaActionValidationEvaluated:
 		return DeltaKindValidation + "|" + delta.ValidationID()
-	case DeltaActionClaimTransitioned:
-		return DeltaKindClaimStatus + "|" + claimID + "|" + string(delta.ClaimToStatus())
 	default:
 		if key := strings.TrimSpace(delta.Key); key != "" {
 			return key
@@ -900,11 +914,11 @@ func deltaMatchesExpectation(d Delta, expected string) bool {
 	}
 	switch expected {
 	case DeltaKindTestament:
-		if d.DeltaKind() == string(DeltaActionTestamentSubmitted) {
+		if d.DeltaKind() == string(DeltaActionTestamentPosted) {
 			return true
 		}
-		if d.DeltaKind() == string(DeltaActionClaimTransitioned) {
-			return claimTransitionDeltaResolvesExpectation(d)
+		if canonicalClaimLifecycleDeltaResolvesExpectation(d) {
+			return true
 		}
 		if d.DeltaKind() == DeltaKindClaimStatus {
 			return claimStatusDeltaResolvesExpectation(d)
@@ -913,21 +927,26 @@ func deltaMatchesExpectation(d Delta, expected string) bool {
 	case DeltaKindValidation:
 		return d.DeltaKind() == string(DeltaActionValidationEvaluated)
 	case DeltaKindClaimStatus:
-		return d.DeltaKind() == string(DeltaActionClaimTransitioned)
+		return canonicalClaimLifecycleDeltaResolvesExpectation(d)
 	default:
 		return false
 	}
 }
 
-func claimTransitionDeltaResolvesExpectation(d Delta) bool {
+func canonicalClaimLifecycleDeltaResolvesExpectation(d Delta) bool {
 	switch delta := d.(type) {
 	case CanonicalDelta:
-		return claimStatusResolvesExpectation(delta.ClaimToStatus())
+		return claimLifecycleResolvesExpectation(delta)
 	case *CanonicalDelta:
-		return delta != nil && claimStatusResolvesExpectation(delta.ClaimToStatus())
+		return delta != nil && claimLifecycleResolvesExpectation(*delta)
 	default:
 		return false
 	}
+}
+
+func claimLifecycleResolvesExpectation(delta CanonicalDelta) bool {
+	status, ok := delta.ClaimLifecycleStatus()
+	return ok && claimLifecycleStatusResolvesExpectation(status)
 }
 
 func claimStatusDeltaResolvesExpectation(d Delta) bool {
@@ -943,6 +962,21 @@ func claimStatusDeltaResolvesExpectation(d Delta) bool {
 
 func claimStatusResolvesExpectation(status ClaimStatus) bool {
 	return status == ClaimStatusTestified || status.IsTerminal()
+}
+
+func claimLifecycleStatusResolvesExpectation(status ClaimLifecycleStatus) bool {
+	switch status {
+	case ClaimLifecycleTestamentAcknowledged,
+		ClaimLifecycleSatisfied,
+		ClaimLifecycleValidationIncomplete,
+		ClaimLifecycleValidationFailed,
+		ClaimLifecycleValidationErrored,
+		ClaimLifecycleTestamentGenerationFailed,
+		ClaimLifecycleTestamentAcknowledgementFailed:
+		return true
+	default:
+		return false
+	}
 }
 
 const orphanInboxDeltaMaxAge = 10 * time.Minute
@@ -1048,12 +1082,10 @@ func canonicalDeltaMayResolveFutureExpectation(delta CanonicalDelta) bool {
 		return false
 	}
 	switch delta.Action {
-	case DeltaActionTestamentSubmitted, DeltaActionValidationEvaluated:
+	case DeltaActionTestamentPosted, DeltaActionValidationEvaluated:
 		return true
-	case DeltaActionClaimTransitioned:
-		return claimStatusResolvesExpectation(delta.ClaimToStatus())
 	default:
-		return false
+		return claimLifecycleResolvesExpectation(delta)
 	}
 }
 
@@ -1174,7 +1206,7 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 		role = RoleSubject
 	}
 	switch delta.Action {
-	case DeltaActionClaimDirected:
+	case DeltaActionClaimPosted:
 		if IsSystemInternalAction(delta.ClaimActionType()) {
 			return false
 		}
@@ -1182,17 +1214,36 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 			return true
 		}
 		return role.Has(RoleSubject) && delta.DeliveredTo(i.agentID)
-	case DeltaActionTestamentSubmitted:
+	case DeltaActionTestamentPosted:
 		if IsSystemInternalAction(delta.ClaimActionType()) {
 			return false
 		}
 		return role.Has(RoleAuditor) || role.Has(RoleArchivist) || role.Has(RoleObserver)
-	case DeltaActionClaimTransitioned:
+	case DeltaActionClaimValidationFailed, DeltaActionClaimValidationIncomplete, DeltaActionClaimValidationErrored:
 		if IsSystemInternalAction(delta.ClaimActionType()) {
 			return false
 		}
 		return claimStatusMatchesRole(role, delta.ClaimToStatus()) || role.Has(RoleObserver)
-	case DeltaActionValidationEvaluated, DeltaActionClaimProgressed:
+	case DeltaActionClaimGenerated,
+		DeltaActionClaimReceived,
+		DeltaActionClaimProgressed,
+		DeltaActionClaimTestamentGenerated,
+		DeltaActionClaimTestamentAcknowledged,
+		DeltaActionClaimValidating,
+		DeltaActionClaimSatisfied,
+		DeltaActionClaimGenerationFailed,
+		DeltaActionClaimPostFailed,
+		DeltaActionClaimReceiptFailed,
+		DeltaActionClaimProgressFailed,
+		DeltaActionClaimTestamentGenerationFailed,
+		DeltaActionClaimTestamentAcknowledgementFailed,
+		DeltaActionTestamentGenerated,
+		DeltaActionTestamentReceived,
+		DeltaActionTestamentValidating,
+		DeltaActionTestamentValidationIncomplete,
+		DeltaActionTestamentValidationFailed,
+		DeltaActionTestamentValidated,
+		DeltaActionValidationEvaluated:
 		return role.Has(RoleObserver)
 	default:
 		return false
@@ -1413,15 +1464,32 @@ func derivePriority(d Delta) WorkUnitPriority {
 
 func canonicalPriority(delta CanonicalDelta) WorkUnitPriority {
 	switch delta.Action {
-	case DeltaActionClaimDirected:
+	case DeltaActionClaimPosted:
 		return inboxDeltaPriority(delta.ClaimActionType())
-	case DeltaActionTestamentSubmitted:
+	case DeltaActionTestamentPosted, DeltaActionTestamentReceived, DeltaActionTestamentValidated:
 		return PriorityResponse
 	case DeltaActionValidationEvaluated:
 		return PriorityEvaluation
-	case DeltaActionClaimTransitioned:
+	case DeltaActionClaimSatisfied,
+		DeltaActionClaimValidationIncomplete,
+		DeltaActionClaimValidationFailed,
+		DeltaActionClaimValidationErrored,
+		DeltaActionClaimPostFailed,
+		DeltaActionClaimReceiptFailed,
+		DeltaActionClaimProgressFailed,
+		DeltaActionClaimTestamentGenerationFailed,
+		DeltaActionClaimTestamentAcknowledgementFailed:
 		return claimStatusPriority(delta.ClaimToStatus())
-	case DeltaActionClaimProgressed:
+	case DeltaActionClaimGenerated,
+		DeltaActionClaimReceived,
+		DeltaActionClaimProgressed,
+		DeltaActionClaimTestamentGenerated,
+		DeltaActionClaimTestamentAcknowledged,
+		DeltaActionClaimValidating,
+		DeltaActionTestamentGenerated,
+		DeltaActionTestamentValidating,
+		DeltaActionTestamentValidationIncomplete,
+		DeltaActionTestamentValidationFailed:
 		return PriorityAdvisory
 	default:
 		return PriorityAdvisory

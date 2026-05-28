@@ -305,8 +305,8 @@ func TestInboxPatternsFor_RoleSubject_NarrowedToActivationTypes(t *testing.T) {
 	if len(patterns) != want {
 		t.Fatalf("RoleSubject patterns count = %d, want %d (activation + canonical)", len(patterns), want)
 	}
-	canonicalUID := CanonicalAgentActionPattern("sess", "architect", DeltaActionClaimDirected)
-	canonicalType := CanonicalAgentTypeActionPattern("sess", "architect", DeltaActionClaimDirected)
+	canonicalUID := CanonicalAgentActionPattern("sess", "architect", DeltaActionClaimPosted)
+	canonicalType := CanonicalAgentTypeActionPattern("sess", "architect", DeltaActionClaimPosted)
 	// Every activation type's pattern must be present.
 	for _, ty := range activation {
 		want := AgentInboxActionPattern("sess", "architect", RelationshipSubject, ty)

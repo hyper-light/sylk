@@ -279,7 +279,7 @@ func TestConsultPeerSkill_TicketModeUsesClaimContinuation(t *testing.T) {
 	store.DeliverClaimResult(context.Background(), &AwaitedClaimResult{
 		SessionID:        sessionID,
 		ClaimID:          consultID,
-		Action:           claims.DeltaActionTestamentSubmitted,
+		Action:           claims.DeltaActionTestamentPosted,
 		Status:           claims.ConsultStatusCompleted,
 		ResponderAgentID: "librarian",
 		EmittedAt:        time.Now().UTC(),

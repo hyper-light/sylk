@@ -21,12 +21,67 @@ const DeltaSchemaV1 = "sylk.claims.delta.v1"
 type DeltaAction string
 
 const (
-	DeltaActionClaimDirected       DeltaAction = "claim.directed"
-	DeltaActionClaimProgressed     DeltaAction = "claim.progressed"
-	DeltaActionTestamentSubmitted  DeltaAction = "testament.submitted"
+	DeltaActionClaimGenerated                      DeltaAction = "claim.generated"
+	DeltaActionClaimGenerationFailed               DeltaAction = "claim.generation_failed"
+	DeltaActionClaimPosted                         DeltaAction = "claim.posted"
+	DeltaActionClaimPostFailed                     DeltaAction = "claim.post_failed"
+	DeltaActionClaimReceived                       DeltaAction = "claim.received"
+	DeltaActionClaimReceiptFailed                  DeltaAction = "claim.receipt_failed"
+	DeltaActionClaimProgressed                     DeltaAction = "claim.progressed"
+	DeltaActionClaimProgressFailed                 DeltaAction = "claim.progress_failed"
+	DeltaActionClaimTestamentGenerated             DeltaAction = "claim.testament_generated"
+	DeltaActionClaimTestamentGenerationFailed      DeltaAction = "claim.testament_generation_failed"
+	DeltaActionClaimTestamentAcknowledged          DeltaAction = "claim.testament_acknowledged"
+	DeltaActionClaimTestamentAcknowledgementFailed DeltaAction = "claim.testament_acknowledgement_failed"
+	DeltaActionClaimValidating                     DeltaAction = "claim.validating"
+	DeltaActionClaimSatisfied                      DeltaAction = "claim.satisfied"
+	DeltaActionClaimValidationIncomplete           DeltaAction = "claim.validation_incomplete"
+	DeltaActionClaimValidationFailed               DeltaAction = "claim.validation_failed"
+	DeltaActionClaimValidationErrored              DeltaAction = "claim.validation_errored"
+
+	DeltaActionTestamentGenerated            DeltaAction = "testament.generated"
+	DeltaActionTestamentPosted               DeltaAction = "testament.posted"
+	DeltaActionTestamentReceived             DeltaAction = "testament.received"
+	DeltaActionTestamentValidating           DeltaAction = "testament.validating"
+	DeltaActionTestamentValidationIncomplete DeltaAction = "testament.validation_incomplete"
+	DeltaActionTestamentValidationFailed     DeltaAction = "testament.validation_failed"
+	DeltaActionTestamentValidated            DeltaAction = "testament.validated"
+
 	DeltaActionValidationEvaluated DeltaAction = "validation.evaluated"
-	DeltaActionClaimTransitioned   DeltaAction = "claim.transitioned"
 )
+
+var claimLifecycleDeltaActions = map[ClaimLifecycleStatus]DeltaAction{
+	ClaimLifecycleGenerated:                      DeltaActionClaimGenerated,
+	ClaimLifecycleGenerationFailed:               DeltaActionClaimGenerationFailed,
+	ClaimLifecyclePosted:                         DeltaActionClaimPosted,
+	ClaimLifecyclePostFailed:                     DeltaActionClaimPostFailed,
+	ClaimLifecycleReceived:                       DeltaActionClaimReceived,
+	ClaimLifecycleReceiptFailed:                  DeltaActionClaimReceiptFailed,
+	ClaimLifecycleProgressed:                     DeltaActionClaimProgressed,
+	ClaimLifecycleProgressFailed:                 DeltaActionClaimProgressFailed,
+	ClaimLifecycleTestamentGenerated:             DeltaActionClaimTestamentGenerated,
+	ClaimLifecycleTestamentGenerationFailed:      DeltaActionClaimTestamentGenerationFailed,
+	ClaimLifecycleTestamentAcknowledged:          DeltaActionClaimTestamentAcknowledged,
+	ClaimLifecycleTestamentAcknowledgementFailed: DeltaActionClaimTestamentAcknowledgementFailed,
+	ClaimLifecycleValidating:                     DeltaActionClaimValidating,
+	ClaimLifecycleSatisfied:                      DeltaActionClaimSatisfied,
+	ClaimLifecycleValidationIncomplete:           DeltaActionClaimValidationIncomplete,
+	ClaimLifecycleValidationFailed:               DeltaActionClaimValidationFailed,
+	ClaimLifecycleValidationErrored:              DeltaActionClaimValidationErrored,
+}
+
+var testamentLifecycleDeltaActions = map[TestamentLifecycleStatus]DeltaAction{
+	TestamentLifecycleGenerated:            DeltaActionTestamentGenerated,
+	TestamentLifecyclePosted:               DeltaActionTestamentPosted,
+	TestamentLifecycleReceived:             DeltaActionTestamentReceived,
+	TestamentLifecycleValidating:           DeltaActionTestamentValidating,
+	TestamentLifecycleValidationIncomplete: DeltaActionTestamentValidationIncomplete,
+	TestamentLifecycleValidationFailed:     DeltaActionTestamentValidationFailed,
+	TestamentLifecycleValidated:            DeltaActionTestamentValidated,
+}
+
+var deltaActionClaimLifecycleStatuses = invertClaimLifecycleDeltaActions()
+var deltaActionTestamentLifecycleStatuses = invertTestamentLifecycleDeltaActions()
 
 // CanonicalDelta is the immutable envelope emitted after a board
 // mutation commits. It intentionally has no top-level JSON "kind";
@@ -124,9 +179,9 @@ func validateCanonicalDelta(d CanonicalDelta, strict bool) error {
 			return fmt.Errorf("refs[%d]: %w", idx, err)
 		}
 	}
-	if d.Action == DeltaActionClaimDirected {
+	if d.Action == DeltaActionClaimPosted || d.Action == DeltaActionTestamentPosted {
 		if d.Delivery == nil || len(d.Delivery.To) == 0 {
-			return fmt.Errorf("claim.directed requires delivery.to")
+			return fmt.Errorf("%s requires delivery.to", d.Action)
 		}
 	}
 	if d.Delivery != nil {
@@ -138,12 +193,14 @@ func validateCanonicalDelta(d CanonicalDelta, strict bool) error {
 }
 
 func KnownDeltaAction(action DeltaAction) bool {
+	if _, ok := deltaActionClaimLifecycleStatuses[action]; ok {
+		return true
+	}
+	if _, ok := deltaActionTestamentLifecycleStatuses[action]; ok {
+		return true
+	}
 	switch action {
-	case DeltaActionClaimDirected,
-		DeltaActionClaimProgressed,
-		DeltaActionTestamentSubmitted,
-		DeltaActionValidationEvaluated,
-		DeltaActionClaimTransitioned:
+	case DeltaActionValidationEvaluated:
 		return true
 	default:
 		return false
@@ -151,26 +208,90 @@ func KnownDeltaAction(action DeltaAction) bool {
 }
 
 func KnownDeltaActions() []DeltaAction {
-	return []DeltaAction{
-		DeltaActionClaimDirected,
-		DeltaActionClaimProgressed,
-		DeltaActionTestamentSubmitted,
-		DeltaActionValidationEvaluated,
-		DeltaActionClaimTransitioned,
+	out := make([]DeltaAction, 0, len(claimLifecycleDeltaActions)+len(testamentLifecycleDeltaActions)+1)
+	for _, status := range KnownClaimLifecycleStatuses() {
+		if action, ok := ClaimLifecycleDeltaAction(status); ok {
+			out = append(out, action)
+		}
 	}
+	for _, status := range KnownTestamentLifecycleStatuses() {
+		if action, ok := TestamentLifecycleDeltaAction(status); ok {
+			out = append(out, action)
+		}
+	}
+	out = append(out, DeltaActionValidationEvaluated)
+	return out
 }
 
 // DeltaActionMayCompleteExpectedWork reports whether a canonical
 // action can satisfy an expectation registered by an issuing agent.
-// Progress and directed-work notifications are deliberately false:
+// Generated, posted claim, and progress notifications are deliberately false:
 // they are narration/routing, never terminal peer-work completion.
 func DeltaActionMayCompleteExpectedWork(action DeltaAction) bool {
 	switch action {
-	case DeltaActionTestamentSubmitted, DeltaActionValidationEvaluated, DeltaActionClaimTransitioned:
+	case DeltaActionTestamentPosted,
+		DeltaActionTestamentReceived,
+		DeltaActionTestamentValidated,
+		DeltaActionTestamentValidationIncomplete,
+		DeltaActionTestamentValidationFailed,
+		DeltaActionClaimTestamentAcknowledged,
+		DeltaActionClaimSatisfied,
+		DeltaActionClaimValidationIncomplete,
+		DeltaActionClaimValidationFailed,
+		DeltaActionClaimValidationErrored,
+		DeltaActionValidationEvaluated:
 		return true
 	default:
 		return false
 	}
+}
+
+func ClaimLifecycleDeltaAction(status ClaimLifecycleStatus) (DeltaAction, bool) {
+	action, ok := claimLifecycleDeltaActions[status]
+	return action, ok
+}
+
+func TestamentLifecycleDeltaAction(status TestamentLifecycleStatus) (DeltaAction, bool) {
+	action, ok := testamentLifecycleDeltaActions[status]
+	return action, ok
+}
+
+func DeltaActionClaimLifecycleStatus(action DeltaAction) (ClaimLifecycleStatus, bool) {
+	status, ok := deltaActionClaimLifecycleStatuses[action]
+	return status, ok
+}
+
+func DeltaActionTestamentLifecycleStatus(action DeltaAction) (TestamentLifecycleStatus, bool) {
+	status, ok := deltaActionTestamentLifecycleStatuses[action]
+	return status, ok
+}
+
+func DeltaActionStartsClaimWork(action DeltaAction) bool {
+	return action == DeltaActionClaimPosted
+}
+
+func DeltaActionIsGenerated(action DeltaAction) bool {
+	return action == DeltaActionClaimGenerated || action == DeltaActionTestamentGenerated
+}
+
+func DeltaActionIsProgressOnly(action DeltaAction) bool {
+	return action == DeltaActionClaimProgressed
+}
+
+func invertClaimLifecycleDeltaActions() map[DeltaAction]ClaimLifecycleStatus {
+	out := make(map[DeltaAction]ClaimLifecycleStatus, len(claimLifecycleDeltaActions))
+	for status, action := range claimLifecycleDeltaActions {
+		out[action] = status
+	}
+	return out
+}
+
+func invertTestamentLifecycleDeltaActions() map[DeltaAction]TestamentLifecycleStatus {
+	out := make(map[DeltaAction]TestamentLifecycleStatus, len(testamentLifecycleDeltaActions))
+	for status, action := range testamentLifecycleDeltaActions {
+		out[action] = status
+	}
+	return out
 }
 
 func BuildCanonicalDeltaKey(action DeltaAction, sessionID, boardID string, refs []DeltaRef, delivery *DeltaDelivery) string {
@@ -456,6 +577,9 @@ func (d CanonicalDelta) ClaimActionType() ActionType {
 }
 
 func (d CanonicalDelta) ClaimToStatus() ClaimStatus {
+	if lifecycle, ok := d.ClaimLifecycleStatus(); ok {
+		return claimLifecycleCoarseStatus(lifecycle)
+	}
 	claim, ok := d.Context["claim"].(map[string]any)
 	if !ok {
 		return ""
@@ -467,6 +591,61 @@ func (d CanonicalDelta) ClaimToStatus() ClaimStatus {
 		return ClaimStatus(status)
 	}
 	return ""
+}
+
+func (d CanonicalDelta) ClaimLifecycleStatus() (ClaimLifecycleStatus, bool) {
+	if status, ok := DeltaActionClaimLifecycleStatus(d.Action); ok {
+		return status, true
+	}
+	claim, ok := d.Context["claim"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	if status, _ := claim["lifecycle_status"].(string); strings.TrimSpace(status) != "" {
+		lifecycle := ClaimLifecycleStatus(strings.TrimSpace(status))
+		return lifecycle, lifecycle.Valid()
+	}
+	return "", false
+}
+
+func (d CanonicalDelta) TestamentLifecycleStatus() (TestamentLifecycleStatus, bool) {
+	if status, ok := DeltaActionTestamentLifecycleStatus(d.Action); ok {
+		return status, true
+	}
+	testament, ok := d.Context["testament"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	if status, _ := testament["lifecycle_status"].(string); strings.TrimSpace(status) != "" {
+		lifecycle := TestamentLifecycleStatus(strings.TrimSpace(status))
+		return lifecycle, lifecycle.Valid()
+	}
+	return "", false
+}
+
+func claimLifecycleCoarseStatus(status ClaimLifecycleStatus) ClaimStatus {
+	switch status {
+	case ClaimLifecycleGenerated, ClaimLifecyclePosted:
+		return ClaimStatusPending
+	case ClaimLifecycleReceived, ClaimLifecycleProgressed:
+		return ClaimStatusInProgress
+	case ClaimLifecycleTestamentGenerated, ClaimLifecycleTestamentAcknowledged, ClaimLifecycleValidating:
+		return ClaimStatusTestified
+	case ClaimLifecycleSatisfied:
+		return ClaimStatusAccepted
+	case ClaimLifecycleGenerationFailed,
+		ClaimLifecyclePostFailed,
+		ClaimLifecycleReceiptFailed,
+		ClaimLifecycleProgressFailed,
+		ClaimLifecycleTestamentGenerationFailed,
+		ClaimLifecycleTestamentAcknowledgementFailed,
+		ClaimLifecycleValidationIncomplete,
+		ClaimLifecycleValidationFailed,
+		ClaimLifecycleValidationErrored:
+		return ClaimStatusRejected
+	default:
+		return ""
+	}
 }
 
 func (d CanonicalDelta) DeliveredTo(agentID string) bool {

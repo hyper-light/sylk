@@ -10,6 +10,86 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
+func TestClaimsIntakeAcknowledgesClaimPostedBeforeProcessing(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-intake-receipt",
+		SessionID: "sess-intake-receipt",
+		TaskID:    "task-intake-receipt",
+	})
+	if err := board.PostAction(context.Background(), claims.Action{Type: claims.ActionTypeTask, AgentID: "architect"}, []claims.Claim{{
+		Title:       "Do work",
+		Description: "Perform the work",
+		Relations: []claims.Relation{
+			{Related: "librarian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	entry := &claims.GraphEntryPoint{Delta: claims.NewCanonicalDelta(
+		claims.DeltaActionClaimPosted,
+		"sess-intake-receipt",
+		board.BoardID(),
+		2,
+		time.Now(),
+		claims.DegradedAgentRef("architect", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: claimID}},
+		&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef("librarian", "test")}, Relationship: claims.RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(claims.ActionTypeTask), "lifecycle_status": string(claims.ClaimLifecyclePosted)}},
+	)}
+	if !acknowledgeLifecycleReceipt(ClaimsIntakeConfig{AgentID: "librarian", SessionID: "sess-intake-receipt", Board: board}, claims.RoleSubject, entry) {
+		t.Fatal("receipt acknowledgement rejected valid receiver")
+	}
+	stored, ok := board.CloneClaim(claimID)
+	if !ok {
+		t.Fatalf("claim %q not found", claimID)
+	}
+	if stored.LifecycleStatus != claims.ClaimLifecycleReceived {
+		t.Fatalf("lifecycle = %q, want %q", stored.LifecycleStatus, claims.ClaimLifecycleReceived)
+	}
+}
+
+func TestClaimsIntakeReceiptFailureStopsProcessing(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-intake-receipt-failed",
+		SessionID: "sess-intake-receipt-failed",
+		TaskID:    "task-intake-receipt-failed",
+	})
+	if err := board.PostAction(context.Background(), claims.Action{Type: claims.ActionTypeTask, AgentID: "architect"}, []claims.Claim{{
+		Title:       "Do work",
+		Description: "Perform the work",
+		Relations: []claims.Relation{
+			{Related: "librarian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	entry := &claims.GraphEntryPoint{Delta: claims.NewCanonicalDelta(
+		claims.DeltaActionClaimPosted,
+		"sess-intake-receipt-failed",
+		board.BoardID(),
+		2,
+		time.Now(),
+		claims.DegradedAgentRef("architect", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: claimID}},
+		&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef("librarian", "test")}, Relationship: claims.RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(claims.ActionTypeTask), "lifecycle_status": string(claims.ClaimLifecyclePosted)}},
+	)}
+	if acknowledgeLifecycleReceipt(ClaimsIntakeConfig{AgentID: "architect", SessionID: "sess-intake-receipt-failed", Board: board}, claims.RoleSubject, entry) {
+		t.Fatal("receipt acknowledgement accepted mismatched receiver")
+	}
+	stored, ok := board.CloneClaim(claimID)
+	if !ok {
+		t.Fatalf("claim %q not found", claimID)
+	}
+	if stored.LifecycleStatus != claims.ClaimLifecycleReceiptFailed {
+		t.Fatalf("lifecycle = %q, want %q", stored.LifecycleStatus, claims.ClaimLifecycleReceiptFailed)
+	}
+}
+
 func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 		BoardID:   "board-intake-consult",
@@ -136,7 +216,7 @@ func TestClaimsIntakeExpectedCanonicalConsultTestamentDeliversContinuation(t *te
 	}
 
 	delta := claims.NewCanonicalDelta(
-		claims.DeltaActionTestamentSubmitted,
+		claims.DeltaActionTestamentPosted,
 		"sess-intake-canonical-consult",
 		"board-intake-canonical-consult",
 		2,
@@ -146,7 +226,7 @@ func TestClaimsIntakeExpectedCanonicalConsultTestamentDeliversContinuation(t *te
 			{Role: "claim", Type: claims.RelatedTypeClaim, ID: "consult-123"},
 			{Role: "testament", Type: claims.RelatedTypeTestament, ID: "testament-1"},
 		},
-		nil,
+		&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef("architect-1", "test")}, Relationship: claims.RelationshipIssuer},
 		map[string]any{
 			"claim": map[string]any{
 				"id":     "consult-123",
@@ -217,7 +297,7 @@ func TestClaimsIntakeExpectedTerminalClaimDeliversContinuation(t *testing.T) {
 	}
 
 	delta := claims.NewCanonicalDelta(
-		claims.DeltaActionClaimTransitioned,
+		claims.DeltaActionClaimSatisfied,
 		"sess-intake-terminal-consult",
 		"board-intake-terminal-consult",
 		3,
@@ -227,11 +307,12 @@ func TestClaimsIntakeExpectedTerminalClaimDeliversContinuation(t *testing.T) {
 		nil,
 		map[string]any{
 			"claim": map[string]any{
-				"id":        "consult-terminal",
-				"action":    string(claims.ActionTypeConsultation),
-				"status":    string(claims.ClaimStatusAccepted),
-				"to_status": string(claims.ClaimStatusAccepted),
-				"context":   "receipt accepted",
+				"id":               "consult-terminal",
+				"action":           string(claims.ActionTypeConsultation),
+				"status":           string(claims.ClaimStatusAccepted),
+				"to_status":        string(claims.ClaimStatusAccepted),
+				"lifecycle_status": string(claims.ClaimLifecycleSatisfied),
+				"context":          "receipt accepted",
 			},
 		},
 	)
@@ -261,7 +342,7 @@ func TestClaimsIntakeExpectedTerminalClaimDeliversContinuation(t *testing.T) {
 	if got == nil {
 		t.Fatalf("results = %#v, want consult-terminal", resumed)
 	}
-	if got.Action != claims.DeltaActionClaimTransitioned || got.Status != claims.ConsultStatusCompleted {
+	if got.Action != claims.DeltaActionClaimSatisfied || got.Status != claims.ConsultStatusCompleted {
 		t.Fatalf("result = %#v", got)
 	}
 	if got.ResponseSummary != "receipt accepted" {

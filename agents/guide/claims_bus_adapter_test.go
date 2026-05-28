@@ -73,7 +73,7 @@ func TestClaimsBusAdapter_PublishSubscribeCanonicalRoundTrip(t *testing.T) {
 	adapter := NewClaimsBusAdapter(bus)
 
 	received := make(chan claims.Delta, 1)
-	topic := claims.CanonicalAgentTypeTopic("sess", "librarian", claims.DeltaActionClaimDirected)
+	topic := claims.CanonicalAgentTypeTopic("sess", "librarian", claims.DeltaActionClaimPosted)
 	sub, err := adapter.SubscribeDelta(topic, func(d claims.Delta) {
 		received <- d
 	})
@@ -83,7 +83,7 @@ func TestClaimsBusAdapter_PublishSubscribeCanonicalRoundTrip(t *testing.T) {
 	defer sub.Unsubscribe()
 
 	want := claims.NewCanonicalDelta(
-		claims.DeltaActionClaimDirected,
+		claims.DeltaActionClaimPosted,
 		"sess",
 		"board",
 		1,
@@ -106,7 +106,7 @@ func TestClaimsBusAdapter_PublishSubscribeCanonicalRoundTrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected CanonicalDelta, got %T", got)
 		}
-		if canonical.Action != claims.DeltaActionClaimDirected || canonical.ClaimID() != "c1" {
+		if canonical.Action != claims.DeltaActionClaimPosted || canonical.ClaimID() != "c1" {
 			t.Fatalf("unexpected canonical delta: %+v", canonical)
 		}
 	case <-time.After(2 * time.Second):

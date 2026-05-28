@@ -64,11 +64,13 @@ func resolveGraphNode(board *ClaimsBoard, d Delta) GraphNode {
 }
 
 func resolveCanonicalGraphNode(board *ClaimsBoard, delta CanonicalDelta) GraphNode {
-	switch delta.Action {
-	case DeltaActionClaimDirected, DeltaActionClaimProgressed, DeltaActionClaimTransitioned:
+	if _, ok := DeltaActionClaimLifecycleStatus(delta.Action); ok {
 		return resolveClaimNode(board, delta.ClaimID())
-	case DeltaActionTestamentSubmitted:
+	}
+	if _, ok := DeltaActionTestamentLifecycleStatus(delta.Action); ok {
 		return resolveTestamentNode(board, delta.TestamentID())
+	}
+	switch delta.Action {
 	case DeltaActionValidationEvaluated:
 		return resolveValidationNode(board, delta.ClaimID(), delta.ValidationID())
 	default:

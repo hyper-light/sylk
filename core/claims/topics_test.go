@@ -38,13 +38,13 @@ func TestPhaseTopic(t *testing.T) {
 }
 
 func TestCanonicalTopics(t *testing.T) {
-	if got, want := CanonicalAgentTopic("sess", "uid.1", DeltaActionClaimDirected), "claims.sess.agent.uid_1.claim_directed"; got != want {
+	if got, want := CanonicalAgentTopic("sess", "uid.1", DeltaActionClaimPosted), "claims.sess.agent.uid_1.claim_posted"; got != want {
 		t.Fatalf("agent topic got %q want %q", got, want)
 	}
-	if got, want := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimDirected), "claims.sess.agent_type.librarian.claim_directed"; got != want {
+	if got, want := CanonicalAgentTypeTopic("sess", "librarian", DeltaActionClaimPosted), "claims.sess.agent_type.librarian.claim_posted"; got != want {
 		t.Fatalf("agent type topic got %q want %q", got, want)
 	}
-	if got, want := CanonicalClaimTopic("sess", "c1", DeltaActionTestamentSubmitted), "claims.sess.claim.c1.testament_submitted"; got != want {
+	if got, want := CanonicalClaimTopic("sess", "c1", DeltaActionTestamentPosted), "claims.sess.claim.c1.testament_posted"; got != want {
 		t.Fatalf("claim topic got %q want %q", got, want)
 	}
 	if got, want := CanonicalValidationTopic("sess", "v1", DeltaActionValidationEvaluated), "claims.sess.validation.v1.validation_evaluated"; got != want {
@@ -56,10 +56,10 @@ func TestCanonicalTopics(t *testing.T) {
 }
 
 func TestCanonicalPatterns(t *testing.T) {
-	if got, want := CanonicalAgentActionPattern("sess", "uid", DeltaActionClaimDirected), "claims.sess.agent.uid.claim_directed"; got != want {
+	if got, want := CanonicalAgentActionPattern("sess", "uid", DeltaActionClaimPosted), "claims.sess.agent.uid.claim_posted"; got != want {
 		t.Fatalf("agent pattern got %q want %q", got, want)
 	}
-	if got, want := CanonicalClaimActionPattern("sess", "*", DeltaActionTestamentSubmitted), "claims.sess.claim.*.testament_submitted"; got != want {
+	if got, want := CanonicalClaimActionPattern("sess", "*", DeltaActionTestamentPosted), "claims.sess.claim.*.testament_posted"; got != want {
 		t.Fatalf("claim pattern got %q want %q", got, want)
 	}
 	if got, want := CanonicalSessionPattern("sess"), "claims.sess.*.*.*"; got != want {

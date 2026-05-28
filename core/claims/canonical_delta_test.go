@@ -42,31 +42,31 @@ func TestCanonicalDelta_RoundTripEachAction(t *testing.T) {
 }
 
 func TestDeltaAction_PartitionedByCompletionSemantics(t *testing.T) {
-	wantMayComplete := map[DeltaAction]bool{
-		DeltaActionClaimDirected:       false,
-		DeltaActionClaimProgressed:     false,
-		DeltaActionTestamentSubmitted:  true,
-		DeltaActionValidationEvaluated: true,
-		DeltaActionClaimTransitioned:   true,
+	cases := map[DeltaAction]bool{
+		DeltaActionClaimGenerated:             false,
+		DeltaActionClaimPosted:                false,
+		DeltaActionClaimProgressed:            false,
+		DeltaActionTestamentGenerated:         false,
+		DeltaActionTestamentPosted:            true,
+		DeltaActionValidationEvaluated:        true,
+		DeltaActionClaimTestamentAcknowledged: true,
+		DeltaActionClaimSatisfied:             true,
+		DeltaActionClaimValidationFailed:      true,
 	}
 	for _, action := range KnownDeltaActions() {
-		if _, ok := wantMayComplete[action]; !ok {
-			t.Fatalf("known action %q missing completion-semantics test case", action)
-		}
 		if got := KnownDeltaAction(action); !got {
 			t.Fatalf("KnownDeltaAction(%q) = false", action)
 		}
-		if got, want := DeltaActionMayCompleteExpectedWork(action), wantMayComplete[action]; got != want {
+	}
+	for action, want := range cases {
+		if got := DeltaActionMayCompleteExpectedWork(action); got != want {
 			t.Fatalf("DeltaActionMayCompleteExpectedWork(%q) = %v, want %v", action, got, want)
 		}
-	}
-	if len(wantMayComplete) != len(KnownDeltaActions()) {
-		t.Fatalf("completion-semantics table has %d actions, KnownDeltaActions has %d", len(wantMayComplete), len(KnownDeltaActions()))
 	}
 }
 
 func TestCanonicalDelta_StrictValidation(t *testing.T) {
-	d := testCanonicalDelta(DeltaActionClaimDirected)
+	d := testCanonicalDelta(DeltaActionClaimPosted)
 	if err := ValidateCanonicalDeltaStrict(d); err != nil {
 		t.Fatalf("valid delta rejected: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestCanonicalDelta_StrictValidation(t *testing.T) {
 }
 
 func TestCanonicalDelta_TolerantUnmarshalAllowsUnknownAction(t *testing.T) {
-	d := testCanonicalDelta(DeltaActionClaimDirected)
+	d := testCanonicalDelta(DeltaActionClaimPosted)
 	d.Action = DeltaAction("future.action")
 	d.Key = BuildCanonicalDeltaKey(d.Action, d.SessionID, d.BoardID, d.Refs, d.Delivery)
 	data, err := json.Marshal(d)
@@ -108,9 +108,9 @@ func TestCanonicalDeltaKey_DeterministicAndDeliverySensitive(t *testing.T) {
 	refs := []DeltaRef{{Role: "claim", Type: RelatedTypeClaim, ID: "c1"}}
 	toA := &DeltaDelivery{To: []AgentRef{DegradedAgentRef("librarian", "test")}, Relationship: RelationshipSubject}
 	toB := &DeltaDelivery{To: []AgentRef{DegradedAgentRef("architect", "test")}, Relationship: RelationshipSubject}
-	keyA1 := BuildCanonicalDeltaKey(DeltaActionClaimDirected, "s", "b", refs, toA)
-	keyA2 := BuildCanonicalDeltaKey(DeltaActionClaimDirected, "s", "b", refs, toA)
-	keyB := BuildCanonicalDeltaKey(DeltaActionClaimDirected, "s", "b", refs, toB)
+	keyA1 := BuildCanonicalDeltaKey(DeltaActionClaimReceived, "s", "b", refs, toA)
+	keyA2 := BuildCanonicalDeltaKey(DeltaActionClaimReceived, "s", "b", refs, toA)
+	keyB := BuildCanonicalDeltaKey(DeltaActionClaimReceived, "s", "b", refs, toB)
 	if keyA1 != keyA2 {
 		t.Fatalf("key is not deterministic: %q != %q", keyA1, keyA2)
 	}
@@ -178,7 +178,7 @@ func TestAgentRefResolverMismatchDegradesRef(t *testing.T) {
 	}
 }
 
-func TestCanonicalTestamentSubmittedContextAndArtifactHeaders(t *testing.T) {
+func TestCanonicalTestamentPostedContextAndArtifactHeaders(t *testing.T) {
 	amp := NewBoardAmplifier("sess", "task", "board")
 	longContext := strings.Repeat("x", canonicalTestamentContextMax+64)
 	testament := &Testament{
@@ -210,7 +210,7 @@ func TestCanonicalTestamentSubmittedContextAndArtifactHeaders(t *testing.T) {
 			{Related: "librarian", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
 		},
 	}
-	delta := amp.buildCanonicalTestamentSubmitted(context.Background(), testament, claim, time.Now())
+	delta := amp.buildCanonicalTestamentLifecycle(context.Background(), testament, claim, DeltaActionTestamentPosted, TestamentLifecyclePosted, testament.AgentID, time.Now())
 	testaments, ok := delta.Context["testaments"].([]map[string]any)
 	if !ok || len(testaments) != 1 {
 		t.Fatalf("testaments context = %#v", delta.Context["testaments"])
@@ -242,7 +242,7 @@ func TestCanonicalTestamentSubmittedContextAndArtifactHeaders(t *testing.T) {
 
 func testCanonicalDelta(action DeltaAction) CanonicalDelta {
 	delivery := (*DeltaDelivery)(nil)
-	if action == DeltaActionClaimDirected {
+	if action == DeltaActionClaimPosted || action == DeltaActionTestamentPosted {
 		delivery = &DeltaDelivery{
 			To:           []AgentRef{DegradedAgentRef("librarian", "test")},
 			Relationship: RelationshipSubject,

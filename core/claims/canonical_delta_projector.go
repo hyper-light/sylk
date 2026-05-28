@@ -50,6 +50,31 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 		return nil
 	}
 	occurredAt := firstNonZeroTime(record.CreatedAt, time.Now().UTC())
+	if status, ok := DeltaActionClaimLifecycleStatus(DeltaAction(record.MutationKind)); ok {
+		claim, ok := board.CloneClaim(record.EntityID)
+		if !ok || IsSystemInternalAction(claim.ActionType) {
+			return nil
+		}
+		action := actionForClaimRecord(board, claim)
+		actorID := firstNonEmpty(latestClaimLifecycleChange(claim).AgentID, IssuerAgentID(claim.Relations), claim.AgentID)
+		return a.buildClaimLifecycleDeltas(ctx, action, claim, status, actorID, occurredAt)
+	}
+	if status, ok := DeltaActionTestamentLifecycleStatus(DeltaAction(record.MutationKind)); ok {
+		testament, ok := board.CloneTestament(record.EntityID)
+		if !ok {
+			return nil
+		}
+		claim, _ := board.CloneClaim(ClaimIDFromRelations(testament.Relations))
+		if claim != nil && IsSystemInternalAction(claim.ActionType) {
+			return nil
+		}
+		actorID := firstNonEmpty(latestTestamentLifecycleChange(testament).AgentID, testament.AgentID)
+		dispatches := a.buildTestamentLifecycleDeltas(ctx, testament, claim, status, actorID, occurredAt)
+		if status == TestamentLifecyclePosted && claim != nil && claim.LifecycleStatus != "" {
+			dispatches = append(dispatches, a.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(board, claim), claim, claim.LifecycleStatus, actorID, occurredAt)...)
+		}
+		return dispatches
+	}
 	switch record.MutationKind {
 	case "claim_issued":
 		claim, ok := board.CloneClaim(record.EntityID)
@@ -57,7 +82,7 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 			return nil
 		}
 		action := actionForClaimRecord(board, claim)
-		return a.buildClaimDirectedDeltas(ctx, action, claim, occurredAt)
+		return a.buildClaimLifecycleDeltas(ctx, action, claim, ClaimLifecyclePosted, firstNonEmpty(IssuerAgentID(claim.Relations), claim.AgentID), occurredAt)
 	case walEventClaimUpdated:
 		claim, ok := board.CloneClaim(record.EntityID)
 		if !ok || IsSystemInternalAction(claim.ActionType) {
@@ -80,10 +105,7 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 		if !ok || IsSystemInternalAction(claim.ActionType) {
 			return nil
 		}
-		return []canonicalDispatch{{
-			topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionTestamentSubmitted),
-			delta: a.buildCanonicalTestamentSubmitted(ctx, testament, claim, occurredAt),
-		}}
+		return a.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecyclePosted, testament.AgentID, occurredAt)
 	case walEventValidationEvaluated:
 		validation, claim, ok := board.CloneValidation(record.EntityID)
 		if !ok || IsSystemInternalAction(claim.ActionType) {
@@ -106,28 +128,11 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 		if !ok || IsSystemInternalAction(claim.ActionType) {
 			return nil
 		}
-		change := latestClaimChange(claim)
-		if change.To == "" {
+		lifecycle := claim.LifecycleStatus
+		if lifecycle == "" {
 			return nil
 		}
-		statusDelta := ClaimStatusDelta{
-			SessionID:      record.SessionID,
-			BoardID:        record.BoardID,
-			ClaimID:        claim.ID,
-			Sequence:       claim.Sequence,
-			EmittedAt:      occurredAt,
-			ActionKind:     claim.ActionType,
-			FromStatus:     ClaimStatus(change.From),
-			ToStatus:       ClaimStatus(change.To),
-			Reason:         change.Reason,
-			AgentID:        change.AgentID,
-			SubjectAgentID: SubjectAgentID(claim.Relations),
-			IssuerAgentID:  IssuerAgentID(claim.Relations),
-		}
-		return []canonicalDispatch{{
-			topic: CanonicalClaimTopic(a.sessionID, claim.ID, DeltaActionClaimTransitioned),
-			delta: a.buildCanonicalClaimTransitioned(ctx, statusDelta),
-		}}
+		return a.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(board, claim), claim, lifecycle, firstNonEmpty(latestClaimLifecycleChange(claim).AgentID, claim.AgentID), occurredAt)
 	default:
 		return nil
 	}
@@ -165,9 +170,10 @@ func (a *BoardAmplifier) buildCanonicalClaimProgressed(ctx context.Context, clai
 		nil,
 		map[string]any{
 			"claim": map[string]any{
-				"id":     claim.ID,
-				"action": string(claim.ActionType),
-				"status": string(claim.Status),
+				"id":               claim.ID,
+				"action":           string(claim.ActionType),
+				"status":           string(claim.Status),
+				"lifecycle_status": string(ClaimLifecycleProgressed),
 			},
 			"progress": map[string]any{
 				"state":      string(claim.Status),
@@ -183,6 +189,20 @@ func latestClaimChange(claim *Claim) StatusChange {
 		return StatusChange{}
 	}
 	return claim.StatusHistory[len(claim.StatusHistory)-1]
+}
+
+func latestClaimLifecycleChange(claim *Claim) StatusChange {
+	if claim == nil || len(claim.LifecycleHistory) == 0 {
+		return StatusChange{}
+	}
+	return claim.LifecycleHistory[len(claim.LifecycleHistory)-1]
+}
+
+func latestTestamentLifecycleChange(testament *Testament) StatusChange {
+	if testament == nil || len(testament.LifecycleHistory) == 0 {
+		return StatusChange{}
+	}
+	return testament.LifecycleHistory[len(testament.LifecycleHistory)-1]
 }
 
 func latestValidationChange(validation *Validation) StatusChange {
