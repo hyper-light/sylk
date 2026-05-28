@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -134,8 +135,8 @@ func TestGenerateClaimActionDoesNotWakeTargetUntilPosted(t *testing.T) {
 	if stored.LifecycleStatus != ClaimLifecycleGenerated {
 		t.Fatalf("claim lifecycle = %q, want generated", stored.LifecycleStatus)
 	}
-	if len(bus.Published()) != 0 {
-		t.Fatalf("generated claim published bus deltas: %+v", bus.Published())
+	if got := bus.filterPublishedByKind(string(DeltaActionClaimPosted)); len(got) != 0 {
+		t.Fatalf("generated claim published actionable claim.posted deltas: %+v", got)
 	}
 	env := PullWork(PullWorkConfig{AgentID: "engineer-b", Board: board})
 	if env == nil {
@@ -408,7 +409,12 @@ func TestRecordClaimLifecycleFailureCreatesStructuredErrorArtifact(t *testing.T)
 func TestGeneratedTestamentPostsBeforeClaimResolution(t *testing.T) {
 	board := testBoard()
 	ctx := context.Background()
-	if err := board.PostAction(ctx, Action{AgentID: "architect", Type: ActionTypeConsultation}, []Claim{lifecycleReceiptClaim("claim-consult")}); err != nil {
+	inputClaim := lifecycleReceiptClaim("claim-consult")
+	inputClaim.Relations = []Relation{
+		{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+		{Related: "librarian", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+	}
+	if err := board.PostAction(ctx, Action{AgentID: "architect", Type: ActionTypeConsultation}, []Claim{inputClaim}); err != nil {
 		t.Fatal(err)
 	}
 	generated, err := board.GenerateTestamentAction(ctx, Action{AgentID: "librarian", Type: ActionTypeTestament}, []Testament{{
@@ -432,15 +438,34 @@ func TestGeneratedTestamentPostsBeforeClaimResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim, _ = board.CloneClaim("claim-consult")
-	if claim.Status != ClaimStatusAccepted {
-		t.Fatalf("claim status after posted testament = %q, want accepted", claim.Status)
+	if claim.Status != ClaimStatusTestified {
+		t.Fatalf("claim status after posted testament = %q, want testified", claim.Status)
 	}
-	if claim.LifecycleStatus != ClaimLifecycleSatisfied {
-		t.Fatalf("claim lifecycle after posted testament = %q, want satisfied", claim.LifecycleStatus)
+	if claim.LifecycleStatus != ClaimLifecycleTestamentGenerated {
+		t.Fatalf("claim lifecycle after posted testament = %q, want testament_generated", claim.LifecycleStatus)
+	}
+	if claim.Validations[0].Status != ValidationStatusPending {
+		t.Fatalf("receipt validation after posted testament = %q, want pending", claim.Validations[0].Status)
 	}
 	testament, _ := board.CloneTestament("testament-consult")
 	if testament.LifecycleStatus != TestamentLifecyclePosted {
 		t.Fatalf("testament lifecycle = %q, want posted", testament.LifecycleStatus)
+	}
+	if err := board.AcknowledgeTestamentReceipt(ctx, "testament-consult", "architect"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.BeginTestamentValidation(ctx, "testament-consult", "architect"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.EvaluateValidation(ctx, "claim-consult", "claim-consult-receipt", StatusChange{AgentID: "architect", To: string(ValidationStatusPassed), Reason: "receipt observed"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.CompleteTestamentValidation(ctx, "testament-consult", "architect", TestamentLifecycleValidated, "receipt passed"); err != nil {
+		t.Fatal(err)
+	}
+	claim, _ = board.CloneClaim("claim-consult")
+	if claim.LifecycleStatus != ClaimLifecycleSatisfied {
+		t.Fatalf("claim lifecycle after validation = %q, want satisfied", claim.LifecycleStatus)
 	}
 }
 
@@ -476,6 +501,78 @@ func TestGeneratedTestamentValidatesActionAndArtifactHeaders(t *testing.T) {
 				t.Fatal("expected validation error")
 			}
 		})
+	}
+}
+
+func TestGeneratedTestamentRequiresExistingClaimUnlessStandalone(t *testing.T) {
+	board := testBoard()
+	ctx := context.Background()
+	testament := Testament{
+		ID:        "orphan-testament",
+		AgentID:   "librarian",
+		Summary:   "answer",
+		Relations: []Relation{{Related: "missing-claim", RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim}},
+		Artifacts: []*Artifact{{Kind: "response_text", Reference: "answer"}},
+	}
+	if _, err := board.GenerateTestamentAction(ctx, Action{AgentID: "librarian", Type: ActionTypeTestament}, []Testament{testament}, GenerateTestamentActionOptions{}); err == nil {
+		t.Fatal("expected generated testament with missing claim relation to fail")
+	}
+	standalone := testament
+	standalone.ID = "standalone-testament"
+	standalone.Relations = nil
+	if _, err := board.GenerateTestamentAction(ctx, Action{AgentID: "librarian", Type: ActionTypeTestament}, []Testament{standalone}, GenerateTestamentActionOptions{AllowStandalone: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLifecycleTransitionErrorsAreTyped(t *testing.T) {
+	board := testBoard()
+	ctx := context.Background()
+	if _, err := board.GenerateClaimAction(ctx, Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{lifecycleTestClaim("typed-transition", "Typed transition")}, GenerateClaimActionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	err := board.AcknowledgeClaimReceipt(ctx, "typed-transition", "engineer-b")
+	var transitionErr *LifecycleTransitionError
+	if !errors.As(err, &transitionErr) {
+		t.Fatalf("error = %T %[1]v, want LifecycleTransitionError", err)
+	}
+	if transitionErr.EntityType != RelatedTypeClaim || transitionErr.From != string(ClaimLifecycleGenerated) || transitionErr.To != string(ClaimLifecycleReceived) {
+		t.Fatalf("unexpected transition error payload: %+v", transitionErr)
+	}
+}
+
+func TestReceiptAcknowledgementRequiresCanonicalReceiverWhenResolverConfigured(t *testing.T) {
+	resolver := AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (AgentRef, bool) {
+		if sessionID != "ses-canonical" {
+			return AgentRef{}, false
+		}
+		switch agentID {
+		case "architect":
+			return AgentRef{UID: "uid-architect", Type: "architect", Name: "architect"}.Normalized(), true
+		case "engineer-alias", "engineer-canonical":
+			return AgentRef{UID: "uid-engineer", Type: "engineer", Name: agentID}.Normalized(), true
+		default:
+			return AgentRef{}, false
+		}
+	})
+	board := NewClaimsBoard(ClaimsBoardConfig{
+		BoardID:          "board-canonical-receipt",
+		SessionID:        "ses-canonical",
+		TaskID:           "task-canonical",
+		AgentRefResolver: resolver,
+	})
+	claim := lifecyclePeerClaim("canonical-receipt", "Canonical receipt", "architect", "engineer-alias")
+	if _, err := board.GenerateClaimAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{claim}, GenerateClaimActionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.PostGeneratedClaim(context.Background(), "canonical-receipt", "architect", ClaimPostOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.AcknowledgeClaimReceipt(context.Background(), "canonical-receipt", "engineer-b"); err == nil {
+		t.Fatal("expected unresolved raw receiver to fail when canonical resolver is configured")
+	}
+	if err := board.AcknowledgeClaimReceipt(context.Background(), "canonical-receipt", "engineer-canonical"); err != nil {
+		t.Fatal(err)
 	}
 }
 

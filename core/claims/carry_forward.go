@@ -408,6 +408,9 @@ func CarryForward(ctx context.Context, board *ClaimsBoard, opts CarryForwardOpti
 	if err := board.PostGeneratedTestament(ctx, generated.Testaments[0].ID, agentID, TestamentPostOptions{Reason: "continuity testament posted"}); err != nil {
 		return nil, err
 	}
+	if err := completeReceiptOnlyTestamentValidation(ctx, board, generated.Testaments[0].ID, agentID, "continuity receipt validated"); err != nil {
+		return nil, err
+	}
 	result.Mutated = true
 	if latest, ok := latestContinuityRecord(board, agentID, topic); ok {
 		result.TestamentID = latest.Testament.ID

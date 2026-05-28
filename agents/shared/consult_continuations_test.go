@@ -2,6 +2,8 @@ package shared
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -154,6 +156,90 @@ func TestAwaitClaimResultsSynchronouslyResolvesCanonicalResult(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("AwaitClaimResults did not return")
 	}
+}
+
+func TestContinuationStore_StopReleasesSynchronousWait(t *testing.T) {
+	board := testContinuationBoard("board-cont-stop-sync")
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-stop-sync",
+		Board:     board,
+	})
+	if store == nil {
+		t.Fatal("expected continuation store")
+	}
+
+	done := make(chan map[string]*AwaitedClaimResult, 1)
+	errs := make(chan error, 1)
+	go func() {
+		results, err := store.AwaitClaimResults(context.Background(), []string{"claim-stop"}, time.Now().Add(time.Hour))
+		if err != nil {
+			errs <- err
+			return
+		}
+		done <- results
+	}()
+
+	waitForContinuationPending(t, store)
+	store.Stop("operator interrupt")
+
+	select {
+	case err := <-errs:
+		t.Fatalf("AwaitClaimResults returned error: %v", err)
+	case results := <-done:
+		got := results["claim-stop"]
+		if got == nil {
+			t.Fatalf("results = %#v, want claim-stop cancellation", results)
+		}
+		if got.Status != claims.ConsultStatusCancelled {
+			t.Fatalf("status = %q, want cancelled", got.Status)
+		}
+		if !strings.Contains(got.ErrorMessage, "operator interrupt") {
+			t.Fatalf("error message = %q, want interrupt reason", got.ErrorMessage)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not release synchronous continuation wait")
+	}
+}
+
+func TestContinuationStore_OrphanResolutionsAreGloballyBounded(t *testing.T) {
+	board := testContinuationBoard("board-cont-orphan-bound")
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect",
+		SessionID: "sess-cont-orphan-bound",
+		Board:     board,
+	})
+	if store == nil {
+		t.Fatal("expected continuation store")
+	}
+	limit := store.orphanLimit
+	for i := range limit + continuationOrphanLimitMin {
+		store.DeliverClaimResult(context.Background(), &AwaitedClaimResult{
+			ClaimID: fmt.Sprintf("orphan-%d", i),
+			Status:  claims.ConsultStatusCompleted,
+		})
+	}
+	store.mu.Lock()
+	got := len(store.orphans)
+	store.mu.Unlock()
+	if got > limit {
+		t.Fatalf("orphan resolutions = %d, want <= %d", got, limit)
+	}
+}
+
+func waitForContinuationPending(t *testing.T, store *ContinuationStore) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		pending := len(store.pending)
+		store.mu.Unlock()
+		if pending > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("continuation wait was not registered")
 }
 
 func testContinuationBoard(id string) *claims.ClaimsBoard {

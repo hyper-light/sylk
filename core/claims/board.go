@@ -19,6 +19,7 @@ const (
 	defaultMaxIterations      = 3
 	subscriberNotifyTimeout   = 5 * time.Second
 	subscriberNotifyTaskLabel = "claims_board_notify"
+	notificationErrorLimit    = 256
 )
 
 // ClaimsBoard is the per-pipeline (or per-session) sovereign store that
@@ -89,8 +90,9 @@ type ClaimsBoard struct {
 	// next board query and can record them as testament error
 	// artifacts. Drained on read (projection) to prevent unbounded
 	// growth.
-	notificationErrors []string
-	projectionErrors   map[string]string
+	notificationErrors          []string
+	notificationErrorsTruncated uint64
+	projectionErrors            map[string]string
 
 	legacySessionNoWAL bool
 	rollout            RolloutConfig
@@ -889,6 +891,51 @@ type validationStatusTransition struct {
 	changed    time.Time
 }
 
+// recordClaimTestamentGeneratedLocked records the parent-claim effect of
+// posting a generated testament. It activates the response and moves the
+// parent claim to the "testament generated" lifecycle point, but it does
+// not run receipt validations or terminal claim resolution. Those are
+// separate receiver/evaluator commits in the lifecycle model.
+//
+// Caller holds b.mu (write-locked).
+func (b *ClaimsBoard) recordClaimTestamentGeneratedLocked(t *Testament, now time.Time) claimResolution {
+	claimRel := FindRelation(t.Relations, RelationshipClaim)
+	if claimRel == nil {
+		return claimResolution{}
+	}
+	c, ok := b.claims[claimRel.Related]
+	if !ok {
+		return claimResolution{}
+	}
+	var result claimResolution
+	if CanTransitionClaimLifecycle(c.LifecycleStatus, ClaimLifecycleTestamentGenerated) {
+		b.transitionClaimLifecycleLocked(c, ClaimLifecycleTestamentGenerated, t.AgentID, "testament posted", now)
+	}
+	if !c.Status.IsTerminal() && c.Status != ClaimStatusTestified {
+		prevStatus := c.Status
+		transition := claimStatusTransition{
+			from:    prevStatus,
+			to:      ClaimStatusTestified,
+			reason:  "testament posted",
+			agentID: t.AgentID,
+			changed: now,
+		}
+		c.StatusHistory = capStatusHistory(append(c.StatusHistory, StatusChange{
+			From:    string(prevStatus),
+			To:      string(ClaimStatusTestified),
+			Reason:  transition.reason,
+			AgentID: t.AgentID,
+			Changed: now,
+		}))
+		c.Status = ClaimStatusTestified
+		c.Accessed = now
+		b.adjustStatusCounter(prevStatus, ClaimStatusTestified)
+		result.transitions = append(result.transitions, transition)
+	}
+	result.claim = CloneClaimEntity(c)
+	return result
+}
+
 // resolveClaimForTestamentLocked returns the Claim referenced by the
 // testament's "claim" Relation and transitions it to Testified. Empty
 // when the relation is absent or the target claim no longer exists.
@@ -1658,6 +1705,7 @@ func (b *ClaimsBoard) Projection() *ClaimsBoardProjection {
 		b.mu.Lock()
 		p = b.projectionLocked()
 		b.notificationErrors = b.notificationErrors[:0]
+		b.notificationErrorsTruncated = 0
 		b.mu.Unlock()
 	}
 
@@ -1685,9 +1733,8 @@ func (b *ClaimsBoard) projectionLocked() *ClaimsBoardProjection {
 	b.populateActionsProjectionLocked(p)
 	b.populateTestamentsProjectionLocked(p)
 
-	if len(b.notificationErrors) > 0 {
-		p.NotificationErrors = make([]string, len(b.notificationErrors))
-		copy(p.NotificationErrors, b.notificationErrors)
+	if errors := b.notificationErrorsSnapshotLocked(); len(errors) > 0 {
+		p.NotificationErrors = errors
 	}
 
 	return p
@@ -2065,7 +2112,7 @@ func (b *ClaimsBoard) dispatchSubscriber(fn ClaimsBoardSubscriber, proj *ClaimsB
 // record them as testament error artifacts. Thread-safe.
 func (b *ClaimsBoard) RecordNotificationError(msg string) {
 	b.mu.Lock()
-	b.notificationErrors = append(b.notificationErrors, msg)
+	b.appendNotificationErrorLocked(msg)
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
 }
@@ -2083,7 +2130,7 @@ func (b *ClaimsBoard) RecordProjectionError(record ClaimsOutboxRecord, projector
 	}
 	if b.projectionErrors[key] != msg {
 		b.projectionErrors[key] = msg
-		b.notificationErrors = append(b.notificationErrors, msg)
+		b.appendNotificationErrorLocked(msg)
 		b.invalidateProjectionCache()
 		shouldSubmit = true
 	}
@@ -2111,6 +2158,42 @@ func (b *ClaimsBoard) RecordProjectionSuccess(record ClaimsOutboxRecord, project
 			projector, record.BoardID, record.Sequence, record.EntityType, record.EntityID)
 		b.submitProjectionDiagnostic(context.Background(), record, projector, ArtifactKindProjectionReceipt, msg, "")
 	}
+}
+
+func (b *ClaimsBoard) appendNotificationErrorLocked(msg string) {
+	if b == nil || msg == "" {
+		return
+	}
+	if len(b.notificationErrors) < notificationErrorLimit {
+		b.notificationErrors = append(b.notificationErrors, msg)
+		return
+	}
+	copy(b.notificationErrors, b.notificationErrors[1:])
+	b.notificationErrors[len(b.notificationErrors)-1] = msg
+	b.notificationErrorsTruncated++
+}
+
+func (b *ClaimsBoard) notificationErrorsSnapshotLocked() []string {
+	if b == nil {
+		return nil
+	}
+	total := len(b.notificationErrors)
+	if b.notificationErrorsTruncated > 0 {
+		total++
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]string, 0, total)
+	if b.notificationErrorsTruncated > 0 {
+		out = append(out, fmt.Sprintf(
+			"notification_errors_truncated dropped=%d retained=%d",
+			b.notificationErrorsTruncated,
+			len(b.notificationErrors),
+		))
+	}
+	out = append(out, b.notificationErrors...)
+	return out
 }
 
 // ── Read-path accessors used by pull_work / context queries ─────────

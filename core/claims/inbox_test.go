@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -899,6 +900,26 @@ func TestDedupLRU_TouchKeepsRecentEntries(t *testing.T) {
 	}
 	if _, ok := l.nodes["a"]; !ok {
 		t.Fatal("expected 'a' to be retained")
+	}
+}
+
+func TestInbox_OrphansAreGloballyBounded(t *testing.T) {
+	inbox, _ := NewClaimsInbox(InboxConfig{
+		AgentID:                 "architect",
+		SessionID:               "sess",
+		BusSubscriptionQueueCap: orphanInboxClaimLimitMin,
+	})
+	limit := inbox.orphanClaimLimitLocked()
+	for idx := 0; idx < limit+orphanInboxClaimLimitMin; idx++ {
+		claimID := fmt.Sprintf("claim-%d", idx)
+		testamentID := fmt.Sprintf("testament-%d", idx)
+		inbox.Ingest(canonicalTestamentPostedForInboxTest(claimID, testamentID, "architect", uint64(idx+1)))
+	}
+	inbox.mu.Lock()
+	got := len(inbox.orphans)
+	inbox.mu.Unlock()
+	if got > limit {
+		t.Fatalf("orphan claim buckets = %d, want <= %d", got, limit)
 	}
 }
 

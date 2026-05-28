@@ -860,7 +860,12 @@ func claimLifecycleStatusResolvesExpectation(status ClaimLifecycleStatus) bool {
 	}
 }
 
-const orphanInboxDeltaMaxAge = 10 * time.Minute
+const (
+	orphanInboxDeltaMaxAge       = 10 * time.Minute
+	orphanInboxClaimLimitMin     = 16
+	orphanInboxClaimLimitMax     = 1024
+	orphanInboxClaimLimitDivisor = 4
+)
 
 type orphanedInboxDelta struct {
 	delta     Delta
@@ -923,6 +928,7 @@ func (i *ClaimsInbox) stashOrphanIfResponseLocked(d Delta) {
 		kept = kept[len(kept)-capLimit:]
 	}
 	i.orphans[claimID] = kept
+	i.pruneOrphanClaimsLocked(now)
 }
 
 func (i *ClaimsInbox) orphanLimitLocked() int {
@@ -937,6 +943,79 @@ func (i *ClaimsInbox) orphanLimitLocked() int {
 		limit = 1024
 	}
 	return limit
+}
+
+func (i *ClaimsInbox) orphanClaimLimitLocked() int {
+	limit := i.queueCap / orphanInboxClaimLimitDivisor
+	if limit < orphanInboxClaimLimitMin {
+		return orphanInboxClaimLimitMin
+	}
+	if limit > orphanInboxClaimLimitMax {
+		return orphanInboxClaimLimitMax
+	}
+	return limit
+}
+
+func (i *ClaimsInbox) pruneOrphanClaimsLocked(now time.Time) {
+	i.pruneExpiredOrphanClaimsLocked(now)
+	for len(i.orphans) > i.orphanClaimLimitLocked() {
+		claimID := i.oldestOrphanClaimLocked()
+		if claimID == "" {
+			return
+		}
+		delete(i.orphans, claimID)
+	}
+}
+
+func (i *ClaimsInbox) pruneExpiredOrphanClaimsLocked(now time.Time) {
+	for claimID, list := range i.orphans {
+		kept := compactLiveOrphans(list, now)
+		if len(kept) == 0 {
+			delete(i.orphans, claimID)
+			continue
+		}
+		i.orphans[claimID] = kept
+	}
+}
+
+func compactLiveOrphans(list []orphanedInboxDelta, now time.Time) []orphanedInboxDelta {
+	kept := list[:0]
+	for _, orphan := range list {
+		if orphan.delta == nil || now.Sub(orphan.stashedAt) > orphanInboxDeltaMaxAge {
+			continue
+		}
+		kept = append(kept, orphan)
+	}
+	return kept
+}
+
+func (i *ClaimsInbox) oldestOrphanClaimLocked() string {
+	var oldestClaim string
+	var oldestAt time.Time
+	for claimID, list := range i.orphans {
+		at := oldestOrphanTime(list)
+		if at.IsZero() {
+			continue
+		}
+		if oldestAt.IsZero() || at.Before(oldestAt) {
+			oldestAt = at
+			oldestClaim = claimID
+		}
+	}
+	return oldestClaim
+}
+
+func oldestOrphanTime(list []orphanedInboxDelta) time.Time {
+	var oldest time.Time
+	for _, orphan := range list {
+		if orphan.delta == nil || orphan.stashedAt.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || orphan.stashedAt.Before(oldest) {
+			oldest = orphan.stashedAt
+		}
+	}
+	return oldest
 }
 
 func deltaMayResolveFutureExpectation(d Delta) bool {

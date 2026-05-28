@@ -48,6 +48,47 @@ const (
 	TestamentLifecycleValidated            TestamentLifecycleStatus = "validated"
 )
 
+// LifecycleTransitionError is returned when a caller requests a lifecycle
+// transition that is not legal for the entity's current state.
+type LifecycleTransitionError struct {
+	EntityType string
+	EntityID   string
+	From       string
+	To         string
+	Reason     string
+}
+
+func (e *LifecycleTransitionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "transition is not allowed"
+	}
+	return fmt.Sprintf("cannot transition %s %q lifecycle from %q to %q: %s", e.EntityType, e.EntityID, e.From, e.To, reason)
+}
+
+func newClaimLifecycleTransitionError(claimID string, from, to ClaimLifecycleStatus, reason string) error {
+	return &LifecycleTransitionError{
+		EntityType: RelatedTypeClaim,
+		EntityID:   strings.TrimSpace(claimID),
+		From:       string(from),
+		To:         string(to),
+		Reason:     strings.TrimSpace(reason),
+	}
+}
+
+func newTestamentLifecycleTransitionError(testamentID string, from, to TestamentLifecycleStatus, reason string) error {
+	return &LifecycleTransitionError{
+		EntityType: RelatedTypeTestament,
+		EntityID:   strings.TrimSpace(testamentID),
+		From:       string(from),
+		To:         string(to),
+		Reason:     strings.TrimSpace(reason),
+	}
+}
+
 func KnownClaimLifecycleStatuses() []ClaimLifecycleStatus {
 	return []ClaimLifecycleStatus{
 		ClaimLifecycleGenerated,

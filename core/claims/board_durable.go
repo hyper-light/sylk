@@ -35,6 +35,9 @@ const (
 	walEventClaimRejected                = "claim_rejected"
 	walEventPhaseTransition              = "phase_transition"
 	walEventBoardComplete                = "board_complete"
+
+	durableOutboxProjectBatchLimit = 128
+	walReplayErrorPreviewBytes     = 80
 )
 
 type walEvent struct {
@@ -160,6 +163,9 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 		return nil, fmt.Errorf("replay claims WAL: %w", err)
 	}
 	db.projectOutbox(context.Background())
+	if cfg.Scope == nil && cfg.DeltaBus != nil {
+		db.DrainOutbox(context.Background(), durableOutboxProjectBatchLimit)
+	}
 
 	return db, nil
 }
@@ -245,11 +251,11 @@ func (db *DurableBoard) appendEvent(kind, agentID string, payload any) (uint64, 
 
 	eventID := uuid.NewString()
 
-	// Dedup by EventID + content fingerprint. The EventID provides
-	// identity uniqueness; the content fingerprint provides collision
-	// resistance across replays where the same logical event could
-	// carry a different EventID (e.g., retry after partial write).
-	fingerprint := eventID + "\x1f" + walContentFingerprint(kind, payloadJSON)
+	// Dedup by logical event content. A process may retry the same
+	// committed lifecycle event with a fresh EventID after a partial
+	// append or restart; replay must still collapse it to one board
+	// mutation and one outbox record.
+	fingerprint := walContentFingerprint(kind, payloadJSON)
 	if existingSeq, ok := db.seen[fingerprint]; ok {
 		return existingSeq, time.Now().UTC(), nil
 	}
@@ -317,7 +323,7 @@ func (db *DurableBoard) projectOutbox(ctx context.Context) {
 	}
 	if err := db.board.scope.Go("claims_outbox_project", 30*time.Second, func(runCtx context.Context) error {
 		defer db.projectionScheduled.Store(false)
-		db.DrainOutbox(runCtx, 128)
+		db.DrainOutbox(runCtx, durableOutboxProjectBatchLimit)
 		return nil
 	}); err != nil {
 		db.projectionScheduled.Store(false)
@@ -427,6 +433,7 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	var seq uint64
 	var corruptEntries []string
+	var replayErrors []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -437,13 +444,13 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 		var event walEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			corruptEntries = append(corruptEntries, fmt.Sprintf(
-				"WAL seq %d: %s (prefix: %s)", seq, err.Error(), truncateForLog(line, 80),
+				"WAL seq %d: %s (prefix: %s)", seq, err.Error(), truncateForLog(line, walReplayErrorPreviewBytes),
 			))
 			continue
 		}
 		event.Sequence = seq
 
-		fp := event.EventID + "\x1f" + walContentFingerprint(event.Kind, event.Payload)
+		fp := walContentFingerprint(event.Kind, event.Payload)
 		if seq <= afterSeq {
 			db.seen[fp] = seq
 			continue
@@ -454,6 +461,9 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 		db.seen[fp] = seq
 
 		if err := db.applyEvent(&event); err != nil {
+			replayErrors = append(replayErrors, fmt.Sprintf(
+				"WAL seq %d kind %s: %s", seq, event.Kind, err.Error(),
+			))
 			continue
 		}
 	}
@@ -462,9 +472,14 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 	// Surface corruption as notification errors on the board so the
 	// first projection query exposes them to agents. Agents can then
 	// record them as testament error artifacts.
-	if len(corruptEntries) > 0 && db.board != nil {
+	if (len(corruptEntries) > 0 || len(replayErrors) > 0) && db.board != nil {
 		db.board.mu.Lock()
-		db.board.notificationErrors = append(db.board.notificationErrors, corruptEntries...)
+		for _, entry := range corruptEntries {
+			db.board.appendNotificationErrorLocked(entry)
+		}
+		for _, entry := range replayErrors {
+			db.board.appendNotificationErrorLocked(entry)
+		}
 		db.board.mu.Unlock()
 	}
 	if db.board != nil {
@@ -597,11 +612,15 @@ func (db *DurableBoard) applyClaimLifecycleTransition(event *walEvent) error {
 		db.board.testaments[t.ID] = t
 	}
 	for _, claimID := range payload.ClaimIDs {
-		if c, ok := db.board.claims[claimID]; ok {
-			db.board.transitionClaimLifecycleLocked(c, payload.To, payload.AgentID, payload.Reason, changed)
-			if payload.To.IsFailure() && !c.Status.IsTerminal() {
-				c.Status = ClaimStatusRejected
-			}
+		if _, ok := db.board.claims[claimID]; !ok {
+			return replayMissingReference("claim", claimID)
+		}
+	}
+	for _, claimID := range payload.ClaimIDs {
+		c := db.board.claims[claimID]
+		db.board.transitionClaimLifecycleLocked(c, payload.To, payload.AgentID, payload.Reason, changed)
+		if payload.To.IsFailure() && !c.Status.IsTerminal() {
+			c.Status = ClaimStatusRejected
 		}
 	}
 	return nil
@@ -619,7 +638,7 @@ func (db *DurableBoard) applyClaimUpdated(event *walEvent) error {
 	}
 	c, ok := db.board.claims[payload.ClaimID]
 	if !ok {
-		return nil
+		return replayMissingReference("claim", payload.ClaimID)
 	}
 	now := payload.Accessed
 	if now.IsZero() {
@@ -657,7 +676,7 @@ func (db *DurableBoard) applyClaimContextSet(event *walEvent) error {
 	}
 	c, ok := db.board.claims[payload.ClaimID]
 	if !ok {
-		return nil
+		return replayMissingReference("claim", payload.ClaimID)
 	}
 	c.Context = payload.Context
 	c.ContextTransition = payload.TransitionID
@@ -701,18 +720,22 @@ func (db *DurableBoard) applyTestamentLifecycleTransition(event *walEvent) error
 	}
 	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
 	for _, testamentID := range payload.TestamentIDs {
-		t, ok := db.board.testaments[testamentID]
-		if !ok {
-			continue
+		if _, ok := db.board.testaments[testamentID]; !ok {
+			return replayMissingReference("testament", testamentID)
 		}
+	}
+	for _, testamentID := range payload.TestamentIDs {
+		t := db.board.testaments[testamentID]
 		db.board.transitionTestamentLifecycleLocked(t, payload.To, payload.AgentID, payload.Reason, changed)
 		if payload.To == TestamentLifecyclePosted {
-			db.board.resolveClaimForTestamentLocked(t, changed)
+			db.board.recordClaimTestamentGeneratedLocked(t, changed)
 		}
 		if payload.To == TestamentLifecycleReceived {
 			if claimID := ClaimIDFromRelations(t.Relations); claimID != "" {
 				if c, found := db.board.claims[claimID]; found {
 					db.board.transitionClaimLifecycleLocked(c, ClaimLifecycleTestamentAcknowledged, payload.AgentID, "testament acknowledged", changed)
+				} else {
+					return replayMissingReference("claim", claimID)
 				}
 			}
 		}
@@ -733,7 +756,7 @@ func (db *DurableBoard) applyTestamentContextSet(event *walEvent) error {
 	}
 	t, ok := db.board.testaments[payload.TestamentID]
 	if !ok {
-		return nil
+		return replayMissingReference("testament", payload.TestamentID)
 	}
 	t.Context = payload.Context
 	t.ContextTransition = payload.TransitionID
@@ -793,7 +816,7 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 	}
 	c, ok := db.board.claims[payload.ClaimID]
 	if !ok {
-		return nil
+		return replayMissingReference("claim", payload.ClaimID)
 	}
 	var validation *Validation
 	for _, v := range c.Validations {
@@ -808,6 +831,9 @@ func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {
 			validation = v
 			break
 		}
+	}
+	if validation == nil {
+		return replayMissingReference("validation", payload.ValidationID)
 	}
 	accepted := c.AllValidationsPassed()
 	nextStatus, nextLifecycle, hasOutcome := validationClaimOutcome(c, validation, validationStatusOf(validation), accepted)
@@ -842,12 +868,14 @@ func (db *DurableBoard) applyClaimRejected(event *walEvent) error {
 		return err
 	}
 	b := db.board
-	if c, ok := b.claims[payload.ClaimID]; ok {
-		if payload.Change.To != "" {
-			c.StatusHistory = append(c.StatusHistory, payload.Change)
-		}
-		c.Status = ClaimStatusRejected
+	c, ok := b.claims[payload.ClaimID]
+	if !ok {
+		return replayMissingReference("claim", payload.ClaimID)
 	}
+	if payload.Change.To != "" {
+		c.StatusHistory = append(c.StatusHistory, payload.Change)
+	}
+	c.Status = ClaimStatusRejected
 	if payload.Action != nil {
 		b.actions[payload.Action.ID] = payload.Action
 	}
@@ -894,14 +922,18 @@ func (db *DurableBoard) applyPhaseTransition(event *walEvent) error {
 	return nil
 }
 
+func replayMissingReference(entityType, id string) error {
+	return fmt.Errorf("missing %s %q for replay event", entityType, id)
+}
+
 func (db *DurableBoard) snapshotPath() string {
 	return filepath.Join(filepath.Dir(db.walDir), "projection.snapshot.json")
 }
 
 // walContentFingerprint produces a stable hash of the event's kind +
-// payload for dedup collision resistance. Combined with EventID, this
-// ensures: same EventID + same content = same event (replay dedup),
-// different EventID + same content = different events (no false dedup).
+// payload. EventID is deliberately excluded: replay must collapse the
+// same logical lifecycle fact even if a retry wrote it with a fresh
+// event ID.
 func walContentFingerprint(kind string, payload json.RawMessage) string {
 	h := sha256.Sum256(append([]byte(kind+"\x1f"), payload...))
 	return hex.EncodeToString(h[:16]) // 128-bit truncation is sufficient for dedup

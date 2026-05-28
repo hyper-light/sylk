@@ -103,6 +103,9 @@ func SubmitKnowledgeBackendReadyTestament(ctx context.Context, board *ClaimsBoar
 	if err := board.PostGeneratedTestament(ctx, generated.Testaments[0].ID, KnowledgeBackendAgentID, TestamentPostOptions{Reason: "knowledge readiness testament posted"}); err != nil {
 		return nil, err
 	}
+	if err := completeReceiptOnlyTestamentValidation(ctx, board, generated.Testaments[0].ID, KnowledgeBackendAgentID, "knowledge readiness receipt validated"); err != nil {
+		return nil, err
+	}
 	if submitted, ok := KnowledgeBackendReadyTestament(board); ok {
 		return submitted, nil
 	}
@@ -125,7 +128,7 @@ func WaitForKnowledgeBackendReady(ctx context.Context, board *ClaimsBoard) (*Tes
 
 	ready := make(chan struct{}, 1)
 	unsubscribe := board.SubscribeDelta(func(delta BoardMutationDelta) error {
-		if (delta.Kind == "testament_posted" || delta.Kind == "testament_submitted") && delta.ClaimID == KnowledgeBackendReadyClaimID {
+		if delta.ClaimID == KnowledgeBackendReadyClaimID {
 			select {
 			case ready <- struct{}{}:
 			default:

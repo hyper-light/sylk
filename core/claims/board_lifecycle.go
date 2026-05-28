@@ -73,10 +73,15 @@ const (
 type lifecyclePostError struct {
 	reason       string
 	artifactKind string
+	cause        error
 }
 
 func (e lifecyclePostError) Error() string {
 	return e.reason
+}
+
+func (e lifecyclePostError) Unwrap() error {
+	return e.cause
 }
 
 type GeneratedClaimAction struct {
@@ -347,7 +352,7 @@ func (b *ClaimsBoard) PostGeneratedTestaments(ctx context.Context, testamentIDs 
 	resolutions := make([]claimResolution, len(testaments))
 	for i, testament := range testaments {
 		b.transitionTestamentLifecycleLocked(testament, TestamentLifecyclePosted, actorID, lifecycleReason(opts.Reason, "testament posted"), now)
-		resolutions[i] = b.resolveClaimForTestamentLocked(testament, now)
+		resolutions[i] = b.recordClaimTestamentGeneratedLocked(testament, now)
 	}
 	testamentSnapshots := cloneTestaments(testaments)
 	b.invalidateProjectionCache()
@@ -387,7 +392,7 @@ func (b *ClaimsBoard) AcknowledgeTestamentReceipt(ctx context.Context, testament
 	}
 	if !CanTransitionTestamentLifecycle(t.LifecycleStatus, TestamentLifecycleReceived) {
 		b.mu.Unlock()
-		return fmt.Errorf("cannot transition testament %q lifecycle from %q to %q", t.ID, t.LifecycleStatus, TestamentLifecycleReceived)
+		return newTestamentLifecycleTransitionError(t.ID, t.LifecycleStatus, TestamentLifecycleReceived, "testament receipt requires a posted testament")
 	}
 	now := time.Now().UTC()
 	outboxRecords := b.outboxRecordsForTestamentLifecyclePtrLocked([]*Testament{t}, TestamentLifecycleReceived, now)
@@ -415,6 +420,10 @@ func (b *ClaimsBoard) AcknowledgeTestamentReceipt(ctx context.Context, testament
 		if claimTransitioned {
 			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(b, claimSnapshot), claimSnapshot, ClaimLifecycleTestamentAcknowledged, receiverID, now))
 		}
+	}
+	b.notifyTestamentLifecycleDelta(testamentSnapshot, TestamentLifecycleReceived, receiverID)
+	if claimTransitioned {
+		b.notifyClaimLifecycleDelta(claimSnapshot, ClaimLifecycleTestamentAcknowledged, receiverID, testamentSnapshot.ID)
 	}
 	b.notifySubscribers()
 	return nil
@@ -449,7 +458,7 @@ func (b *ClaimsBoard) RecordClaimLifecycleFailure(ctx context.Context, claimID, 
 	}
 	if !CanTransitionClaimLifecycle(claim.LifecycleStatus, to) {
 		b.mu.Unlock()
-		return fmt.Errorf("cannot transition claim %q lifecycle from %q to %q", claim.ID, claim.LifecycleStatus, to)
+		return newClaimLifecycleTransitionError(claim.ID, claim.LifecycleStatus, to, "claim lifecycle failure target is not reachable")
 	}
 	now := time.Now().UTC()
 	if err := b.failClaimsLifecycleLocked([]*Claim{claim}, actorID, to, opts, now); err != nil {
@@ -462,8 +471,17 @@ func (b *ClaimsBoard) RecordClaimLifecycleFailure(ctx context.Context, claimID, 
 	if b.shouldEmitCanonicalDirect() {
 		b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(b, snapshot), snapshot, to, actorID, now))
 	}
+	b.notifyClaimLifecycleDelta(snapshot, to, actorID, "")
 	b.notifySubscribers()
 	return nil
+}
+
+func (b *ClaimsBoard) RecordClaimGenerationFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecycleGenerationFailed, opts)
+}
+
+func (b *ClaimsBoard) RecordClaimPostFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
+	return b.RecordClaimLifecycleFailure(ctx, claimID, actorID, ClaimLifecyclePostFailed, opts)
 }
 
 func (b *ClaimsBoard) RecordClaimReceiptFailure(ctx context.Context, claimID, actorID string, opts LifecycleFailureOptions) error {
@@ -497,6 +515,50 @@ func (b *ClaimsBoard) CompleteTestamentValidation(ctx context.Context, testament
 	return b.transitionTestamentValidation(ctx, testamentID, actorID, to, lifecycleReason(reason, string(to)))
 }
 
+func completeReceiptOnlyTestamentValidation(ctx context.Context, board *ClaimsBoard, testamentID, actorID, reason string) error {
+	if board == nil {
+		return fmt.Errorf("claims board is required")
+	}
+	testament, ok := board.CloneTestament(testamentID)
+	if !ok {
+		return fmt.Errorf("testament %q not found", testamentID)
+	}
+	claim, ok := board.CloneClaim(ClaimIDFromRelations(testament.Relations))
+	if !ok {
+		return fmt.Errorf("testament %q parent claim not found", testamentID)
+	}
+	receiptValidationIDs, err := receiptOnlyValidationIDs(claim)
+	if err != nil {
+		return err
+	}
+	if err := board.AcknowledgeTestamentReceipt(ctx, testamentID, actorID); err != nil {
+		return err
+	}
+	if err := board.BeginTestamentValidation(ctx, testamentID, actorID); err != nil {
+		return err
+	}
+	for _, validationID := range receiptValidationIDs {
+		if err := board.EvaluateValidation(ctx, claim.ID, validationID, StatusChange{AgentID: actorID, To: string(ValidationStatusPassed), Reason: lifecycleReason(reason, "receipt validation passed")}); err != nil {
+			return err
+		}
+	}
+	return board.CompleteTestamentValidation(ctx, testamentID, actorID, TestamentLifecycleValidated, lifecycleReason(reason, "receipt-only testament validated"))
+}
+
+func receiptOnlyValidationIDs(claim *Claim) ([]string, error) {
+	ids := make([]string, 0, len(claim.Validations))
+	for _, validation := range claim.Validations {
+		if validation == nil || !validation.Required {
+			continue
+		}
+		if validation.Type != ValidationTypeReceipt {
+			return nil, fmt.Errorf("claim %q has non-receipt required validation %q", claim.ID, validation.ID)
+		}
+		ids = append(ids, validation.ID)
+	}
+	return ids, nil
+}
+
 func (b *ClaimsBoard) transitionTestamentValidation(ctx context.Context, testamentID, actorID string, to TestamentLifecycleStatus, reason string) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -516,7 +578,7 @@ func (b *ClaimsBoard) transitionTestamentValidation(ctx context.Context, testame
 	}
 	if !CanTransitionTestamentLifecycle(testament.LifecycleStatus, to) {
 		b.mu.Unlock()
-		return fmt.Errorf("cannot transition testament %q lifecycle from %q to %q", testament.ID, testament.LifecycleStatus, to)
+		return newTestamentLifecycleTransitionError(testament.ID, testament.LifecycleStatus, to, "testament validation target is not reachable")
 	}
 	now := time.Now().UTC()
 	outboxRecords := b.outboxRecordsForTestamentLifecyclePtrLocked([]*Testament{testament}, to, now)
@@ -544,6 +606,10 @@ func (b *ClaimsBoard) transitionTestamentValidation(ctx context.Context, testame
 			claimStatus := claimLifecycleForTestamentValidation(to)
 			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(b, claimSnapshot), claimSnapshot, claimStatus, actorID, now))
 		}
+	}
+	b.notifyTestamentLifecycleDelta(testamentSnapshot, to, actorID)
+	if claimTransitioned {
+		b.notifyClaimLifecycleDelta(claimSnapshot, claimLifecycleForTestamentValidation(to), actorID, testamentSnapshot.ID)
 	}
 	b.notifySubscribers()
 	return nil
@@ -573,7 +639,7 @@ func (b *ClaimsBoard) transitionClaimLifecycle(ctx context.Context, claimID, act
 	now := time.Now().UTC()
 	if !CanTransitionClaimLifecycle(c.LifecycleStatus, to) {
 		b.mu.Unlock()
-		return fmt.Errorf("cannot transition claim %q lifecycle from %q to %q", c.ID, c.LifecycleStatus, to)
+		return newClaimLifecycleTransitionError(c.ID, c.LifecycleStatus, to, "claim lifecycle target is not reachable")
 	}
 	if err := b.appendDurableEventLocked(walEventClaimLifecycleTransition, actorID, map[string]any{
 		"claim_ids": []string{c.ID}, "to": to, "agent_id": actorID, "reason": reason, "changed": now,
@@ -590,6 +656,7 @@ func (b *ClaimsBoard) transitionClaimLifecycle(ctx context.Context, claimID, act
 		action := actionForClaimRecord(b, snapshot)
 		b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, action, snapshot, to, actorID, now))
 	}
+	b.notifyClaimLifecycleDelta(snapshot, to, actorID, "")
 	b.notifySubscribers()
 	return nil
 }
@@ -685,7 +752,8 @@ func (b *ClaimsBoard) validateClaimPostableLocked(ctx context.Context, claim *Cl
 		return nil
 	}
 	if claim.LifecycleStatus != ClaimLifecycleGenerated {
-		return lifecyclePostError{reason: fmt.Sprintf("claim %q lifecycle is %q, expected generated", claim.ID, claim.LifecycleStatus), artifactKind: ArtifactKindErrorDiagnostic}
+		cause := newClaimLifecycleTransitionError(claim.ID, claim.LifecycleStatus, ClaimLifecyclePosted, "claim posting requires generated lifecycle status")
+		return lifecyclePostError{reason: cause.Error(), artifactKind: ArtifactKindErrorDiagnostic, cause: cause}
 	}
 	if !opts.AllowMissingSubject && SubjectAgentID(claim.Relations) == "" {
 		return lifecyclePostError{reason: fmt.Sprintf("claim %q subject relation is required before post", claim.ID), artifactKind: ArtifactKindMissingDependency}
@@ -807,7 +875,7 @@ func (b *ClaimsBoard) testamentsForLifecyclePostLocked(ids []string) ([]*Testame
 			return nil, fmt.Errorf("testament %q not found", id)
 		}
 		if testament.LifecycleStatus != TestamentLifecycleGenerated && testament.LifecycleStatus != TestamentLifecyclePosted {
-			return nil, fmt.Errorf("testament %q lifecycle is %q, expected generated", testament.ID, testament.LifecycleStatus)
+			return nil, newTestamentLifecycleTransitionError(testament.ID, testament.LifecycleStatus, TestamentLifecyclePosted, "testament posting requires generated lifecycle status")
 		}
 		testaments = append(testaments, testament)
 	}
@@ -916,8 +984,14 @@ func (b *ClaimsBoard) validateGenerateTestamentActionLocked(action Action, testa
 		if strings.TrimSpace(testament.Summary) == "" && strings.TrimSpace(testament.Context) == "" {
 			return fmt.Errorf("generated testament summary or context is required")
 		}
-		if !opts.AllowStandalone && ClaimIDFromRelations(testament.Relations) == "" {
+		claimID := ClaimIDFromRelations(testament.Relations)
+		if !opts.AllowStandalone && claimID == "" {
 			return fmt.Errorf("generated testament %q claim relation is required", firstNonEmpty(testament.ID, testament.Summary))
+		}
+		if claimID != "" {
+			if _, exists := b.claims[claimID]; !exists {
+				return fmt.Errorf("generated testament %q claim relation %q does not resolve to a board claim", firstNonEmpty(testament.ID, testament.Summary), claimID)
+			}
 		}
 		if testament.ID != "" {
 			if _, exists := b.testaments[testament.ID]; exists {
@@ -1073,7 +1147,7 @@ func (b *ClaimsBoard) transitionClaimLifecycleLocked(claim *Claim, to ClaimLifec
 		return false
 	}
 	change := StatusChange{From: string(claim.LifecycleStatus), To: string(to), Reason: reason, AgentID: agentID, Changed: now}
-	claim.LifecycleHistory = append(claim.LifecycleHistory, change)
+	claim.LifecycleHistory = capStatusHistory(append(claim.LifecycleHistory, change))
 	claim.LifecycleStatus = to
 	claim.Accessed = now
 	return true
@@ -1087,7 +1161,7 @@ func (b *ClaimsBoard) transitionTestamentLifecycleLocked(testament *Testament, t
 		return false
 	}
 	change := StatusChange{From: string(testament.LifecycleStatus), To: string(to), Reason: reason, AgentID: agentID, Changed: now}
-	testament.LifecycleHistory = append(testament.LifecycleHistory, change)
+	testament.LifecycleHistory = capStatusHistory(append(testament.LifecycleHistory, change))
 	testament.LifecycleStatus = to
 	testament.Accessed = now
 	return true
@@ -1098,9 +1172,12 @@ func (b *ClaimsBoard) outboxRecordsForClaimPostLocked(claims []*Claim, now time.
 }
 
 func (b *ClaimsBoard) outboxRecordsForGeneratedTestamentPostLocked(testaments []*Testament, now time.Time) []ClaimsOutboxRecord {
-	records := make([]ClaimsOutboxRecord, 0, len(testaments))
+	records := make([]ClaimsOutboxRecord, 0, len(testaments)*2)
 	for _, testament := range testaments {
 		records = append(records, b.outboxRecordLocked(testament.Sequence, "testament", testament.ID, string(DeltaActionTestamentPosted), now))
+		if claim := b.claims[ClaimIDFromRelations(testament.Relations)]; claim != nil && CanTransitionClaimLifecycle(claim.LifecycleStatus, ClaimLifecycleTestamentGenerated) {
+			records = append(records, b.outboxRecordLocked(claim.Sequence, "claim", claim.ID, string(DeltaActionClaimTestamentGenerated), now))
+		}
 		for _, artifact := range testament.Artifacts {
 			if artifact != nil {
 				records = append(records, b.outboxRecordLocked(artifact.Sequence, "artifact", artifact.ID, "artifact_published", now))
@@ -1338,7 +1415,7 @@ func (b *ClaimsBoard) agentRelationMatches(ctx context.Context, relations []Rela
 		if relation.RelatedType != RelatedTypeAgent || relation.Relationship != relationship {
 			continue
 		}
-		if strings.TrimSpace(relation.Related) == agentID {
+		if b.agentRefResolver == nil && strings.TrimSpace(relation.Related) == agentID {
 			return true
 		}
 		if b.agentRefsMatch(ctx, relation.Related, agentID) {
@@ -1422,7 +1499,46 @@ func (b *ClaimsBoard) publishPostedTestaments(ctx context.Context, testaments []
 		}
 		b.publishTestamentResolution(ctx, &testaments[i], resolutionAt(resolutions, i))
 		b.notifyDelta(BoardMutationDelta{Kind: "testament_posted", TestamentID: testaments[i].ID, ClaimID: claimIDFromTestament(&testaments[i]), AgentID: testaments[i].AgentID})
+		if resolution := resolutionAt(resolutions, i); resolution.claim != nil {
+			b.notifyClaimLifecycleDelta(resolution.claim, ClaimLifecycleTestamentGenerated, testaments[i].AgentID, testaments[i].ID)
+		}
 	}
+}
+
+func (b *ClaimsBoard) notifyClaimLifecycleDelta(claim *Claim, status ClaimLifecycleStatus, agentID, testamentID string) {
+	if b == nil || claim == nil {
+		return
+	}
+	action, ok := ClaimLifecycleDeltaAction(status)
+	if !ok {
+		return
+	}
+	b.notifyDelta(BoardMutationDelta{
+		Kind:        lifecycleBoardMutationKind(action),
+		ClaimID:     claim.ID,
+		TestamentID: testamentID,
+		AgentID:     agentID,
+	})
+}
+
+func (b *ClaimsBoard) notifyTestamentLifecycleDelta(testament *Testament, status TestamentLifecycleStatus, agentID string) {
+	if b == nil || testament == nil {
+		return
+	}
+	action, ok := TestamentLifecycleDeltaAction(status)
+	if !ok {
+		return
+	}
+	b.notifyDelta(BoardMutationDelta{
+		Kind:        lifecycleBoardMutationKind(action),
+		ClaimID:     claimIDFromTestament(testament),
+		TestamentID: testament.ID,
+		AgentID:     agentID,
+	})
+}
+
+func lifecycleBoardMutationKind(action DeltaAction) string {
+	return strings.ReplaceAll(string(action), ".", "_")
 }
 
 func (b *ClaimsBoard) publishTestamentResolution(ctx context.Context, testament *Testament, resolution claimResolution) {

@@ -805,15 +805,18 @@ func (a *BoardAmplifier) canonicalDispatchesWithBoardTopic(deltas []canonicalDis
 }
 
 // runTracked dispatches fn under scope as a tracked async goroutine.
-// Scope is mandatory; a nil scope is a programming error at
-// construction and the emission is dropped with a structured error
-// so the failure is observable rather than silently inlined onto the
-// caller's hot path. Per the substrate's "async by default, always
-// tracked" invariant, there is no sync fallback.
-func (a *BoardAmplifier) runTracked(_ context.Context, description string, fn func(context.Context) error) {
+// When no scope is configured, it runs inline. Inline execution preserves
+// deterministic tests and standalone boards without spawning untracked
+// goroutines; production boards should provide a ScopeProvider for async
+// dispatch and bounded shutdown.
+func (a *BoardAmplifier) runTracked(ctx context.Context, description string, fn func(context.Context) error) {
 	if a.scope == nil {
-		a.reportEmitError("amplifier_scope_unwired", description,
-			fmt.Errorf("amplifier scope not configured; emission dropped"))
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := fn(ctx); err != nil {
+			a.reportEmitError("inline_dispatch_failed", description, err)
+		}
 		return
 	}
 	if err := a.scope.Go(description, amplifierEmitTimeout, fn); err != nil {

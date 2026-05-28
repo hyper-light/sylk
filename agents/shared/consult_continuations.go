@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,12 @@ import (
 // and cannot be safely restored. Bump this when the snapshot shape
 // changes incompatibly.
 const turnSnapshotCodecVersion = 1
+
+const (
+	continuationOrphanPerCoreFloor = 32
+	continuationOrphanLimitMin     = 64
+	continuationOrphanLimitMax     = 2048
+)
 
 // ErrConsultYielded is the continuation-store's internal slow-path
 // signal when the LLM turn has yielded to await peer consults. Tool
@@ -291,7 +298,12 @@ type ContinuationStore struct {
 	// their issuing AwaitConsultsOrYield/AwaitClaimResults call
 	// registered the continuation. Claimed by the next await call
 	// referencing the claim ref; expire after orphanResolutionsMaxAge.
-	orphans map[string]orphanedResolution
+	orphans     map[string]orphanedResolution
+	orphanLimit int
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
 // GoroutineScopeProxy is the minimal interface ContinuationStore
@@ -322,14 +334,18 @@ func NewContinuationStore(cfg ContinuationStoreConfig) *ContinuationStore {
 	if cfg.AgentID == "" || cfg.SessionID == "" || cfg.Board == nil {
 		return nil
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ContinuationStore{
-		agentID:    cfg.AgentID,
-		sessionID:  cfg.SessionID,
-		board:      cfg.Board,
-		pending:    make(map[string]*pendingContinuation),
-		claimIndex: make(map[string]string),
-		resumeFn:   cfg.ResumeFn,
-		scope:      cfg.Scope,
+		agentID:     cfg.AgentID,
+		sessionID:   cfg.SessionID,
+		board:       cfg.Board,
+		pending:     make(map[string]*pendingContinuation),
+		claimIndex:  make(map[string]string),
+		resumeFn:    cfg.ResumeFn,
+		scope:       cfg.Scope,
+		orphanLimit: computeContinuationOrphanLimit(),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 }
 
@@ -745,7 +761,11 @@ func (s *ContinuationStore) startDeadlineWatcher(continuationID string, idleWind
 		s.fireDeadline(continuationID)
 		return
 	}
-	watcherCtx, cancel := context.WithCancel(context.Background())
+	parentCtx := context.Background()
+	if s.ctx != nil {
+		parentCtx = s.ctx
+	}
+	watcherCtx, cancel := context.WithCancel(parentCtx)
 
 	s.mu.Lock()
 	if pending, ok := s.pending[continuationID]; ok {
@@ -790,9 +810,11 @@ func (s *ContinuationStore) startDeadlineWatcher(continuationID string, idleWind
 		}
 		return
 	}
-	// No scope: run watcher inline in a bare goroutine. Acceptable
-	// for tests; production wires a scope.
-	go func() { _ = watch(watcherCtx) }()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		_ = watch(watcherCtx)
+	}()
 }
 
 func (s *ContinuationStore) nextDeadlineWait(continuationID string) (time.Duration, bool) {
@@ -1209,24 +1231,29 @@ func (s *ContinuationStore) Stop(reason string) {
 	s.mu.Lock()
 	pending := make([]*pendingContinuation, 0, len(s.pending))
 	for _, p := range s.pending {
+		s.cancelPendingLocked(p, reason)
 		pending = append(pending, p)
 	}
 	s.pending = make(map[string]*pendingContinuation)
 	s.claimIndex = make(map[string]string)
+	if s.cancel != nil {
+		s.cancel()
+	}
 	s.mu.Unlock()
 
 	if reason == "" {
 		reason = "agent stopped"
 	}
 	for _, p := range pending {
-		if p.deadlineFn != nil {
-			p.deadlineFn()
+		if p.waitCh != nil {
+			s.dispatchWaitResult(p)
 		}
 		s.markContinuationResolved(context.Background(), p.id)
-		for id := range p.awaiting {
+		for _, id := range cancelledResolutionIDs(p) {
 			s.submitAwaitFailureTestament(context.Background(), id, claims.ConsultStatusCancelled, reason)
 		}
 	}
+	s.wg.Wait()
 }
 
 // CancelContinuation cancels one specific continuation by ID. Used
@@ -1246,23 +1273,58 @@ func (s *ContinuationStore) CancelContinuation(continuationID, reason string) {
 		return
 	}
 	delete(s.pending, continuationID)
-	awaiting := make([]string, 0, len(p.awaiting))
-	for id := range p.awaiting {
-		delete(s.claimIndex, id)
-		awaiting = append(awaiting, id)
-	}
-	if p.deadlineFn != nil {
-		p.deadlineFn()
-	}
+	s.cancelPendingLocked(p, reason)
 	s.mu.Unlock()
 
 	if reason == "" {
 		reason = "continuation cancelled"
 	}
+	if p.waitCh != nil {
+		s.dispatchWaitResult(p)
+	}
 	s.markContinuationResolved(context.Background(), continuationID)
-	for _, id := range awaiting {
+	for _, id := range cancelledResolutionIDs(p) {
 		s.submitAwaitFailureTestament(context.Background(), id, claims.ConsultStatusCancelled, reason)
 	}
+}
+
+func cancelledResolutionIDs(p *pendingContinuation) []string {
+	if p == nil || len(p.resolved) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(p.resolved))
+	for id, result := range p.resolved {
+		if result != nil && result.Status == claims.ConsultStatusCancelled {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func (s *ContinuationStore) cancelPendingLocked(p *pendingContinuation, reason string) {
+	if s == nil || p == nil {
+		return
+	}
+	if reason == "" {
+		reason = "continuation cancelled"
+	}
+	for id := range p.awaiting {
+		delete(s.claimIndex, id)
+		if p.resolved == nil {
+			p.resolved = make(map[string]*AwaitedClaimResult)
+		}
+		p.resolved[id] = (&AwaitedClaimResult{
+			ClaimID:      id,
+			Action:       claims.DeltaActionClaimValidationErrored,
+			Status:       claims.ConsultStatusCancelled,
+			ErrorMessage: reason,
+			EmittedAt:    time.Now().UTC(),
+		}).normalized()
+	}
+	if p.deadlineFn != nil {
+		p.deadlineFn()
+	}
+	p.awaiting = make(map[string]struct{})
 }
 
 func (s *ContinuationStore) submitAwaitFailureTestament(ctx context.Context, claimID, status, message string) {
@@ -1594,6 +1656,21 @@ func testamentRelatesToClaim(t claims.Testament, claimID string) bool {
 // expiry.
 const orphanResolutionsMaxAge = 10 * time.Minute
 
+func computeContinuationOrphanLimit() int {
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 1 {
+		procs = 1
+	}
+	limit := procs * continuationOrphanPerCoreFloor
+	if limit < continuationOrphanLimitMin {
+		return continuationOrphanLimitMin
+	}
+	if limit > continuationOrphanLimitMax {
+		return continuationOrphanLimitMax
+	}
+	return limit
+}
+
 func (s *ContinuationStore) stashOrphanResolutionLocked(delta *AwaitedClaimResult) {
 	if delta == nil || strings.TrimSpace(delta.ClaimID) == "" {
 		return
@@ -1601,10 +1678,12 @@ func (s *ContinuationStore) stashOrphanResolutionLocked(delta *AwaitedClaimResul
 	if s.orphans == nil {
 		s.orphans = make(map[string]orphanedResolution)
 	}
+	s.pruneOrphanResolutionsLocked(time.Now())
 	s.orphans[delta.ClaimID] = orphanedResolution{
 		delta:     delta,
 		stashedAt: time.Now(),
 	}
+	s.enforceOrphanResolutionLimitLocked()
 }
 
 func (s *ContinuationStore) takeOrphanResolutionLocked(claimID string) *AwaitedClaimResult {
@@ -1622,6 +1701,49 @@ func (s *ContinuationStore) takeOrphanResolutionLocked(claimID string) *AwaitedC
 		return nil
 	}
 	return o.delta
+}
+
+func (s *ContinuationStore) pruneOrphanResolutionsLocked(now time.Time) {
+	if s == nil || s.orphans == nil {
+		return
+	}
+	for claimID, orphan := range s.orphans {
+		if now.Sub(orphan.stashedAt) > orphanResolutionsMaxAge {
+			delete(s.orphans, claimID)
+		}
+	}
+}
+
+func (s *ContinuationStore) enforceOrphanResolutionLimitLocked() {
+	if s == nil || s.orphans == nil {
+		return
+	}
+	limit := s.orphanLimit
+	if limit <= 0 {
+		limit = computeContinuationOrphanLimit()
+	}
+	for len(s.orphans) > limit {
+		claimID := s.oldestOrphanResolutionLocked()
+		if claimID == "" {
+			return
+		}
+		delete(s.orphans, claimID)
+	}
+}
+
+func (s *ContinuationStore) oldestOrphanResolutionLocked() string {
+	var oldestClaim string
+	var oldestAt time.Time
+	for claimID, orphan := range s.orphans {
+		if orphan.stashedAt.IsZero() {
+			continue
+		}
+		if oldestAt.IsZero() || orphan.stashedAt.Before(oldestAt) {
+			oldestAt = orphan.stashedAt
+			oldestClaim = claimID
+		}
+	}
+	return oldestClaim
 }
 
 type orphanedResolution struct {
