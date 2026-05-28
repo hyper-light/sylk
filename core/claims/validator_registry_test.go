@@ -10,7 +10,11 @@ import (
 func TestProgrammaticValidatorDispatcherPassesRequiredValidation(t *testing.T) {
 	registry := NewValidatorRegistry()
 	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
-		return ValidatorHandlerResult{ResultArtifact: &Artifact{Kind: ArtifactKindReadiness, Reference: "valid"}}, nil
+		artifact := &Artifact{Kind: ArtifactKindReadiness, Reference: "valid"}
+		if err := SetArtifactData(artifact, PresentationEvidenceArtifactData{Kind: "validation", Reference: "valid"}); err != nil {
+			t.Fatalf("SetArtifactData result: %v", err)
+		}
+		return ValidatorHandlerResult{ResultArtifact: artifact}, nil
 	}))
 	if _, err := registry.Register(reg); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -74,6 +78,85 @@ func TestValidatorRegistryRejectsMissingDeterminismAndArtifactContract(t *testin
 	}
 }
 
+func TestValidatorRegistryDuplicateImmutableRegistrationIsIdempotent(t *testing.T) {
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		return ValidatorHandlerResult{}, nil
+	}))
+	first, err := registry.Register(reg)
+	if err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	second, err := registry.Register(reg)
+	if err != nil {
+		t.Fatalf("Register duplicate: %v", err)
+	}
+	if first.ValidatorID != second.ValidatorID || first.ArtifactDataType != second.ArtifactDataType {
+		t.Fatalf("duplicate registration changed immutable metadata: first=%#v second=%#v", first, second)
+	}
+	conflict := reg
+	conflict.ResultDataType = ArtifactDataTypeKnowledgeReadiness
+	if _, err := registry.Register(conflict); !errors.Is(err, ErrValidatorRegistrationConflict) {
+		t.Fatalf("Register conflict error = %v, want conflict", err)
+	}
+}
+
+func TestProgrammaticValidatorDispatcherRejectsArtifactContractBeforeHandler(t *testing.T) {
+	called := false
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		called = true
+		return ValidatorHandlerResult{}, nil
+	}))
+	if _, err := registry.Register(reg); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	req := testValidationDispatchRequest(true)
+	req.Artifact.ArtifactName = "wrong"
+	result, err := NewProgrammaticValidatorDispatcher(registry, SystemClock{}).DispatchValidation(context.Background(), req)
+	if err != nil {
+		t.Fatalf("DispatchValidation: %v", err)
+	}
+	if called {
+		t.Fatal("handler was invoked for artifact contract mismatch")
+	}
+	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	}
+}
+
+func TestProgrammaticValidatorDispatcherRejectsMismatchedResultDataType(t *testing.T) {
+	registry := NewValidatorRegistry()
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		artifact := &Artifact{Kind: ArtifactKindReadiness, Reference: "wrong result"}
+		if err := SetArtifactData(artifact, KnowledgeReadinessArtifactData{Component: "validator"}); err != nil {
+			t.Fatalf("SetArtifactData result: %v", err)
+		}
+		return ValidatorHandlerResult{ResultArtifact: artifact}, nil
+	}))
+	if _, err := registry.Register(reg); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	result, err := NewProgrammaticValidatorDispatcher(registry, SystemClock{}).DispatchValidation(context.Background(), testValidationDispatchRequest(true))
+	if err != nil {
+		t.Fatalf("DispatchValidation: %v", err)
+	}
+	if result.Status != ValidationStatusValidationFailed || result.Error == nil || result.Error.Category != ValidationErrorCategoryArtifactType {
+		t.Fatalf("result = %#v, want artifact type validation failure", result)
+	}
+}
+
+func TestValidatorRegistryRejectsUnknownRegisteredDataTypes(t *testing.T) {
+	reg := testValidatorRegistration(t, validatorHandlerFunc(func(context.Context, ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+		return ValidatorHandlerResult{}, nil
+	}))
+	reg.ArtifactDataType = "unknown.v1"
+	_, err := NewValidatorRegistry().Register(reg)
+	if !errors.Is(err, ErrValidatorRegistrationInvalid) {
+		t.Fatalf("Register unknown artifact datatype error = %v, want invalid", err)
+	}
+}
+
 func testValidatorRegistration(t *testing.T, handler ValidatorHandler) ValidatorRegistration {
 	t.Helper()
 	return ValidatorRegistration{
@@ -84,7 +167,8 @@ func testValidatorRegistration(t *testing.T, handler ValidatorHandler) Validator
 		Timeout:            time.Second,
 		ConcurrencyBudget:  1,
 		TargetArtifactName: "evidence",
-		ArtifactDataType:   "text/plain",
+		ArtifactDataType:   ArtifactDataTypePlanMarkdown,
+		ResultDataType:     ArtifactDataTypePresentationEvidence,
 		Handler:            handler,
 	}
 }
@@ -96,12 +180,17 @@ func testValidationDispatchRequest(required bool) ValidationDispatchRequest {
 		Required:           required,
 		ValidatorID:        "validator",
 		TargetArtifactName: "evidence",
-		ArtifactDataType:   "text/plain",
+		ArtifactDataType:   ArtifactDataTypePlanMarkdown,
+		ResultDataType:     ArtifactDataTypePresentationEvidence,
+	}
+	artifact := &Artifact{ArtifactName: "evidence", Kind: ArtifactKindReadiness, Reference: "evidence"}
+	if err := SetArtifactData(artifact, PlanMarkdownArtifactData{Markdown: "# Evidence"}); err != nil {
+		panic(err)
 	}
 	return ValidationDispatchRequest{
 		Claim:      &Claim{ID: "claim", ActionType: ActionTypeTask},
 		Validation: validation,
-		Artifact:   &Artifact{ArtifactName: "evidence", DataType: "text/plain", Kind: ArtifactKindReadiness, Reference: "evidence"},
+		Artifact:   artifact,
 		StartedAt:  time.Unix(9, 0),
 	}
 }

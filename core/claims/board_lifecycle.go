@@ -304,7 +304,7 @@ func (b *ClaimsBoard) GenerateTestamentAction(ctx context.Context, action Action
 	}
 	if err := b.appendDurableEventLocked(walEventTestamentActionGenerated, action.AgentID, map[string]any{
 		"action": action, "testaments": input,
-	}, b.outboxRecordsForTestamentLifecycleLocked(input, TestamentLifecycleGenerated, now)); err != nil {
+	}, b.outboxRecordsForGeneratedTestamentActionLocked(input, now)); err != nil {
 		b.seq.Store(prevSeq)
 		b.mu.Unlock()
 		return nil, err
@@ -318,7 +318,19 @@ func (b *ClaimsBoard) GenerateTestamentAction(ctx context.Context, action Action
 		for i := range result.Testaments {
 			testament := &result.Testaments[i]
 			claim, _ := b.CloneClaim(ClaimIDFromRelations(testament.Relations))
-			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecycleGenerated, result.Action.AgentID, now))
+			dispatches := b.amplifier.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecycleGenerated, result.Action.AgentID, now)
+			for _, artifact := range testament.Artifacts {
+				if artifact == nil {
+					continue
+				}
+				dispatches = append(dispatches,
+					b.amplifier.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusGenerated, result.Action.AgentID, now)...,
+				)
+				dispatches = append(dispatches,
+					b.amplifier.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusAttached, result.Action.AgentID, now)...,
+				)
+			}
+			b.amplifier.dispatchCanonical(ctx, dispatches)
 		}
 	}
 	if !opts.SuppressGeneratedNotifications {
@@ -1236,6 +1248,22 @@ func (b *ClaimsBoard) outboxRecordsForGeneratedTestamentPostLocked(testaments []
 			if artifact != nil {
 				records = append(records, b.outboxRecordLocked(artifact.Sequence, "artifact", artifact.ID, "artifact_published", now))
 			}
+		}
+	}
+	return records
+}
+
+func (b *ClaimsBoard) outboxRecordsForGeneratedTestamentActionLocked(testaments []Testament, now time.Time) []ClaimsOutboxRecord {
+	records := b.outboxRecordsForTestamentLifecycleLocked(testaments, TestamentLifecycleGenerated, now)
+	for i := range testaments {
+		for _, artifact := range testaments[i].Artifacts {
+			if artifact == nil {
+				continue
+			}
+			records = append(records,
+				b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactGenerated), now),
+				b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactAttached), now),
+			)
 		}
 	}
 	return records

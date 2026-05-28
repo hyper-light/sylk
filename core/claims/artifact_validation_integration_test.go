@@ -28,7 +28,7 @@ func TestFixtureClaimPassesBoardValidationAndDurableReplay(t *testing.T) {
 	if !ok {
 		t.Fatalf("artifact %s not stored", artifactID)
 	}
-	if stored.Status != ArtifactStatusGenerated || stored.ClaimID != artifactFixtureClaimID || stored.ContentHash == "" {
+	if stored.Status != ArtifactStatusAttached || stored.ClaimID != artifactFixtureClaimID || stored.ContentHash == "" {
 		t.Fatalf("stored artifact = %+v", stored)
 	}
 	db.Close()
@@ -93,7 +93,7 @@ func TestConcurrentProjectionClonesDoNotExposeArtifactOrValidationSlices(t *test
 	if !ok {
 		t.Fatal("artifact clone missing")
 	}
-	if len(artifactClone.StatusHistory) != 1 {
+	if len(artifactClone.StatusHistory) != 2 {
 		t.Fatalf("board artifact history mutated through projection: %+v", artifactClone.StatusHistory)
 	}
 }

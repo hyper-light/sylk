@@ -3,6 +3,13 @@ package mocks
 import "github.com/adalundhe/sylk/core/claims"
 
 func _() {
+	var _ claims.ValidationDispatcher = (*ValidationDispatcher)(nil)
+	var _ claims.ValidatorHandler = (*ValidatorHandler)(nil)
+	var _ claims.AgentTurnEvaluator = (*AgentTurnEvaluator)(nil)
+	var _ claims.ArtifactLifecycleBusSink = (*ArtifactLifecycleBusSink)(nil)
+	var _ claims.ValidationLifecycleBusSink = (*ValidationLifecycleBusSink)(nil)
+	var _ claims.ClaimsClock = (*ClaimsClock)(nil)
+	var _ claims.TestamentGenerator = (*TestamentGenerator)(nil)
 	var _ claims.DeltaPublisher = (*DeltaPublisher)(nil)
 	var _ claims.DeltaSubscriber = (*DeltaSubscriber)(nil)
 	var _ claims.DeltaBus = (*DeltaBus)(nil)

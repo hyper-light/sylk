@@ -50,6 +50,9 @@ func TestCanonicalTopics(t *testing.T) {
 	if got, want := CanonicalValidationTopic("sess", "v1", DeltaActionValidationEvaluated), "claims.sess.validation.v1.validation_evaluated"; got != want {
 		t.Fatalf("validation topic got %q want %q", got, want)
 	}
+	if got, want := CanonicalArtifactTopic("sess", "a1", DeltaActionArtifactAttached), "claims.sess.artifact.a1.artifact_attached"; got != want {
+		t.Fatalf("artifact topic got %q want %q", got, want)
+	}
 	if got, want := CanonicalBoardTopic("sess", "b1", DeltaActionClaimProgressed), "claims.sess.board.b1.claim_progressed"; got != want {
 		t.Fatalf("board topic got %q want %q", got, want)
 	}

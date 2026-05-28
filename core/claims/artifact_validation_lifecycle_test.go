@@ -99,6 +99,18 @@ func TestValidationDeclarationAllowsQualityBarOnlyLegacy(t *testing.T) {
 	if err := ValidateTypedValidationDeclaration(typed); err == nil {
 		t.Fatal("expected missing TargetArtifactName error")
 	}
+	targetOnly := &Validation{ID: "target-only", TargetArtifactName: "plan"}
+	if err := ValidateTypedValidationDeclaration(targetOnly); err == nil {
+		t.Fatal("expected target-only typed declaration error")
+	}
+	missingValidator := &Validation{ID: "missing-validator", TargetArtifactName: "plan", ArtifactDataType: ArtifactDataTypePlanMarkdown}
+	if err := ValidateTypedValidationDeclaration(missingValidator); err == nil {
+		t.Fatal("expected missing ValidatorID error")
+	}
+	missingDataType := &Validation{ID: "missing-datatype", TargetArtifactName: "plan", ValidatorID: "plan.markdown"}
+	if err := ValidateTypedValidationDeclaration(missingDataType); err == nil {
+		t.Fatal("expected missing ArtifactDataType error")
+	}
 }
 
 func TestArtifactAndValidationTransitionTables(t *testing.T) {

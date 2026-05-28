@@ -21,20 +21,22 @@ import (
 const (
 	walNamespace = "claims_board"
 
-	walEventActionPosted                 = "action_posted"
-	walEventClaimActionGenerated         = "claim_action_generated"
-	walEventClaimLifecycleTransition     = "claim_lifecycle_transition"
-	walEventTestamentActionGenerated     = "testament_action_generated"
-	walEventTestamentLifecycleTransition = "testament_lifecycle_transition"
-	walEventClaimUpdated                 = "claim_updated"
-	walEventClaimContextSet              = "claim_context_set"
-	walEventTestamentContextSet          = "testament_context_set"
-	walEventTestamentSubmitted           = "testament_submitted"
-	walEventValidationEvaluated          = "validation_evaluated"
-	walEventClaimAccepted                = "claim_accepted"
-	walEventClaimRejected                = "claim_rejected"
-	walEventPhaseTransition              = "phase_transition"
-	walEventBoardComplete                = "board_complete"
+	walEventActionPosted                  = "action_posted"
+	walEventClaimActionGenerated          = "claim_action_generated"
+	walEventClaimLifecycleTransition      = "claim_lifecycle_transition"
+	walEventTestamentActionGenerated      = "testament_action_generated"
+	walEventTestamentLifecycleTransition  = "testament_lifecycle_transition"
+	walEventClaimUpdated                  = "claim_updated"
+	walEventClaimContextSet               = "claim_context_set"
+	walEventTestamentContextSet           = "testament_context_set"
+	walEventTestamentSubmitted            = "testament_submitted"
+	walEventArtifactLifecycleTransition   = "artifact_lifecycle_transition"
+	walEventValidationLifecycleTransition = "validation_lifecycle_transition"
+	walEventValidationEvaluated           = "validation_evaluated"
+	walEventClaimAccepted                 = "claim_accepted"
+	walEventClaimRejected                 = "claim_rejected"
+	walEventPhaseTransition               = "phase_transition"
+	walEventBoardComplete                 = "board_complete"
 
 	durableOutboxProjectBatchLimit = 128
 	walReplayErrorPreviewBytes     = 80
@@ -423,6 +425,46 @@ func (db *DurableBoard) EvaluateValidation(ctx context.Context, claimID, validat
 	return db.board.EvaluateValidation(ctx, claimID, validationID, change)
 }
 
+func (db *DurableBoard) TransitionArtifactLifecycle(ctx context.Context, artifactID string, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions) error {
+	return db.board.TransitionArtifactLifecycle(ctx, artifactID, to, actorID, opts)
+}
+
+func (db *DurableBoard) AcknowledgeArtifactReceipt(ctx context.Context, artifactID, receiverID string) error {
+	return db.board.AcknowledgeArtifactReceipt(ctx, artifactID, receiverID)
+}
+
+func (db *DurableBoard) RecordArtifactReceiptFailure(ctx context.Context, artifactID, receiverID string, artifactErr *ArtifactError) error {
+	return db.board.RecordArtifactReceiptFailure(ctx, artifactID, receiverID, artifactErr)
+}
+
+func (db *DurableBoard) BeginArtifactValidation(ctx context.Context, artifactID, actorID string) error {
+	return db.board.BeginArtifactValidation(ctx, artifactID, actorID)
+}
+
+func (db *DurableBoard) CompleteArtifactValidation(ctx context.Context, artifactID, actorID string, validated bool, artifactErr *ArtifactError) error {
+	return db.board.CompleteArtifactValidation(ctx, artifactID, actorID, validated, artifactErr)
+}
+
+func (db *DurableBoard) TransitionValidationLifecycle(ctx context.Context, claimID, validationID string, to ValidationStatus, actorID string, opts ValidationLifecycleOptions) error {
+	return db.board.TransitionValidationLifecycle(ctx, claimID, validationID, to, actorID, opts)
+}
+
+func (db *DurableBoard) MarkValidationReady(ctx context.Context, claimID, validationID, actorID string) error {
+	return db.board.MarkValidationReady(ctx, claimID, validationID, actorID)
+}
+
+func (db *DurableBoard) BeginValidation(ctx context.Context, claimID, validationID, actorID, artifactID string) error {
+	return db.board.BeginValidation(ctx, claimID, validationID, actorID, artifactID)
+}
+
+func (db *DurableBoard) BeginValidationQualityBar(ctx context.Context, claimID, validationID, actorID, artifactID string) error {
+	return db.board.BeginValidationQualityBar(ctx, claimID, validationID, actorID, artifactID)
+}
+
+func (db *DurableBoard) CompleteValidationLifecycle(ctx context.Context, claimID, validationID, actorID string, status ValidationStatus, opts ValidationLifecycleOptions) error {
+	return db.board.CompleteValidationLifecycle(ctx, claimID, validationID, actorID, status, opts)
+}
+
 func (db *DurableBoard) RejectClaim(ctx context.Context, claimID string, change StatusChange, replacements *Action, replacementClaims []Claim) error {
 	return db.board.RejectClaim(ctx, claimID, change, replacements, replacementClaims)
 }
@@ -567,6 +609,10 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 		return db.applyTestamentContextSet(event)
 	case walEventTestamentSubmitted:
 		return db.applyTestamentSubmitted(event)
+	case walEventArtifactLifecycleTransition:
+		return db.applyArtifactLifecycleTransition(event)
+	case walEventValidationLifecycleTransition:
+		return db.applyValidationLifecycleTransition(event)
 	case walEventValidationEvaluated:
 		return db.applyValidationEvaluated(event)
 	case walEventClaimRejected:
@@ -856,6 +902,82 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 	}
 	records := b.outboxRecordsForSubmitTestamentsLocked(payload.Action, payload.Testaments, event.CreatedAt)
 	setOutboxRecordSequence(records, event.Sequence)
+	db.insertReplayOutbox(records)
+	return nil
+}
+
+func (db *DurableBoard) applyArtifactLifecycleTransition(event *walEvent) error {
+	var payload struct {
+		ArtifactID   string         `json:"artifact_id"`
+		To           ArtifactStatus `json:"to"`
+		AgentID      string         `json:"agent_id"`
+		Reason       string         `json:"reason"`
+		Changed      time.Time      `json:"changed"`
+		Error        *ArtifactError `json:"error,omitempty"`
+		ValidationID string         `json:"validation_id,omitempty"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	artifact, _, _, ok := db.board.findArtifactForMutationLocked(payload.ArtifactID)
+	if !ok {
+		return replayMissingReference("artifact", payload.ArtifactID)
+	}
+	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
+	if _, err := TransitionArtifactStatus(artifact, payload.To, payload.AgentID, payload.Reason, changed); err != nil {
+		return err
+	}
+	if payload.Error != nil {
+		artifact.Errors = append(artifact.Errors, cloneArtifactError(payload.Error))
+	}
+	artifact.Accessed = changed
+	action := mustArtifactLifecycleDeltaAction(payload.To)
+	db.insertReplayOutbox([]ClaimsOutboxRecord{
+		db.board.outboxRecordLocked(event.Sequence, RelatedTypeArtifact, artifact.ID, string(action), event.CreatedAt),
+	})
+	return nil
+}
+
+func (db *DurableBoard) applyValidationLifecycleTransition(event *walEvent) error {
+	var payload struct {
+		ClaimID          string           `json:"claim_id"`
+		ValidationID     string           `json:"validation_id"`
+		To               ValidationStatus `json:"to"`
+		AgentID          string           `json:"agent_id"`
+		Reason           string           `json:"reason"`
+		Changed          time.Time        `json:"changed"`
+		TargetArtifactID string           `json:"target_artifact_id,omitempty"`
+		ResultArtifact   *Artifact        `json:"result_artifact,omitempty"`
+		ResultArtifactID string           `json:"result_artifact_id,omitempty"`
+		Error            *ValidationError `json:"error,omitempty"`
+		EvaluatorRef     *ParticipantRef  `json:"evaluator_ref,omitempty"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil {
+		return err
+	}
+	validation, claim, ok := db.board.findValidationForMutationLocked(payload.ClaimID, payload.ValidationID)
+	if !ok {
+		return replayMissingReference("validation", payload.ValidationID)
+	}
+	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
+	to := validationLifecycleTarget(validation, payload.To)
+	if validation.Status != to && !CanTransitionValidationStatus(validation.Status, to) {
+		return newValidationLifecycleTransitionError(validation.ID, validation.Status, to, payload.AgentID, "validation replay transition is not allowed")
+	}
+	opts := ValidationLifecycleOptions{
+		Reason:           payload.Reason,
+		TargetArtifactID: payload.TargetArtifactID,
+		ResultArtifact:   payload.ResultArtifact,
+		ResultArtifactID: payload.ResultArtifactID,
+		Error:            payload.Error,
+		EvaluatorRef:     payload.EvaluatorRef,
+	}
+	resultArtifactID := db.board.recordValidationLifecycleMutationLocked(claim, validation, to, payload.AgentID, opts, changed)
+	records := []ClaimsOutboxRecord{db.board.outboxRecordLocked(event.Sequence, RelatedTypeValidation, validation.ID, string(mustValidationLifecycleDeltaAction(to)), event.CreatedAt)}
+	if payload.ResultArtifact != nil {
+		artifactID := firstNonEmpty(resultArtifactID, payload.ResultArtifact.ID)
+		records = append(records, db.board.outboxRecordLocked(event.Sequence, RelatedTypeArtifact, artifactID, string(DeltaActionArtifactGenerated), event.CreatedAt))
+	}
 	db.insertReplayOutbox(records)
 	return nil
 }

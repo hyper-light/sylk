@@ -14,6 +14,7 @@ var (
 	ErrArtifactDataMismatch     = errors.New("artifact data type mismatch")
 	ErrArtifactDataEmpty        = errors.New("artifact data is empty")
 	ErrArtifactDataHashMismatch = errors.New("artifact data hash mismatch")
+	ErrArtifactDataSizeMismatch = errors.New("artifact data size mismatch")
 	ErrArtifactCodecPanic       = errors.New("artifact codec panic")
 )
 
@@ -54,6 +55,9 @@ func SetArtifactDataWithRegistry[T any](registry *TypeRegistry, artifact *Artifa
 	data, err := safeCodecMarshal(entry.Codec, value)
 	if err != nil {
 		return artifactDataError(artifact.ID, entry.DataType, "marshal", err)
+	}
+	if len(data) == 0 {
+		return artifactDataError(artifact.ID, entry.DataType, "marshal", ErrArtifactDataEmpty)
 	}
 	artifact.DataType = entry.DataType
 	artifact.Data = append([]byte(nil), data...)
@@ -145,6 +149,9 @@ func artifactTypeForValue[T any](registry *TypeRegistry, value T) (RegisteredArt
 	if registry == nil {
 		return RegisteredArtifactType{}, ErrArtifactTypeUnknown
 	}
+	if artifactValueIsNil(value) {
+		return RegisteredArtifactType{}, ErrArtifactTypeInvalid
+	}
 	return registry.LookupArtifactTypeFor(indirectArtifactGoType(reflect.TypeOf(value)))
 }
 
@@ -158,10 +165,13 @@ func artifactTypeForGeneric[T any](registry *TypeRegistry) (RegisteredArtifactTy
 func validateArtifactContentHash(artifact *Artifact) error {
 	hash := strings.TrimSpace(artifact.ContentHash)
 	if hash == "" {
-		return nil
+		return ErrArtifactDataHashMismatch
 	}
 	if hash != ArtifactContentHash(artifact.Data) {
 		return ErrArtifactDataHashMismatch
+	}
+	if artifact.Size != 0 && artifact.Size != int64(len(artifact.Data)) {
+		return ErrArtifactDataSizeMismatch
 	}
 	return nil
 }

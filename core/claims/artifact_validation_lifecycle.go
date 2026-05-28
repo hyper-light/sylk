@@ -257,7 +257,7 @@ func TransitionArtifactStatus(a *Artifact, to ArtifactStatus, actor, reason stri
 		return false, newArtifactLifecycleTransitionError(a.ID, from, to, actor, "artifact status transition is not allowed")
 	}
 	a.Status = to
-	a.StatusHistory = append(a.StatusHistory, statusChange(from, to, actor, reason, changed))
+	a.StatusHistory = capStatusHistory(append(a.StatusHistory, statusChange(from, to, actor, reason, changed)))
 	return true, nil
 }
 
@@ -273,7 +273,7 @@ func TransitionValidationStatus(v *Validation, to ValidationStatus, actor, reaso
 		return false, newValidationLifecycleTransitionError(v.ID, from, to, actor, "validation status transition is not allowed")
 	}
 	v.Status = to
-	v.StatusHistory = append(v.StatusHistory, statusChange(from, to, actor, reason, changed))
+	v.StatusHistory = capStatusHistory(append(v.StatusHistory, statusChange(from, to, actor, reason, changed)))
 	if to.IsTerminal() {
 		v.EvaluatedAt = changeTime(changed)
 	}
@@ -349,7 +349,8 @@ func oneOfArtifactStatus(status ArtifactStatus, values ...ArtifactStatus) bool {
 }
 
 func validationDeclaresTypedHandler(v *Validation) bool {
-	return strings.TrimSpace(v.ValidatorID) != "" ||
+	return strings.TrimSpace(v.TargetArtifactName) != "" ||
+		strings.TrimSpace(v.ValidatorID) != "" ||
 		strings.TrimSpace(v.ArtifactDataType) != "" ||
 		strings.TrimSpace(v.ResultDataType) != ""
 }

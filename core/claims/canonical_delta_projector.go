@@ -75,6 +75,26 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 		}
 		return dispatches
 	}
+	if status, ok := DeltaActionArtifactLifecycleStatus(DeltaAction(record.MutationKind)); ok {
+		artifact, testament, claim, ok := board.cloneArtifactWithParents(record.EntityID)
+		if !ok {
+			return nil
+		}
+		if claim != nil && IsSystemInternalAction(claim.ActionType) {
+			return nil
+		}
+		actorID := firstNonEmpty(artifactStatusChangeFor(artifact, status).AgentID, artifact.ParticipantID, artifact.AgentID)
+		return a.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, status, actorID, occurredAt)
+	}
+	if status, ok := DeltaActionValidationLifecycleStatus(DeltaAction(record.MutationKind)); ok {
+		validation, claim, ok := board.CloneValidation(record.EntityID)
+		if !ok || IsSystemInternalAction(claim.ActionType) {
+			return nil
+		}
+		artifact, _ := board.cloneValidationTargetArtifact(claim.ID, validation)
+		actorID := firstNonEmpty(validationStatusChangeFor(validation, status).AgentID, validation.ParticipantID, validation.AgentID, validation.ValidatorID)
+		return a.buildValidationLifecycleDeltas(ctx, claim, validation, artifact, status, actorID, occurredAt)
+	}
 	switch record.MutationKind {
 	case "claim_issued":
 		claim, ok := board.CloneClaim(record.EntityID)
@@ -106,6 +126,15 @@ func (a *BoardAmplifier) canonicalDispatchesForOutboxRecord(ctx context.Context,
 			return nil
 		}
 		return a.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecyclePosted, testament.AgentID, occurredAt)
+	case "artifact_published":
+		artifact, testament, claim, ok := board.cloneArtifactWithParents(record.EntityID)
+		if !ok {
+			return nil
+		}
+		if claim != nil && IsSystemInternalAction(claim.ActionType) {
+			return nil
+		}
+		return a.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusAttached, artifact.AgentID, occurredAt)
 	case walEventValidationEvaluated:
 		validation, claim, ok := board.CloneValidation(record.EntityID)
 		if !ok || IsSystemInternalAction(claim.ActionType) {

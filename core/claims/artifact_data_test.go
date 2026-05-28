@@ -18,6 +18,16 @@ func (panicCodec) Unmarshal([]byte, any) error {
 	panic("unmarshal exploded")
 }
 
+type emptyPayloadCodec struct{}
+
+func (emptyPayloadCodec) Marshal(any) ([]byte, error) {
+	return nil, nil
+}
+
+func (emptyPayloadCodec) Unmarshal([]byte, any) error {
+	return nil
+}
+
 type countingCodec struct {
 	marshalCount   atomic.Int64
 	unmarshalCount atomic.Int64
@@ -75,9 +85,34 @@ func TestArtifactDataFailuresAreDistinct(t *testing.T) {
 	if _, err := ArtifactData[syntheticArtifactPayload](unknown); !errors.Is(err, ErrArtifactTypeUnknown) {
 		t.Fatalf("unknown codec error = %v", err)
 	}
+	missingHash := CloneArtifact(mismatch)
+	missingHash.ContentHash = ""
+	if _, err := ArtifactData[PlanMarkdownArtifactData](missingHash); !errors.Is(err, ErrArtifactDataHashMismatch) {
+		t.Fatalf("missing hash error = %v", err)
+	}
 	mismatch.ContentHash = ArtifactContentHash([]byte("different"))
 	if _, err := ArtifactData[PlanMarkdownArtifactData](mismatch); !errors.Is(err, ErrArtifactDataHashMismatch) {
 		t.Fatalf("hash mismatch error = %v", err)
+	}
+	sizeMismatch := CloneArtifact(mismatch)
+	sizeMismatch.ContentHash = ArtifactContentHash(sizeMismatch.Data)
+	sizeMismatch.Size = int64(len(sizeMismatch.Data) + 1)
+	if _, err := ArtifactData[PlanMarkdownArtifactData](sizeMismatch); !errors.Is(err, ErrArtifactDataSizeMismatch) {
+		t.Fatalf("size mismatch error = %v", err)
+	}
+	var nilPayload *PlanMarkdownArtifactData
+	if err := SetArtifactData(&Artifact{ID: "nil-payload"}, nilPayload); !errors.Is(err, ErrArtifactTypeInvalid) {
+		t.Fatalf("nil typed payload error = %v, want invalid", err)
+	}
+}
+
+func TestSetArtifactDataRejectsEmptyCodecPayload(t *testing.T) {
+	registry := NewTypeRegistry()
+	if err := registry.Register("empty.v1", syntheticArtifactPayload{}, emptyPayloadCodec{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetArtifactDataWithRegistry(registry, &Artifact{ID: "empty"}, syntheticArtifactPayload{Name: "x"}); !errors.Is(err, ErrArtifactDataEmpty) {
+		t.Fatalf("empty codec payload error = %v, want empty data", err)
 	}
 }
 

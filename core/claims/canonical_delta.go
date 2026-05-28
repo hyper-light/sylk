@@ -48,6 +48,26 @@ const (
 	DeltaActionTestamentValidationErrored    DeltaAction = "testament.validation_errored"
 	DeltaActionTestamentValidated            DeltaAction = "testament.validated"
 
+	DeltaActionArtifactGenerated        DeltaAction = "artifact.generated"
+	DeltaActionArtifactGenerationFailed DeltaAction = "artifact.generation_failed"
+	DeltaActionArtifactReceived         DeltaAction = "artifact.received"
+	DeltaActionArtifactReceiptFailed    DeltaAction = "artifact.receipt_failed"
+	DeltaActionArtifactAttached         DeltaAction = "artifact.attached"
+	DeltaActionArtifactValidating       DeltaAction = "artifact.validating"
+	DeltaActionArtifactValidationFailed DeltaAction = "artifact.validation_failed"
+	DeltaActionArtifactValidated        DeltaAction = "artifact.validated"
+
+	DeltaActionValidationReady                                 DeltaAction = "validation.ready"
+	DeltaActionValidationValidating                            DeltaAction = "validation.validating"
+	DeltaActionValidationValidationFailed                      DeltaAction = "validation.validation_failed"
+	DeltaActionValidationValidationFailedNotRequired           DeltaAction = "validation.validation_failed_not_required"
+	DeltaActionValidationErrored                               DeltaAction = "validation.errored"
+	DeltaActionValidationErroredNotRequired                    DeltaAction = "validation.errored_not_required"
+	DeltaActionValidationValidatingQualityBar                  DeltaAction = "validation.validating_quality_bar"
+	DeltaActionValidationQualityBarValidationFailed            DeltaAction = "validation.quality_bar_validation_failed"
+	DeltaActionValidationQualityBarValidationFailedNotRequired DeltaAction = "validation.quality_bar_validation_failed_not_required"
+	DeltaActionValidationValidated                             DeltaAction = "validation.validated"
+
 	DeltaActionValidationEvaluated DeltaAction = "validation.evaluated"
 )
 
@@ -82,8 +102,34 @@ var testamentLifecycleDeltaActions = map[TestamentLifecycleStatus]DeltaAction{
 	TestamentLifecycleValidated:            DeltaActionTestamentValidated,
 }
 
+var artifactLifecycleDeltaActions = map[ArtifactStatus]DeltaAction{
+	ArtifactStatusGenerated:        DeltaActionArtifactGenerated,
+	ArtifactStatusGenerationFailed: DeltaActionArtifactGenerationFailed,
+	ArtifactStatusReceived:         DeltaActionArtifactReceived,
+	ArtifactStatusReceiptFailed:    DeltaActionArtifactReceiptFailed,
+	ArtifactStatusAttached:         DeltaActionArtifactAttached,
+	ArtifactStatusValidating:       DeltaActionArtifactValidating,
+	ArtifactStatusValidationFailed: DeltaActionArtifactValidationFailed,
+	ArtifactStatusValidated:        DeltaActionArtifactValidated,
+}
+
+var validationLifecycleDeltaActions = map[ValidationStatus]DeltaAction{
+	ValidationStatusReady:                                 DeltaActionValidationReady,
+	ValidationStatusValidating:                            DeltaActionValidationValidating,
+	ValidationStatusValidationFailed:                      DeltaActionValidationValidationFailed,
+	ValidationStatusValidationFailedNotRequired:           DeltaActionValidationValidationFailedNotRequired,
+	ValidationStatusErrored:                               DeltaActionValidationErrored,
+	ValidationStatusErroredNotRequired:                    DeltaActionValidationErroredNotRequired,
+	ValidationStatusValidatingQualityBar:                  DeltaActionValidationValidatingQualityBar,
+	ValidationStatusQualityBarValidationFailed:            DeltaActionValidationQualityBarValidationFailed,
+	ValidationStatusQualityBarValidationFailedNotRequired: DeltaActionValidationQualityBarValidationFailedNotRequired,
+	ValidationStatusValidated:                             DeltaActionValidationValidated,
+}
+
 var deltaActionClaimLifecycleStatuses = invertClaimLifecycleDeltaActions()
 var deltaActionTestamentLifecycleStatuses = invertTestamentLifecycleDeltaActions()
+var deltaActionArtifactLifecycleStatuses = invertArtifactLifecycleDeltaActions()
+var deltaActionValidationLifecycleStatuses = invertValidationLifecycleDeltaActions()
 
 // CanonicalDelta is the immutable envelope emitted after a board
 // mutation commits. It intentionally has no top-level JSON "kind";
@@ -201,6 +247,12 @@ func KnownDeltaAction(action DeltaAction) bool {
 	if _, ok := deltaActionTestamentLifecycleStatuses[action]; ok {
 		return true
 	}
+	if _, ok := deltaActionArtifactLifecycleStatuses[action]; ok {
+		return true
+	}
+	if _, ok := deltaActionValidationLifecycleStatuses[action]; ok {
+		return true
+	}
 	switch action {
 	case DeltaActionValidationEvaluated:
 		return true
@@ -210,7 +262,7 @@ func KnownDeltaAction(action DeltaAction) bool {
 }
 
 func KnownDeltaActions() []DeltaAction {
-	out := make([]DeltaAction, 0, len(claimLifecycleDeltaActions)+len(testamentLifecycleDeltaActions)+1)
+	out := make([]DeltaAction, 0, len(claimLifecycleDeltaActions)+len(testamentLifecycleDeltaActions)+len(artifactLifecycleDeltaActions)+len(validationLifecycleDeltaActions)+1)
 	for _, status := range KnownClaimLifecycleStatuses() {
 		if action, ok := ClaimLifecycleDeltaAction(status); ok {
 			out = append(out, action)
@@ -218,6 +270,16 @@ func KnownDeltaActions() []DeltaAction {
 	}
 	for _, status := range KnownTestamentLifecycleStatuses() {
 		if action, ok := TestamentLifecycleDeltaAction(status); ok {
+			out = append(out, action)
+		}
+	}
+	for _, status := range KnownArtifactStatuses() {
+		if action, ok := ArtifactLifecycleDeltaAction(status); ok {
+			out = append(out, action)
+		}
+	}
+	for _, status := range KnownValidationLifecycleStatuses() {
+		if action, ok := ValidationLifecycleDeltaAction(status); ok {
 			out = append(out, action)
 		}
 	}
@@ -242,7 +304,16 @@ func DeltaActionMayCompleteExpectedWork(action DeltaAction) bool {
 		DeltaActionClaimValidationIncomplete,
 		DeltaActionClaimValidationFailed,
 		DeltaActionClaimValidationErrored,
-		DeltaActionValidationEvaluated:
+		DeltaActionValidationEvaluated,
+		DeltaActionArtifactValidationFailed,
+		DeltaActionArtifactValidated,
+		DeltaActionValidationValidationFailed,
+		DeltaActionValidationValidationFailedNotRequired,
+		DeltaActionValidationErrored,
+		DeltaActionValidationErroredNotRequired,
+		DeltaActionValidationQualityBarValidationFailed,
+		DeltaActionValidationQualityBarValidationFailedNotRequired,
+		DeltaActionValidationValidated:
 		return true
 	default:
 		return false
@@ -257,7 +328,9 @@ func DeltaActionRequiresDelivery(action DeltaAction) bool {
 		DeltaActionClaimTestamentAcknowledged,
 		DeltaActionClaimTestamentAcknowledgementFailed,
 		DeltaActionTestamentPosted,
-		DeltaActionTestamentReceived:
+		DeltaActionTestamentReceived,
+		DeltaActionArtifactReceived,
+		DeltaActionValidationValidatingQualityBar:
 		return true
 	default:
 		return false
@@ -274,6 +347,16 @@ func TestamentLifecycleDeltaAction(status TestamentLifecycleStatus) (DeltaAction
 	return action, ok
 }
 
+func ArtifactLifecycleDeltaAction(status ArtifactStatus) (DeltaAction, bool) {
+	action, ok := artifactLifecycleDeltaActions[status]
+	return action, ok
+}
+
+func ValidationLifecycleDeltaAction(status ValidationStatus) (DeltaAction, bool) {
+	action, ok := validationLifecycleDeltaActions[status]
+	return action, ok
+}
+
 func DeltaActionClaimLifecycleStatus(action DeltaAction) (ClaimLifecycleStatus, bool) {
 	status, ok := deltaActionClaimLifecycleStatuses[action]
 	return status, ok
@@ -281,6 +364,16 @@ func DeltaActionClaimLifecycleStatus(action DeltaAction) (ClaimLifecycleStatus, 
 
 func DeltaActionTestamentLifecycleStatus(action DeltaAction) (TestamentLifecycleStatus, bool) {
 	status, ok := deltaActionTestamentLifecycleStatuses[action]
+	return status, ok
+}
+
+func DeltaActionArtifactLifecycleStatus(action DeltaAction) (ArtifactStatus, bool) {
+	status, ok := deltaActionArtifactLifecycleStatuses[action]
+	return status, ok
+}
+
+func DeltaActionValidationLifecycleStatus(action DeltaAction) (ValidationStatus, bool) {
+	status, ok := deltaActionValidationLifecycleStatuses[action]
 	return status, ok
 }
 
@@ -307,6 +400,22 @@ func invertClaimLifecycleDeltaActions() map[DeltaAction]ClaimLifecycleStatus {
 func invertTestamentLifecycleDeltaActions() map[DeltaAction]TestamentLifecycleStatus {
 	out := make(map[DeltaAction]TestamentLifecycleStatus, len(testamentLifecycleDeltaActions))
 	for status, action := range testamentLifecycleDeltaActions {
+		out[action] = status
+	}
+	return out
+}
+
+func invertArtifactLifecycleDeltaActions() map[DeltaAction]ArtifactStatus {
+	out := make(map[DeltaAction]ArtifactStatus, len(artifactLifecycleDeltaActions))
+	for status, action := range artifactLifecycleDeltaActions {
+		out[action] = status
+	}
+	return out
+}
+
+func invertValidationLifecycleDeltaActions() map[DeltaAction]ValidationStatus {
+	out := make(map[DeltaAction]ValidationStatus, len(validationLifecycleDeltaActions))
+	for status, action := range validationLifecycleDeltaActions {
 		out[action] = status
 	}
 	return out
@@ -398,7 +507,7 @@ func AgentRefFromIdentity(id *identity.AgentIdentity, task *identity.TaskRef) Ag
 		Pod:        string(pod.ID),
 		Name:       string(id.Name()),
 		Type:       id.Kind().String(),
-		Category:   id.Category().String(),
+		Category:   participantCategoryForIdentity(id),
 		Generation: uint64(id.Generation()),
 		Model:      id.Model().String(),
 		Labels:     mapStringString(id.Labels()),
@@ -413,6 +522,13 @@ func AgentRefFromIdentity(id *identity.AgentIdentity, task *identity.TaskRef) Ag
 	return ref.Normalized()
 }
 
+func participantCategoryForIdentity(id *identity.AgentIdentity) string {
+	if identity.IsSystem(id) {
+		return string(ParticipantCategorySystem)
+	}
+	return string(ParticipantCategoryAgent)
+}
+
 func DegradedAgentRef(agentType, reason string) AgentRef {
 	agentType = strings.TrimSpace(agentType)
 	if reason = strings.TrimSpace(reason); reason == "" {
@@ -421,6 +537,7 @@ func DegradedAgentRef(agentType, reason string) AgentRef {
 	return AgentRef{
 		Type:             agentType,
 		Name:             agentType,
+		Category:         string(ParticipantCategoryAgent),
 		Unresolved:       true,
 		ResolutionReason: reason,
 	}.Normalized()
@@ -432,7 +549,7 @@ func (r AgentRef) Normalized() AgentRef {
 	r.Pod = strings.TrimSpace(r.Pod)
 	r.Name = strings.TrimSpace(r.Name)
 	r.Type = strings.TrimSpace(r.Type)
-	r.Category = strings.TrimSpace(r.Category)
+	r.Category = normalizeParticipantCategoryString(r.Category)
 	r.Model = strings.TrimSpace(r.Model)
 	r.ResolutionReason = strings.TrimSpace(r.ResolutionReason)
 	if r.Type == "" && r.Name != "" {
@@ -440,6 +557,9 @@ func (r AgentRef) Normalized() AgentRef {
 	}
 	if r.Name == "" && r.Type != "" {
 		r.Name = r.Type
+	}
+	if r.Category == "" {
+		r.Category = string(ParticipantCategoryAgent)
 	}
 	if len(r.Labels) == 0 {
 		r.Labels = nil
@@ -453,6 +573,9 @@ func (r AgentRef) Validate() error {
 		if r.Type == "" && r.Name == "" && r.UID == "" {
 			return fmt.Errorf("unresolved ref requires type, name, or uid")
 		}
+		if !ParticipantCategory(r.Category).Valid() {
+			return fmt.Errorf("category %q is invalid", r.Category)
+		}
 		return nil
 	}
 	if r.UID == "" {
@@ -463,6 +586,9 @@ func (r AgentRef) Validate() error {
 	}
 	if r.Generation == 0 && r.Model == "" {
 		return fmt.Errorf("generation/model are required for canonical refs")
+	}
+	if !ParticipantCategory(r.Category).Valid() {
+		return fmt.Errorf("category %q is invalid", r.Category)
 	}
 	return nil
 }
@@ -485,6 +611,23 @@ func (r AgentRef) MatchesAgentID(agentID string) bool {
 	}
 	r = r.Normalized()
 	return agentID == r.UID || agentID == r.Type || agentID == r.Name
+}
+
+func normalizeParticipantCategoryString(category string) string {
+	category = strings.TrimSpace(category)
+	switch category {
+	case "", "unspecified":
+		return ""
+	case string(ParticipantCategoryAgent),
+		string(ParticipantCategoryService),
+		string(ParticipantCategorySystem),
+		string(ParticipantCategoryExternal):
+		return category
+	case "knowledge", "standalone", "pipeline":
+		return string(ParticipantCategoryAgent)
+	default:
+		return category
+	}
 }
 
 // DeltaDelivery identifies intended recipients for directed deltas.

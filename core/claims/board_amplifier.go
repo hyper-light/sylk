@@ -321,6 +321,30 @@ func (a *BoardAmplifier) PublishCanonicalValidationEvaluated(ctx context.Context
 	})
 }
 
+// PublishCanonicalArtifactLifecycle emits canonical artifact lifecycle
+// deltas after the board has committed the transition.
+func (a *BoardAmplifier) PublishCanonicalArtifactLifecycle(ctx context.Context, artifact *Artifact, testament *Testament, claim *Claim, status ArtifactStatus, actorID string, now time.Time) {
+	if a == nil || artifact == nil {
+		return
+	}
+	if claim != nil && IsSystemInternalAction(claim.ActionType) {
+		return
+	}
+	a.dispatchCanonical(ctx, a.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, status, actorID, now))
+}
+
+// PublishCanonicalValidationLifecycle emits canonical validation lifecycle
+// deltas after the board has committed the transition.
+func (a *BoardAmplifier) PublishCanonicalValidationLifecycle(ctx context.Context, claim *Claim, validation *Validation, artifact *Artifact, status ValidationStatus, actorID string, now time.Time) {
+	if a == nil || claim == nil || validation == nil {
+		return
+	}
+	if IsSystemInternalAction(claim.ActionType) {
+		return
+	}
+	a.dispatchCanonical(ctx, a.buildValidationLifecycleDeltas(ctx, claim, validation, artifact, status, actorID, now))
+}
+
 func (a *BoardAmplifier) PublishCanonicalClaimProgressed(ctx context.Context, claim *Claim, agentID, state, message string, transitionID int64, now time.Time) {
 	if a == nil || claim == nil {
 		return
@@ -780,6 +804,84 @@ func (a *BoardAmplifier) buildCanonicalValidationEvaluated(ctx context.Context, 
 	)
 }
 
+func (a *BoardAmplifier) buildArtifactLifecycleDeltas(ctx context.Context, artifact *Artifact, testament *Testament, claim *Claim, status ArtifactStatus, actorID string, occurredAt time.Time) []canonicalDispatch {
+	action, ok := ArtifactLifecycleDeltaAction(status)
+	if !ok || artifact == nil {
+		return nil
+	}
+	delta := a.buildCanonicalArtifactLifecycle(ctx, artifact, testament, claim, action, status, actorID, occurredAt)
+	out := []canonicalDispatch{{topic: CanonicalArtifactTopic(a.sessionID, artifact.ID, action), delta: delta}}
+	if claim != nil && strings.TrimSpace(claim.ID) != "" {
+		out = append(out, canonicalDispatch{topic: CanonicalClaimTopic(a.sessionID, claim.ID, action), delta: delta})
+	}
+	return append(out, a.receiverDispatches(action, delta, delta.Delivery)...)
+}
+
+func (a *BoardAmplifier) buildCanonicalArtifactLifecycle(ctx context.Context, artifact *Artifact, testament *Testament, claim *Claim, action DeltaAction, status ArtifactStatus, actorID string, occurredAt time.Time) CanonicalDelta {
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	change := artifactStatusChangeFor(artifact, status)
+	refs := artifactDeltaRefs(artifact, testament, claim, "")
+	delivery := a.artifactLifecycleDelivery(ctx, claim, status, actorID)
+	context := map[string]any{"artifact": artifactLifecycleContext(artifact, status)}
+	addArtifactParentContext(context, claim, testament)
+	addLifecycleChangeContext(context, change, actorID)
+	addArtifactErrorContext(context, artifact)
+	return NewCanonicalDelta(
+		action,
+		a.sessionID,
+		a.boardID,
+		artifact.Sequence,
+		occurredAt,
+		a.resolveAgentRef(ctx, firstNonEmpty(actorID, change.AgentID, artifact.ParticipantID, artifact.AgentID), "artifact lifecycle actor"),
+		refs,
+		delivery,
+		context,
+	)
+}
+
+func (a *BoardAmplifier) buildValidationLifecycleDeltas(ctx context.Context, claim *Claim, validation *Validation, artifact *Artifact, status ValidationStatus, actorID string, occurredAt time.Time) []canonicalDispatch {
+	action, ok := ValidationLifecycleDeltaAction(status)
+	if !ok || claim == nil || validation == nil {
+		return nil
+	}
+	delta := a.buildCanonicalValidationLifecycle(ctx, claim, validation, artifact, action, status, actorID, occurredAt)
+	out := []canonicalDispatch{
+		{topic: CanonicalValidationTopic(a.sessionID, validation.ID, action), delta: delta},
+		{topic: CanonicalClaimTopic(a.sessionID, claim.ID, action), delta: delta},
+	}
+	return append(out, a.receiverDispatches(action, delta, delta.Delivery)...)
+}
+
+func (a *BoardAmplifier) buildCanonicalValidationLifecycle(ctx context.Context, claim *Claim, validation *Validation, artifact *Artifact, action DeltaAction, status ValidationStatus, actorID string, occurredAt time.Time) CanonicalDelta {
+	if occurredAt.IsZero() {
+		occurredAt = time.Now().UTC()
+	}
+	change := validationStatusChangeFor(validation, status)
+	refs := append(claimRefs(claim.ID), DeltaRef{Role: "validation", Type: RelatedTypeValidation, ID: validation.ID})
+	if artifact != nil && artifact.ID != "" {
+		refs = append(refs, DeltaRef{Role: "artifact", Type: RelatedTypeArtifact, ID: artifact.ID})
+	}
+	context := map[string]any{
+		"claim":      claimLifecycleContext(claim),
+		"validation": validationLifecycleContext(validation, status),
+	}
+	addLifecycleChangeContext(context, change, actorID)
+	addValidationErrorContext(context, validation)
+	return NewCanonicalDelta(
+		action,
+		a.sessionID,
+		a.boardID,
+		validation.Sequence,
+		occurredAt,
+		a.resolveAgentRef(ctx, firstNonEmpty(actorID, change.AgentID, validation.ParticipantID, validation.AgentID, validation.ValidatorID), "validation lifecycle actor"),
+		refs,
+		a.validationLifecycleDelivery(ctx, claim, status, actorID),
+		context,
+	)
+}
+
 func (a *BoardAmplifier) buildCanonicalClaimLifecycleFromStatusDelta(ctx context.Context, delta ClaimStatusDelta, lifecycle ClaimLifecycleStatus) CanonicalDelta {
 	action := mustClaimLifecycleDeltaAction(lifecycle)
 	return NewCanonicalDelta(
@@ -1012,6 +1114,34 @@ func claimScopeContext(scope []ClaimScopeEntry) []map[string]string {
 	return out
 }
 
+func claimLifecycleContext(claim *Claim) map[string]any {
+	if claim == nil {
+		return nil
+	}
+	return map[string]any{
+		"id":                  claim.ID,
+		"action":              string(claim.ActionType),
+		"title":               claim.Title,
+		"status":              string(claim.Status),
+		"lifecycle_status":    string(claim.LifecycleStatus),
+		"validations":         validationContext(claim.Validations),
+		"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
+	}
+}
+
+func testamentLifecycleContext(testament *Testament) map[string]any {
+	if testament == nil {
+		return nil
+	}
+	return map[string]any{
+		"id":               testament.ID,
+		"verdict":          DeriveTestamentVerdict(testament.Artifacts),
+		"confidence":       testament.Confidence,
+		"lifecycle_status": string(testament.LifecycleStatus),
+		"artifacts":        artifactHeadersContext(testament.Artifacts),
+	}
+}
+
 func validationContext(validations []*Validation) []map[string]any {
 	if len(validations) == 0 {
 		return nil
@@ -1035,6 +1165,134 @@ func validationContext(validations []*Validation) []map[string]any {
 		out = append(out, entry)
 	}
 	return out
+}
+
+func validationLifecycleContext(validation *Validation, status ValidationStatus) map[string]any {
+	if validation == nil {
+		return nil
+	}
+	if status == "" {
+		status = validation.Status
+	}
+	return map[string]any{
+		"id":                   validation.ID,
+		"type":                 string(validation.Type),
+		"status":               string(status),
+		"required":             validation.Required,
+		"target_artifact_name": validation.TargetArtifactName,
+		"validator_id":         validation.ValidatorID,
+		"artifact_data_type":   validation.ArtifactDataType,
+		"result_data_type":     validation.ResultDataType,
+		"result_artifact_id":   validation.ResultArtifactID,
+		"expected_tool_calls":  expectedToolCallContext(validation.ExpectedToolCalls),
+	}
+}
+
+func artifactDeltaRefs(artifact *Artifact, testament *Testament, claim *Claim, validationID string) []DeltaRef {
+	refs := claimRefs("")
+	if claim != nil {
+		refs = claimRefs(claim.ID)
+	}
+	if testament != nil && testament.ID != "" {
+		refs = append(refs, DeltaRef{Role: "testament", Type: RelatedTypeTestament, ID: testament.ID})
+	}
+	if artifact != nil && artifact.ID != "" {
+		refs = append(refs, DeltaRef{Role: "artifact", Type: RelatedTypeArtifact, ID: artifact.ID})
+	}
+	if strings.TrimSpace(validationID) != "" {
+		refs = append(refs, DeltaRef{Role: "validation", Type: RelatedTypeValidation, ID: strings.TrimSpace(validationID)})
+	}
+	return refs
+}
+
+func artifactStatusChangeFor(artifact *Artifact, status ArtifactStatus) StatusChange {
+	if artifact == nil {
+		return StatusChange{}
+	}
+	for i := len(artifact.StatusHistory) - 1; i >= 0; i-- {
+		if ArtifactStatus(artifact.StatusHistory[i].To) == status {
+			return artifact.StatusHistory[i]
+		}
+	}
+	return StatusChange{To: string(status)}
+}
+
+func validationStatusChangeFor(validation *Validation, status ValidationStatus) StatusChange {
+	if validation == nil {
+		return StatusChange{}
+	}
+	for i := len(validation.StatusHistory) - 1; i >= 0; i-- {
+		if ValidationStatus(validation.StatusHistory[i].To) == status {
+			return validation.StatusHistory[i]
+		}
+	}
+	return StatusChange{To: string(status)}
+}
+
+func addArtifactParentContext(context map[string]any, claim *Claim, testament *Testament) {
+	if claim != nil {
+		context["claim"] = claimLifecycleContext(claim)
+	}
+	if testament != nil {
+		context["testament"] = testamentLifecycleContext(testament)
+	}
+}
+
+func addLifecycleChangeContext(context map[string]any, change StatusChange, actorID string) {
+	context["transition"] = map[string]any{
+		"from_status": change.From,
+		"to_status":   change.To,
+		"reason":      change.Reason,
+		"actor_id":    firstNonEmpty(actorID, change.AgentID, change.ParticipantID),
+	}
+}
+
+func addArtifactErrorContext(context map[string]any, artifact *Artifact) {
+	if artifact == nil || len(artifact.Errors) == 0 {
+		return
+	}
+	err := artifact.Errors[len(artifact.Errors)-1]
+	if err != nil {
+		context["error"] = map[string]any{"category": string(err.Category), "description": err.Description}
+	}
+}
+
+func addValidationErrorContext(context map[string]any, validation *Validation) {
+	if validation == nil || validation.Error == nil {
+		return
+	}
+	context["error"] = map[string]any{"category": string(validation.Error.Category), "description": validation.Error.Description}
+}
+
+func (a *BoardAmplifier) artifactLifecycleDelivery(ctx context.Context, claim *Claim, status ArtifactStatus, actorID string) *DeltaDelivery {
+	if status != ArtifactStatusReceived {
+		return nil
+	}
+	issuerID := ""
+	if claim != nil {
+		issuerID = IssuerAgentID(claim.Relations)
+	}
+	targetID := firstNonEmpty(actorID, issuerID)
+	if strings.TrimSpace(targetID) == "" {
+		return nil
+	}
+	return &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, targetID, "artifact lifecycle receiver")}, Relationship: RelationshipIssuer}
+}
+
+func (a *BoardAmplifier) validationLifecycleDelivery(ctx context.Context, claim *Claim, status ValidationStatus, actorID string) *DeltaDelivery {
+	if status != ValidationStatusValidatingQualityBar {
+		return nil
+	}
+	evaluatorID, issuerID := "", ""
+	if claim != nil {
+		evaluatorID = firstAgentIDForRelationship(claim.Relations, RelationshipEvaluator)
+		issuerID = IssuerAgentID(claim.Relations)
+	}
+	targetID := firstNonEmpty(actorID, evaluatorID, issuerID)
+	if strings.TrimSpace(targetID) == "" {
+		return nil
+	}
+	return &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, targetID, "validation quality bar receiver")}, Relationship: RelationshipEvaluator}
 }
 
 func artifactHeadersContext(artifacts []*Artifact) []map[string]any {
@@ -1063,6 +1321,28 @@ func artifactHeadersContext(artifacts []*Artifact) []map[string]any {
 		out = append(out, header)
 	}
 	return out
+}
+
+func artifactLifecycleContext(artifact *Artifact, status ArtifactStatus) map[string]any {
+	if artifact == nil {
+		return nil
+	}
+	if status == "" {
+		status = artifact.Status
+	}
+	return map[string]any{
+		"id":             artifact.ID,
+		"name":           artifact.ArtifactName,
+		"kind":           artifact.Kind,
+		"data_type":      artifact.DataType,
+		"content_hash":   artifact.ContentHash,
+		"size":           artifact.Size,
+		"ephemeral":      artifact.Ephemeral,
+		"status":         string(status),
+		"testament_id":   artifact.TestamentID,
+		"claim_id":       artifact.ClaimID,
+		"participant_id": firstNonEmpty(artifact.ParticipantID, artifact.AgentID),
+	}
 }
 
 const canonicalTestamentContextMax = 4096

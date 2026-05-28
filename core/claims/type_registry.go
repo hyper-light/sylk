@@ -81,6 +81,9 @@ func NewTypeRegistry() *TypeRegistry {
 
 func (r *TypeRegistry) Register(dataType string, sample any, codec ArtifactDataCodec) error {
 	dataType = strings.TrimSpace(dataType)
+	if r == nil {
+		return artifactTypeError(dataType, "register", ErrArtifactTypeInvalid)
+	}
 	if dataType == "" {
 		return artifactTypeError(dataType, "register", ErrArtifactTypeInvalid)
 	}
@@ -107,6 +110,9 @@ func (r *TypeRegistry) Register(dataType string, sample any, codec ArtifactDataC
 
 func (r *TypeRegistry) LookupArtifactType(dataType string) (RegisteredArtifactType, error) {
 	dataType = strings.TrimSpace(dataType)
+	if r == nil {
+		return RegisteredArtifactType{}, artifactTypeError(dataType, "lookup", ErrArtifactTypeUnknown)
+	}
 	r.mu.RLock()
 	entry, ok := r.byDataType[dataType]
 	r.mu.RUnlock()
@@ -118,6 +124,9 @@ func (r *TypeRegistry) LookupArtifactType(dataType string) (RegisteredArtifactTy
 
 func (r *TypeRegistry) LookupArtifactTypeFor(goType reflect.Type) (RegisteredArtifactType, error) {
 	goType = indirectArtifactGoType(goType)
+	if r == nil {
+		return RegisteredArtifactType{}, artifactTypeError("", "lookup_go_type", ErrArtifactTypeUnknown)
+	}
 	r.mu.RLock()
 	dataType := r.byGoType[goType]
 	entry, ok := r.byDataType[dataType]
@@ -129,6 +138,9 @@ func (r *TypeRegistry) LookupArtifactTypeFor(goType reflect.Type) (RegisteredArt
 }
 
 func (r *TypeRegistry) ListArtifactTypes() []RegisteredArtifactType {
+	if r == nil {
+		return nil
+	}
 	r.mu.RLock()
 	out := make([]RegisteredArtifactType, 0, len(r.byDataType))
 	for _, entry := range r.byDataType {
@@ -297,6 +309,9 @@ func artifactGoTypeFromValue(value any) (reflect.Type, error) {
 	if value == nil {
 		return nil, ErrArtifactTypeInvalid
 	}
+	if artifactValueIsNil(value) {
+		return nil, ErrArtifactTypeInvalid
+	}
 	goType := indirectArtifactGoType(reflect.TypeOf(value))
 	if goType == nil {
 		return nil, ErrArtifactTypeInvalid
@@ -309,6 +324,19 @@ func indirectArtifactGoType(goType reflect.Type) reflect.Type {
 		goType = goType.Elem()
 	}
 	return goType
+}
+
+func artifactValueIsNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
 }
 
 func artifactTypeError(dataType, op string, err error) error {

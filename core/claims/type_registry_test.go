@@ -2,6 +2,7 @@ package claims
 
 import (
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -28,8 +29,43 @@ func TestTypeRegistryRegisterLookupListAndDuplicate(t *testing.T) {
 	if err := registry.Register("synthetic.v1", struct{ Other string }{}, JSONArtifactCodec{}); !errors.Is(err, ErrArtifactTypeDuplicate) {
 		t.Fatalf("duplicate error = %v", err)
 	}
+	if err := registry.Register("synthetic_alias.v1", syntheticArtifactPayload{}, JSONArtifactCodec{}); !errors.Is(err, ErrArtifactTypeDuplicate) {
+		t.Fatalf("duplicate Go type error = %v, want duplicate", err)
+	}
+	if err := registry.Register("synthetic_pointer.v1", &struct{ Pointer string }{}, JSONArtifactCodec{}); err != nil {
+		t.Fatalf("pointer sample register: %v", err)
+	}
+	if _, err := registry.LookupArtifactTypeFor(reflect.TypeOf((*struct{ Pointer string })(nil))); err != nil {
+		t.Fatalf("pointer lookup: %v", err)
+	}
 	if _, err := registry.LookupArtifactType("missing.v1"); !errors.Is(err, ErrArtifactTypeUnknown) {
 		t.Fatalf("unknown error = %v", err)
+	}
+}
+
+func TestTypeRegistryRejectsInvalidRegistrationInputs(t *testing.T) {
+	registry := NewTypeRegistry()
+	for _, tc := range []struct {
+		name     string
+		dataType string
+		sample   any
+		codec    ArtifactDataCodec
+		want     error
+	}{
+		{name: "empty datatype", dataType: "", sample: syntheticArtifactPayload{}, codec: JSONArtifactCodec{}, want: ErrArtifactTypeInvalid},
+		{name: "nil sample", dataType: "nil_sample.v1", sample: nil, codec: JSONArtifactCodec{}, want: ErrArtifactTypeInvalid},
+		{name: "nil pointer sample", dataType: "nil_pointer_sample.v1", sample: (*syntheticArtifactPayload)(nil), codec: JSONArtifactCodec{}, want: ErrArtifactTypeInvalid},
+		{name: "nil codec", dataType: "nil_codec.v1", sample: syntheticArtifactPayload{}, codec: nil, want: ErrArtifactCodecNil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := registry.Register(tc.dataType, tc.sample, tc.codec); !errors.Is(err, tc.want) {
+				t.Fatalf("Register error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	var nilRegistry *TypeRegistry
+	if err := nilRegistry.Register("x.v1", syntheticArtifactPayload{}, JSONArtifactCodec{}); !errors.Is(err, ErrArtifactTypeInvalid) {
+		t.Fatalf("nil registry register error = %v, want invalid", err)
 	}
 }
 

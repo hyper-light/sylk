@@ -84,6 +84,24 @@ func TestDeltaAction_LifecycleCoverageAndActionability(t *testing.T) {
 			t.Fatalf("testament action %q maps back to (%q, %v), want %q", action, got, ok, status)
 		}
 	}
+	for _, status := range KnownArtifactStatuses() {
+		action, ok := ArtifactLifecycleDeltaAction(status)
+		if !ok {
+			t.Fatalf("artifact lifecycle status %q has no canonical delta action", status)
+		}
+		if got, ok := DeltaActionArtifactLifecycleStatus(action); !ok || got != status {
+			t.Fatalf("artifact action %q maps back to (%q, %v), want %q", action, got, ok, status)
+		}
+	}
+	for _, status := range KnownValidationLifecycleStatuses() {
+		action, ok := ValidationLifecycleDeltaAction(status)
+		if !ok {
+			t.Fatalf("validation lifecycle status %q has no canonical delta action", status)
+		}
+		if got, ok := DeltaActionValidationLifecycleStatus(action); !ok || got != status {
+			t.Fatalf("validation action %q maps back to (%q, %v), want %q", action, got, ok, status)
+		}
+	}
 	if DeltaActionStartsClaimWork(DeltaActionClaimGenerated) {
 		t.Fatal("claim.generated must not start claim work")
 	}
@@ -207,7 +225,7 @@ func TestAgentRefFromIdentityAndDegradedRef(t *testing.T) {
 	if err := ref.Validate(); err != nil {
 		t.Fatalf("canonical ref invalid: %v", err)
 	}
-	if ref.UID != "uid-1" || ref.Type != "librarian" || ref.Task.PipelineID != "pipe-1" {
+	if ref.UID != "uid-1" || ref.Type != "librarian" || ref.Category != string(ParticipantCategoryAgent) || ref.Task.PipelineID != "pipe-1" {
 		t.Fatalf("unexpected ref: %+v", ref)
 	}
 	degraded := DegradedAgentRef("librarian", "legacy")
@@ -219,6 +237,41 @@ func TestAgentRefFromIdentityAndDegradedRef(t *testing.T) {
 	}
 	if err := (AgentRef{Type: "librarian"}).Validate(); err == nil {
 		t.Fatal("missing uid without unresolved=true accepted")
+	}
+}
+
+func TestCanonicalDeltaStrictValidationAcceptsServiceParticipantRef(t *testing.T) {
+	participant, err := NewServiceParticipantRegistration("tool_runtime", map[string]string{"session": "sess"}, 4, 1, time.Second, []ActionType{ActionTypeTask})
+	if err != nil {
+		t.Fatalf("NewServiceParticipantRegistration: %v", err)
+	}
+	delta := NewCanonicalDelta(
+		DeltaActionClaimPosted,
+		"sess",
+		"board",
+		1,
+		time.Unix(1, 0),
+		AgentRef{UID: "issuer-uid", Type: "architect", Category: string(ParticipantCategoryAgent), Generation: 1},
+		[]DeltaRef{{Role: "claim", Type: RelatedTypeClaim, ID: "claim-1"}},
+		&DeltaDelivery{To: []AgentRef{participant.AgentRef()}, Relationship: RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": "claim-1", "action": string(ActionTypeTask)}},
+	)
+	if err := ValidateCanonicalDeltaStrict(delta); err != nil {
+		t.Fatalf("strict service delta rejected: %v", err)
+	}
+	if got := delta.Delivery.To[0].Category; got != string(ParticipantCategoryService) {
+		t.Fatalf("delivery category = %q, want service", got)
+	}
+}
+
+func TestCanonicalAgentRefTopicUsesTypeRouteForDegradedRefsEvenWithUID(t *testing.T) {
+	ref := AgentRef{UID: "spoofed-uid", Type: "librarian", Unresolved: true, ResolutionReason: "legacy relation"}.Normalized()
+	topic := CanonicalAgentRefTopic("session", ref, DeltaActionClaimPosted)
+	if strings.Contains(topic, "."+TopicSegmentAgent+".") {
+		t.Fatalf("degraded ref used canonical uid topic: %s", topic)
+	}
+	if !strings.Contains(topic, "."+TopicSegmentAgentType+".librarian.") {
+		t.Fatalf("degraded ref topic = %s, want agent_type route", topic)
 	}
 }
 
@@ -325,6 +378,7 @@ func testCanonicalDelta(action DeltaAction) CanonicalDelta {
 			{Role: "action", Type: RelatedTypeAction, ID: "a1"},
 			{Role: "claim", Type: RelatedTypeClaim, ID: "c1"},
 			{Role: "testament", Type: RelatedTypeTestament, ID: "t1"},
+			{Role: "artifact", Type: RelatedTypeArtifact, ID: "art1"},
 			{Role: "validation", Type: RelatedTypeValidation, ID: "v1"},
 		},
 		delivery,

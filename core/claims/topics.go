@@ -18,6 +18,7 @@ const (
 	TopicSegmentAgent            = "agent"
 	TopicSegmentAgentType        = "agent_type"
 	TopicSegmentClaim            = "claim"
+	TopicSegmentArtifact         = "artifact"
 	TopicSegmentValidation       = "validation"
 	TopicSegmentBoard            = "board"
 	TopicSegmentPhase            = "phase"
@@ -131,10 +132,21 @@ func CanonicalAgentTypeTopic(sessionID, agentType string, action DeltaAction) st
 
 func CanonicalAgentRefTopic(sessionID string, ref AgentRef, action DeltaAction) string {
 	ref = ref.Normalized()
-	if ref.UID != "" {
+	if ref.UID != "" && !ref.Unresolved {
 		return CanonicalAgentTopic(sessionID, ref.UID, action)
 	}
-	return CanonicalAgentTypeTopic(sessionID, ref.RouteKey(), action)
+	return CanonicalAgentTypeTopic(sessionID, degradedAgentRefRouteKey(ref), action)
+}
+
+func degradedAgentRefRouteKey(ref AgentRef) string {
+	ref = ref.Normalized()
+	if ref.Type != "" {
+		return ref.Type
+	}
+	if ref.Name != "" {
+		return ref.Name
+	}
+	return ref.RouteKey()
 }
 
 func CanonicalClaimTopic(sessionID, claimID string, action DeltaAction) string {
@@ -143,6 +155,16 @@ func CanonicalClaimTopic(sessionID, claimID string, action DeltaAction) string {
 		normalizeTopicSegment(sessionID),
 		TopicSegmentClaim,
 		normalizeTopicSegment(claimID),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalArtifactTopic(sessionID, artifactID string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		normalizeTopicSegment(sessionID),
+		TopicSegmentArtifact,
+		normalizeTopicSegment(artifactID),
 		normalizeTopicSegment(string(action)),
 	)
 }
@@ -277,6 +299,16 @@ func CanonicalClaimActionPattern(sessionFilter, claimFilter string, action Delta
 		wildcardOrSegment(sessionFilter),
 		TopicSegmentClaim,
 		wildcardOrSegment(claimFilter),
+		normalizeTopicSegment(string(action)),
+	)
+}
+
+func CanonicalArtifactActionPattern(sessionFilter, artifactFilter string, action DeltaAction) string {
+	return joinTopic(
+		TopicNamespace,
+		wildcardOrSegment(sessionFilter),
+		TopicSegmentArtifact,
+		wildcardOrSegment(artifactFilter),
 		normalizeTopicSegment(string(action)),
 	)
 }

@@ -24,6 +24,8 @@ const (
 
 	InitialParticipantGeneration uint64 = 1
 
+	ParticipantUIDDerivationVersion = "v1"
+
 	participantUIDNamespace = "participant"
 )
 
@@ -62,7 +64,8 @@ func NewParticipantRegistry() *ParticipantRegistry {
 func DeriveParticipantUID(category ParticipantCategory, routeKey string, scopeKeys map[string]string) (string, error) {
 	category = ParticipantCategory(strings.TrimSpace(string(category)))
 	routeKey = strings.TrimSpace(routeKey)
-	if category == "" || routeKey == "" {
+	scopeKeys = cloneStringMap(scopeKeys)
+	if !category.Valid() || routeKey == "" {
 		return "", fmt.Errorf("%w: category and route key are required", ErrParticipantRegistrationInvalid)
 	}
 	if len(scopeKeys) == 0 && category != ParticipantCategoryAgent {
@@ -72,25 +75,29 @@ func DeriveParticipantUID(category ParticipantCategory, routeKey string, scopeKe
 	return strings.Join([]string{participantUIDNamespace, string(category), sanitizeParticipantSegment(routeKey), hex.EncodeToString(hash[:])}, ":"), nil
 }
 
-func NewServiceParticipantRegistration(routeKey string, scopeKeys map[string]string, queueCapacity, concurrencyBudget int, timeout time.Duration, actions []ActionType) (ParticipantRegistration, error) {
-	uid, err := DeriveParticipantUID(ParticipantCategoryService, routeKey, scopeKeys)
+func NewParticipantRegistration(category ParticipantCategory, routeKey string, scopeKeys map[string]string, queueCapacity, concurrencyBudget int, timeout time.Duration, determinism HandlerDeterminism, actions []ActionType) (ParticipantRegistration, error) {
+	uid, err := DeriveParticipantUID(category, routeKey, scopeKeys)
 	if err != nil {
 		return ParticipantRegistration{}, err
 	}
 	reg := ParticipantRegistration{
 		UID:               uid,
-		Category:          ParticipantCategoryService,
+		Category:          ParticipantCategory(strings.TrimSpace(string(category))),
 		RouteKey:          strings.TrimSpace(routeKey),
 		ScopeKeys:         cloneStringMap(scopeKeys),
 		QueueCapacity:     queueCapacity,
 		ConcurrencyBudget: concurrencyBudget,
 		HandlerTimeout:    timeout,
-		Determinism:       HandlerDeterminismContent,
+		Determinism:       HandlerDeterminism(strings.TrimSpace(string(determinism))),
 		Actions:           normalizeActionTypes(actions),
 		Generation:        InitialParticipantGeneration,
 	}
 	reg.Ref = reg.AgentRef()
 	return reg, reg.Validate()
+}
+
+func NewServiceParticipantRegistration(routeKey string, scopeKeys map[string]string, queueCapacity, concurrencyBudget int, timeout time.Duration, actions []ActionType) (ParticipantRegistration, error) {
+	return NewParticipantRegistration(ParticipantCategoryService, routeKey, scopeKeys, queueCapacity, concurrencyBudget, timeout, HandlerDeterminismContent, actions)
 }
 
 func ParticipantRegistrationFromAgentRef(ref AgentRef, queueCapacity, concurrencyBudget int, timeout time.Duration, actions []ActionType) (ParticipantRegistration, error) {
@@ -115,13 +122,16 @@ func (r ParticipantRegistration) Validate() error {
 	if strings.TrimSpace(r.UID) == "" || strings.TrimSpace(r.RouteKey) == "" {
 		return fmt.Errorf("%w: uid and route key are required", ErrParticipantRegistrationInvalid)
 	}
-	if !r.Category.valid() {
+	if !r.Category.Valid() {
 		return fmt.Errorf("%w: category %q is invalid", ErrParticipantRegistrationInvalid, r.Category)
 	}
 	if r.QueueCapacity <= 0 || r.ConcurrencyBudget <= 0 {
 		return fmt.Errorf("%w: queue capacity and concurrency budget must be bounded positive values", ErrParticipantRegistrationInvalid)
 	}
-	if !r.Determinism.valid() {
+	if r.HandlerTimeout <= 0 {
+		return fmt.Errorf("%w: handler timeout must be a bounded positive value", ErrParticipantRegistrationInvalid)
+	}
+	if !r.Determinism.Valid() {
 		return fmt.Errorf("%w: determinism is required", ErrParticipantRegistrationInvalid)
 	}
 	if len(r.Actions) == 0 {
@@ -129,6 +139,29 @@ func (r ParticipantRegistration) Validate() error {
 	}
 	if r.Generation == 0 {
 		return fmt.Errorf("%w: generation is required", ErrParticipantRegistrationInvalid)
+	}
+	scopeKeys := cloneStringMap(r.ScopeKeys)
+	if r.Category != ParticipantCategoryAgent && len(scopeKeys) == 0 {
+		return fmt.Errorf("%w: non-agent participants require scope keys", ErrParticipantRegistrationInvalid)
+	}
+	if r.Category != ParticipantCategoryAgent {
+		derivedUID, err := DeriveParticipantUID(r.Category, r.RouteKey, scopeKeys)
+		if err != nil {
+			return err
+		}
+		if derivedUID != strings.TrimSpace(r.UID) {
+			return fmt.Errorf("%w: uid %q does not match deterministic uid %q", ErrParticipantRegistrationInvalid, r.UID, derivedUID)
+		}
+	}
+	ref := r.AgentRef()
+	if err := ref.Validate(); err != nil {
+		return fmt.Errorf("%w: canonical ref invalid: %v", ErrParticipantRegistrationInvalid, err)
+	}
+	if ref.UID != strings.TrimSpace(r.UID) {
+		return fmt.Errorf("%w: ref uid %q does not match registration uid %q", ErrParticipantRegistrationInvalid, ref.UID, r.UID)
+	}
+	if ref.Category != string(r.Category) {
+		return fmt.Errorf("%w: ref category %q does not match registration category %q", ErrParticipantRegistrationInvalid, ref.Category, r.Category)
 	}
 	return nil
 }
@@ -144,11 +177,14 @@ func (r ParticipantRegistration) AgentRef() AgentRef {
 	if ref.Name == "" {
 		ref.Name = ref.Type
 	}
-	if ref.Category == "" {
+	if r.Category.Valid() {
 		ref.Category = string(r.Category)
 	}
-	if ref.Generation == 0 {
+	if r.Generation != 0 {
 		ref.Generation = r.Generation
+	}
+	if len(ref.Labels) == 0 && len(r.ScopeKeys) != 0 {
+		ref.Labels = cloneStringMap(r.ScopeKeys)
 	}
 	return ref.Normalized()
 }
@@ -291,7 +327,25 @@ func stringMapsEqual(a, b map[string]string) bool {
 	return true
 }
 
-func (c ParticipantCategory) valid() bool {
+func KnownParticipantCategories() []ParticipantCategory {
+	return []ParticipantCategory{
+		ParticipantCategoryAgent,
+		ParticipantCategoryService,
+		ParticipantCategorySystem,
+		ParticipantCategoryExternal,
+	}
+}
+
+func KnownHandlerDeterminismLevels() []HandlerDeterminism {
+	return []HandlerDeterminism{
+		HandlerDeterminismPure,
+		HandlerDeterminismContent,
+		HandlerDeterminismSideEffect,
+		HandlerDeterminismNondeterministic,
+	}
+}
+
+func (c ParticipantCategory) Valid() bool {
 	switch c {
 	case ParticipantCategoryAgent, ParticipantCategoryService, ParticipantCategorySystem, ParticipantCategoryExternal:
 		return true
@@ -301,6 +355,10 @@ func (c ParticipantCategory) valid() bool {
 }
 
 func (d HandlerDeterminism) valid() bool {
+	return d.Valid()
+}
+
+func (d HandlerDeterminism) Valid() bool {
 	switch d {
 	case HandlerDeterminismPure, HandlerDeterminismContent, HandlerDeterminismSideEffect, HandlerDeterminismNondeterministic:
 		return true
@@ -310,7 +368,7 @@ func (d HandlerDeterminism) valid() bool {
 }
 
 func sanitizeParticipantSegment(value string) string {
-	return strings.NewReplacer(":", "_", "/", "_", " ", "_", "\t", "_", "\n", "_", "\r", "_").Replace(strings.TrimSpace(value))
+	return strings.NewReplacer(":", "_", "/", "_", ".", "_", " ", "_", "\t", "_", "\n", "_", "\r", "_").Replace(strings.TrimSpace(value))
 }
 
 func maxUint64(a, b uint64) uint64 {

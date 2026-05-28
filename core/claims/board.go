@@ -469,6 +469,9 @@ func (b *ClaimsBoard) stampValidationsLocked(c *Claim, now time.Time) {
 		v.Accessed = now
 		if v.Status == "" {
 			v.Status = ValidationStatusPending
+			if validationDeclaresTypedHandler(v) {
+				v.Status = ValidationStatusReady
+			}
 		}
 		if len(v.StatusHistory) == 0 {
 			actorID := firstNonEmpty(v.ParticipantID, v.AgentID, c.AgentID)
@@ -845,16 +848,19 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.Sequence = b.nextSeq()
 		artifact.Created = now
 		artifact.Accessed = now
+		actorID := firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID)
 		if artifact.Status == "" {
 			artifact.Status = ArtifactStatusGenerated
-			actorID := firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID)
-			artifact.StatusHistory = append(artifact.StatusHistory, StatusChange{
+			artifact.StatusHistory = capStatusHistory(append(artifact.StatusHistory, StatusChange{
 				To:            string(ArtifactStatusGenerated),
 				Reason:        "artifact generated",
 				AgentID:       actorID,
 				ParticipantID: actorID,
 				Changed:       now,
-			})
+			}))
+		}
+		if CanTransitionArtifactStatus(artifact.Status, ArtifactStatusAttached) {
+			_, _ = TransitionArtifactStatus(artifact, ArtifactStatusAttached, actorID, "artifact attached to testament", now)
 		}
 		ApplyDefaultArtifactPresentation(artifact)
 		artifact.Presentation = NormalizePresentation(artifact.Presentation)
@@ -1124,6 +1130,10 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	toStatus := ValidationStatus(change.To)
+	if b.shouldUseValidationLifecycleAdapter(claimID, validationID, toStatus) {
+		return b.evaluateValidationLifecycleAdapter(ctx, claimID, validationID, change, toStatus)
+	}
 	b.mu.Lock()
 
 	c, ok := b.claims[claimID]
@@ -1141,7 +1151,6 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	now := time.Now().UTC()
 	change.Changed = now
 	change.From = string(v.Status)
-	toStatus := ValidationStatus(change.To)
 	if !isKnownValidationStatus(toStatus) {
 		b.mu.Unlock()
 		return fmt.Errorf("validation %q on claim %q cannot transition to unknown status %q", validationID, claimID, change.To)
@@ -1256,6 +1265,68 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 	})
 	b.notifySubscribers()
 	return nil
+}
+
+func (b *ClaimsBoard) shouldUseValidationLifecycleAdapter(claimID, validationID string, to ValidationStatus) bool {
+	if !to.IsLifecycleStatus() {
+		return false
+	}
+	validation, _, ok := b.CloneValidation(validationID)
+	return ok && validation.ClaimID == claimID && validationDeclaresTypedHandler(validation)
+}
+
+func (b *ClaimsBoard) evaluateValidationLifecycleAdapter(ctx context.Context, claimID, validationID string, change StatusChange, to ValidationStatus) error {
+	validation, _, ok := b.CloneValidation(validationID)
+	if !ok {
+		return fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
+	}
+	actorID := firstNonEmpty(change.AgentID, change.ParticipantID, validationAgentID(validation))
+	if err := b.prepareValidationLifecycleAdapter(ctx, claimID, validationID, actorID, validation.Status, to); err != nil {
+		return err
+	}
+	if to == ValidationStatusValidating || to == ValidationStatusValidatingQualityBar {
+		return nil
+	}
+	return b.CompleteValidationLifecycle(ctx, claimID, validationID, actorID, to, ValidationLifecycleOptions{
+		Reason: strings.TrimSpace(change.Reason),
+		Error:  validationErrorForLifecycleAdapter(validation, to, change),
+	})
+}
+
+func (b *ClaimsBoard) prepareValidationLifecycleAdapter(ctx context.Context, claimID, validationID, actorID string, from, to ValidationStatus) error {
+	current := from
+	if current == ValidationStatusReady && to != ValidationStatusReady {
+		if err := b.BeginValidation(ctx, claimID, validationID, actorID, ""); err != nil {
+			return err
+		}
+		current = ValidationStatusValidating
+	}
+	if to == ValidationStatusValidating || to == ValidationStatusValidated || to == ValidationStatusValidationFailed || to == ValidationStatusValidationFailedNotRequired || to == ValidationStatusErrored || to == ValidationStatusErroredNotRequired {
+		return nil
+	}
+	if current == ValidationStatusValidating && to.IsQualityBarState() {
+		return b.BeginValidationQualityBar(ctx, claimID, validationID, actorID, "")
+	}
+	return nil
+}
+
+func validationErrorForLifecycleAdapter(validation *Validation, to ValidationStatus, change StatusChange) *ValidationError {
+	if !to.IsBlockingFailure() && !to.IsOptionalFailure() {
+		return nil
+	}
+	category := ValidationErrorCategoryHandler
+	if to == ValidationStatusErrored || to == ValidationStatusErroredNotRequired {
+		category = ValidationErrorCategoryInternal
+	}
+	if to == ValidationStatusQualityBarValidationFailed || to == ValidationStatusQualityBarValidationFailedNotRequired {
+		category = ValidationErrorCategoryQualityBar
+	}
+	return &ValidationError{
+		Category:    category,
+		Description: strings.TrimSpace(change.Reason),
+		Source:      validationErrorSource(ValidationDispatchRequest{Validation: validation}),
+		OccurredAt:  changeTime(change.Changed),
+	}
 }
 
 func findValidationOnClaim(c *Claim, validationID string) *Validation {
