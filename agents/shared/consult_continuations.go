@@ -1285,8 +1285,18 @@ func (s *ContinuationStore) submitAwaitFailureTestament(ctx context.Context, cla
 	if status == claims.ConsultStatusTimeout {
 		kind = claims.ArtifactKindToolTimeout
 	}
-	action := claims.Action{AgentID: s.agentID, Type: claims.ActionTypeTestament}
+	action := claims.Action{
+		ID:      "await_failure:" + claimID + ":" + uuid.NewString(),
+		AgentID: s.agentID,
+		Type:    claims.ActionTypeTestament,
+		Relations: []claims.Relation{
+			{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim},
+			{Related: s.agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+	}
+	testamentID := "await_failure:" + claimID + ":" + uuid.NewString()
 	testament := claims.Testament{
+		ID:         testamentID,
 		AgentID:    s.agentID,
 		SessionID:  s.sessionID,
 		Summary:    message,
@@ -1296,6 +1306,10 @@ func (s *ContinuationStore) submitAwaitFailureTestament(ctx context.Context, cla
 			Related:      claimID,
 			RelatedType:  claims.RelatedTypeClaim,
 			Relationship: claims.RelationshipClaim,
+		}, {
+			Related:      s.agentID,
+			RelatedType:  claims.RelatedTypeAgent,
+			Relationship: claims.RelationshipIssuer,
 		}},
 		Artifacts: []*claims.Artifact{{
 			ID:        uuid.NewString(),
@@ -1315,14 +1329,28 @@ func (s *ContinuationStore) submitAwaitFailureTestament(ctx context.Context, cla
 			},
 		}},
 	}
-	if err := s.board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+	generated, err := s.board.GenerateTestamentAction(ctx, action, []claims.Testament{testament}, claims.GenerateTestamentActionOptions{
+		IdempotencyKey:  testamentID,
+		Reason:          "awaited claim failure testament generated",
+		AllowStandalone: false,
+	})
+	if err != nil || len(generated.Testaments) == 0 {
 		slog.Warn("await_failure_testament_submit_failed",
 			"agent_id", s.agentID,
 			"session_id", s.sessionID,
 			"claim_id", claimID,
 			"status", status,
-			"error", err.Error(),
 		)
+		return
+	}
+	testamentID = strings.TrimSpace(generated.Testaments[0].ID)
+	if err := s.board.PostGeneratedTestament(ctx, testamentID, s.agentID, claims.TestamentPostOptions{Reason: "awaited claim failure testament posted"}); err != nil {
+		slog.Warn("await_failure_testament_post_failed", "agent_id", s.agentID, "session_id", s.sessionID, "claim_id", claimID, "status", status, "error", err.Error())
+		return
+	}
+	_ = s.board.AcknowledgeTestamentReceipt(ctx, testamentID, s.agentID)
+	if err := s.board.BeginTestamentValidation(ctx, testamentID, s.agentID); err == nil {
+		_ = s.board.CompleteTestamentValidation(ctx, testamentID, s.agentID, claims.TestamentLifecycleValidationErrored, message)
 	}
 }
 

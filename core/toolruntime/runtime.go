@@ -956,41 +956,16 @@ func recordGuardianWaitContext(ctx context.Context, inv Invocation, guardianClai
 	})
 }
 
-// guardianCheckTrace bundles the IDs that pair the started guardian
-// artifact with its eventual completed artifact.
+// guardianCheckTrace carries the lifecycle claim that receives the guardian's
+// verdict testament. Guardian checks no longer emit started/completed artifact
+// pairs; the claim/testament lifecycle is the sole authoritative row source.
 type guardianCheckTrace struct {
 	startedArtifactID string
 	guardianClaimID   string
 }
 
 func recordGuardianCheckStart(ctx context.Context, inv Invocation, guardianClaimID string) guardianCheckTrace {
-	acc := claims.AccumulatorFromContext(ctx)
-	if acc == nil {
-		return guardianCheckTrace{}
-	}
-	startedID := uuid.NewString()
-	metadata := map[string]any{
-		"tool_name":      strings.TrimSpace(inv.ToolCall.Name),
-		"tool_call_id":   strings.TrimSpace(inv.ToolCall.ID),
-		"correlation_id": strings.TrimSpace(inv.CorrelationID),
-		"started_at":     time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if guardianClaimID != "" {
-		// Stamp the structured guardian-check claim ID so the bridge's
-		// claimToInvocationArtifact index nests guardian's processing
-		// artifacts under this artifact row when guardian's testament
-		// flushes. See docs/CLAIMS_UI.md §5.3.
-		metadata["claim_id"] = guardianClaimID
-	}
-	acc.RecordArtifact(&claims.Artifact{
-		ID:        startedID,
-		AgentID:   inv.AgentID,
-		Kind:      "guardian_check_started",
-		Reference: strings.TrimSpace(inv.ToolCall.Name),
-		Metadata:  metadata,
-		Ephemeral: true,
-	})
-	return guardianCheckTrace{startedArtifactID: startedID, guardianClaimID: guardianClaimID}
+	return guardianCheckTrace{guardianClaimID: strings.TrimSpace(guardianClaimID)}
 }
 
 func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianCheckTrace, started time.Time, grantErr error) {
@@ -1010,35 +985,6 @@ func recordGuardianCheckEnd(ctx context.Context, inv Invocation, trace guardianC
 	default:
 		outcome = "failure"
 	}
-	metadata := map[string]any{
-		"outcome":      outcome,
-		"tool_name":    strings.TrimSpace(inv.ToolCall.Name),
-		"tool_call_id": strings.TrimSpace(inv.ToolCall.ID),
-		"started_at":   started.UTC().Format(time.RFC3339Nano),
-		"ended_at":     now.Format(time.RFC3339Nano),
-		"duration_ms":  now.Sub(started).Milliseconds(),
-	}
-	if grantErr != nil {
-		metadata["error"] = grantErr.Error()
-	}
-	artifact := &claims.Artifact{
-		ID:        uuid.NewString(),
-		AgentID:   inv.AgentID,
-		Kind:      "guardian_check_completed",
-		Reference: strings.TrimSpace(inv.ToolCall.Name),
-		Metadata:  metadata,
-		Ephemeral: true,
-	}
-	if trace.startedArtifactID != "" {
-		artifact.Relations = []claims.Relation{
-			{
-				Related:      trace.startedArtifactID,
-				RelatedType:  claims.RelatedTypeArtifact,
-				Relationship: claims.RelationshipCompletes,
-			},
-		}
-	}
-	acc.RecordArtifact(artifact)
 	submitGuardianCheckTestament(ctx, acc, inv, trace.guardianClaimID, started, now, outcome, grantErr)
 }
 

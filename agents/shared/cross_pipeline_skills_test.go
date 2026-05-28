@@ -24,10 +24,7 @@ func findSkill(t *testing.T, ss []*skills.Skill, name string) *skills.Skill {
 	return nil
 }
 
-func TestConsultPeerSkill_NilRouteSyncReturnsConsultID(t *testing.T) {
-	// Fire-and-forget fallback: when no RouteSync transport is wired,
-	// the skill emits the consult_emitted activity and returns the
-	// consult_id + in_flight status without blocking on a response.
+func TestConsultPeerSkill_RequiresClaimsBoard(t *testing.T) {
 	cfg := CrossPipelineSkillConfig{
 		SessionID:  func() string { return "sess-1" },
 		AgentID:    func() string { return "agent-1" },
@@ -37,19 +34,8 @@ func TestConsultPeerSkill_NilRouteSyncReturnsConsultID(t *testing.T) {
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
 	input := json.RawMessage(`{"target_agent_type":"librarian","query":"Any prior art?"}`)
-	result, err := skill.Handler(context.Background(), input)
-	if err != nil {
-		t.Fatalf("handler err = %v", err)
-	}
-	got, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("handler result type = %T", result)
-	}
-	if got["status"] != "in_flight" {
-		t.Fatalf("status = %v, want in_flight", got["status"])
-	}
-	if _, ok := got["consult_id"].(string); !ok {
-		t.Fatalf("consult_id missing or wrong type: %#v", got)
+	if _, err := skill.Handler(context.Background(), input); err == nil {
+		t.Fatal("expected missing claims board to fail")
 	}
 }
 
@@ -68,13 +54,11 @@ func TestConsultPeerSkill_RejectsSelfConsult(t *testing.T) {
 	}
 }
 
-func TestConsultPeerSkill_ReturnsTicketWithoutSynchronousPeerRoute(t *testing.T) {
-	// Without continuation context, consult_peer returns a claim ticket
-	// and lets claim.posted/testament.posted lifecycle deltas drive the work. There
-	// is no RouteSync hook in the config: the test fails at compile time
-	// if the old synchronous route authority returns.
+func TestConsultPeerSkill_RequiresContinuationStoreWithoutSynchronousPeerRoute(t *testing.T) {
+	sessionID := "sess-consult-requires-store"
+	board := registerCrossPipelineTestBoard(t, sessionID)
 	cfg := CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
+		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "" },
@@ -82,16 +66,11 @@ func TestConsultPeerSkill_ReturnsTicketWithoutSynchronousPeerRoute(t *testing.T)
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 
 	input := json.RawMessage(`{"target_agent_type":"librarian","query":"Any prior art?"}`)
-	result, err := skill.Handler(context.Background(), input)
-	if err != nil {
-		t.Fatalf("handler err = %v", err)
+	if _, err := skill.Handler(context.Background(), input); err == nil {
+		t.Fatal("expected missing continuation store to fail")
 	}
-	got, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("handler result type = %T", result)
-	}
-	if got["status"] != "in_flight" {
-		t.Fatalf("status = %v, want in_flight", got["status"])
+	if len(board.Projection().Claims) == 0 {
+		t.Fatal("expected consultation claim to be posted before wait precondition failure")
 	}
 }
 
@@ -133,6 +112,14 @@ func TestConsultPeerSkill_StampsNestedClaimAndBranchMetadata(t *testing.T) {
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
 	ctx := claims.WithParentClaimID(context.Background(), parentClaimID)
+	ctx = WithContinuationStore(ctx, NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect-1",
+		SessionID: sessionID,
+		Board:     board,
+		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*AwaitedClaimResult) error {
+			return nil
+		},
+	}))
 	ctx = WithTurnContext(ctx, &TurnContext{
 		Request:       &providers.Request{},
 		CorrelationID: "corr-parent",
@@ -149,13 +136,13 @@ func TestConsultPeerSkill_StampsNestedClaimAndBranchMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handler err = %v", err)
 	}
-	got, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("handler result type = %T", result)
+	outcome, ok := skills.NormalizeToolOutcome(result)
+	if !ok || outcome.Status != skills.ToolStatusYielded {
+		t.Fatalf("result = %#v, want yielded ToolOutcome", result)
 	}
-	consultID, _ := got["consult_id"].(string)
+	consultID := firstContinuationClaimRef(ctx)
 	if consultID == "" {
-		t.Fatalf("consult_id missing: %#v", got)
+		t.Fatal("consult claim was not registered with continuation store")
 	}
 	consultClaim, ok := board.CloneClaim(consultID)
 	if !ok {
@@ -170,54 +157,61 @@ func TestConsultPeerSkill_StampsNestedClaimAndBranchMetadata(t *testing.T) {
 }
 
 func TestConsultPeerSkill_CrossPipelineMetadataStaysOnClaimTicket(t *testing.T) {
-	// Cross-pipeline consults carry target_pipeline_id in the claim
-	// ticket/activity. The config has no synchronous route hook, so no
-	// side-channel metadata path can run.
+	sessionID := "sess-cross-pipeline-consult"
+	board := registerCrossPipelineTestBoard(t, sessionID)
 	cfg := CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
+		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipe-origin" },
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+	ctx := contextWithYieldingContinuation(context.Background(), "agent-1", sessionID, board)
 
 	// Cross-pipeline consult: engineer in pipe-origin asking the
 	// tester-pipeline in pipe-42 about shared fixture state. Per the
 	// authority matrix (see docs/COMMS_MATRIX.md), engineer may
 	// consult tester-pipeline and holds AllowsCrossPipelineConsult.
 	input := json.RawMessage(`{"target_agent_type":"tester-pipeline","target_pipeline_id":"pipe-42","query":"How are you handling retries?"}`)
-	result, err := skill.Handler(context.Background(), input)
+	result, err := skill.Handler(ctx, input)
 	if err != nil {
 		t.Fatalf("handler err = %v", err)
 	}
-	got, ok := result.(map[string]any)
-	if !ok {
-		t.Fatalf("handler result type = %T", result)
+	if outcome, ok := skills.NormalizeToolOutcome(result); !ok || outcome.Status != skills.ToolStatusYielded {
+		t.Fatalf("result = %#v, want yielded ToolOutcome", result)
 	}
-	if got["target"] != "tester-pipeline/pipe-42" {
-		t.Fatalf("target = %#v, want tester-pipeline/pipe-42", got["target"])
+	claimID := firstContinuationClaimRef(ctx)
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		t.Fatalf("consult claim %q not found", claimID)
+	}
+	if !claimScopeContains(claim.Scope, "consultation", "tester-pipeline/pipe-42") {
+		t.Fatalf("consult claim scope = %#v, want cross-pipeline target", claim.Scope)
 	}
 }
 
-func TestConsultPeerSkill_ReturnsTicketWhenPeerMayLaterFailWithArtifact(t *testing.T) {
+func TestConsultPeerSkill_YieldsWhenPeerMayLaterFailWithArtifact(t *testing.T) {
 	// Peer errors are returned as artifacts in the eventual testament.
-	// consult_peer itself only posts the claim and returns/yields.
+	// consult_peer itself posts the claim and yields/waits on lifecycle.
+	sessionID := "sess-peer-error-yields"
+	board := registerCrossPipelineTestBoard(t, sessionID)
 	cfg := CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
+		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "" },
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+	ctx := contextWithYieldingContinuation(context.Background(), "agent-1", sessionID, board)
 
 	input := json.RawMessage(`{"target_agent_type":"librarian","query":"Q"}`)
-	result, err := skill.Handler(context.Background(), input)
+	result, err := skill.Handler(ctx, input)
 	if err != nil {
 		t.Fatalf("handler err = %v", err)
 	}
-	got := result.(map[string]any)
-	if got["status"] != "in_flight" {
-		t.Fatalf("status = %#v, want in_flight", got["status"])
+	outcome, ok := skills.NormalizeToolOutcome(result)
+	if !ok || outcome.Status != skills.ToolStatusYielded {
+		t.Fatalf("result = %#v, want yielded ToolOutcome", result)
 	}
 }
 
@@ -288,32 +282,41 @@ func TestConsultPeerSkill_TicketModeUsesClaimContinuation(t *testing.T) {
 
 func TestConsultPeerSkill_EmitsConsultEmittedActivity(t *testing.T) {
 	// Audit-trail invariant: the consult_emitted activity is written
-	// regardless of which mode (sync vs. fire-and-forget) the caller
-	// is in, so post-hoc causal_trace and ambient recall still work.
+	// alongside the claim-backed lifecycle so post-hoc causal_trace and
+	// ambient recall still work.
 	collector := &activity.TestCollector{}
 	prev := activity.SetDefaultSource(nil) // sink-only, no source
 	prevSink := activity.SetDefaultSink(collector)
 	defer activity.SetDefaultSource(prev)
 	defer activity.SetDefaultSink(prevSink)
 
+	sessionID := "sess-consult-activity"
+	board := registerCrossPipelineTestBoard(t, sessionID)
 	cfg := CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
+		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "agent-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipe-1" },
 	}
 	skill := findSkill(t, CrossPipelineSkills(cfg), "consult_peer")
+	ctx := contextWithYieldingContinuation(context.Background(), "agent-1", sessionID, board)
 
 	input := json.RawMessage(`{"target_agent_type":"librarian","query":"X","scope":"svc/auth/"}`)
-	if _, err := skill.Handler(context.Background(), input); err != nil {
+	if _, err := skill.Handler(ctx, input); err != nil {
 		t.Fatalf("handler err = %v", err)
 	}
 
 	acts := collector.Snapshot()
-	if len(acts) != 1 {
-		t.Fatalf("expected 1 activity, got %d", len(acts))
+	matching := make([]activity.AgentActivity, 0, len(acts))
+	for _, candidate := range acts {
+		if candidate.SessionID == activity.SessionID(sessionID) && candidate.Action == activity.ActionConsultEmitted {
+			matching = append(matching, candidate)
+		}
 	}
-	act := acts[0]
+	if len(matching) != 1 {
+		t.Fatalf("expected 1 matching consult activity, got %d from %d total", len(matching), len(acts))
+	}
+	act := matching[0]
 	if act.Action != activity.ActionConsultEmitted {
 		t.Fatalf("action = %q", act.Action)
 	}
@@ -326,4 +329,59 @@ func TestConsultPeerSkill_EmitsConsultEmittedActivity(t *testing.T) {
 	if act.Subject.PathPrefix != "svc/auth/" {
 		t.Fatalf("subject.PathPrefix = %q", act.Subject.PathPrefix)
 	}
+}
+
+func registerCrossPipelineTestBoard(t *testing.T, sessionID string) *claims.ClaimsBoard {
+	t.Helper()
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.Remove(sessionID)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-" + sessionID,
+		SessionID: sessionID,
+		TaskID:    "task-" + sessionID,
+	})
+	if err := registry.Register(sessionID, board); err != nil {
+		t.Fatalf("register board: %v", err)
+	}
+	t.Cleanup(func() { registry.Remove(sessionID) })
+	return board
+}
+
+func contextWithYieldingContinuation(ctx context.Context, agentID, sessionID string, board *claims.ClaimsBoard) context.Context {
+	ctx = WithContinuationStore(ctx, NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   agentID,
+		SessionID: sessionID,
+		Board:     board,
+		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*AwaitedClaimResult) error {
+			return nil
+		},
+	}))
+	return WithTurnContext(ctx, &TurnContext{
+		Request:       &providers.Request{},
+		CorrelationID: "corr-" + sessionID,
+		AgentID:       agentID,
+		SessionID:     sessionID,
+	})
+}
+
+func firstContinuationClaimRef(ctx context.Context) string {
+	store := ContinuationStoreFromContext(ctx)
+	if store == nil {
+		return ""
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for id := range store.claimIndex {
+		return id
+	}
+	return ""
+}
+
+func claimScopeContains(scope []claims.ClaimScopeEntry, kind, key string) bool {
+	for _, entry := range scope {
+		if entry.Kind == kind && entry.Key == key {
+			return true
+		}
+	}
+	return false
 }

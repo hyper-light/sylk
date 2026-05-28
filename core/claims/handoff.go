@@ -194,7 +194,7 @@ func BuildHandoffClaim(
 // claims and are intentionally absent here.
 func isStartedArtifactKind(kind string) bool {
 	switch kind {
-	case "tool_started", "llm_started", "guardian_check_started":
+	case "tool_started", "llm_started":
 		return true
 	}
 	return false
@@ -202,7 +202,7 @@ func isStartedArtifactKind(kind string) bool {
 
 func isCompletedArtifactKind(kind string) bool {
 	switch kind {
-	case "tool_completed", "llm_completed", "guardian_check_completed":
+	case "tool_completed", "llm_completed":
 		return true
 	}
 	return false

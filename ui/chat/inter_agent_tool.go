@@ -370,92 +370,7 @@ func updateInterAgentCompletion(record *ToolCallRecord, ev msg.ToolCallEventMsg)
 }
 
 func interAgentOriginUpdate(ev msg.ToolCallEventMsg, currentAgentType string) (*InterAgentTool, bool) {
-	if ev.InterAgent != nil && ev.InterAgent.UpdateOrigin {
-		return interAgentRowFromMetadata(ev.InterAgent)
-	}
-	args := parseJSONMap(ev.FullArgs)
-	output := parseJSONMap(ev.Output)
-
-	switch ev.ToolName {
-	case "validate_global_review":
-		challengeID := firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id"))
-		if challengeID == "" {
-			return nil, false
-		}
-		status := stringFromMap(output, "status")
-		return &InterAgentTool{
-			Kind:      InterAgentToolChallenge,
-			ThreadKey: globalReviewThreadPrefix + challengeID,
-			AgentTypes: normalizeAgentTypes([]string{firstNonEmptyString(
-				stringFromMap(output, "responding_agent"),
-				currentAgentType,
-			)}),
-			Summary: normalizeInlineText(firstNonEmptyString(
-				stringFromMap(args, "summary"),
-				stringFromMap(output, "summary"),
-				ev.ArgsSummary,
-			)),
-			Status: validationStatusToInterAgentStatus(status, ev.Success, ev.ErrorMsg),
-		}, true
-	case "process_global_validation":
-		challengeID := firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id"))
-		if challengeID == "" {
-			return nil, false
-		}
-		return &InterAgentTool{
-			Kind:      InterAgentToolChallenge,
-			ThreadKey: globalReviewThreadPrefix + challengeID,
-			Summary: normalizeInlineText(firstNonEmptyString(
-				stringFromMap(args, "summary"),
-				stringFromMap(output, "decision"),
-				ev.ArgsSummary,
-			)),
-			Status: validationDecisionToInterAgentStatus(firstNonEmptyString(
-				stringFromMap(output, "decision"),
-				stringFromMap(args, "decision"),
-			), ev.Success, ev.ErrorMsg),
-		}, true
-	case "validate_work":
-		challengeID := firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id"))
-		if challengeID == "" {
-			return nil, false
-		}
-		status := stringFromMap(output, "status")
-		return &InterAgentTool{
-			Kind:      InterAgentToolChallenge,
-			ThreadKey: responseThreadKey(ev.ToolName, args, output, challengeID),
-			AgentTypes: normalizeAgentTypes([]string{firstNonEmptyString(
-				stringFromMap(output, "responding_agent"),
-				currentAgentType,
-			)}),
-			Summary: normalizeInlineText(firstNonEmptyString(
-				stringFromMap(args, "summary"),
-				stringFromMap(output, "summary"),
-				ev.ArgsSummary,
-			)),
-			Status: validationStatusToInterAgentStatus(status, ev.Success, ev.ErrorMsg),
-		}, true
-	case "process_validation":
-		challengeID := firstNonEmptyString(stringFromMap(output, "challenge_id"), stringFromMap(args, "challenge_id"))
-		if challengeID == "" {
-			return nil, false
-		}
-		return &InterAgentTool{
-			Kind:      InterAgentToolChallenge,
-			ThreadKey: responseThreadKey(ev.ToolName, args, output, challengeID),
-			Summary: normalizeInlineText(firstNonEmptyString(
-				stringFromMap(args, "summary"),
-				stringFromMap(output, "decision"),
-				ev.ArgsSummary,
-			)),
-			Status: validationDecisionToInterAgentStatus(firstNonEmptyString(
-				stringFromMap(output, "decision"),
-				stringFromMap(args, "decision"),
-			), ev.Success, ev.ErrorMsg),
-		}, true
-	default:
-		return nil, false
-	}
+	return nil, false
 }
 
 // responseThreadKey computes a challenge-response ThreadKey from explicit
@@ -584,38 +499,7 @@ func interAgentRecordFromMetadata(ev msg.ToolCallEventMsg) (ToolCallRecord, bool
 }
 
 func interAgentRowFromMetadata(meta *msg.InterAgentToolEventMsg) (*InterAgentTool, bool) {
-	if meta == nil || strings.TrimSpace(meta.Kind) == "" {
-		return nil, false
-	}
-	var kind InterAgentToolKind
-	switch strings.TrimSpace(meta.Kind) {
-	case "consult", "challenge":
-		return nil, false
-	case "approval":
-		kind = InterAgentToolApproval
-	case "store":
-		kind = InterAgentToolStore
-	case "claim":
-		kind = InterAgentToolClaim
-	case "testament":
-		kind = InterAgentToolTestament
-	default:
-		return nil, false
-	}
-	status := InterAgentToolPending
-	switch strings.TrimSpace(meta.Status) {
-	case "done":
-		status = InterAgentToolDone
-	case "failed":
-		status = InterAgentToolFailed
-	}
-	return &InterAgentTool{
-		Kind:       kind,
-		AgentTypes: normalizeAgentTypes(meta.AgentTypes),
-		Summary:    normalizeInlineText(meta.Summary),
-		ThreadKey:  strings.TrimSpace(meta.ThreadKey),
-		Status:     status,
-	}, true
+	return nil, false
 }
 
 func isConsultationTool(toolName string, args map[string]any) bool {

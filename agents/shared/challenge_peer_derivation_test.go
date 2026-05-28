@@ -7,20 +7,12 @@ import (
 	"testing"
 
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/providers"
+	coreskills "github.com/adalundhe/sylk/core/skills"
 )
 
-// TestChallengePeerSkill_EmitsDerivableCompletionEvent is the regression
-// guard for the UI-attribution bug where challenge_peer's tool-call
-// completion never produced a child agent row in the chat panel. The
-// handler has to resolve the challenged activity's author and stamp
-// target_agent_type into its result map so interAgentChallengeTargets
-// can attach the branch to the right agent — otherwise the derivation
-// sees only an opaque target_activity_id UUID, returns empty targets,
-// and the UI event is silently dropped.
-//
-// If this assertion fails, challenge_peer will go back to firing into
-// the void as far as the chat UI is concerned.
-func TestChallengePeerSkill_EmitsDerivableCompletionEvent(t *testing.T) {
+func TestChallengePeerSkill_PostsClaimAndYieldsFromResolvedActivity(t *testing.T) {
 	source := &fakeActivitySource{
 		activities: map[activity.ActivityID]activity.AgentActivity{
 			"target-activity-1": {
@@ -38,9 +30,11 @@ func TestChallengePeerSkill_EmitsDerivableCompletionEvent(t *testing.T) {
 	}
 	prev := activity.SetDefaultSource(source)
 	t.Cleanup(func() { activity.SetDefaultSource(prev) })
+	sessionID := "sess-challenge-claim-yield"
+	board := registerChallengePeerTestBoard(t, sessionID)
 
 	skills := CrossPipelineSkills(CrossPipelineSkillConfig{
-		SessionID:  func() string { return "sess-1" },
+		SessionID:  func() string { return sessionID },
 		AgentID:    func() string { return "engineer-1" },
 		AgentType:  func() string { return "engineer" },
 		PipelineID: func() string { return "pipeline-b" },
@@ -69,57 +63,32 @@ func TestChallengePeerSkill_EmitsDerivableCompletionEvent(t *testing.T) {
 		"alternative": "Adopt convention from docs/STYLE.md instead",
 		"deadline_seconds": 300
 	}`)
-	raw, err := challenge.Handler(context.Background(), input)
+	ctx := contextWithChallengeContinuation(context.Background(), "engineer-1", sessionID, board)
+	raw, err := challenge.Handler(ctx, input)
 	if err != nil {
 		t.Fatalf("challenge_peer handler returned error: %v", err)
 	}
-	result, ok := raw.(map[string]any)
+	outcome, ok := coreskills.NormalizeToolOutcome(raw)
+	if !ok || outcome.Status != coreskills.ToolStatusYielded {
+		t.Fatalf("handler result = %#v, want yielded ToolOutcome", raw)
+	}
+	claimID := firstChallengeContinuationClaimRef(ctx)
+	claim, ok := board.CloneClaim(claimID)
 	if !ok {
-		t.Fatalf("handler result type = %T, want map[string]any", raw)
+		t.Fatalf("challenge claim %q missing", claimID)
 	}
-
-	// Result must carry target_agent_type so UI derivation can attach
-	// the branch. Without this key, the chat panel gets no child row.
-	targetAgent, _ := result["target_agent_type"].(string)
-	if targetAgent != "designer" {
-		t.Fatalf("result target_agent_type = %q, want %q", targetAgent, "designer")
+	if claim.ActionType != claims.ActionTypeChallenge {
+		t.Fatalf("claim action type = %q, want challenge", claim.ActionType)
 	}
-	targetPipeline, _ := result["target_pipeline_id"].(string)
-	if targetPipeline != "pipeline-a" {
-		t.Fatalf("result target_pipeline_id = %q, want %q", targetPipeline, "pipeline-a")
+	if !claims.HasRelation(claim.Relations, claims.RelationshipSubject, "designer") {
+		t.Fatalf("challenge claim relations = %#v, want designer subject", claim.Relations)
 	}
-
-	// End-to-end: the completion derivation must now produce a
-	// publishable event with the correct AgentTypes.
-	outputJSON, err := json.Marshal(result)
-	if err != nil {
-		t.Fatalf("marshal result: %v", err)
-	}
-	event := DeriveInterAgentToolEvent(
-		"challenge_peer",
-		string(input),
-		string(outputJSON),
-		ToolCallComplete,
-		true,
-		"",
-	)
-	if event == nil {
-		t.Fatal("DeriveInterAgentToolEvent returned nil — UI will render no child row")
-	}
-	if event.Kind != InterAgentToolEventKindChallenge {
-		t.Fatalf("event kind = %q, want %q", event.Kind, InterAgentToolEventKindChallenge)
-	}
-	if len(event.AgentTypes) != 1 || event.AgentTypes[0] != "designer" {
-		t.Fatalf("event AgentTypes = %v, want [designer]", event.AgentTypes)
+	if !claimScopeContainsChallenge(claim.Scope, "challenge", "designer") {
+		t.Fatalf("challenge claim scope = %#v, want designer challenge scope", claim.Scope)
 	}
 }
 
-// TestChallengePeerSkill_GracefulWhenActivitySourceMissing is the
-// negative path: if the activity source is unavailable (test wiring
-// missing, or the target activity has been pruned), the handler still
-// succeeds and returns a valid challenge_id. The UI branch won't
-// attach — but that's a downgrade, not a hard failure.
-func TestChallengePeerSkill_GracefulWhenActivitySourceMissing(t *testing.T) {
+func TestChallengePeerSkill_RejectsUnresolvedTarget(t *testing.T) {
 	prev := activity.SetDefaultSource(nil)
 	t.Cleanup(func() { activity.SetDefaultSource(prev) })
 
@@ -138,21 +107,12 @@ func TestChallengePeerSkill_GracefulWhenActivitySourceMissing(t *testing.T) {
 	if handler == nil {
 		t.Fatal("challenge_peer not found")
 	}
-	raw, err := handler(context.Background(), json.RawMessage(`{
+	_, err := handler(context.Background(), json.RawMessage(`{
 		"target_activity_id": "some-id",
 		"evidence": "x"
 	}`))
-	if err != nil {
-		t.Fatalf("handler should succeed when source is nil, got %v", err)
-	}
-	result := raw.(map[string]any)
-	if _, ok := result["challenge_id"]; !ok {
-		t.Fatal("result missing challenge_id on graceful path")
-	}
-	// target_agent_type must be absent when resolution failed (don't
-	// fabricate one).
-	if _, ok := result["target_agent_type"]; ok {
-		t.Fatal("target_agent_type should be absent when source returns no activity")
+	if err == nil {
+		t.Fatal("expected unresolved challenge target to fail")
 	}
 }
 
@@ -176,6 +136,57 @@ func (f *fakeActivitySource) GetActivity(_ context.Context, id activity.Activity
 
 func (f *fakeActivitySource) LatestActivityID(context.Context, activity.QueryFilter) (activity.ActivityID, error) {
 	return "", nil
+}
+
+func registerChallengePeerTestBoard(t *testing.T, sessionID string) *claims.ClaimsBoard {
+	t.Helper()
+	registry := claims.DefaultSessionBoardRegistry()
+	registry.Remove(sessionID)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "board-" + sessionID, SessionID: sessionID, TaskID: "task-" + sessionID})
+	if err := registry.Register(sessionID, board); err != nil {
+		t.Fatalf("register board: %v", err)
+	}
+	t.Cleanup(func() { registry.Remove(sessionID) })
+	return board
+}
+
+func contextWithChallengeContinuation(ctx context.Context, agentID, sessionID string, board *claims.ClaimsBoard) context.Context {
+	ctx = WithContinuationStore(ctx, NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   agentID,
+		SessionID: sessionID,
+		Board:     board,
+		ResumeFn: func(context.Context, *TurnSnapshot, map[string]*AwaitedClaimResult) error {
+			return nil
+		},
+	}))
+	return WithTurnContext(ctx, &TurnContext{
+		Request:       &providers.Request{},
+		CorrelationID: "corr-" + sessionID,
+		AgentID:       agentID,
+		SessionID:     sessionID,
+	})
+}
+
+func firstChallengeContinuationClaimRef(ctx context.Context) string {
+	store := ContinuationStoreFromContext(ctx)
+	if store == nil {
+		return ""
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for id := range store.claimIndex {
+		return id
+	}
+	return ""
+}
+
+func claimScopeContainsChallenge(scope []claims.ClaimScopeEntry, kind, key string) bool {
+	for _, entry := range scope {
+		if entry.Kind == kind && entry.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 // Sanity on build: make sure the package-local helper we're depending

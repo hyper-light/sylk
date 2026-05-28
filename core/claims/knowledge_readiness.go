@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -147,9 +149,95 @@ func WaitForKnowledgeBackendReady(ctx context.Context, board *ClaimsBoard) (*Tes
 				return testament, nil
 			}
 		case <-ctx.Done():
+			RecordKnowledgeBackendReadinessFailure(context.Background(), board, ctx.Err())
 			return nil, ctx.Err()
 		}
 	}
+}
+
+// RecordKnowledgeBackendReadinessFailure persists a readiness wait/backend
+// failure as claim lifecycle evidence. Callers use this when the committed
+// backend cannot become ready before a request deadline or initialization
+// fails outright.
+func RecordKnowledgeBackendReadinessFailure(ctx context.Context, board *ClaimsBoard, cause error) error {
+	if board == nil {
+		return ErrNilKnowledgeReadinessBoard
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := EnsureKnowledgeBackendReadyClaim(ctx, board); err != nil {
+		return err
+	}
+	reason := "knowledge backend readiness failed"
+	if cause != nil && strings.TrimSpace(cause.Error()) != "" {
+		reason = cause.Error()
+	}
+	kind := ArtifactKindErrorDiagnostic
+	if errors.Is(cause, context.DeadlineExceeded) {
+		kind = ArtifactKindToolTimeout
+	}
+	if errors.Is(cause, context.Canceled) {
+		kind = ArtifactKindInterrupted
+	}
+	metadata := map[string]any{
+		"component":   KnowledgeBackendAgentID,
+		"quality_bar": KnowledgeBackendReadyQuality,
+	}
+	if cause != nil {
+		metadata["error"] = cause.Error()
+	}
+	failureClaimID, err := postKnowledgeBackendReadinessFailureClaim(ctx, board, reason)
+	if err != nil {
+		return err
+	}
+	return board.RecordClaimValidationError(ctx, failureClaimID, KnowledgeBackendAgentID, LifecycleFailureOptions{
+		Reason:       reason,
+		ArtifactKind: kind,
+		Metadata:     metadata,
+	})
+}
+
+func postKnowledgeBackendReadinessFailureClaim(ctx context.Context, board *ClaimsBoard, reason string) (string, error) {
+	claimID := "knowledge_backend.ready.failure." + uuid.NewString()
+	claim := Claim{
+		ID:          claimID,
+		AgentID:     KnowledgeBackendAgentID,
+		Title:       "Knowledge backend readiness wait failed",
+		Description: lifecycleReason(reason, "knowledge backend readiness wait failed"),
+		ActionType:  ActionTypeTask,
+		Context:     lifecycleReason(reason, "knowledge backend readiness wait failed"),
+		Scope: []ClaimScopeEntry{
+			{Kind: "knowledge_backend", Key: KnowledgeBackendReadyScopeKey},
+			{Kind: "knowledge_backend_failure", Key: claimID},
+		},
+		Relations: []Relation{
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: KnowledgeBackendAgentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+			{Related: KnowledgeBackendReadyClaimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipCausedBy},
+		},
+		Validations: []*Validation{{
+			ID:          claimID + ".readiness",
+			Description: "Knowledge readiness wait completed without backend readiness",
+			QualityBar:  KnowledgeBackendReadyQuality,
+			Type:        ValidationTypeInspection,
+			Required:    true,
+		}},
+	}
+	generated, err := board.GenerateClaimAction(ctx, Action{ID: claimID + ".action", AgentID: KnowledgeBackendAgentID, Type: ActionTypeTask}, []Claim{claim}, GenerateClaimActionOptions{
+		IdempotencyKey: claimID,
+		Reason:         "knowledge readiness failure claim generated",
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(generated.Claims) == 0 {
+		return "", fmt.Errorf("claims: knowledge readiness failure claim generation returned no claims")
+	}
+	if err := board.PostGeneratedClaim(ctx, generated.Claims[0].ID, KnowledgeBackendAgentID, ClaimPostOptions{Reason: "knowledge readiness failure claim posted"}); err != nil {
+		return "", err
+	}
+	return generated.Claims[0].ID, nil
 }
 
 func knowledgeBackendReadyAction() Action {

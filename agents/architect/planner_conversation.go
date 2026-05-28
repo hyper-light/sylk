@@ -208,8 +208,8 @@ func (a *Architect) composeUserFacingResponseWithTools(
 	// User-facing Architect turns have a synchronous caller waiting for
 	// the final response. Stamp only the continuation store, not a turn
 	// snapshot, so consult_peer/challenge_peer block on canonical
-	// claim/testament deltas via AwaitClaimResults instead of returning
-	// an in-flight ticket or yielding to a background resume.
+	// claim/testament deltas via AwaitClaimResults instead of yielding
+	// to a background resume.
 	loopCtx := a.withSynchronousPeerWait(ctx)
 	text, err := shared.ExecuteTurnLoop(loopCtx, ledger, req, func() (string, error) {
 		return a.executeToolLoop(loopCtx, req, stage, request.OnChunk, ledger)

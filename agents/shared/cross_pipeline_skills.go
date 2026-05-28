@@ -18,15 +18,11 @@ import (
 // CrossPipelineSkillConfig wires the cross-pipeline primitives onto
 // per-agent identity.
 //
-// challenge_peer is fire-and-forget: it writes a challenge_emitted
-// activity and returns. Delivery is handled by the fabric via ambient
-// context envelopes.
-//
 // consult_peer and challenge_peer are claim-backed. They post directed
-// claims to the session board and then either yield the current LLM
-// turn on canonical testament/claim deltas or return an in-flight
-// ticket when no continuation context is available. They do not
-// synchronously RouteSync peer execution after posting the claim.
+// claims to the session board and then either yield the current LLM turn on
+// canonical testament/claim deltas or synchronously wait through the current
+// ContinuationStore. They do not return fire-and-forget tickets and they do
+// not synchronously RouteSync peer execution after posting the claim.
 //
 // See docs/FABRIC.md Part 3: cross-pipeline collaboration.
 type CrossPipelineSkillConfig struct {
@@ -46,8 +42,7 @@ type CrossPipelineSkillConfig struct {
 
 	// Scope is the calling agent's tracked goroutine scope. The peer
 	// runs from the posted claim; the issuer's claims inbox converts
-	// the peer testament into a continuation resolution. Nil returns an
-	// in-flight ticket instead of yielding the current turn.
+	// the peer testament into a continuation resolution.
 	Scope GoroutineScopeProxy
 }
 
@@ -111,13 +106,13 @@ func ClaimsCrossPipelineSkills(_ CrossPipelineSkillConfig) []*skills.Skill {
 
 func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string) *skills.Skill {
 	return skills.NewSkill("challenge_peer").
-		Description("Dispute a peer agent's commitment with concrete evidence. Targets a specific fabric activity (not an agent directly). The challenged peer will see your challenge in their next ambient_context envelope and respond with defend / yield / scope-split / escalate. Asynchronous — neither pipeline blocks. The dispute lives durably until resolved or it passes its deadline. PREFER THIS over silent divergence — adopt-or-challenge is the binary; never just diverge. SUPERSEDES the narrower `challenge_agent` for cross-pipeline disputes (challenge_agent stays for same-pipeline protocol).").
+		Description("Dispute a peer agent's commitment with concrete evidence. Targets a specific fabric activity (not an agent directly), posts a directed challenge claim, and waits through canonical lifecycle deltas for the challenged peer's testament. The dispute lives durably until validated, failed, errored, interrupted, or timed out. PREFER THIS over silent divergence — adopt-or-challenge is the binary; never just diverge. SUPERSEDES the narrower `challenge_agent` for cross-pipeline disputes (challenge_agent stays for same-pipeline protocol).").
 		Domain("fabric").
 		Keywords("challenge", "fabric", "cross-pipeline", "dispute", "peer", "disagree", "evidence", "diverge").
 		Priority(92).
 		Usage("Use when you genuinely disagree with a peer's commitment (decision, claim, plan step) — typically because you have evidence they didn't have or a constraint they didn't model. Pass the activity_id (commonly surfaced in ambient_context) and your concrete evidence.").
 		Requirement("Carry a specific target_activity_id and concrete evidence. Vague disagreement is not actionable — be precise.").
-		Satisfies("Records a challenge_emitted activity in the fabric; the addressee sees it in their next ambient_context envelope.").
+		Satisfies("Posts a challenge claim addressed to the target and waits/yields on the peer's testament. Also records a fabric activity for ambient traceability.").
 		Avoid("Don't challenge the same activity multiple times. Don't issue a challenge without evidence — the system requires concrete grounds.").
 		StringParam("target_activity_id", "The activity ID being challenged (commonly from ambient_context).", true).
 		StringParam("evidence", "Concrete evidence supporting your alternative position (file paths, prior conventions, downstream constraints, etc.).", true).
@@ -203,6 +198,17 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			if resolvedAgentType != "" && !selfTargeted && !authority.CanChallenge(callerType, resolvedAgentType) {
 				return nil, unauthorizedChallengeError(callerType, resolvedAgentType, permittedTargets)
 			}
+			challengeTarget := resolvedAgentType
+			if challengeTarget == "" {
+				challengeTarget = strings.TrimSpace(params.TargetAgentType)
+			}
+			if challengeTarget == "" {
+				return nil, fmt.Errorf("challenge_peer: target_agent_type is required or must resolve from target_activity_id")
+			}
+			board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID))
+			if board == nil {
+				return nil, fmt.Errorf("challenge_peer: claims board is required")
+			}
 
 			payload, _ := json.Marshal(map[string]any{
 				"target_activity_id": params.TargetActivityID,
@@ -238,52 +244,43 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 
 			// Issuing-side claim: the challenging agent posts a challenge
 			// claim against the target agent.
-			challengeTarget := resolvedAgentType
-			if challengeTarget == "" {
-				challengeTarget = strings.TrimSpace(params.TargetAgentType)
-			}
 			challengeClaimID := ""
-			if challengeTarget != "" {
-				if board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)); board != nil {
-					agentType := safeCallString(cfg.AgentType)
-					challengeRelations := AttachCausedByFromContext(ctx, []claims.Relation{
-						{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-						{Related: challengeTarget, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-					})
-					challengeClaims := []claims.Claim{{
-						ID:          challengeID,
-						Title:       "Challenge " + challengeTarget + ": " + truncateSharedClaim(params.Evidence, 60),
-						Description: "Cross-pipeline peer challenge",
-						Scope: []claims.ClaimScopeEntry{
-							{Kind: "challenge", Key: challengeTarget},
-							{Kind: "challenge_id", Key: challengeID},
-						},
-						ActionType: claims.ActionTypeChallenge,
-						Relations:  challengeRelations,
-						Validations: []*claims.Validation{{
-							ID:   challengeID + ".inspection",
-							Type: claims.ValidationTypeInspection, Required: true,
-							Description: "Challenged peer responds (defend/yield/scope-split/escalate)", QualityBar: "resolution.received",
-							Status: claims.ValidationStatusPending,
-						}},
-					}}
-					challengeAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeChallenge}
-					if err := postGeneratedPeerClaim(ctx, board, challengeAction, challengeClaims, agentType, "challenge_peer"); err != nil {
-						slog.Error("challenge_peer_issuing_claim_failed", "error", err.Error())
-						return nil, err
-					} else {
-						challengeClaimID = challengeClaims[0].ID
-						if cfg.Inbox != nil {
-							claims.RegisterPostActionExpectations(cfg.Inbox(), challengeAction, challengeClaims)
-						}
-					}
+			agentType := safeCallString(cfg.AgentType)
+			challengeRelations := AttachCausedByFromContext(ctx, []claims.Relation{
+				{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: challengeTarget, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			})
+			challengeClaims := []claims.Claim{{
+				ID:          challengeID,
+				Title:       "Challenge " + challengeTarget + ": " + truncateSharedClaim(params.Evidence, 60),
+				Description: "Cross-pipeline peer challenge",
+				Scope: []claims.ClaimScopeEntry{
+					{Kind: "challenge", Key: challengeTarget},
+					{Kind: "challenge_id", Key: challengeID},
+				},
+				ActionType: claims.ActionTypeChallenge,
+				Relations:  challengeRelations,
+				Validations: []*claims.Validation{{
+					ID:   challengeID + ".inspection",
+					Type: claims.ValidationTypeInspection, Required: true,
+					Description: "Challenged peer responds (defend/yield/scope-split/escalate)", QualityBar: "resolution.received",
+					Status: claims.ValidationStatusPending,
+				}},
+			}}
+			challengeAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeChallenge}
+			if err := postGeneratedPeerClaim(ctx, board, challengeAction, challengeClaims, agentType, "challenge_peer"); err != nil {
+				slog.Error("challenge_peer_issuing_claim_failed", "error", err.Error())
+				return nil, err
+			} else {
+				challengeClaimID = challengeClaims[0].ID
+				if cfg.Inbox != nil {
+					claims.RegisterPostActionExpectations(cfg.Inbox(), challengeAction, challengeClaims)
 				}
 			}
 
 			// Narrate the ChallengingPeer state on the issuer's claim
 			// so the agent panel + chat row reflect the wait per
 			// docs/CLAIMS_UI.md §5.2 (1-3).
-			board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID))
 			issuerClaimID := ""
 			if a := claims.AccumulatorFromContext(ctx); a != nil {
 				issuerClaimID = a.ClaimID()
@@ -302,70 +299,55 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 			// testament.posted or a terminal claim lifecycle delta.
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
-			if store != nil {
-				if challengeClaimID == "" {
-					return nil, fmt.Errorf("challenge_peer: claims-native continuation requires a posted challenge claim")
-				}
-				if turn == nil || turn.Request == nil {
-					results, waitErr := store.AwaitClaimResults(ctx, []string{challengeClaimID}, time.Now().Add(deadline))
-					if waitErr != nil {
-						return nil, waitErr
-					}
-					return FormatConsultResults(results), nil
-				}
-				toolCallID, toolName := activeToolCallFromContext(ctx)
-				if toolCallID == "" {
-					toolCallID = "challenge_" + string(act.ID)
-				}
-				if toolName == "" {
-					toolName = "challenge_peer"
-				}
-				snapshot := &TurnSnapshot{
-					CorrelationID:    turn.CorrelationID,
-					Request:          cloneProvidersRequest(turn.Request),
-					AccumulatorState: snapshotAccumulator(ctx),
-				}
-				_, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
-					ClaimRefs:       []string{challengeClaimID},
-					AwaitToolCallID: toolCallID,
-					AwaitToolName:   toolName,
-					Deadline:        time.Now().Add(deadline),
-					Snapshot:        snapshot,
-				})
-				if awaitErr != nil && !yielded {
-					return nil, awaitErr
-				}
-				if yielded {
-					if a := claims.AccumulatorFromContext(ctx); a != nil {
-						a.SuppressFlush()
-					}
-					return skills.YieldToolOutcome(&skills.YieldContinuation{
-						Kind:        "challenge",
-						AwaitedIDs:  []string{challengeClaimID},
-						ToolCallID:  toolCallID,
-						ToolName:    toolName,
-						Deadline:    time.Now().Add(deadline),
-						Description: "challenge response pending",
-					}), nil
-				}
-				// Not yielded: fall through to the fire-and-forget
-				// ticket so the LLM still progresses.
+			if store == nil {
+				return nil, fmt.Errorf("challenge_peer: continuation store is required to await lifecycle response")
 			}
-
-			result := map[string]any{
-				"challenge_id": act.ID,
-				"deadline_at":  time.Now().Add(deadline),
-				"status":       "in_flight",
+			if challengeClaimID == "" {
+				return nil, fmt.Errorf("challenge_peer: claims-native continuation requires a posted challenge claim")
 			}
-			if resolvedAgentType != "" {
-				// Read by interAgentChallengeTargets so the UI derivation
-				// can attach the completion event to the right agent row.
-				result["target_agent_type"] = resolvedAgentType
+			if turn == nil || turn.Request == nil {
+				results, waitErr := store.AwaitClaimResults(ctx, []string{challengeClaimID}, time.Now().Add(deadline))
+				if waitErr != nil {
+					return nil, waitErr
+				}
+				return FormatConsultResults(results), nil
 			}
-			if resolvedPipelineID != "" {
-				result["target_pipeline_id"] = resolvedPipelineID
+			toolCallID, toolName := activeToolCallFromContext(ctx)
+			if toolCallID == "" {
+				toolCallID = "challenge_" + string(act.ID)
 			}
-			return result, nil
+			if toolName == "" {
+				toolName = "challenge_peer"
+			}
+			snapshot := &TurnSnapshot{
+				CorrelationID:    turn.CorrelationID,
+				Request:          cloneProvidersRequest(turn.Request),
+				AccumulatorState: snapshotAccumulator(ctx),
+			}
+			results, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
+				ClaimRefs:       []string{challengeClaimID},
+				AwaitToolCallID: toolCallID,
+				AwaitToolName:   toolName,
+				Deadline:        time.Now().Add(deadline),
+				Snapshot:        snapshot,
+			})
+			if awaitErr != nil && !yielded {
+				return nil, awaitErr
+			}
+			if yielded {
+				if a := claims.AccumulatorFromContext(ctx); a != nil {
+					a.SuppressFlush()
+				}
+				return skills.YieldToolOutcome(&skills.YieldContinuation{
+					Kind:        "challenge",
+					AwaitedIDs:  []string{challengeClaimID},
+					ToolCallID:  toolCallID,
+					ToolName:    toolName,
+					Deadline:    time.Now().Add(deadline),
+					Description: "challenge response pending",
+				}), nil
+			}
+			return FormatConsultResults(results), nil
 		}).
 		Build()
 }
@@ -400,11 +382,9 @@ func postGeneratedPeerClaim(ctx context.Context, board *claims.ClaimsBoard, acti
 
 // lookupTargetActivity resolves the challenged activity from the
 // ambient activity source. Returns nil when the source is unavailable,
-// when the ID doesn't parse, when the activity isn't present, or when
-// the lookup errors — every failure path is silent because the
-// downstream challenge append still needs to succeed (the challenge's
-// usefulness doesn't depend on UI attribution). Callers should treat a
-// nil return as "no resolved target" and fall through.
+// when the ID doesn't parse, when the activity isn't present, or when the
+// lookup errors. Callers must still resolve a canonical target before posting
+// the challenge claim; there is no metadata-only challenge fallback.
 func lookupTargetActivity(ctx context.Context, id activity.ActivityID) *activity.AgentActivity {
 	if strings.TrimSpace(string(id)) == "" {
 		return nil
@@ -422,7 +402,7 @@ func lookupTargetActivity(ctx context.Context, id activity.ActivityID) *activity
 
 func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, allowsCrossPipeline bool) *skills.Skill {
 	return skills.NewSkill("consult_peer").
-		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. This posts a directed consultation claim; the peer receives the claim through the Guide bus and answers by submitting a testament with artifacts. When the current turn can be parked, the tool yields and resumes from canonical deltas. Otherwise it returns an in-flight ticket. PREFER THIS over guessing when peer state matters.").
+		Description("Ask a peer agent (cross-pipeline specialist or knowledge agent) for their evidence on a shared concern. This posts a directed consultation claim; the peer receives the claim through the Guide bus and answers by submitting a testament with artifacts. The tool waits through canonical lifecycle deltas, yielding the current turn when a turn snapshot is available. PREFER THIS over guessing when peer state matters.").
 		Domain("fabric").
 		Keywords("consult", "fabric", "cross-pipeline", "peer", "knowledge-agent", "ask", "question").
 		Priority(91).
@@ -485,6 +465,10 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 					)
 				}
 			}
+			board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID))
+			if board == nil {
+				return nil, fmt.Errorf("consult_peer: claims board is required")
+			}
 			deadline := time.Duration(params.DeadlineSeconds) * time.Second
 			if deadline <= 0 {
 				deadline = 3 * time.Minute
@@ -526,52 +510,43 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 			// testament and artifacts to this claim, and the bridge projects
 			// the exchange from the claim graph.
 			consultationClaimID := ""
-			if board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID)); board != nil {
-				agentType := safeCallString(cfg.AgentType)
-				consultRelations := AttachCausedByFromContext(ctx, []claims.Relation{
-					{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-					{Related: strings.TrimSpace(params.TargetAgentType), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-				})
-				consultClaims := []claims.Claim{{
-					ID:          consultID,
-					Title:       "Consult peer " + targetAddress + ": " + truncateSharedClaim(params.Query, 60),
-					Description: "Cross-pipeline peer consultation",
-					Scope: []claims.ClaimScopeEntry{
-						{Kind: "consultation", Key: targetAddress},
-						{Kind: "consult_id", Key: consultID},
-					},
-					ActionType: claims.ActionTypeConsultation,
-					Relations:  consultRelations,
-					Validations: []*claims.Validation{{
-						ID:   consultID + ".receipt",
-						Type: claims.ValidationTypeReceipt, Required: true,
-						Description: "Peer responds to consultation", QualityBar: "response.received",
-						Status: claims.ValidationStatusPending,
-					}},
-				}}
-				consultAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeConsultation}
-				if err := postGeneratedPeerClaim(ctx, board, consultAction, consultClaims, agentType, "consult_peer"); err != nil {
-					slog.Error("consult_peer_issuing_claim_failed", "error", err.Error())
-					return nil, err
-				} else {
-					consultationClaimID = consultClaims[0].ID
-					if cfg.Inbox != nil {
-						claims.RegisterPostActionExpectations(cfg.Inbox(), consultAction, consultClaims)
-					}
+			agentType := safeCallString(cfg.AgentType)
+			consultRelations := AttachCausedByFromContext(ctx, []claims.Relation{
+				{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: strings.TrimSpace(params.TargetAgentType), RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			})
+			consultClaims := []claims.Claim{{
+				ID:          consultID,
+				Title:       "Consult peer " + targetAddress + ": " + truncateSharedClaim(params.Query, 60),
+				Description: "Cross-pipeline peer consultation",
+				Scope: []claims.ClaimScopeEntry{
+					{Kind: "consultation", Key: targetAddress},
+					{Kind: "consult_id", Key: consultID},
+				},
+				ActionType: claims.ActionTypeConsultation,
+				Relations:  consultRelations,
+				Validations: []*claims.Validation{{
+					ID:   consultID + ".receipt",
+					Type: claims.ValidationTypeReceipt, Required: true,
+					Description: "Peer responds to consultation", QualityBar: "response.received",
+					Status: claims.ValidationStatusPending,
+				}},
+			}}
+			consultAction := claims.Action{AgentID: agentType, Type: claims.ActionTypeConsultation}
+			if err := postGeneratedPeerClaim(ctx, board, consultAction, consultClaims, agentType, "consult_peer"); err != nil {
+				slog.Error("consult_peer_issuing_claim_failed", "error", err.Error())
+				return nil, err
+			} else {
+				consultationClaimID = consultClaims[0].ID
+				if cfg.Inbox != nil {
+					claims.RegisterPostActionExpectations(cfg.Inbox(), consultAction, consultClaims)
 				}
-			}
-
-			ticket := map[string]any{
-				"consult_id":  consultID,
-				"deadline_at": time.Now().Add(deadline),
-				"status":      "in_flight",
-				"target":      targetAddress,
 			}
 
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
 			if store == nil {
-				return ticket, nil
+				return nil, fmt.Errorf("consult_peer: continuation store is required to await lifecycle response")
 			}
 			if consultationClaimID == "" {
 				return nil, fmt.Errorf("consult_peer: claims-native continuation requires a posted consultation claim")
@@ -583,8 +558,6 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				}
 				return FormatConsultResults(results), nil
 			}
-
-			board := claims.DefaultSessionBoardRegistry().Lookup(safeCallString(cfg.SessionID))
 
 			// Push: narrate the dispatch transition on the issuer's
 			// own claim (the claim the issuer is currently processing).
@@ -624,7 +597,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 				Request:          cloneProvidersRequest(turn.Request),
 				AccumulatorState: snapshotAccumulator(ctx),
 			}
-			_, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
+			results, yielded, awaitErr := store.AwaitConsultsOrYield(ctx, AwaitOptions{
 				ClaimRefs:       []string{consultationClaimID},
 				AwaitToolCallID: toolCallID,
 				AwaitToolName:   toolName,
@@ -657,10 +630,7 @@ func consultPeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string, a
 					Description: "consult response pending",
 				}), nil
 			}
-			// Pre-resolved: orphan delta was already in the store
-			// (peer answered before consult_peer's persist landed).
-			// Treat as fast-path return — resume not needed.
-			return ticket, nil
+			return FormatConsultResults(results), nil
 		}).
 		Build()
 }

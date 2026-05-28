@@ -533,12 +533,14 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, delta claims.CanonicalDelta) {
 	claimID := strings.TrimSpace(delta.ClaimID())
 	switch delta.Action {
+	case claims.DeltaActionClaimGenerated:
+		b.handleEntryClaim(sessionID, board, entry, claimID)
 	case claims.DeltaActionClaimPosted:
 		b.handleEntryClaim(sessionID, board, entry, claimID)
-		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", "", delta)
+		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", canonicalClaimLifecycleDisplayMessage(delta), delta)
 	case claims.DeltaActionTestamentPosted:
 		b.handleEntryTestament(sessionID, board, entry, delta.TestamentID())
-		b.emitPeerInteractionForDelta(sessionID, claimID, "done", canonicalTestamentContext(delta), delta)
+		b.emitPeerInteractionForDelta(sessionID, claimID, b.peerStatusForTestamentPosted(claimID), canonicalTestamentPostedContext(delta), delta)
 	case claims.DeltaActionValidationEvaluated:
 		b.emitPeerInteractionForDelta(sessionID, claimID, canonicalValidationPeerStatus(delta), canonicalValidationReason(delta), delta)
 		if canonicalValidationAutoAccepted(delta) {
@@ -572,10 +574,11 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 		claims.DeltaActionClaimTestamentGenerated,
 		claims.DeltaActionClaimTestamentAcknowledged,
 		claims.DeltaActionClaimValidating:
+		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", canonicalClaimLifecycleDisplayMessage(delta), delta)
 		b.handleClaimContext(sessionID, claimContextEvent{
 			ClaimID:           claimID,
 			AgentID:           delta.Actor.RouteKey(),
-			Context:           canonicalProgressMessage(delta),
+			Context:           canonicalClaimLifecycleDisplayMessage(delta),
 			ContextTransition: canonicalProgressTransition(delta),
 		})
 	}
@@ -643,6 +646,13 @@ func canonicalTestamentContext(delta claims.CanonicalDelta) string {
 	return ""
 }
 
+func canonicalTestamentPostedContext(delta claims.CanonicalDelta) string {
+	if contextValue := canonicalTestamentContext(delta); contextValue != "" {
+		return contextValue
+	}
+	return "Response received"
+}
+
 func canonicalClaimTransitionReason(delta claims.CanonicalDelta) string {
 	claim, ok := delta.Context["claim"].(map[string]any)
 	if !ok {
@@ -650,6 +660,57 @@ func canonicalClaimTransitionReason(delta claims.CanonicalDelta) string {
 	}
 	reason, _ := claim["reason"].(string)
 	return strings.TrimSpace(reason)
+}
+
+func canonicalClaimLifecycleDisplayMessage(delta claims.CanonicalDelta) string {
+	if message := canonicalProgressMessage(delta); message != "" {
+		return message
+	}
+	if reason := canonicalClaimTransitionReason(delta); reason != "" {
+		return reason
+	}
+	status, ok := delta.ClaimLifecycleStatus()
+	if !ok {
+		return ""
+	}
+	switch status {
+	case claims.ClaimLifecycleGenerated:
+		return "Generated"
+	case claims.ClaimLifecyclePosted:
+		return "Posted"
+	case claims.ClaimLifecycleReceived:
+		return "Received"
+	case claims.ClaimLifecycleProgressed:
+		return "Working"
+	case claims.ClaimLifecycleTestamentGenerated:
+		return "Response generated"
+	case claims.ClaimLifecycleTestamentAcknowledged:
+		return "Response received"
+	case claims.ClaimLifecycleValidating:
+		return "Validating"
+	case claims.ClaimLifecycleSatisfied:
+		return "Satisfied"
+	case claims.ClaimLifecycleValidationIncomplete:
+		return "Validation incomplete"
+	case claims.ClaimLifecycleValidationFailed:
+		return "Validation failed"
+	case claims.ClaimLifecycleValidationErrored:
+		return "Validation errored"
+	case claims.ClaimLifecyclePostFailed:
+		return "Post failed"
+	case claims.ClaimLifecycleReceiptFailed:
+		return "Receipt failed"
+	case claims.ClaimLifecycleProgressFailed:
+		return "Progress failed"
+	case claims.ClaimLifecycleTestamentGenerationFailed:
+		return "Response generation failed"
+	case claims.ClaimLifecycleTestamentAcknowledgementFailed:
+		return "Response acknowledgement failed"
+	case claims.ClaimLifecycleGenerationFailed:
+		return "Generation failed"
+	default:
+		return strings.ReplaceAll(string(status), "_", " ")
+	}
 }
 
 func canonicalProgressMessage(delta claims.CanonicalDelta) string {
@@ -1010,6 +1071,21 @@ func (b *ClaimsBridge) emitPeerInteractionForClaimID(sessionID, claimID, status,
 	b.mu.Unlock()
 	if out != nil {
 		b.enqueue(*out)
+	}
+}
+
+func (b *ClaimsBridge) peerStatusForTestamentPosted(claimID string) string {
+	if b == nil {
+		return "done"
+	}
+	b.mu.Lock()
+	meta := b.metaForClaimLocked(claimID)
+	b.mu.Unlock()
+	switch strings.TrimSpace(meta.ActionType) {
+	case string(claims.ActionTypeChallenge):
+		return "pending"
+	default:
+		return "done"
 	}
 }
 

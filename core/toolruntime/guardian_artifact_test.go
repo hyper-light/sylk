@@ -10,11 +10,8 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
-// Guardian-check artifact pair contract (UI_DESIGN.md §2.4 + §4.1).
-// Every approval-gated tool emits a guardian_check_started artifact
-// onto the caller's accumulator the moment the gate is invoked, and a
-// matching guardian_check_completed artifact via Relation{completes}
-// the moment the grant returns (any outcome).
+// Guardian checks are claim/testament lifecycle rows. They must not emit
+// legacy guardian_check_started/guardian_check_completed artifact pairs.
 
 func guardianInvocation() Invocation {
 	return Invocation{
@@ -29,46 +26,31 @@ func guardianInvocation() Invocation {
 	}
 }
 
-func TestRecordGuardianCheckStart_EmitsStartedArtifact(t *testing.T) {
+func TestRecordGuardianCheckStart_DoesNotEmitLegacyArtifact(t *testing.T) {
 	ctx, acc := newAccumulatorOnContext(t)
 	trace := recordGuardianCheckStart(ctx, guardianInvocation(), "")
-	if trace.startedArtifactID == "" {
-		t.Fatal("expected non-empty startedArtifactID")
+	if trace.startedArtifactID != "" {
+		t.Fatalf("startedArtifactID = %q, want empty legacy artifact ref", trace.startedArtifactID)
 	}
-	arts := acc.Artifacts()
-	if len(arts) != 1 {
-		t.Fatalf("expected 1 artifact, got %d", len(arts))
-	}
-	a := arts[0]
-	if a.ID != trace.startedArtifactID {
-		t.Fatalf("artifact.ID = %q, want %q", a.ID, trace.startedArtifactID)
-	}
-	if a.Kind != "guardian_check_started" {
-		t.Fatalf("artifact.Kind = %q, want guardian_check_started", a.Kind)
-	}
-	if a.Reference != "command_execution_control" {
-		t.Fatalf("artifact.Reference = %q, want command_execution_control", a.Reference)
+	if arts := acc.Artifacts(); len(arts) != 0 {
+		t.Fatalf("expected no legacy guardian artifacts, got %d", len(arts))
 	}
 }
 
-func TestRecordGuardianCheckEnd_PairsViaCompletesRelation(t *testing.T) {
-	ctx, acc := newAccumulatorOnContext(t)
-	trace := recordGuardianCheckStart(ctx, guardianInvocation(), "")
+func TestRecordGuardianCheckEnd_PostsGuardianTestament(t *testing.T) {
+	ctx, acc, guardianClaimID := guardianLifecycleContext(t)
+	trace := recordGuardianCheckStart(ctx, guardianInvocation(), guardianClaimID)
 	recordGuardianCheckEnd(ctx, guardianInvocation(), trace, time.Now().UTC(), nil)
 
-	arts := acc.Artifacts()
-	if len(arts) != 2 {
-		t.Fatalf("expected 2 artifacts, got %d", len(arts))
+	if arts := acc.Artifacts(); len(arts) != 0 {
+		t.Fatalf("expected no legacy guardian artifacts, got %d", len(arts))
 	}
-	completed := arts[1]
-	if completed.Kind != "guardian_check_completed" {
-		t.Fatalf("completed.Kind = %q, want guardian_check_completed", completed.Kind)
+	testaments := acc.Board().TestamentsByClaim(guardianClaimID)
+	if len(testaments) != 1 {
+		t.Fatalf("guardian testaments = %d, want 1", len(testaments))
 	}
-	if got := claims.CompletesArtifactID(completed.Relations); got != trace.startedArtifactID {
-		t.Fatalf("completes relation = %q, want %q", got, trace.startedArtifactID)
-	}
-	if got := completed.Metadata["outcome"]; got != "success" {
-		t.Fatalf("outcome = %v, want success", got)
+	if testaments[0].LifecycleStatus != claims.TestamentLifecycleValidated {
+		t.Fatalf("testament lifecycle = %q, want validated", testaments[0].LifecycleStatus)
 	}
 }
 
@@ -84,11 +66,18 @@ func TestRecordGuardianCheckEnd_MapsOutcomes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, acc := newAccumulatorOnContext(t)
-			trace := recordGuardianCheckStart(ctx, guardianInvocation(), "")
+			ctx, acc, guardianClaimID := guardianLifecycleContext(t)
+			trace := recordGuardianCheckStart(ctx, guardianInvocation(), guardianClaimID)
 			recordGuardianCheckEnd(ctx, guardianInvocation(), trace, time.Now().UTC(), tc.err)
-			completed := acc.Artifacts()[1]
-			if got := completed.Metadata["outcome"]; got != tc.want {
+			testaments := acc.Board().TestamentsByClaim(guardianClaimID)
+			if len(testaments) != 1 {
+				t.Fatalf("guardian testaments = %d, want 1", len(testaments))
+			}
+			got := ""
+			if len(testaments[0].Artifacts) > 0 {
+				got, _ = testaments[0].Artifacts[0].Metadata["outcome"].(string)
+			}
+			if got != tc.want {
 				t.Fatalf("outcome = %v, want %q", got, tc.want)
 			}
 		})
@@ -102,4 +91,16 @@ func TestRecordGuardianCheck_NoAccumulator_NoOps(t *testing.T) {
 	}
 	// must not panic
 	recordGuardianCheckEnd(context.Background(), guardianInvocation(), guardianCheckTrace{startedArtifactID: "x"}, time.Now().UTC(), nil)
+}
+
+func guardianLifecycleContext(t *testing.T) (context.Context, *claims.TestamentAccumulator, string) {
+	t.Helper()
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "guardian-board", SessionID: "test-session", TaskID: "guardian-test"})
+	acc := claims.NewTestamentAccumulator("tester-agent", "test-session").WithBoard(board)
+	ctx := claims.WithTestamentAccumulator(context.Background(), acc)
+	claimID := postGuardianCheckClaim(ctx, guardianInvocation())
+	if claimID == "" {
+		t.Fatal("guardian claim was not posted")
+	}
+	return ctx, acc, claimID
 }

@@ -118,8 +118,8 @@ func TestBuildInterAgentStartRecord_MergesMetadataWithFallbackChallengeTargets(t
 	}
 }
 
-func TestBuildInterAgentStartRecord_UsesApprovalMetadata(t *testing.T) {
-	record, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
+func TestBuildInterAgentStartRecord_RejectsApprovalMetadata(t *testing.T) {
+	_, ok := buildInterAgentStartRecord(msg.ToolCallEventMsg{
 		CorrelationID: "corr-approval",
 		ToolCallKey:   "approval-1",
 		ToolName:      "approval_guardian",
@@ -132,17 +132,8 @@ func TestBuildInterAgentStartRecord_UsesApprovalMetadata(t *testing.T) {
 			Status:     "pending",
 		},
 	})
-	if !ok {
-		t.Fatal("expected metadata-driven approval start record")
-	}
-	if record.InterAgent == nil {
-		t.Fatal("expected inter-agent row")
-	}
-	if got := record.InterAgent.Kind; got != InterAgentToolApproval {
-		t.Fatalf("kind = %q, want %q", got, InterAgentToolApproval)
-	}
-	if got := record.InterAgent.AgentTypes; len(got) != 1 || got[0] != "guardian" {
-		t.Fatalf("agent types = %#v, want [guardian]", got)
+	if ok {
+		t.Fatal("approval rows must be claims-projected, not inferred from tool metadata")
 	}
 }
 
@@ -255,8 +246,8 @@ func TestHandleInterAgentToolCallInList_ApprovalPairsByLifecycleID(t *testing.T)
 	if calls[0].InterAgent.Status != InterAgentToolDone {
 		t.Fatalf("status = %q, want Done", calls[0].InterAgent.Status)
 	}
-	if calls[0].InterAgent.Summary != "approved by user" {
-		t.Fatalf("summary = %q, want updated to %q", calls[0].InterAgent.Summary, "approved by user")
+	if calls[0].InterAgent.Summary != "Requesting Guardian approval for run_command" {
+		t.Fatalf("summary = %q, want metadata ignored", calls[0].InterAgent.Summary)
 	}
 }
 

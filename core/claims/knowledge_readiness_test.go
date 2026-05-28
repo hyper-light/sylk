@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -157,4 +158,19 @@ func TestWaitForKnowledgeBackendReadyContextDeadline(t *testing.T) {
 	if _, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); !ok {
 		t.Fatal("wait did not post readiness claim")
 	}
+	if !boardHasErrorArtifactForClaimWithPrefix(board, "knowledge_backend.ready.failure.") {
+		t.Fatal("wait deadline did not post readiness failure error artifact")
+	}
+	if claim, ok := board.CloneClaim(KnowledgeBackendReadyClaimID); !ok || claim.LifecycleStatus != ClaimLifecyclePosted {
+		t.Fatalf("readiness claim lifecycle = %v/%q, want posted and recoverable", ok, claim.LifecycleStatus)
+	}
+}
+
+func boardHasErrorArtifactForClaimWithPrefix(board *ClaimsBoard, prefix string) bool {
+	for _, claim := range board.Projection().Claims {
+		if strings.HasPrefix(claim.ID, prefix) && boardHasErrorArtifactForClaim(board, claim.ID) {
+			return true
+		}
+	}
+	return false
 }

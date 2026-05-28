@@ -290,7 +290,7 @@ func interAgentStatusFromPeerEvent(status string) InterAgentToolStatus {
 	switch strings.TrimSpace(status) {
 	case "failed", "failure", "error", "timeout", "cancelled", "canceled", "rejected":
 		return InterAgentToolFailed
-	case "done", "success", "complete", "completed", "accepted", "responded", "received":
+	case "done", "success", "complete", "completed", "accepted", "responded":
 		return InterAgentToolDone
 	default:
 		return InterAgentToolPending

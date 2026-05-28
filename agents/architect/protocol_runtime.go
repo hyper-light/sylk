@@ -478,7 +478,7 @@ func (r *planningProtocolRunner) run() error {
 	// The protocol is user-facing and synchronous: the caller is waiting
 	// for the plan presentation. Stamp only the continuation store so peer
 	// tools wait on canonical claim/testament deltas inline instead of
-	// returning in-flight tickets or yielding to a background resume.
+	// yielding to a background resume.
 	loopCtx = r.architect.withSynchronousPeerWait(loopCtx)
 	ledger := shared.SteeringLedgerFromContext(loopCtx)
 
