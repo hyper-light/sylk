@@ -78,8 +78,8 @@ func IsConsultYielded(err error) bool { return errors.Is(err, ErrConsultYielded)
 
 // AwaitedClaimResult is the continuation-store result for one awaited
 // directed claim. It is deliberately claim/testament shaped: canonical
-// testament.submitted and terminal claim.transitioned deltas populate
-// this directly.
+// testament.posted and terminal claim lifecycle deltas populate this
+// directly.
 type AwaitedClaimResult struct {
 	SessionID string `json:"session_id,omitempty"`
 	BoardID   string `json:"board_id,omitempty"`
@@ -87,6 +87,7 @@ type AwaitedClaimResult struct {
 	ClaimID      string `json:"claim_id"`
 	TestamentID  string `json:"testament_id,omitempty"`
 	ValidationID string `json:"validation_id,omitempty"`
+	DeltaKey     string `json:"delta_key,omitempty"`
 
 	Action  claims.DeltaAction `json:"action,omitempty"`
 	Verdict string             `json:"verdict,omitempty"`
@@ -109,6 +110,7 @@ func (r *AwaitedClaimResult) normalized() *AwaitedClaimResult {
 	cp.ClaimID = strings.TrimSpace(cp.ClaimID)
 	cp.TestamentID = strings.TrimSpace(cp.TestamentID)
 	cp.ValidationID = strings.TrimSpace(cp.ValidationID)
+	cp.DeltaKey = strings.TrimSpace(cp.DeltaKey)
 	cp.SessionID = strings.TrimSpace(cp.SessionID)
 	cp.BoardID = strings.TrimSpace(cp.BoardID)
 	cp.Status = strings.TrimSpace(cp.Status)
@@ -593,7 +595,7 @@ func (s *ContinuationStore) AwaitClaimResults(ctx context.Context, claimRefs []s
 }
 
 // DeliverClaimResult is the inbox-side entry: when canonical
-// testament.submitted or terminal claim.transitioned resolves an
+// testament.posted or a terminal claim lifecycle delta resolves an
 // awaited claim, the dispatcher calls this with the result. If the
 // result matches a
 // pending continuation, it's recorded; if all of that continuation's

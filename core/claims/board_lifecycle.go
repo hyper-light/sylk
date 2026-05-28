@@ -377,7 +377,7 @@ func (b *ClaimsBoard) AcknowledgeTestamentReceipt(ctx context.Context, testament
 	}
 	claimID := ClaimIDFromRelations(t.Relations)
 	claim := b.claims[claimID]
-	if !canAcknowledgeTestamentReceipt(claim, receiverID) {
+	if !b.canAcknowledgeTestamentReceipt(ctx, claim, receiverID) {
 		b.mu.Unlock()
 		return fmt.Errorf("receiver %q cannot acknowledge testament %q for claim %q", receiverID, t.ID, claimID)
 	}
@@ -566,7 +566,7 @@ func (b *ClaimsBoard) transitionClaimLifecycle(ctx context.Context, claimID, act
 		b.mu.Unlock()
 		return nil
 	}
-	if err := validateLifecycleReceiver(c, actorID, to); err != nil {
+	if err := b.validateLifecycleReceiver(ctx, c, actorID, to); err != nil {
 		b.mu.Unlock()
 		return err
 	}
@@ -1287,15 +1287,15 @@ func allTestamentsLifecyclePosted(testaments []*Testament) bool {
 	return true
 }
 
-func validateLifecycleReceiver(claim *Claim, actorID string, to ClaimLifecycleStatus) error {
+func (b *ClaimsBoard) validateLifecycleReceiver(ctx context.Context, claim *Claim, actorID string, to ClaimLifecycleStatus) error {
 	switch to {
 	case ClaimLifecycleReceived:
-		if canAcknowledgeClaimReceipt(claim, actorID) {
+		if b.canAcknowledgeClaimReceipt(ctx, claim, actorID) {
 			return nil
 		}
 		return fmt.Errorf("receiver %q cannot acknowledge claim %q", actorID, claim.ID)
 	case ClaimLifecycleTestamentAcknowledged:
-		if canAcknowledgeClaimTestament(claim, actorID) {
+		if b.canAcknowledgeClaimTestament(ctx, claim, actorID) {
 			return nil
 		}
 		return fmt.Errorf("receiver %q cannot acknowledge testament for claim %q", actorID, claim.ID)
@@ -1304,32 +1304,74 @@ func validateLifecycleReceiver(claim *Claim, actorID string, to ClaimLifecycleSt
 	}
 }
 
-func canAcknowledgeClaimReceipt(claim *Claim, actorID string) bool {
-	return hasAgentRelation(claim.Relations, RelationshipSubject, actorID)
+func (b *ClaimsBoard) canAcknowledgeClaimReceipt(ctx context.Context, claim *Claim, actorID string) bool {
+	if claim == nil {
+		return false
+	}
+	if isPeerDirectedActionType(claim.ActionType) &&
+		b.agentRelationMatches(ctx, claim.Relations, RelationshipIssuer, actorID) &&
+		b.agentRelationMatches(ctx, claim.Relations, RelationshipSubject, actorID) &&
+		HandoffFromClaimID(claim.Relations) == "" {
+		return false
+	}
+	return b.agentRelationMatches(ctx, claim.Relations, RelationshipSubject, actorID)
 }
 
-func canAcknowledgeClaimTestament(claim *Claim, actorID string) bool {
-	return hasAgentRelation(claim.Relations, RelationshipIssuer, actorID) ||
-		hasAgentRelation(claim.Relations, RelationshipEvaluator, actorID)
+func (b *ClaimsBoard) canAcknowledgeClaimTestament(ctx context.Context, claim *Claim, actorID string) bool {
+	if claim == nil {
+		return false
+	}
+	return b.agentRelationMatches(ctx, claim.Relations, RelationshipIssuer, actorID) ||
+		b.agentRelationMatches(ctx, claim.Relations, RelationshipEvaluator, actorID)
 }
 
-func canAcknowledgeTestamentReceipt(claim *Claim, actorID string) bool {
-	return claim != nil && canAcknowledgeClaimTestament(claim, actorID)
+func (b *ClaimsBoard) canAcknowledgeTestamentReceipt(ctx context.Context, claim *Claim, actorID string) bool {
+	return b.canAcknowledgeClaimTestament(ctx, claim, actorID)
 }
 
-func hasAgentRelation(relations []Relation, relationship, agentID string) bool {
+func (b *ClaimsBoard) agentRelationMatches(ctx context.Context, relations []Relation, relationship, agentID string) bool {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
 		return false
 	}
 	for _, relation := range relations {
-		if relation.RelatedType == RelatedTypeAgent &&
-			relation.Relationship == relationship &&
-			strings.TrimSpace(relation.Related) == agentID {
+		if relation.RelatedType != RelatedTypeAgent || relation.Relationship != relationship {
+			continue
+		}
+		if strings.TrimSpace(relation.Related) == agentID {
+			return true
+		}
+		if b.agentRefsMatch(ctx, relation.Related, agentID) {
 			return true
 		}
 	}
 	return false
+}
+
+func (b *ClaimsBoard) agentRefsMatch(ctx context.Context, leftID, rightID string) bool {
+	left, okLeft := b.resolveAgentRefForMatch(ctx, leftID)
+	right, okRight := b.resolveAgentRefForMatch(ctx, rightID)
+	if !okLeft || !okRight {
+		return false
+	}
+	left = left.Normalized()
+	right = right.Normalized()
+	if left.UID != "" && right.UID != "" {
+		return left.UID == right.UID
+	}
+	return left.RouteKey() != "" && left.RouteKey() == right.RouteKey()
+}
+
+func (b *ClaimsBoard) resolveAgentRefForMatch(ctx context.Context, agentID string) (AgentRef, bool) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" || b == nil || b.agentRefResolver == nil {
+		return AgentRef{}, false
+	}
+	ref, ok := b.agentRefResolver.ResolveAgentRef(ctx, b.sessionID, agentID)
+	if !ok || ref.RouteKey() == "" || ref.Unresolved {
+		return AgentRef{}, false
+	}
+	return ref.Normalized(), true
 }
 
 func isKnownActionType(actionType ActionType) bool {

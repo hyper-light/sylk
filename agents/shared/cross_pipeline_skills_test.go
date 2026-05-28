@@ -70,7 +70,7 @@ func TestConsultPeerSkill_RejectsSelfConsult(t *testing.T) {
 
 func TestConsultPeerSkill_ReturnsTicketWithoutSynchronousPeerRoute(t *testing.T) {
 	// Without continuation context, consult_peer returns a claim ticket
-	// and lets claim.directed/testament.submitted drive the work. There
+	// and lets claim.posted/testament.posted lifecycle deltas drive the work. There
 	// is no RouteSync hook in the config: the test fails at compile time
 	// if the old synchronous route authority returns.
 	cfg := CrossPipelineSkillConfig{

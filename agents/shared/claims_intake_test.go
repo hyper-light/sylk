@@ -10,6 +10,38 @@ import (
 	"github.com/adalundhe/sylk/core/providers"
 )
 
+func canonicalTestamentPostedDeltaForClaimsIntakeTest(sessionID, boardID, claimID, testamentID string, action claims.ActionType, responderID, receiverID, context string) claims.CanonicalDelta {
+	return claims.NewCanonicalDelta(
+		claims.DeltaActionTestamentPosted,
+		sessionID,
+		boardID,
+		2,
+		time.Now(),
+		claims.DegradedAgentRef(responderID, "test"),
+		[]claims.DeltaRef{
+			{Role: "claim", Type: claims.RelatedTypeClaim, ID: claimID},
+			{Role: "testament", Type: claims.RelatedTypeTestament, ID: testamentID},
+		},
+		&claims.DeltaDelivery{
+			To:           []claims.AgentRef{claims.DegradedAgentRef(receiverID, "test")},
+			Relationship: claims.RelationshipIssuer,
+		},
+		map[string]any{
+			"claim": map[string]any{
+				"id":               claimID,
+				"action":           string(action),
+				"status":           string(claims.ClaimStatusTestified),
+				"lifecycle_status": string(claims.ClaimLifecycleTestamentGenerated),
+			},
+			"testaments": []map[string]any{{
+				"id":      testamentID,
+				"verdict": claims.TestamentVerdictWorkComplete,
+				"context": context,
+			}},
+		},
+	)
+}
+
 func TestClaimsIntakeAcknowledgesClaimPostedBeforeProcessing(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 		BoardID:   "board-intake-receipt",
@@ -120,16 +152,16 @@ func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) 
 	}
 
 	entry := &claims.GraphEntryPoint{
-		Delta: claims.TestamentDelta{
-			SessionID:      "sess-intake-consult",
-			BoardID:        "board-intake-consult",
-			ClaimID:        "claim-1",
-			TestamentID:    "testament-1",
-			ActionKind:     claims.ActionTypeConsultation,
-			Verdict:        claims.TestamentVerdictWorkComplete,
-			SubjectAgentID: "librarian",
-			Summary:        "The repository is currently a Go project.",
-		},
+		Delta: canonicalTestamentPostedDeltaForClaimsIntakeTest(
+			"sess-intake-consult",
+			"board-intake-consult",
+			"claim-1",
+			"testament-1",
+			claims.ActionTypeConsultation,
+			"librarian",
+			"architect-1",
+			"The repository is currently a Go project.",
+		),
 		Node: claims.GraphNode{
 			Claim: &claims.Claim{
 				ID:         "claim-1",
@@ -179,12 +211,67 @@ func TestClaimsIntakeExpectedConsultTestamentDeliversContinuation(t *testing.T) 
 	if got.ResponseSummary != "The repository is currently a Go project." {
 		t.Fatalf("summary = %q", got.ResponseSummary)
 	}
+	if got.DeltaKey == "" || got.DeltaKey != entry.Delta.DeltaKey() {
+		t.Fatalf("delta key = %q, want %q", got.DeltaKey, entry.Delta.DeltaKey())
+	}
 	var payload map[string]any
 	if err := json.Unmarshal(got.ResponsePayload, &payload); err != nil {
 		t.Fatalf("payload json: %v", err)
 	}
 	if payload["response"] != "The repository is currently a Go project." {
 		t.Fatalf("payload.response = %#v", payload["response"])
+	}
+}
+
+func TestClaimsIntakeLegacyConsultTestamentDoesNotDeliverContinuation(t *testing.T) {
+	var resumed map[string]*AwaitedClaimResult
+	store := NewContinuationStore(ContinuationStoreConfig{
+		AgentID:   "architect-1",
+		SessionID: "sess-intake-legacy-consult",
+		Board: claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+			BoardID:   "board-intake-legacy-consult",
+			SessionID: "sess-intake-legacy-consult",
+		}),
+		ResumeFn: func(_ context.Context, _ *TurnSnapshot, results map[string]*AwaitedClaimResult) error {
+			resumed = results
+			return nil
+		},
+	})
+	entry := &claims.GraphEntryPoint{
+		Delta: claims.TestamentDelta{
+			SessionID:      "sess-intake-legacy-consult",
+			BoardID:        "board-intake-legacy-consult",
+			ClaimID:        "claim-1",
+			TestamentID:    "testament-1",
+			ActionKind:     claims.ActionTypeConsultation,
+			Verdict:        claims.TestamentVerdictWorkComplete,
+			SubjectAgentID: "librarian",
+			Summary:        "legacy path should not resume",
+		},
+		Node: claims.GraphNode{
+			Claim: &claims.Claim{
+				ID:         "claim-1",
+				ActionType: claims.ActionTypeConsultation,
+				Scope: []claims.ClaimScopeEntry{
+					{Kind: "consult_id", Key: "consult-123"},
+				},
+			},
+			Testament: &claims.Testament{ID: "testament-1", AgentID: "librarian"},
+		},
+		Expectation: &claims.Expectation{
+			ClaimID:       "claim-1",
+			ExpectedDelta: claims.DeltaKindTestament,
+		},
+	}
+	if deliverExpectedPeerResultToContinuation(ClaimsIntakeConfig{
+		AgentID:           "architect-1",
+		SessionID:         "sess-intake-legacy-consult",
+		ContinuationStore: store,
+	}, entry) {
+		t.Fatal("legacy testament delta must not resolve lifecycle continuations")
+	}
+	if resumed != nil {
+		t.Fatalf("resume invoked with %#v", resumed)
 	}
 }
 
@@ -356,12 +443,16 @@ func TestClaimsIntakeExpectedConsultTestamentWithoutResolutionIDIsConsumed(t *te
 		SessionID:         "sess-intake-consult-missing-id",
 		ContinuationStore: &ContinuationStore{},
 	}, &claims.GraphEntryPoint{
-		Delta: claims.TestamentDelta{
-			ActionKind:  claims.ActionTypeConsultation,
-			ClaimID:     "claim-1",
-			TestamentID: "testament-1",
-			Summary:     "done",
-		},
+		Delta: canonicalTestamentPostedDeltaForClaimsIntakeTest(
+			"sess-intake-consult-missing-id",
+			"board-intake-consult-missing-id",
+			"claim-1",
+			"testament-1",
+			claims.ActionTypeConsultation,
+			"librarian",
+			"architect-1",
+			"done",
+		),
 		Node: claims.GraphNode{
 			Claim: &claims.Claim{
 				ID:         "",
@@ -452,14 +543,18 @@ func TestClaimsIntakeExecutesOwnedExpectedValidationToolsFromTestament(t *testin
 	if err := board.SubmitTestaments(context.Background(), claims.Action{AgentID: "engineer", Type: claims.ActionTypeTestament}, testaments); err != nil {
 		t.Fatal(err)
 	}
-	entry := claims.ResolveEntryPoint(board, claims.TestamentDelta{
-		SessionID:   "sess-expected-tools",
-		BoardID:     "board-expected-tools",
-		ClaimID:     claim.ID,
-		TestamentID: testaments[0].ID,
-		ActionKind:  claims.ActionTypeTask,
-		Verdict:     claims.TestamentVerdictWorkComplete,
-	}, claims.PriorityEvaluation, nil)
+	projection := board.Projection()
+	testamentID := projection.Testaments[0].ID
+	entry := claims.ResolveEntryPoint(board, canonicalTestamentPostedDeltaForClaimsIntakeTest(
+		"sess-expected-tools",
+		"board-expected-tools",
+		claim.ID,
+		testamentID,
+		claims.ActionTypeTask,
+		"engineer",
+		"architect",
+		"done",
+	), claims.PriorityEvaluation, nil)
 	exec := &intakeExpectedToolExecutor{}
 	if !dispatchExpectedValidationTools(ClaimsIntakeConfig{
 		AgentID:              "architect",
@@ -483,7 +578,16 @@ func TestClaimsIntakeExecutesOwnedExpectedValidationToolsFromTestament(t *testin
 
 func TestClaimsIntakeDoesNotExecuteIssuerOwnedExpectedValidationToolsForOtherAgents(t *testing.T) {
 	entry := &claims.GraphEntryPoint{
-		Delta: claims.TestamentDelta{ClaimID: "claim-1", TestamentID: "testament-1", ActionKind: claims.ActionTypeTask},
+		Delta: canonicalTestamentPostedDeltaForClaimsIntakeTest(
+			"sess-expected-tools",
+			"board-expected-tools",
+			"claim-1",
+			"testament-1",
+			claims.ActionTypeTask,
+			"engineer",
+			"architect",
+			"done",
+		),
 		Node: claims.GraphNode{Claim: &claims.Claim{
 			ID:         "claim-1",
 			ActionType: claims.ActionTypeTask,

@@ -66,7 +66,7 @@ type ClaimsIntakeConfig struct {
 	Factory *identity.Factory
 
 	// ContinuationStore handles canonical response deltas for this
-	// agent. Expected testament.submitted and terminal claim.transitioned
+	// agent. Expected testament.posted and terminal claim lifecycle
 	// deltas are routed to the store INSTEAD of ProcessEntry —
 	// responses feed pending continuations (waking yielded LLM turns)
 	// rather than firing fresh inference.
@@ -256,10 +256,8 @@ func entryIsTestamentSubmitted(entry *claims.GraphEntryPoint) bool {
 		return delta.Action == claims.DeltaActionTestamentPosted
 	case *claims.CanonicalDelta:
 		return delta != nil && delta.Action == claims.DeltaActionTestamentPosted
-	case claims.TestamentDelta, *claims.TestamentDelta:
-		return true
 	default:
-		return entry.Delta.DeltaKind() == claims.DeltaKindTestament
+		return false
 	}
 }
 
@@ -368,6 +366,7 @@ func awaitedClaimResultFromPeerTestament(entry *claims.GraphEntryPoint, signal p
 		BoardID:          signal.BoardID,
 		ClaimID:          strings.TrimSpace(resolutionID),
 		TestamentID:      signal.TestamentID,
+		DeltaKey:         entry.Delta.DeltaKey(),
 		Action:           claims.DeltaActionTestamentPosted,
 		Verdict:          signal.Verdict,
 		Context:          summary,
@@ -400,12 +399,6 @@ func terminalClaimSignalFromEntry(entry *claims.GraphEntryPoint) (terminalClaimS
 		if delta != nil {
 			return terminalClaimSignalFromCanonical(*delta)
 		}
-	case claims.ClaimStatusDelta:
-		return terminalClaimSignalFromLegacyStatus(delta)
-	case *claims.ClaimStatusDelta:
-		if delta != nil {
-			return terminalClaimSignalFromLegacyStatus(*delta)
-		}
 	}
 	return terminalClaimSignal{}, false
 }
@@ -429,20 +422,6 @@ func terminalClaimSignalFromCanonical(delta claims.CanonicalDelta) (terminalClai
 		Status:    status,
 		Context:   context,
 		ActorID:   delta.Actor.RouteKey(),
-	}, true
-}
-
-func terminalClaimSignalFromLegacyStatus(delta claims.ClaimStatusDelta) (terminalClaimSignal, bool) {
-	if !claimStatusResolvesAwait(delta.ToStatus) {
-		return terminalClaimSignal{}, false
-	}
-	return terminalClaimSignal{
-		SessionID: delta.SessionID,
-		BoardID:   delta.BoardID,
-		ClaimID:   delta.ClaimID,
-		Status:    delta.ToStatus,
-		Context:   delta.Reason,
-		ActorID:   delta.AgentID,
 	}, true
 }
 
@@ -507,6 +486,7 @@ func awaitedClaimResultFromTerminalClaim(entry *claims.GraphEntryPoint, signal t
 		SessionID:        firstNonEmptyIntakeString(signal.SessionID, cfg.SessionID),
 		BoardID:          signal.BoardID,
 		ClaimID:          strings.TrimSpace(resolutionID),
+		DeltaKey:         entry.Delta.DeltaKey(),
 		Action:           claimStatusResultAction(signal.Status),
 		Context:          summary,
 		ResponderAgentID: signal.ActorID,
@@ -585,12 +565,6 @@ func peerTestamentSignalFromEntry(entry *claims.GraphEntryPoint) (peerTestamentS
 		return peerTestamentSignal{}, false
 	}
 	switch delta := entry.Delta.(type) {
-	case claims.TestamentDelta:
-		return peerTestamentSignalFromLegacyDelta(delta), true
-	case *claims.TestamentDelta:
-		if delta != nil {
-			return peerTestamentSignalFromLegacyDelta(*delta), true
-		}
 	case claims.CanonicalDelta:
 		return peerTestamentSignalFromCanonicalDelta(delta)
 	case *claims.CanonicalDelta:
@@ -599,19 +573,6 @@ func peerTestamentSignalFromEntry(entry *claims.GraphEntryPoint) (peerTestamentS
 		}
 	}
 	return peerTestamentSignal{}, false
-}
-
-func peerTestamentSignalFromLegacyDelta(delta claims.TestamentDelta) peerTestamentSignal {
-	return peerTestamentSignal{
-		SessionID:        delta.SessionID,
-		BoardID:          delta.BoardID,
-		ClaimID:          delta.ClaimID,
-		TestamentID:      delta.TestamentID,
-		ActionKind:       delta.ActionKind,
-		Verdict:          delta.Verdict,
-		ResponderAgentID: delta.SubjectAgentID,
-		Context:          delta.Summary,
-	}
 }
 
 func peerTestamentSignalFromCanonicalDelta(delta claims.CanonicalDelta) (peerTestamentSignal, bool) {

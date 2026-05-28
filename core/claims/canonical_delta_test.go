@@ -83,6 +83,23 @@ func TestCanonicalDelta_StrictValidation(t *testing.T) {
 	}
 }
 
+func TestCanonicalDelta_StrictValidationRequiresDeliveryForReceiverFacts(t *testing.T) {
+	for _, action := range KnownDeltaActions() {
+		d := testCanonicalDelta(action)
+		d.Delivery = nil
+		err := ValidateCanonicalDeltaStrict(d)
+		if DeltaActionRequiresDelivery(action) {
+			if err == nil {
+				t.Fatalf("%s accepted without receiver delivery", action)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s rejected without delivery: %v", action, err)
+		}
+	}
+}
+
 func TestCanonicalDelta_TolerantUnmarshalAllowsUnknownAction(t *testing.T) {
 	d := testCanonicalDelta(DeltaActionClaimPosted)
 	d.Action = DeltaAction("future.action")
@@ -242,7 +259,7 @@ func TestCanonicalTestamentPostedContextAndArtifactHeaders(t *testing.T) {
 
 func testCanonicalDelta(action DeltaAction) CanonicalDelta {
 	delivery := (*DeltaDelivery)(nil)
-	if action == DeltaActionClaimPosted || action == DeltaActionTestamentPosted {
+	if DeltaActionRequiresDelivery(action) {
 		delivery = &DeltaDelivery{
 			To:           []AgentRef{DegradedAgentRef("librarian", "test")},
 			Relationship: RelationshipSubject,

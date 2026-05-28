@@ -299,28 +299,8 @@ func (a *BoardAmplifier) PublishTestamentDelta(ctx context.Context, testament *T
 	a.dispatchCanonical(ctx, a.buildTestamentLifecycleDeltas(ctx, testament, claim, TestamentLifecyclePosted, testament.AgentID, time.Now().UTC()))
 }
 
-// PublishValidationDelta emits a ValidationDelta on the
-// validation-verdict topic. Also mirrored on the claim-accepted or
-// claim-rejected topic when the validation resolves the claim.
-func (a *BoardAmplifier) PublishValidationDelta(ctx context.Context, delta ValidationDelta) {
-	if a == nil {
-		return
-	}
-	primary := ValidationTopic(a.sessionID, delta.ValidationID, ValidationStatus(delta.Verdict))
-	a.dispatchSingle(ctx, primary, delta)
-
-	if delta.ClaimAutoAccepted {
-		a.dispatchSingle(
-			ctx,
-			ClaimStatusTopic(a.sessionID, delta.ClaimID, ClaimStatusAccepted),
-			delta,
-		)
-	}
-}
-
 // PublishCanonicalValidationEvaluated emits the canonical validation
-// fact with full validation context. The legacy ValidationDelta path
-// remains separate during migration.
+// fact with full validation context.
 func (a *BoardAmplifier) PublishCanonicalValidationEvaluated(ctx context.Context, claim *Claim, validation *Validation, change StatusChange, accepted bool, now time.Time) {
 	if a == nil || claim == nil || validation == nil {
 		return
@@ -377,11 +357,10 @@ func (a *BoardAmplifier) PublishCanonicalClaimProgressed(ctx context.Context, cl
 	}})
 }
 
-// PublishClaimStatusDelta emits a ClaimStatusDelta on the
-// claim-status topic for the target status. System-internal action
-// types short-circuit — Remediator / Auditor / Archivist roles
-// would otherwise wake on every system claim's status transition,
-// reproducing the storm the inbox fix already closed.
+// PublishClaimStatusDelta maps the coarse compatibility status fact to
+// the canonical claim lifecycle delta. The retained method name is a
+// compatibility call site; it does not publish legacy ClaimStatusDelta
+// workflow inputs.
 func (a *BoardAmplifier) PublishClaimStatusDelta(ctx context.Context, delta ClaimStatusDelta) {
 	if a == nil {
 		return
@@ -466,88 +445,6 @@ func (a *BoardAmplifier) PublishTestamentContextDelta(ctx context.Context, delta
 // Delta builders
 // ────────────────────────────────────────────────────────────────────
 
-func (a *BoardAmplifier) buildInboxDeltas(action *Action, claim *Claim) []inboxDispatch {
-	// System-internal action types never publish InboxDeltas. Without
-	// this guard, every Boot / Activation / Shutdown / Archival action
-	// posted with subject=<some-agent> would wake that agent's
-	// standing inbox subscription and trigger inference — producing
-	// the runaway feedback loop seen in real sessions where agents
-	// rack up token volume without any user prompt. The classifier
-	// (claims.IsSystemInternalAction) is the canonical authority.
-	if action != nil && IsSystemInternalAction(action.Type) {
-		return nil
-	}
-	if claim != nil && IsSystemInternalAction(claim.ActionType) {
-		return nil
-	}
-	issuerID := action.AgentID
-	if issuerID == "" {
-		issuerID = IssuerAgentID(claim.Relations)
-	}
-	now := time.Now().UTC()
-	var out []inboxDispatch
-	for _, r := range claim.Relations {
-		if r.RelatedType != RelatedTypeAgent {
-			continue
-		}
-		if !isDirectedAgentRelationship(r.Relationship) {
-			continue
-		}
-		// Audit-shaped self-claims never wake the issuer via the inbox
-		// path. The issuer is already executing when it posts the
-		// claim — a directed delivery back to itself produces a
-		// feedback loop: the agent's standing subscription matches,
-		// the request handler activates, and posts another self-claim,
-		// repeating at the dispatch rate. Observed in live sessions as
-		// the architect issuing self-targeted task claims at ~50ms
-		// cadence (lifecycle.log + ui_events.log diagnostic,
-		// 2026-05-04). RegisterPostActionExpectations already skips
-		// self-claims for the issuer's response expectation; this is
-		// the corresponding inbox-side cut.
-		//
-		// Directed self-handoffs (scribe-driven context-exhaustion
-		// continuation, UI_DESIGN.md §2.2 + §5.2): the predecessor
-		// instance posts ActionTypeHandoff with subject=<same agent
-		// ID> and a handoff_from relation pointing at the predecessor
-		// cycle's root claim. The successor MUST receive the inbox
-		// delta or it never wakes. The handoff_from relation is the
-		// canonical signal that this self-targeted post is directed
-		// work, not audit. Same shape covers any future legitimate
-		// self-prompt path that threads a predecessor claim through.
-		if r.Related == issuerID && HandoffFromClaimID(claim.Relations) == "" {
-			continue
-		}
-		delta := InboxDelta{
-			SessionID:       a.sessionID,
-			BoardID:         a.boardID,
-			ActionID:        action.ID,
-			ClaimID:         claim.ID,
-			Sequence:        claim.Sequence,
-			EmittedAt:       now,
-			Relationship:    r.Relationship,
-			AgentID:         r.Related,
-			ActionKind:      claim.ActionType,
-			Priority:        claim.Priority,
-			Scope:           copyScope(claim.Scope),
-			ValidationCount: len(claim.Validations),
-			DependsOn:       collectRelatedIDs(claim.Relations, RelationshipDependsOn),
-			IssuerAgentID:   issuerID,
-			Title:           claim.Title,
-			Description:     claim.Description,
-			Deadline:        claim.Deadline,
-			Iteration:       claim.Iteration,
-		}
-		topic := InboxTopic(a.sessionID, r.Related, r.Relationship, claim.ActionType)
-		out = append(out, inboxDispatch{topic: topic, delta: delta})
-	}
-	return out
-}
-
-type inboxDispatch struct {
-	topic string
-	delta InboxDelta
-}
-
 type canonicalDispatch struct {
 	topic string
 	delta CanonicalDelta
@@ -580,9 +477,10 @@ func (a *BoardAmplifier) buildClaimLifecycleDeltas(ctx context.Context, action *
 		refs = append(actionRefs(action.ID), DeltaRef{Role: "claim", Type: RelatedTypeClaim, ID: claim.ID})
 	}
 	if status != ClaimLifecyclePosted {
+		delivery := a.claimLifecycleDelivery(ctx, claim, status, actorID)
 		return []canonicalDispatch{{
 			topic: CanonicalClaimTopic(a.sessionID, claim.ID, deltaAction),
-			delta: a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, nil),
+			delta: a.buildCanonicalClaimLifecycle(ctx, claim, deltaAction, status, occurredAt, actor, refs, delivery),
 		}}
 	}
 	var out []canonicalDispatch
@@ -605,6 +503,65 @@ func (a *BoardAmplifier) buildClaimLifecycleDeltas(ctx context.Context, action *
 		})
 	}
 	return out
+}
+
+func (a *BoardAmplifier) claimLifecycleDelivery(ctx context.Context, claim *Claim, status ClaimLifecycleStatus, actorID string) *DeltaDelivery {
+	if claim == nil {
+		return nil
+	}
+	relationship := ""
+	switch status {
+	case ClaimLifecycleReceived, ClaimLifecycleReceiptFailed:
+		relationship = RelationshipSubject
+	case ClaimLifecycleTestamentAcknowledged, ClaimLifecycleTestamentAcknowledgementFailed:
+		relationship = firstMatchingAgentRelationship(claim.Relations, actorID, RelationshipIssuer, RelationshipEvaluator)
+		if relationship == "" {
+			relationship = RelationshipIssuer
+		}
+	default:
+		return nil
+	}
+	targetID := strings.TrimSpace(actorID)
+	if targetID == "" {
+		targetID = firstAgentIDForRelationship(claim.Relations, relationship)
+	}
+	if targetID == "" {
+		return nil
+	}
+	return &DeltaDelivery{
+		To:           []AgentRef{a.resolveAgentRef(ctx, targetID, "claim lifecycle receiver")},
+		Relationship: relationship,
+	}
+}
+
+func firstMatchingAgentRelationship(relations []Relation, agentID string, relationships ...string) string {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return ""
+	}
+	for _, relationship := range relationships {
+		for _, relation := range relations {
+			if relation.RelatedType == RelatedTypeAgent &&
+				relation.Relationship == relationship &&
+				strings.TrimSpace(relation.Related) == agentID {
+				return relationship
+			}
+		}
+	}
+	return ""
+}
+
+func firstAgentIDForRelationship(relations []Relation, relationship string) string {
+	relationship = strings.TrimSpace(relationship)
+	if relationship == "" {
+		return ""
+	}
+	for _, relation := range relations {
+		if relation.RelatedType == RelatedTypeAgent && relation.Relationship == relationship {
+			return strings.TrimSpace(relation.Related)
+		}
+	}
+	return ""
 }
 
 func (a *BoardAmplifier) buildCanonicalClaimLifecycle(_ context.Context, claim *Claim, action DeltaAction, status ClaimLifecycleStatus, occurredAt time.Time, actor AgentRef, refs []DeltaRef, delivery *DeltaDelivery) CanonicalDelta {
@@ -633,29 +590,6 @@ func (a *BoardAmplifier) buildCanonicalClaimLifecycle(_ context.Context, claim *
 	)
 }
 
-func (a *BoardAmplifier) buildTestamentDelta(testament *Testament, claim *Claim) TestamentDelta {
-	verdict := DeriveTestamentVerdict(testament.Artifacts)
-	kinds := CollectArtifactKinds(testament.Artifacts)
-	issuer := IssuerAgentID(claim.Relations)
-	return TestamentDelta{
-		SessionID:      a.sessionID,
-		BoardID:        a.boardID,
-		ClaimID:        claim.ID,
-		TestamentID:    testament.ID,
-		Sequence:       testament.Sequence,
-		EmittedAt:      time.Now().UTC(),
-		ActionKind:     claim.ActionType,
-		Verdict:        verdict,
-		ArtifactCount:  len(testament.Artifacts),
-		ArtifactKinds:  kinds,
-		SubjectAgentID: SubjectAgentID(claim.Relations),
-		IssuerAgentID:  issuer,
-		Summary:        testament.Summary,
-		Confidence:     testament.Confidence,
-		AutoAccepted:   claim.Status == ClaimStatusAccepted,
-	}
-}
-
 func (a *BoardAmplifier) buildTestamentLifecycleDeltas(ctx context.Context, testament *Testament, claim *Claim, status TestamentLifecycleStatus, actorID string, occurredAt time.Time) []canonicalDispatch {
 	action, ok := TestamentLifecycleDeltaAction(status)
 	if !ok || testament == nil {
@@ -666,7 +600,7 @@ func (a *BoardAmplifier) buildTestamentLifecycleDeltas(ctx context.Context, test
 		return []canonicalDispatch{{topic: CanonicalBoardTopic(a.sessionID, a.boardID, action), delta: delta}}
 	}
 	out := []canonicalDispatch{{topic: CanonicalClaimTopic(a.sessionID, claim.ID, action), delta: delta}}
-	if status == TestamentLifecyclePosted {
+	if status == TestamentLifecyclePosted || status == TestamentLifecycleReceived {
 		issuer := a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")
 		out = append(out, canonicalDispatch{topic: CanonicalAgentRefTopic(a.sessionID, issuer, action), delta: delta})
 	}
@@ -716,8 +650,18 @@ func (a *BoardAmplifier) buildCanonicalTestamentLifecycle(ctx context.Context, t
 			"validations":         validationContext(claim.Validations),
 			"expected_tool_calls": expectedToolCallContext(claim.ExpectedToolCalls),
 		}
-		if status == TestamentLifecyclePosted {
+		switch status {
+		case TestamentLifecyclePosted:
 			delivery = &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, IssuerAgentID(claim.Relations), "claim issuer")}, Relationship: RelationshipIssuer}
+		case TestamentLifecycleReceived:
+			relationship := firstMatchingAgentRelationship(claim.Relations, actorID, RelationshipIssuer, RelationshipEvaluator)
+			if relationship == "" {
+				relationship = RelationshipIssuer
+			}
+			targetID := firstNonEmpty(actorID, firstAgentIDForRelationship(claim.Relations, relationship))
+			if targetID != "" {
+				delivery = &DeltaDelivery{To: []AgentRef{a.resolveAgentRef(ctx, targetID, "testament lifecycle receiver")}, Relationship: relationship}
+			}
 		}
 	}
 	return NewCanonicalDelta(
@@ -796,32 +740,6 @@ func (a *BoardAmplifier) buildCanonicalClaimLifecycleFromStatusDelta(ctx context
 // ────────────────────────────────────────────────────────────────────
 // Dispatch helpers
 // ────────────────────────────────────────────────────────────────────
-
-func (a *BoardAmplifier) dispatchInbox(ctx context.Context, deltas []inboxDispatch) {
-	publisher := a.deltaBus
-	emit := func(runCtx context.Context) error {
-		a.publishInboxBatch(runCtx, publisher, deltas)
-		return nil
-	}
-	a.runTracked(ctx, "claims_amplifier_inbox", emit)
-}
-
-func (a *BoardAmplifier) publishInboxBatch(ctx context.Context, publisher DeltaPublisher, deltas []inboxDispatch) {
-	for _, d := range deltas {
-		if err := publisher.PublishDelta(ctx, d.topic, d.delta); err != nil {
-			a.reportEmitError("inbox_publish_failed", d.topic, err)
-			continue
-		}
-		slog.Info("amplifier_inbox_delta_published",
-			"session_id", a.sessionID,
-			"board_id", a.boardID,
-			"topic", d.topic,
-			"agent_id", d.delta.AgentID,
-			"claim_id", d.delta.ClaimID,
-			"action_kind", string(d.delta.ActionKind),
-		)
-	}
-}
 
 func (a *BoardAmplifier) dispatchSingle(ctx context.Context, topic string, delta Delta) {
 	publisher := a.deltaBus
@@ -919,9 +837,10 @@ func (a *BoardAmplifier) reportEmitError(event, topic string, err error) {
 // Helpers
 // ────────────────────────────────────────────────────────────────────
 
-// isDirectedAgentRelationship reports whether r should trigger an
-// InboxDelta. Subject and evaluator relations are directed; issuer
-// is the actor (not a recipient) and receives no delta.
+// isDirectedAgentRelationship reports whether r should trigger a
+// receiver-specific claim.posted lifecycle delta. Subject and evaluator
+// relations are directed; issuer is the actor (not a recipient) and
+// receives no posted-work delta.
 func isDirectedAgentRelationship(relationship string) bool {
 	return relationship == RelationshipSubject || relationship == RelationshipEvaluator
 }

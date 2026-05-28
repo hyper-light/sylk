@@ -476,7 +476,7 @@ func TestIntegration_SubmitTestamentsEmitsCanonicalTestamentValidationAndTransit
 	}
 }
 
-func TestIntegration_EvaluateValidationEmitsValidationDelta(t *testing.T) {
+func TestIntegration_EvaluateValidationEmitsCanonicalValidationDelta(t *testing.T) {
 	bus := newCaptureBus()
 	board := newBusBackedBoard(t, bus)
 	_ = board.PostAction(context.Background(),
@@ -500,16 +500,20 @@ func TestIntegration_EvaluateValidationEmitsValidationDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deltas := bus.filterPublishedByKind(DeltaKindValidation)
-	if len(deltas) < 1 {
-		t.Fatalf("expected at least 1 validation delta, got %d", len(deltas))
+	if legacy := bus.filterPublishedByKind(DeltaKindValidation); len(legacy) != 0 {
+		t.Fatalf("legacy validation deltas published: %d", len(legacy))
 	}
-	d := deltas[0].delta.(ValidationDelta)
-	if !d.ClaimAutoAccepted {
+	deltas := bus.filterPublishedByTopic(CanonicalValidationTopic("sess", validationID, DeltaActionValidationEvaluated))
+	if len(deltas) != 1 {
+		t.Fatalf("expected 1 canonical validation delta, got %d", len(deltas))
+	}
+	d := deltas[0].delta.(CanonicalDelta)
+	validationCtx := d.Context["validation"].(map[string]any)
+	if validationCtx["claim_auto_accepted"] != true {
 		t.Error("expected auto-accept with single-validation claim")
 	}
-	if d.Verdict != string(ValidationStatusPassed) {
-		t.Errorf("verdict: %q", d.Verdict)
+	if validationCtx["status"] != string(ValidationStatusPassed) {
+		t.Errorf("status: %q", validationCtx["status"])
 	}
 }
 

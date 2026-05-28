@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // IsSystemInternalAction + AgentActivationActionTypes contracts.
@@ -72,8 +73,9 @@ func TestActionType_PartitionedByVisibility(t *testing.T) {
 }
 
 // Amplifier-side filter: posting an action with a system-internal
-// type produces ZERO InboxDeltas, even when the claim has a subject.
-func TestBoardAmplifier_SystemActionTypes_EmitNoInboxDeltas(t *testing.T) {
+// type produces ZERO claim.posted deltas, even when the claim has a
+// subject.
+func TestBoardAmplifier_SystemActionTypes_EmitNoClaimPostedDeltas(t *testing.T) {
 	systemTypes := []ActionType{
 		ActionTypeBoot,
 		ActionTypeActivation,
@@ -104,9 +106,9 @@ func TestBoardAmplifier_SystemActionTypes_EmitNoInboxDeltas(t *testing.T) {
 			if err != nil {
 				t.Fatalf("PostAction failed: %v", err)
 			}
-			// Hit the amplifier directly to verify the filter.
 			amp := b.amplifier
-			deltas := amp.buildInboxDeltas(
+			deltas := amp.buildClaimLifecycleDeltas(
+				context.Background(),
 				&Action{AgentID: "system:lifecycle", Type: ty},
 				&Claim{
 					ID: "c-1",
@@ -116,23 +118,27 @@ func TestBoardAmplifier_SystemActionTypes_EmitNoInboxDeltas(t *testing.T) {
 					},
 					ActionType: ty,
 				},
+				ClaimLifecyclePosted,
+				"system:lifecycle",
+				nowForTest(),
 			)
 			if len(deltas) != 0 {
-				t.Fatalf("system action %q produced %d InboxDeltas, want 0", ty, len(deltas))
+				t.Fatalf("system action %q produced %d claim.posted deltas, want 0", ty, len(deltas))
 			}
 		})
 	}
 }
 
-// Self-claims (issuer == subject) MUST NOT publish InboxDeltas. The
+// Self-claims (issuer == subject) MUST NOT publish claim.posted deltas. The
 // issuer is already executing when the claim posts; a delivery to its
 // own inbox would wake the standing subscription and trigger another
 // dispatch, producing the runaway feedback loop observed in live
 // sessions (architect posting self-targeted task claims at ~50ms
 // cadence).
-func TestBoardAmplifier_SelfClaim_EmitsNoInboxDelta(t *testing.T) {
+func TestBoardAmplifier_SelfClaim_EmitsNoClaimPostedDelta(t *testing.T) {
 	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
-	deltas := b.amplifier.buildInboxDeltas(
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
 		&Action{AgentID: "architect", Type: ActionTypeTask},
 		&Claim{
 			ID: "self-claim",
@@ -142,9 +148,12 @@ func TestBoardAmplifier_SelfClaim_EmitsNoInboxDelta(t *testing.T) {
 			},
 			ActionType: ActionTypeTask,
 		},
+		ClaimLifecyclePosted,
+		"architect",
+		nowForTest(),
 	)
 	if len(deltas) != 0 {
-		t.Fatalf("self-claim produced %d InboxDeltas, want 0", len(deltas))
+		t.Fatalf("self-claim produced %d claim.posted deltas, want 0", len(deltas))
 	}
 }
 
@@ -171,11 +180,12 @@ func TestClaimsBoard_RejectsSelfTargetPeerClaims(t *testing.T) {
 	}
 }
 
-// Cross-agent claims (issuer != subject) DO emit an InboxDelta to the
+// Cross-agent claims (issuer != subject) DO emit a claim.posted delta to the
 // subject — that's the legitimate wake-up path for peer-directed work.
-func TestBoardAmplifier_CrossAgentClaim_EmitsInboxDelta(t *testing.T) {
+func TestBoardAmplifier_CrossAgentClaim_EmitsClaimPostedDelta(t *testing.T) {
 	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
-	deltas := b.amplifier.buildInboxDeltas(
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
 		&Action{AgentID: "architect", Type: ActionTypeTask},
 		&Claim{
 			ID: "cross-claim",
@@ -185,20 +195,24 @@ func TestBoardAmplifier_CrossAgentClaim_EmitsInboxDelta(t *testing.T) {
 			},
 			ActionType: ActionTypeTask,
 		},
+		ClaimLifecyclePosted,
+		"architect",
+		nowForTest(),
 	)
 	if len(deltas) != 1 {
-		t.Fatalf("cross-agent claim produced %d InboxDeltas, want 1", len(deltas))
+		t.Fatalf("cross-agent claim produced %d claim.posted deltas, want 1", len(deltas))
 	}
-	if deltas[0].delta.AgentID != "engineer" {
-		t.Fatalf("InboxDelta directed at %q, want engineer", deltas[0].delta.AgentID)
+	if !deltas[0].delta.DeliveredTo("engineer") {
+		t.Fatalf("claim.posted delivery = %#v, want engineer", deltas[0].delta.Delivery)
 	}
 }
 
 // Mixed: claim with both self subject AND cross-agent evaluator must
-// emit ONLY the evaluator's InboxDelta — self subject is filtered.
+// emit ONLY the evaluator's claim.posted delta — self subject is filtered.
 func TestBoardAmplifier_SelfSubjectWithCrossEvaluator_EmitsOnlyEvaluator(t *testing.T) {
 	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
-	deltas := b.amplifier.buildInboxDeltas(
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
 		&Action{AgentID: "architect", Type: ActionTypeTask},
 		&Claim{
 			ID: "mixed-claim",
@@ -209,12 +223,15 @@ func TestBoardAmplifier_SelfSubjectWithCrossEvaluator_EmitsOnlyEvaluator(t *test
 			},
 			ActionType: ActionTypeTask,
 		},
+		ClaimLifecyclePosted,
+		"architect",
+		nowForTest(),
 	)
 	if len(deltas) != 1 {
-		t.Fatalf("mixed claim produced %d InboxDeltas, want 1 (evaluator only)", len(deltas))
+		t.Fatalf("mixed claim produced %d claim.posted deltas, want 1 (evaluator only)", len(deltas))
 	}
-	if deltas[0].delta.AgentID != "inspector" {
-		t.Fatalf("InboxDelta directed at %q, want inspector", deltas[0].delta.AgentID)
+	if !deltas[0].delta.DeliveredTo("inspector") {
+		t.Fatalf("claim.posted delivery = %#v, want inspector", deltas[0].delta.Delivery)
 	}
 }
 
@@ -222,12 +239,13 @@ func TestBoardAmplifier_SelfSubjectWithCrossEvaluator_EmitsOnlyEvaluator(t *test
 // UI_DESIGN.md §2.2 + §5.2): predecessor instance posts
 // ActionTypeHandoff with subject=<same agent ID> AND a handoff_from
 // relation pointing at the predecessor cycle's root claim. The
-// successor MUST receive the inbox delta — without it, the new
+// successor MUST receive the claim.posted delta — without it, the new
 // instance never wakes. The handoff_from relation is the canonical
 // signal that this self-targeted post is directed work, not audit.
-func TestBoardAmplifier_SelfHandoffWithHandoffFrom_EmitsInboxDelta(t *testing.T) {
+func TestBoardAmplifier_SelfHandoffWithHandoffFrom_EmitsClaimPostedDelta(t *testing.T) {
 	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
-	deltas := b.amplifier.buildInboxDeltas(
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
 		&Action{AgentID: "architect", Type: ActionTypeHandoff},
 		&Claim{
 			ID: "scribe-handoff",
@@ -238,12 +256,15 @@ func TestBoardAmplifier_SelfHandoffWithHandoffFrom_EmitsInboxDelta(t *testing.T)
 			},
 			ActionType: ActionTypeHandoff,
 		},
+		ClaimLifecyclePosted,
+		"architect",
+		nowForTest(),
 	)
 	if len(deltas) != 1 {
-		t.Fatalf("self-handoff with handoff_from produced %d InboxDeltas, want 1", len(deltas))
+		t.Fatalf("self-handoff with handoff_from produced %d claim.posted deltas, want 1", len(deltas))
 	}
-	if deltas[0].delta.AgentID != "architect" {
-		t.Fatalf("InboxDelta directed at %q, want architect", deltas[0].delta.AgentID)
+	if !deltas[0].delta.DeliveredTo("architect") {
+		t.Fatalf("claim.posted delivery = %#v, want architect", deltas[0].delta.Delivery)
 	}
 }
 
@@ -253,7 +274,8 @@ func TestBoardAmplifier_SelfHandoffWithHandoffFrom_EmitsInboxDelta(t *testing.T)
 // shape, same activation-set ActionType, but no handoff_from → audit.
 func TestBoardAmplifier_SelfClaim_HandoffActionType_NoHandoffFrom_Filtered(t *testing.T) {
 	b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "tb", PipelineID: "p", TaskID: "t", SessionID: "s"})
-	deltas := b.amplifier.buildInboxDeltas(
+	deltas := b.amplifier.buildClaimLifecycleDeltas(
+		context.Background(),
 		&Action{AgentID: "architect", Type: ActionTypeHandoff},
 		&Claim{
 			ID: "self-no-handoff-from",
@@ -263,18 +285,22 @@ func TestBoardAmplifier_SelfClaim_HandoffActionType_NoHandoffFrom_Filtered(t *te
 			},
 			ActionType: ActionTypeHandoff,
 		},
+		ClaimLifecyclePosted,
+		"architect",
+		nowForTest(),
 	)
 	if len(deltas) != 0 {
-		t.Fatalf("self-claim without handoff_from produced %d InboxDeltas, want 0", len(deltas))
+		t.Fatalf("self-claim without handoff_from produced %d claim.posted deltas, want 0", len(deltas))
 	}
 }
 
 // Amplifier still emits for activation types.
-func TestBoardAmplifier_ActivationActionTypes_EmitInboxDeltas(t *testing.T) {
+func TestBoardAmplifier_ActivationActionTypes_EmitClaimPostedDeltas(t *testing.T) {
 	for _, ty := range AgentActivationActionTypes() {
 		t.Run(string(ty), func(t *testing.T) {
 			b := NewClaimsBoard(ClaimsBoardConfig{BoardID: "t", PipelineID: "p", TaskID: "t", SessionID: "s"})
-			deltas := b.amplifier.buildInboxDeltas(
+			deltas := b.amplifier.buildClaimLifecycleDeltas(
+				context.Background(),
 				&Action{AgentID: "architect", Type: ty},
 				&Claim{
 					ID: "c-1",
@@ -284,36 +310,30 @@ func TestBoardAmplifier_ActivationActionTypes_EmitInboxDeltas(t *testing.T) {
 					},
 					ActionType: ty,
 				},
+				ClaimLifecyclePosted,
+				"architect",
+				nowForTest(),
 			)
 			if len(deltas) != 1 {
-				t.Fatalf("activation type %q produced %d InboxDeltas, want 1", ty, len(deltas))
+				t.Fatalf("activation type %q produced %d claim.posted deltas, want 1", ty, len(deltas))
 			}
 		})
 	}
 }
 
-// Standing subscriptions are N legacy activation patterns (one per
-// activation type), plus two canonical directed-work patterns (UID and
-// legacy degraded agent-type) — never the broad firehose. Peer
+// Standing subscriptions are the two canonical directed-work patterns
+// (UID and degraded agent-type) — never the broad firehose. Peer
 // responses are delivered through explicit expectation subscriptions on
 // canonical testament/claim deltas, not a standing consult-resolved
 // channel.
 func TestInboxPatternsFor_RoleSubject_NarrowedToActivationTypes(t *testing.T) {
 	patterns := InboxPatternsFor(RoleSubject, "sess", "architect")
-	activation := AgentActivationActionTypes()
-	want := len(activation) + 2 // +2 canonical directed
+	want := 2
 	if len(patterns) != want {
-		t.Fatalf("RoleSubject patterns count = %d, want %d (activation + canonical)", len(patterns), want)
+		t.Fatalf("RoleSubject patterns count = %d, want %d canonical patterns", len(patterns), want)
 	}
 	canonicalUID := CanonicalAgentActionPattern("sess", "architect", DeltaActionClaimPosted)
 	canonicalType := CanonicalAgentTypeActionPattern("sess", "architect", DeltaActionClaimPosted)
-	// Every activation type's pattern must be present.
-	for _, ty := range activation {
-		want := AgentInboxActionPattern("sess", "architect", RelationshipSubject, ty)
-		if !sliceContains(patterns, want) {
-			t.Fatalf("missing pattern for activation type %q: %q", ty, want)
-		}
-	}
 	if !sliceContains(patterns, canonicalUID) {
 		t.Fatalf("missing canonical uid directed pattern %q in %v", canonicalUID, patterns)
 	}
@@ -355,9 +375,26 @@ func sliceContains(haystack []string, needle string) bool {
 	return false
 }
 
-// Defense-in-depth at the matcher: even if a system InboxDelta ever
-// reaches the inbox (race, misconfigured pattern, etc.),
-// matchesStandingSubscription rejects it.
+func nowForTest() time.Time {
+	return time.Now().UTC()
+}
+
+func canonicalPostedDeltaForTest(sessionID, claimID string, action ActionType, recipient string) CanonicalDelta {
+	return NewCanonicalDelta(
+		DeltaActionClaimPosted,
+		sessionID,
+		"board",
+		1,
+		nowForTest(),
+		DegradedAgentRef("issuer", "test"),
+		[]DeltaRef{{Role: "claim", Type: RelatedTypeClaim, ID: claimID}},
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef(recipient, "test")}, Relationship: RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(action)}},
+	)
+}
+
+// Defense-in-depth at the matcher: legacy InboxDelta values are not
+// workflow inputs, including for system action types.
 func TestClaimsInbox_MatchesStandingSubscription_RejectsSystemTypes(t *testing.T) {
 	systemTypes := []ActionType{
 		ActionTypeBoot,
@@ -385,8 +422,8 @@ func TestClaimsInbox_MatchesStandingSubscription_RejectsSystemTypes(t *testing.T
 	}
 }
 
-// And the activation types still match.
-func TestClaimsInbox_MatchesStandingSubscription_AcceptsActivationTypes(t *testing.T) {
+// And canonical claim.posted activation types still match.
+func TestClaimsInbox_MatchesStandingSubscription_AcceptsCanonicalActivationTypes(t *testing.T) {
 	for _, ty := range AgentActivationActionTypes() {
 		t.Run(string(ty), func(t *testing.T) {
 			i := &ClaimsInbox{
@@ -394,22 +431,18 @@ func TestClaimsInbox_MatchesStandingSubscription_AcceptsActivationTypes(t *testi
 				sessionID: "s",
 				role:      RoleSubject,
 			}
-			matched := i.matchesStandingSubscription(InboxDelta{
-				AgentID:    "architect",
-				ActionKind: ty,
-			})
+			matched := i.matchesStandingSubscription(canonicalPostedDeltaForTest("s", "c-"+string(ty), ty, "architect"))
 			if !matched {
-				t.Fatalf("matchesStandingSubscription rejected activation type %q", ty)
+				t.Fatalf("matchesStandingSubscription rejected canonical activation type %q", ty)
 			}
 		})
 	}
 }
 
-// Archivist / Auditor: TestamentDelta carrying system ActionKind must
-// be rejected by the matcher even though their roles otherwise accept
-// any TestamentDelta. Without this, an activation system's
-// confirmation testament would wake the archivist (via RoleArchivist's
-// claim.testified subscription), reproducing the original storm.
+// Archivist / Auditor: legacy TestamentDelta values are not workflow
+// inputs, including for system action types. Without this, an activation
+// system's confirmation testament could wake the archivist through the old
+// claim.testified subscription path.
 func TestClaimsInbox_TestamentDelta_RejectsSystemActionKind(t *testing.T) {
 	systemTypes := []ActionType{
 		ActionTypeBoot,
@@ -439,7 +472,7 @@ func TestClaimsInbox_TestamentDelta_RejectsSystemActionKind(t *testing.T) {
 	}
 }
 
-func TestClaimsInbox_TestamentDelta_AcceptsActivationActionKind(t *testing.T) {
+func TestClaimsInbox_TestamentDelta_RejectsLegacyActivationActionKind(t *testing.T) {
 	for _, ty := range AgentActivationActionTypes() {
 		t.Run(string(ty), func(t *testing.T) {
 			i := &ClaimsInbox{
@@ -447,8 +480,8 @@ func TestClaimsInbox_TestamentDelta_AcceptsActivationActionKind(t *testing.T) {
 				sessionID: "s",
 				role:      RoleArchivist,
 			}
-			if !i.matchesStandingSubscription(TestamentDelta{ActionKind: ty}) {
-				t.Fatalf("archivist did NOT match testament with activation ActionKind=%q", ty)
+			if i.matchesStandingSubscription(TestamentDelta{ActionKind: ty}) {
+				t.Fatalf("archivist matched legacy testament with activation ActionKind=%q", ty)
 			}
 		})
 	}
@@ -488,9 +521,9 @@ func TestBoardAmplifier_PublishTestamentDelta_SkipsSystemActionType(t *testing.T
 	// More importantly: changing the claim's ActionType to a
 	// non-system type AND running the same call should produce a
 	// different code path. We assert the short-circuit by checking
-	// the build path returns early — easiest via the buildTestamentDelta
-	// being unreachable for system claims. To keep this targeted,
-	// just call the public Publish and rely on no panic + no error log.
+	// the lifecycle build path returns early for system claims. To keep
+	// this targeted, just call the public Publish and rely on no panic +
+	// no error log.
 	b.amplifier.PublishTestamentDelta(context.Background(), systemTestament, systemClaim)
 	// If the short-circuit weren't in place, the dispatch would queue
 	// a goroutine. We can't easily count goroutines here cross-test,

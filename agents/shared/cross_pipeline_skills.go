@@ -293,11 +293,10 @@ func challengePeerSkill(cfg CrossPipelineSkillConfig, permittedTargets []string)
 				"Challenging "+challengeTarget,
 				AgentStateChallengingPeer, peerRef)
 
-			// Yield path: await the challenge claim's canonical response
-			// deltas. The challenged peer answers by submitting a
-			// testament against challengeClaimID; the continuation
-			// resumes from testament.submitted or terminal
-			// claim.transitioned.
+			// Yield path: await the challenge claim's canonical lifecycle
+			// deltas. The challenged peer answers by posting a testament
+			// against challengeClaimID; the continuation resumes from
+			// testament.posted or a terminal claim lifecycle delta.
 			store := ContinuationStoreFromContext(ctx)
 			turn := TurnFromContext(ctx)
 			if store != nil {

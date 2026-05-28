@@ -188,9 +188,9 @@ const (
 // IsSystemInternalAction reports whether an ActionType is system-
 // internal — i.e. a lifecycle / housekeeping action that exists for
 // the runtime's own bookkeeping and MUST NOT trigger agent inference
-// via the inbox-delta path. The amplifier skips InboxDelta emission
-// for these (BoardAmplifier.buildInboxDeltas), and the inbox's
-// standing-subscription matcher rejects them as defense-in-depth
+// via receiver-specific claim.posted lifecycle deltas. The amplifier skips
+// lifecycle delivery for these, and the inbox's standing-subscription
+// matcher rejects them as defense-in-depth
 // (ClaimsInbox.matchesStandingSubscription).
 //
 // The split is deliberate and CLOSED:

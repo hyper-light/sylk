@@ -66,6 +66,54 @@ func (s *recordingSub) Unsubscribe() error {
 	return nil
 }
 
+func canonicalClaimPostedForInboxTest(claimID, agentID string, action ActionType, sequence uint64) CanonicalDelta {
+	return NewCanonicalDelta(
+		DeltaActionClaimPosted,
+		"sess",
+		"board",
+		sequence,
+		time.Now(),
+		DegradedAgentRef("issuer", "test"),
+		claimRefs(claimID),
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef(agentID, "test")}, Relationship: RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(action)}},
+	)
+}
+
+func canonicalTestamentPostedForInboxTest(claimID, testamentID, issuerID string, sequence uint64) CanonicalDelta {
+	return NewCanonicalDelta(
+		DeltaActionTestamentPosted,
+		"sess",
+		"board",
+		sequence,
+		time.Now(),
+		DegradedAgentRef("responder", "test"),
+		[]DeltaRef{
+			{Role: "claim", Type: RelatedTypeClaim, ID: claimID},
+			{Role: "testament", Type: RelatedTypeTestament, ID: testamentID},
+		},
+		&DeltaDelivery{To: []AgentRef{DegradedAgentRef(issuerID, "test")}, Relationship: RelationshipIssuer},
+		map[string]any{
+			"claim":      map[string]any{"id": claimID, "action": string(ActionTypeConsultation), "status": string(ClaimStatusTestified)},
+			"testaments": []map[string]any{{"id": testamentID, "context": "done"}},
+		},
+	)
+}
+
+func canonicalClaimLifecycleForInboxTest(claimID string, action DeltaAction, claimAction ActionType, sequence uint64) CanonicalDelta {
+	return NewCanonicalDelta(
+		action,
+		"sess",
+		"board",
+		sequence,
+		time.Now(),
+		DegradedAgentRef("issuer", "test"),
+		claimRefs(claimID),
+		nil,
+		map[string]any{"claim": map[string]any{"id": claimID, "action": string(claimAction)}},
+	)
+}
+
 // ────────────────────────────────────────────────────────────────────
 
 func TestInbox_RequiresAgentAndSession(t *testing.T) {
@@ -88,16 +136,13 @@ func TestInbox_StartSubscribesRolePatterns(t *testing.T) {
 	if err := inbox.Start(nil); err != nil {
 		t.Fatal(err)
 	}
-	// Default role (RoleSubject) → one narrow legacy pattern per
-	// legitimate activation action type, plus two canonical directed-work
-	// patterns. The broad
-	// AgentInboxPattern(*.*) is NOT used because it would match
-	// system-internal action types and trigger feedback loops.
+	// Default role (RoleSubject) → two canonical directed-work
+	// patterns (UID + agent type). Legacy inbox patterns are not
+	// workflow subscriptions.
 	patterns := InboxPatternsFor(RoleSubject, "sess", "eng")
-	activation := AgentActivationActionTypes()
-	wantCount := len(activation) + 2 // +2 canonical directed
+	wantCount := 2
 	if len(patterns) != wantCount {
-		t.Fatalf("expected RoleSubject to derive %d patterns (activation + canonical), got %d (%v)", wantCount, len(patterns), patterns)
+		t.Fatalf("expected RoleSubject to derive %d canonical patterns, got %d (%v)", wantCount, len(patterns), patterns)
 	}
 	for _, p := range patterns {
 		if bus.SubscriptionCount(p) == 0 {
@@ -130,18 +175,11 @@ func TestInbox_StartSubscribesRolePatterns(t *testing.T) {
 
 func TestInbox_RolePatternsForRoleAuditor(t *testing.T) {
 	patterns := InboxPatternsFor(RoleSubject|RoleAuditor, "sess", "inspector")
-	// RoleSubject is now expressed as N narrow per-action-type
-	// patterns (storm-prevention) instead of the broad
-	// AgentInboxPattern(*.*). RoleAuditor adds the testified status
-	// pattern unchanged.
-	for _, ty := range AgentActivationActionTypes() {
-		want := AgentInboxActionPattern("sess", "inspector", RelationshipSubject, ty)
-		if !sliceContains(patterns, want) {
-			t.Errorf("RoleSubject|RoleAuditor missing subject pattern %q", want)
-		}
+	if !sliceContains(patterns, CanonicalAgentActionPattern("sess", "inspector", DeltaActionClaimPosted)) {
+		t.Errorf("RoleSubject|RoleAuditor missing canonical UID subject pattern")
 	}
-	if !sliceContains(patterns, ClaimStatusPattern("sess", ClaimStatusTestified)) {
-		t.Errorf("RoleSubject|RoleAuditor missing testified status pattern")
+	if !sliceContains(patterns, CanonicalClaimActionPattern("sess", "*", DeltaActionTestamentPosted)) {
+		t.Errorf("RoleSubject|RoleAuditor missing canonical testament pattern")
 	}
 	// The broad firehose pattern must NOT be present.
 	if sliceContains(patterns, AgentInboxPattern("sess", "inspector")) {
@@ -166,18 +204,18 @@ func TestInbox_RolePatternsForRoleRemediator(t *testing.T) {
 	patterns := InboxPatternsFor(RoleSubject|RoleRemediator, "sess", "architect")
 	var sawRejected bool
 	for _, p := range patterns {
-		if p == ClaimStatusPattern("sess", ClaimStatusRejected) {
+		if p == CanonicalClaimActionPattern("sess", "*", DeltaActionClaimValidationFailed) {
 			sawRejected = true
 		}
 	}
 	if !sawRejected {
-		t.Errorf("RoleRemediator missing rejected pattern, got %v", patterns)
+		t.Errorf("RoleRemediator missing canonical validation-failed pattern, got %v", patterns)
 	}
 }
 
 func TestInbox_IngestDedupsBySequence(t *testing.T) {
 	inbox, _ := NewClaimsInbox(InboxConfig{AgentID: "eng", SessionID: "sess"})
-	d := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 5}
+	d := canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 5)
 	inbox.Ingest(d)
 	inbox.Ingest(d) // duplicate
 	if n := inbox.Len(); n != 1 {
@@ -187,8 +225,8 @@ func TestInbox_IngestDedupsBySequence(t *testing.T) {
 
 func TestInbox_IngestDropsOlderSequenceForSameKey(t *testing.T) {
 	inbox, _ := NewClaimsInbox(InboxConfig{AgentID: "eng", SessionID: "sess"})
-	d1 := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 10}
-	d2 := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 5}
+	d1 := canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 10)
+	d2 := canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 5)
 	inbox.Ingest(d1)
 	inbox.Ingest(d2) // older — dropped
 	if n := inbox.Len(); n != 1 {
@@ -196,7 +234,7 @@ func TestInbox_IngestDropsOlderSequenceForSameKey(t *testing.T) {
 	}
 }
 
-func TestInbox_StandingSubscription_InboxDelta(t *testing.T) {
+func TestInbox_StandingSubscription_CanonicalClaimPosted(t *testing.T) {
 	var received atomic.Pointer[GraphEntryPoint]
 	inbox, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "eng",
@@ -205,13 +243,7 @@ func TestInbox_StandingSubscription_InboxDelta(t *testing.T) {
 			received.Store(entry)
 		},
 	})
-	inbox.Ingest(InboxDelta{
-		ClaimID:      "c1",
-		AgentID:      "eng",
-		Relationship: RelationshipSubject,
-		ActionKind:   ActionTypeTask,
-		Sequence:     1,
-	})
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 1))
 	entry := received.Load()
 	if entry == nil {
 		t.Fatal("expected OnResolved to be called")
@@ -274,13 +306,8 @@ func TestInbox_UnmatchedDeltaDiscarded(t *testing.T) {
 			called.Store(true)
 		},
 	})
-	// InboxDelta addressed to a different agent — discarded.
-	inbox.Ingest(InboxDelta{
-		ClaimID:      "c1",
-		AgentID:      "other-agent",
-		Relationship: RelationshipSubject,
-		Sequence:     1,
-	})
+	// canonical claim.posted addressed to a different agent — discarded.
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c1", "other-agent", ActionTypeTask, 1))
 	if called.Load() {
 		t.Fatal("OnResolved should not be called for unmatched delta")
 	}
@@ -306,11 +333,7 @@ func TestInbox_ExpectAndMatch(t *testing.T) {
 		Priority:      PriorityResponse,
 	})
 
-	inbox.Ingest(TestamentDelta{
-		ClaimID:     "c-42",
-		TestamentID: "t-1",
-		Sequence:    10,
-	})
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c-42", "t-1", "eng", 10))
 
 	entry := received.Load()
 	if entry == nil {
@@ -517,10 +540,10 @@ func TestInbox_ExpectConsumesOnMatch(t *testing.T) {
 		Priority:      PriorityResponse,
 	})
 
-	inbox.Ingest(TestamentDelta{ClaimID: "c-42", TestamentID: "t-1", Sequence: 1})
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c-42", "t-1", "eng", 1))
 	// Second ingest — expectation consumed. No standing subscription
 	// match either (IssuerAgentID doesn't match "eng").
-	inbox.Ingest(TestamentDelta{ClaimID: "c-42", TestamentID: "t-2", Sequence: 2})
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c-42", "t-2", "eng", 2))
 	if count.Load() != 1 {
 		t.Fatalf("expected 1 OnResolved call (expectation consumed), got %d", count.Load())
 	}
@@ -556,7 +579,7 @@ func TestInbox_BusDeliveryDispatchesToIngest(t *testing.T) {
 	if err := inbox.Start([]string{"fixed-pattern"}); err != nil {
 		t.Fatal(err)
 	}
-	d := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 1}
+	d := canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 1)
 	bus.Fire("fixed-pattern", d)
 	if !called.Load() {
 		t.Error("expected OnResolved via bus delivery")
@@ -575,10 +598,10 @@ func TestInbox_CloseIdempotent(t *testing.T) {
 	}
 }
 
-func TestInbox_TestamentDelta_RoleGated(t *testing.T) {
+func TestInbox_TestamentPosted_RoleGated(t *testing.T) {
 	// Issuer-side testament delivery flows through Expect(), not
 	// standing subscription. A subject-only inbox never matches a
-	// TestamentDelta via the standing gate.
+	// testament.posted via the standing gate.
 	var subjectCalled atomic.Bool
 	subject, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "eng",
@@ -588,18 +611,12 @@ func TestInbox_TestamentDelta_RoleGated(t *testing.T) {
 			subjectCalled.Store(true)
 		},
 	})
-	subject.Ingest(TestamentDelta{
-		ClaimID:        "c1",
-		TestamentID:    "t1",
-		IssuerAgentID:  "eng",
-		SubjectAgentID: "designer",
-		Sequence:       1,
-	})
+	subject.Ingest(canonicalTestamentPostedForInboxTest("c1", "t1", "eng", 1))
 	if subjectCalled.Load() {
-		t.Fatal("RoleSubject inbox should NOT match TestamentDelta via standing — issuer-side path is Expect()")
+		t.Fatal("RoleSubject inbox should NOT match testament.posted via standing — issuer-side path is Expect()")
 	}
 
-	// RoleAuditor matches every testament regardless of identity.
+	// RoleAuditor matches canonical testament.posted regardless of identity.
 	var auditorCalled atomic.Bool
 	auditor, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "inspector",
@@ -609,15 +626,9 @@ func TestInbox_TestamentDelta_RoleGated(t *testing.T) {
 			auditorCalled.Store(true)
 		},
 	})
-	auditor.Ingest(TestamentDelta{
-		ClaimID:        "c1",
-		TestamentID:    "t1",
-		IssuerAgentID:  "architect",
-		SubjectAgentID: "designer",
-		Sequence:       1,
-	})
+	auditor.Ingest(canonicalTestamentPostedForInboxTest("c1", "t1", "architect", 1))
 	if !auditorCalled.Load() {
-		t.Fatal("RoleAuditor inbox should match every TestamentDelta")
+		t.Fatal("RoleAuditor inbox should match every canonical testament.posted")
 	}
 }
 
@@ -641,7 +652,7 @@ func TestInbox_ExpectSubscribesSpecificTestamentTopic(t *testing.T) {
 	}
 
 	claimID := "claim-consult-1"
-	topic := ClaimStatusTopic("sess", claimID, ClaimStatusTestified)
+	topic := CanonicalClaimTopic("sess", claimID, DeltaActionTestamentPosted)
 	if count := bus.SubscriptionCount(topic); count != 0 {
 		t.Fatalf("precondition: exact expectation topic subscriptions = %d, want 0", count)
 	}
@@ -655,14 +666,18 @@ func TestInbox_ExpectSubscribesSpecificTestamentTopic(t *testing.T) {
 	if count := bus.SubscriptionCount(topic); count != 1 {
 		t.Fatalf("exact expectation topic subscriptions = %d, want 1", count)
 	}
+	for _, legacyTopic := range []string{
+		ClaimStatusTopic("sess", claimID, ClaimStatusTestified),
+		ClaimStatusTopic("sess", claimID, ClaimStatusAccepted),
+		ClaimStatusTopic("sess", claimID, ClaimStatusRejected),
+		ClaimStatusTopic("sess", claimID, ClaimStatusSuperseded),
+	} {
+		if count := bus.SubscriptionCount(legacyTopic); count != 0 {
+			t.Fatalf("legacy expectation topic %q subscriptions = %d, want 0", legacyTopic, count)
+		}
+	}
 
-	bus.Fire(topic, TestamentDelta{
-		ClaimID:       claimID,
-		TestamentID:   "testament-1",
-		ActionKind:    ActionTypeConsultation,
-		IssuerAgentID: "architect",
-		Sequence:      1,
-	})
+	bus.Fire(topic, canonicalTestamentPostedForInboxTest(claimID, "testament-1", "architect", 1))
 	if got == nil {
 		t.Fatal("expected testament delta to resolve via expectation")
 	}
@@ -671,6 +686,58 @@ func TestInbox_ExpectSubscribesSpecificTestamentTopic(t *testing.T) {
 	}
 	if count := bus.SubscriptionCount(topic); count != 0 {
 		t.Fatalf("one-shot expectation topic subscriptions after match = %d, want 0", count)
+	}
+}
+
+func TestInbox_ExpectationSubscribesLifecycleValidationTopicOnly(t *testing.T) {
+	bus := newRecordingBus()
+	inbox, err := NewClaimsInbox(InboxConfig{
+		AgentID:    "architect",
+		SessionID:  "sess",
+		Subscriber: bus,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := inbox.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	claimID := "claim-validation-1"
+	topic := CanonicalClaimTopic("sess", claimID, DeltaActionValidationEvaluated)
+	inbox.Expect(&Expectation{
+		ClaimID:       claimID,
+		ExpectedDelta: DeltaKindValidation,
+		Priority:      PriorityEvaluation,
+	})
+	if count := bus.SubscriptionCount(topic); count != 1 {
+		t.Fatalf("canonical validation expectation subscriptions = %d, want 1", count)
+	}
+	for _, legacyTopic := range []string{
+		ValidationVerdictPattern("sess", ValidationStatusPassed),
+		ValidationVerdictPattern("sess", ValidationStatusFailed),
+	} {
+		if count := bus.SubscriptionCount(legacyTopic); count != 0 {
+			t.Fatalf("legacy validation topic %q subscriptions = %d, want 0", legacyTopic, count)
+		}
+	}
+}
+
+func TestInbox_RoleObserverDoesNotSubscribeLegacyClaimStatusTopics(t *testing.T) {
+	patterns := InboxPatternsFor(RoleObserver, "sess", "ui")
+	if !sliceContains(patterns, CanonicalSessionPattern("sess")) {
+		t.Fatalf("observer patterns missing canonical session wildcard: %v", patterns)
+	}
+	for _, legacyTopic := range []string{
+		ClaimStatusPattern("sess", ClaimStatusPending),
+		ClaimStatusPattern("sess", ClaimStatusInProgress),
+		ClaimStatusPattern("sess", ClaimStatusTestified),
+		ClaimStatusPattern("sess", ClaimStatusAccepted),
+		ClaimStatusPattern("sess", ClaimStatusRejected),
+	} {
+		if sliceContains(patterns, legacyTopic) {
+			t.Fatalf("observer unexpectedly subscribed to legacy claim status topic %q in %v", legacyTopic, patterns)
+		}
 	}
 }
 
@@ -729,7 +796,7 @@ func TestInbox_ExpectationReplaysEarlyCanonicalTestament(t *testing.T) {
 	}
 }
 
-func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
+func TestInbox_ClaimLifecycleStatus_RoleGated(t *testing.T) {
 	// Subject-only inbox does not match claim status deltas via
 	// standing — issuer/subject identity flows are Expect()-driven.
 	var subjectCalled atomic.Bool
@@ -741,18 +808,12 @@ func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
 			subjectCalled.Store(true)
 		},
 	})
-	subject.Ingest(ClaimStatusDelta{
-		ClaimID:        "c1",
-		ToStatus:       ClaimStatusRejected,
-		IssuerAgentID:  "eng",
-		SubjectAgentID: "eng",
-		Sequence:       1,
-	})
+	subject.Ingest(canonicalClaimLifecycleForInboxTest("c1", DeltaActionClaimValidationFailed, ActionTypeTask, 1))
 	if subjectCalled.Load() {
-		t.Fatal("RoleSubject inbox should NOT match ClaimStatusDelta via standing")
+		t.Fatal("RoleSubject inbox should NOT match claim validation failure via standing")
 	}
 
-	// RoleRemediator matches ClaimStatusRejected regardless of identity.
+	// RoleRemediator matches canonical claim validation failure regardless of identity.
 	var remediatorCalled atomic.Bool
 	remediator, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "architect",
@@ -762,18 +823,12 @@ func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
 			remediatorCalled.Store(true)
 		},
 	})
-	remediator.Ingest(ClaimStatusDelta{
-		ClaimID:        "c1",
-		ToStatus:       ClaimStatusRejected,
-		IssuerAgentID:  "engineer",
-		SubjectAgentID: "designer",
-		Sequence:       1,
-	})
+	remediator.Ingest(canonicalClaimLifecycleForInboxTest("c1", DeltaActionClaimValidationFailed, ActionTypeTask, 1))
 	if !remediatorCalled.Load() {
-		t.Fatal("RoleRemediator inbox should match ClaimStatusRejected")
+		t.Fatal("RoleRemediator inbox should match canonical claim validation failure")
 	}
 
-	// RoleRemediator does NOT match ClaimStatusAccepted.
+	// RoleRemediator does NOT match claim.satisfied.
 	var acceptedCalled atomic.Bool
 	remediator2, _ := NewClaimsInbox(InboxConfig{
 		AgentID:   "architect2",
@@ -783,26 +838,16 @@ func TestInbox_ClaimStatusDelta_RoleGated(t *testing.T) {
 			acceptedCalled.Store(true)
 		},
 	})
-	remediator2.Ingest(ClaimStatusDelta{
-		ClaimID:        "c2",
-		ToStatus:       ClaimStatusAccepted,
-		IssuerAgentID:  "engineer",
-		SubjectAgentID: "designer",
-		Sequence:       1,
-	})
+	remediator2.Ingest(canonicalClaimLifecycleForInboxTest("c2", DeltaActionClaimSatisfied, ActionTypeTask, 1))
 	if acceptedCalled.Load() {
-		t.Fatal("RoleRemediator should not match ClaimStatusAccepted")
+		t.Fatal("RoleRemediator should not match claim.satisfied")
 	}
 }
 
 func TestInbox_NilOnResolved_NoError(t *testing.T) {
 	// OnResolved is nil — matched deltas are counted but not dispatched.
 	inbox, _ := NewClaimsInbox(InboxConfig{AgentID: "eng", SessionID: "sess"})
-	inbox.Ingest(InboxDelta{
-		ClaimID: "c1", AgentID: "eng",
-		Relationship: RelationshipSubject,
-		Sequence:     1,
-	})
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 1))
 	if inbox.Len() != 1 {
 		t.Fatalf("expected 1 match, got %d", inbox.Len())
 	}
@@ -859,7 +904,7 @@ func TestDedupLRU_TouchKeepsRecentEntries(t *testing.T) {
 
 func TestInbox_Len_DoesNotMatchDuplicates(t *testing.T) {
 	inbox, _ := NewClaimsInbox(InboxConfig{AgentID: "eng", SessionID: "sess"})
-	d := InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, Sequence: 1}
+	d := canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeTask, 1)
 	for i := 0; i < 100; i++ {
 		inbox.Ingest(d)
 	}
@@ -902,13 +947,7 @@ func TestInbox_ChallengePriority(t *testing.T) {
 			received.Store(entry)
 		},
 	})
-	inbox.Ingest(InboxDelta{
-		ClaimID:      "c1",
-		AgentID:      "eng",
-		Relationship: RelationshipSubject,
-		ActionKind:   ActionTypeChallenge,
-		Sequence:     1,
-	})
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeChallenge, 1))
 	entry := received.Load()
 	if entry == nil {
 		t.Fatal("expected OnResolved")
@@ -928,13 +967,15 @@ func TestDeltaClass_Mapping(t *testing.T) {
 		d    Delta
 		want InboxClass
 	}{
-		{"consult_request", InboxDelta{ActionKind: ActionTypeConsultation}, InboxClassConsultRequest},
-		{"directed_task", InboxDelta{ActionKind: ActionTypeTask}, InboxClassDirected},
-		{"directed_challenge", InboxDelta{ActionKind: ActionTypeChallenge}, InboxClassDirected},
-		{"directed_corrective", InboxDelta{ActionKind: ActionTypeCorrective}, InboxClassDirected},
+		{"consult_request", canonicalClaimPostedForInboxTest("c-consult", "eng", ActionTypeConsultation, 1), InboxClassConsultRequest},
+		{"directed_task", canonicalClaimPostedForInboxTest("c-task", "eng", ActionTypeTask, 1), InboxClassDirected},
+		{"directed_challenge", canonicalClaimPostedForInboxTest("c-challenge", "eng", ActionTypeChallenge, 1), InboxClassDirected},
+		{"directed_corrective", canonicalClaimPostedForInboxTest("c-corrective", "eng", ActionTypeCorrective, 1), InboxClassDirected},
+		{"legacy_inbox_observation", InboxDelta{ActionKind: ActionTypeTask}, InboxClassObservation},
 		{"observation_testament", TestamentDelta{}, InboxClassObservation},
 		{"observation_validation", ValidationDelta{}, InboxClassObservation},
-		{"directed_rejected", ClaimStatusDelta{ToStatus: ClaimStatusRejected}, InboxClassDirected},
+		{"directed_rejected", canonicalClaimLifecycleForInboxTest("c-reject", DeltaActionClaimValidationFailed, ActionTypeTask, 1), InboxClassDirected},
+		{"legacy_claim_status_observation", ClaimStatusDelta{ToStatus: ClaimStatusRejected}, InboxClassObservation},
 		{"observation_accepted", ClaimStatusDelta{ToStatus: ClaimStatusAccepted}, InboxClassObservation},
 		{"phase_transition", PhaseDelta{}, InboxClassPhase},
 		{"nil_delta", nil, InboxClassObservation},
@@ -955,12 +996,12 @@ func TestInbox_DeliveredByClass_IncrementsPerIngest(t *testing.T) {
 		OnResolved: func(_ *GraphEntryPoint) {},
 	})
 	// Two consult requests, three observations, one directed.
-	inbox.Ingest(InboxDelta{ClaimID: "c1", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeConsultation, Sequence: 1})
-	inbox.Ingest(InboxDelta{ClaimID: "c2", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeConsultation, Sequence: 1})
-	inbox.Ingest(TestamentDelta{ClaimID: "c3", Sequence: 1})
-	inbox.Ingest(TestamentDelta{ClaimID: "c4", Sequence: 1})
-	inbox.Ingest(TestamentDelta{ClaimID: "c5", Sequence: 1})
-	inbox.Ingest(InboxDelta{ClaimID: "c6", AgentID: "eng", Relationship: RelationshipSubject, ActionKind: ActionTypeTask, Sequence: 1})
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c1", "eng", ActionTypeConsultation, 1))
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c2", "eng", ActionTypeConsultation, 1))
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c3", "t3", "eng", 1))
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c4", "t4", "eng", 1))
+	inbox.Ingest(canonicalTestamentPostedForInboxTest("c5", "t5", "eng", 1))
+	inbox.Ingest(canonicalClaimPostedForInboxTest("c6", "eng", ActionTypeTask, 1))
 
 	if got, want := inbox.DeliveredByClass(InboxClassConsultRequest), uint64(2); got != want {
 		t.Errorf("ConsultRequest delivered = %d, want %d", got, want)

@@ -179,7 +179,7 @@ func validateCanonicalDelta(d CanonicalDelta, strict bool) error {
 			return fmt.Errorf("refs[%d]: %w", idx, err)
 		}
 	}
-	if d.Action == DeltaActionClaimPosted || d.Action == DeltaActionTestamentPosted {
+	if DeltaActionRequiresDelivery(d.Action) {
 		if d.Delivery == nil || len(d.Delivery.To) == 0 {
 			return fmt.Errorf("%s requires delivery.to", d.Action)
 		}
@@ -240,6 +240,21 @@ func DeltaActionMayCompleteExpectedWork(action DeltaAction) bool {
 		DeltaActionClaimValidationFailed,
 		DeltaActionClaimValidationErrored,
 		DeltaActionValidationEvaluated:
+		return true
+	default:
+		return false
+	}
+}
+
+func DeltaActionRequiresDelivery(action DeltaAction) bool {
+	switch action {
+	case DeltaActionClaimPosted,
+		DeltaActionClaimReceived,
+		DeltaActionClaimReceiptFailed,
+		DeltaActionClaimTestamentAcknowledged,
+		DeltaActionClaimTestamentAcknowledgementFailed,
+		DeltaActionTestamentPosted,
+		DeltaActionTestamentReceived:
 		return true
 	default:
 		return false

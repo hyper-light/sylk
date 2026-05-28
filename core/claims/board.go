@@ -1148,7 +1148,6 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 		}
 	}
 
-	validationDelta := b.buildValidationDeltaLocked(c, v, change, accepted, now)
 	claimSnapshot := CloneClaimEntity(c)
 	validationSnapshot := *v
 	if len(v.ExpectedToolCalls) > 0 {
@@ -1175,7 +1174,6 @@ func (b *ClaimsBoard) EvaluateValidation(ctx context.Context, claimID, validatio
 			b.amplifier.EmitClaimAccepted(ctx, c)
 		}
 	}
-	b.amplifier.PublishValidationDelta(ctx, validationDelta)
 	b.amplifier.PublishCanonicalValidationEvaluated(ctx, claimSnapshot, &validationSnapshot, change, accepted, now)
 	if acceptedTransition != nil {
 		b.amplifier.PublishClaimStatusDelta(ctx, ClaimStatusDelta{
@@ -1215,37 +1213,6 @@ func findValidationOnClaim(c *Claim, validationID string) *Validation {
 		}
 	}
 	return nil
-}
-
-func (b *ClaimsBoard) buildValidationDeltaLocked(c *Claim, v *Validation, change StatusChange, accepted bool, now time.Time) ValidationDelta {
-	remaining := c.PendingValidationCount()
-	failed := countFailedValidations(c)
-	return ValidationDelta{
-		SessionID:          b.sessionID,
-		BoardID:            b.boardID,
-		ClaimID:            c.ID,
-		ValidationID:       v.ID,
-		Sequence:           v.Sequence,
-		EmittedAt:          now,
-		Verdict:            change.To,
-		EvaluatorAgentID:   change.AgentID,
-		Reason:             change.Reason,
-		RemainingOnClaim:   remaining,
-		FailedCountOnClaim: failed,
-		ClaimAutoAccepted:  accepted,
-		SubjectAgentID:     SubjectAgentID(c.Relations),
-		IssuerAgentID:      IssuerAgentID(c.Relations),
-	}
-}
-
-func countFailedValidations(c *Claim) int {
-	count := 0
-	for _, v := range c.Validations {
-		if v.Status == ValidationStatusFailed {
-			count++
-		}
-	}
-	return count
 }
 
 // ── RejectClaim ─────────────────────────────────────────────────────
