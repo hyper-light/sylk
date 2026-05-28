@@ -227,10 +227,16 @@ one-to-one relationship with claims, testaments, artifacts, or validations.
 
 `context` is the action-specific compact payload.
 
-## 7. Canonical Agent Reference
+## 7. Canonical Participant Reference
 
-Agent references must follow the identity model. They must not be plain
-display names when canonical identity is available.
+Participant references must follow the identity model. They must not be
+plain display names when canonical identity is available. Every
+participant — agent, service, system, or external — uses the same
+reference shape. The `category` field distinguishes the four
+participant categories per `docs/CLAIMS_AND_INFRASTRUCTURE.md` §3.2.
+During migration, the historical name `AgentRef` is preserved as a
+backward-compatibility alias that produces a `ParticipantRef` with
+`category: agent`.
 
 ```json
 {
@@ -260,11 +266,19 @@ Minimum fields are:
 - `pod`
 - `name`
 - `type`
+- `category` (one of `agent`, `service`, `system`, `external`)
 - `generation`
-- `model`
+- `model` (for agents: model name; for services: binary version; for
+  system: process binary version; for external: empty)
+
+Services additionally carry `scope_keys` (the deterministic inputs to
+service-UID derivation per `docs/CLAIMS_AND_INFRASTRUCTURE.md` §7.1).
+External participants carry `adapter_id`. See
+`docs/CLAIMS_AND_INFRASTRUCTURE.md` §5.2 for the complete
+`ParticipantRef` schema.
 
 When canonical identity is unavailable, the delta may carry a degraded
-agent ref:
+participant ref:
 
 ```json
 {
@@ -276,6 +290,9 @@ agent ref:
 
 Receivers must treat degraded refs as non-authoritative for identity and
 must resolve them through the identity registry before starting work.
+For services, identity resolution uses `DeriveServiceUID(type, scope_keys)`
+per `docs/CLAIMS_AND_INFRASTRUCTURE.md` §7.1; the result is
+deterministic across process restarts.
 
 ## 8. Object References
 
@@ -482,6 +499,50 @@ Receiver behavior:
 3. Continuations waiting for terminal claim state resume or fail.
 4. Archival and carry-forward logic may index the final state.
 
+### Expanded Lifecycle Actions
+
+The five canonical verbs above are the coarse contract. Per
+`docs/CLAIMS_AND_TESTAMENTS_LIFECYCLE.md` and
+`docs/ARTIFACTS_AND_VALIDATIONS.md`, the full lifecycle uses an
+expanded set of action names that map onto the coarse verbs as
+projections:
+
+**Claim lifecycle actions** (17, per LIFECYCLE §7): `claim.generated`,
+`claim.generation_failed`, `claim.posted`, `claim.post_failed`,
+`claim.received`, `claim.receipt_failed`, `claim.progressed`,
+`claim.progress_failed`, `claim.testament_generated`,
+`claim.testament_generation_failed`, `claim.testament_acknowledged`,
+`claim.testament_acknowledgement_failed`, `claim.validating`,
+`claim.satisfied`, `claim.validation_incomplete`,
+`claim.validation_failed`, `claim.validation_errored`.
+
+**Testament lifecycle actions** (7, per LIFECYCLE §7):
+`testament.generated`, `testament.posted`, `testament.received`,
+`testament.validating`, `testament.validation_incomplete`,
+`testament.validation_failed`, `testament.validated`.
+
+**Artifact lifecycle actions** (8, per ARTIFACTS_AND_VALIDATIONS §12.1):
+`artifact.generated`, `artifact.generation_failed`,
+`artifact.received`, `artifact.receipt_failed`, `artifact.attached`,
+`artifact.validating`, `artifact.validation_failed`,
+`artifact.validated`.
+
+**Validation lifecycle actions** (10, per ARTIFACTS_AND_VALIDATIONS §12.2):
+`validation.ready`, `validation.validating`,
+`validation.validation_failed`, `validation.validation_failed_not_required`,
+`validation.errored`, `validation.errored_not_required`,
+`validation.validating_quality_bar`,
+`validation.quality_bar_validation_failed`,
+`validation.quality_bar_validation_failed_not_required`,
+`validation.validated`.
+
+Receivers that need only the coarse contract may subscribe to the five
+verbs above. Receivers that need finer-grained lifecycle state (UI
+bridges, per-artifact orchestrators, validator dispatchers,
+continuation stores waiting on specific terminal states) subscribe to
+the expanded action set. Both sets are emitted from the same board
+mutations; the coarse verbs are projections.
+
 ## 10. Removed or Downgraded Delta Concepts
 
 ### phase
@@ -521,7 +582,13 @@ Claims and validations may carry expected tool call specifications.
 
 Claims use expected tool calls to describe work expected from the subject.
 Validations use expected tool calls to describe verification expected from
-the evaluator.
+the evaluator. When a validation's expected tool maps to a registered
+typed validator handler (per `docs/ARTIFACTS_AND_VALIDATIONS.md` §8),
+the tool name resolves to a `ValidatorID` and the dispatcher invokes
+the typed handler directly rather than going through the agent's
+tool-loop layer. For agentic validations with non-empty quality bars,
+the expected tools describe the work the agent should perform during
+its quality-bar assessment phase.
 
 Expected tool calls are durable skill invocation specs, not provider
 tool-call messages.
@@ -663,10 +730,23 @@ Recommended topics:
 
 ```text
 claims.<session_id>.agent.<agent_uid>.<action>
+claims.<session_id>.service.<service_uid>.<action>
+claims.<session_id>.system.<system_uid>.<action>
+claims.<session_id>.external.<external_uid>.<action>
 claims.<session_id>.claim.<claim_id>.<action>
+claims.<session_id>.testament.<testament_id>.<action>
+claims.<session_id>.artifact.<artifact_id>.<action>
 claims.<session_id>.validation.<validation_id>.<action>
 claims.<session_id>.board.<board_id>.<action>
 ```
+
+The per-participant topic patterns use the canonical UID for each
+participant category. Service UIDs are deterministically derived from
+(service_type, scope_keys) per `docs/CLAIMS_AND_INFRASTRUCTURE.md`
+§7.1; system and external UIDs use their respective derivation
+helpers. Per-claim, per-testament, per-artifact, and per-validation
+topics route lifecycle observers (UI bridges, validator dispatchers,
+continuation stores) to the specific entities they wait on.
 
 Rules:
 

@@ -120,6 +120,7 @@ type ValidationExpectedToolExecutionResult struct {
 	ClaimID              string                      `json:"claim_id"`
 	ValidationID         string                      `json:"validation_id"`
 	AgentID              string                      `json:"agent_id"`
+	ValidationActorID    string                      `json:"validation_actor_id,omitempty"`
 	AlreadyTerminal      bool                        `json:"already_terminal,omitempty"`
 	Attempts             []ExpectedToolAttemptResult `json:"attempts,omitempty"`
 	TestamentID          string                      `json:"testament_id,omitempty"`
@@ -159,9 +160,10 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 		return nil, fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
 	}
 	result := &ValidationExpectedToolExecutionResult{
-		ClaimID:      claimID,
-		ValidationID: validationID,
-		AgentID:      firstNonEmpty(strings.TrimSpace(opts.AgentID), validation.AgentID, IssuerAgentID(claim.Relations), claim.AgentID),
+		ClaimID:           claimID,
+		ValidationID:      validationID,
+		AgentID:           firstNonEmpty(strings.TrimSpace(opts.AgentID), validation.AgentID, IssuerAgentID(claim.Relations), claim.AgentID),
+		ValidationActorID: expectedToolValidationActorID(claim, validation, opts.AgentID),
 	}
 	if validation.Status.IsTerminal() {
 		result.AlreadyTerminal = true
@@ -198,21 +200,25 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 		result.ArtifactIDs = append(result.ArtifactIDs, artifact.ID)
 	}
 
-	testaments := []Testament{{
+	testament := Testament{
 		AgentID:      result.AgentID,
 		Summary:      validationExpectedToolSummary(result.Attempts),
 		Confidence:   "deterministic",
 		Relations:    validationExpectedToolRelations(claimID, validationID),
 		Artifacts:    artifacts,
 		Presentation: nil,
-	}}
-	if err := board.SubmitTestaments(contextWithoutCancellation(ctx), Action{AgentID: result.AgentID, Type: ActionTypeTestament}, testaments); err != nil {
-		return nil, fmt.Errorf("submit validation expected-tool audit testament: %w", err)
 	}
-	result.TestamentID = testaments[0].ID
+	testamentID, err := postExpectedToolAuditTestament(contextWithoutCancellation(ctx), board, result, testament)
+	if err != nil {
+		return nil, err
+	}
+	result.TestamentID = testamentID
 
 	status := validationExpectedToolStatus(result.Attempts)
 	reason := validationExpectedToolValidationReason(status, result)
+	if err := beginExpectedToolAuditTestamentValidation(contextWithoutCancellation(ctx), board, result, testamentID); err != nil {
+		return nil, err
+	}
 	latestClaim, ok := board.CloneClaim(claimID)
 	if !ok {
 		return nil, fmt.Errorf("claim %q disappeared before validation evaluation", claimID)
@@ -236,6 +242,9 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 	result.ValidationEvaluated = true
 	result.ValidationStatus = status
 	result.ValidationReason = reason
+	if err := completeExpectedToolAuditTestamentValidation(contextWithoutCancellation(ctx), board, result, testamentID, status, reason); err != nil {
+		return nil, err
+	}
 
 	if status.IsNegativeTerminal() && opts.RemediationPoster != nil {
 		ids, err := opts.RemediationPoster.PostValidationExpectedToolRemediation(contextWithoutCancellation(ctx), board, claim, validation, result)
@@ -245,6 +254,101 @@ func ExecuteValidationExpectedTools(ctx context.Context, board *ClaimsBoard, cla
 		}
 	}
 	return result, nil
+}
+
+func expectedToolValidationActorID(claim *Claim, validation *Validation, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if agentCanValidateClaim(claim, requested) {
+		return requested
+	}
+	if validation != nil && agentCanValidateClaim(claim, validation.AgentID) {
+		return strings.TrimSpace(validation.AgentID)
+	}
+	if issuer := IssuerAgentID(claim.Relations); issuer != "" {
+		return issuer
+	}
+	return firstNonEmpty(requested, validationStatusAgentID(validation), claim.AgentID)
+}
+
+func validationStatusAgentID(validation *Validation) string {
+	if validation == nil {
+		return ""
+	}
+	return strings.TrimSpace(validation.AgentID)
+}
+
+func agentCanValidateClaim(claim *Claim, agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if claim == nil || agentID == "" {
+		return false
+	}
+	return HasRelation(claim.Relations, RelationshipIssuer, agentID) ||
+		HasRelation(claim.Relations, RelationshipEvaluator, agentID)
+}
+
+func postExpectedToolAuditTestament(ctx context.Context, board *ClaimsBoard, result *ValidationExpectedToolExecutionResult, testament Testament) (string, error) {
+	if result == nil {
+		return "", fmt.Errorf("expected-tool result is required")
+	}
+	actorID := firstNonEmpty(result.AgentID, result.ValidationActorID, "validator")
+	generated, err := board.GenerateTestamentAction(ctx, Action{AgentID: actorID, Type: ActionTypeTestament}, []Testament{testament}, GenerateTestamentActionOptions{
+		IdempotencyKey: "expected_tool_validation:" + result.ClaimID + ":" + result.ValidationID,
+		Reason:         "validation expected-tool audit testament generated",
+	})
+	if err != nil {
+		return "", fmt.Errorf("generate validation expected-tool audit testament: %w", err)
+	}
+	if generated == nil || len(generated.Testaments) == 0 {
+		return "", fmt.Errorf("generate validation expected-tool audit testament returned no testaments")
+	}
+	testamentID := strings.TrimSpace(generated.Testaments[0].ID)
+	if testamentID == "" {
+		return "", fmt.Errorf("generate validation expected-tool audit testament returned empty testament id")
+	}
+	if err := board.PostGeneratedTestament(ctx, testamentID, actorID, TestamentPostOptions{Reason: "validation expected-tool audit testament posted"}); err != nil {
+		return "", fmt.Errorf("post validation expected-tool audit testament: %w", err)
+	}
+	return testamentID, nil
+}
+
+func beginExpectedToolAuditTestamentValidation(ctx context.Context, board *ClaimsBoard, result *ValidationExpectedToolExecutionResult, testamentID string) error {
+	actorID := expectedToolLifecycleActor(result)
+	if err := board.AcknowledgeTestamentReceipt(ctx, testamentID, actorID); err != nil {
+		return fmt.Errorf("acknowledge validation expected-tool audit testament: %w", err)
+	}
+	if err := board.BeginTestamentValidation(ctx, testamentID, actorID); err != nil {
+		return fmt.Errorf("begin validation expected-tool audit testament validation: %w", err)
+	}
+	return nil
+}
+
+func completeExpectedToolAuditTestamentValidation(ctx context.Context, board *ClaimsBoard, result *ValidationExpectedToolExecutionResult, testamentID string, status ValidationStatus, reason string) error {
+	if err := board.CompleteTestamentValidation(ctx, testamentID, expectedToolLifecycleActor(result), testamentLifecycleForValidationStatus(status), reason); err != nil {
+		return fmt.Errorf("complete validation expected-tool audit testament validation: %w", err)
+	}
+	return nil
+}
+
+func expectedToolLifecycleActor(result *ValidationExpectedToolExecutionResult) string {
+	if result == nil {
+		return "validator"
+	}
+	return firstNonEmpty(result.ValidationActorID, result.AgentID, "validator")
+}
+
+func testamentLifecycleForValidationStatus(status ValidationStatus) TestamentLifecycleStatus {
+	switch status {
+	case ValidationStatusPassed:
+		return TestamentLifecycleValidated
+	case ValidationStatusIncomplete:
+		return TestamentLifecycleValidationIncomplete
+	case ValidationStatusFailed:
+		return TestamentLifecycleValidationFailed
+	case ValidationStatusErrored:
+		return TestamentLifecycleValidationErrored
+	default:
+		return TestamentLifecycleValidationErrored
+	}
 }
 
 func executeExpectedToolAttempt(ctx context.Context, claim *Claim, validation *Validation, call ExpectedToolCall, opts ExpectedToolExecutionOptions, agentID string) (ExpectedToolAttemptResult, []*Artifact) {

@@ -26,27 +26,81 @@ func (g *Guide) guidePostClaimAsync(sessionID string, action claims.Action, clai
 	if board == nil {
 		return
 	}
+	post := func(ctx context.Context) error {
+		generated, err := board.GenerateClaimAction(ctx, action, []claims.Claim{claim}, claims.GenerateClaimActionOptions{
+			IdempotencyKey: firstNonEmptyString(action.IdempotencyKey, claim.IdempotencyKey, "guide:claim:"+sessionID+":"+claim.Title+":"+claim.Description),
+			Reason:         "guide generated claim",
+		})
+		if err != nil {
+			return err
+		}
+		if generated == nil || len(generated.Claims) == 0 {
+			return fmt.Errorf("guide generated claim action returned no claims")
+		}
+		claimID := strings.TrimSpace(generated.Claims[0].ID)
+		if claimID == "" {
+			return fmt.Errorf("guide generated claim action returned empty claim id")
+		}
+		return postGuideGeneratedClaimIfNeeded(ctx, board, generated.Claims[0], "guide", "guide posted claim")
+	}
 	if g.scope != nil {
 		if err := g.scope.Go("guide_post_claim", 5*time.Second, func(ctx context.Context) error {
-			return board.PostAction(ctx, action, []claims.Claim{claim})
+			return post(ctx)
 		}); err != nil {
 			slog.Error("guide_post_claim_dispatch_failed", "session", sessionID, "error", err.Error())
 			board.RecordNotificationError("guide post claim dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.PostAction(context.Background(), action, []claims.Claim{claim}); err != nil {
+	if err := post(context.Background()); err != nil {
 		slog.Error("guide_post_claim_failed", "session", sessionID, "error", err.Error())
 		board.RecordNotificationError("guide post claim: " + err.Error())
 	}
 }
 
+func postGuideGeneratedClaimIfNeeded(ctx context.Context, board *claims.ClaimsBoard, claim claims.Claim, actorID string, reason string) error {
+	if board == nil {
+		return fmt.Errorf("claims board is required")
+	}
+	claimID := strings.TrimSpace(claim.ID)
+	if claimID == "" {
+		return fmt.Errorf("generated claim id is required")
+	}
+	switch claim.LifecycleStatus {
+	case "", claims.ClaimLifecycleGenerated:
+		return board.PostGeneratedClaim(ctx, claimID, actorID, claims.ClaimPostOptions{Reason: reason})
+	case claims.ClaimLifecycleGenerationFailed, claims.ClaimLifecyclePostFailed:
+		return fmt.Errorf("generated claim %q already failed lifecycle at %s", claimID, claim.LifecycleStatus)
+	default:
+		return nil
+	}
+}
+
+func postGuideGeneratedTestamentIfNeeded(ctx context.Context, board *claims.ClaimsBoard, testament claims.Testament, actorID string, reason string) error {
+	if board == nil {
+		return fmt.Errorf("claims board is required")
+	}
+	testamentID := strings.TrimSpace(testament.ID)
+	if testamentID == "" {
+		return fmt.Errorf("generated testament id is required")
+	}
+	switch testament.LifecycleStatus {
+	case "", claims.TestamentLifecycleGenerated:
+		return board.PostGeneratedTestament(ctx, testamentID, actorID, claims.TestamentPostOptions{Reason: reason})
+	default:
+		return nil
+	}
+}
+
 type guideClassificationClaim struct {
-	board        *claims.ClaimsBoard
-	sessionID    string
-	claimID      string
-	validationID string
-	started      time.Time
+	board           *claims.ClaimsBoard
+	sessionID       string
+	claimID         string
+	validationID    string
+	input           string
+	requestedTarget string
+	explicitTarget  bool
+	started         time.Time
 }
 
 const (
@@ -67,9 +121,6 @@ func guideClassificationClaimDecision(request *RouteRequest) (bool, string) {
 	}
 	if request.FireAndForget {
 		return false, "fire_and_forget"
-	}
-	if request.ExplicitTarget || strings.TrimSpace(request.TargetAgentID) != "" {
-		return false, "explicit_or_direct_target"
 	}
 	if metadataHasNonEmptyString(request.Metadata, "parent_claim_id") {
 		return false, "parent_claim_id"
@@ -208,7 +259,10 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		return nil
 	}
 	claimID := strings.TrimSpace(generated.Claims[0].ID)
-	if err := board.PostGeneratedClaim(ctx, claimID, "guide", claims.ClaimPostOptions{Reason: "guide posted classification claim"}); err != nil {
+	if len(generated.Claims[0].Validations) > 0 && generated.Claims[0].Validations[0] != nil {
+		validationID = strings.TrimSpace(generated.Claims[0].Validations[0].ID)
+	}
+	if err := postGuideGeneratedClaimIfNeeded(ctx, board, generated.Claims[0], "guide", "guide posted classification claim"); err != nil {
 		slog.Error("guide_classification_claim_post_failed",
 			"session", request.SessionID,
 			"claim_id", claimID,
@@ -217,12 +271,38 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		board.RecordNotificationError("guide classification claim post: " + err.Error())
 		return nil
 	}
-	if err := board.AcknowledgeClaimReceipt(ctx, claimID, "guide"); err != nil {
-		slog.Warn("guide_classification_claim_receipt_failed",
-			"session", request.SessionID,
-			"claim_id", claimID,
-			"error", err.Error(),
-		)
+	claimStatus := generated.Claims[0].LifecycleStatus
+	if claimStatus == "" || claimStatus == claims.ClaimLifecycleGenerated {
+		claimStatus = claims.ClaimLifecyclePosted
+	}
+	if claimStatus == claims.ClaimLifecyclePosted {
+		if err := board.AcknowledgeClaimReceipt(ctx, claimID, "guide"); err != nil {
+			slog.Warn("guide_classification_claim_receipt_failed",
+				"session", request.SessionID,
+				"claim_id", claimID,
+				"error", err.Error(),
+			)
+		} else {
+			claimStatus = claims.ClaimLifecycleReceived
+		}
+	}
+	if latest, ok := board.CloneClaim(claimID); ok {
+		claimStatus = latest.LifecycleStatus
+	}
+	if !guideClassificationClaimCanProgress(claimStatus) {
+		request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
+			"guide_classification_claim_id": claimID,
+		})
+		return &guideClassificationClaim{
+			board:           board,
+			sessionID:       request.SessionID,
+			claimID:         claimID,
+			validationID:    validationID,
+			input:           request.Input,
+			requestedTarget: strings.TrimSpace(request.TargetAgentID),
+			explicitTarget:  request.ExplicitTarget,
+			started:         time.Now(),
+		}
 	}
 	request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
 		"guide_classification_claim_id": claimID,
@@ -279,12 +359,19 @@ func (g *Guide) beginGuideClassificationClaim(ctx context.Context, request *Rout
 		)
 	}
 	return &guideClassificationClaim{
-		board:        board,
-		sessionID:    request.SessionID,
-		claimID:      claimID,
-		validationID: validationID,
-		started:      time.Now(),
+		board:           board,
+		sessionID:       request.SessionID,
+		claimID:         claimID,
+		validationID:    validationID,
+		input:           request.Input,
+		requestedTarget: strings.TrimSpace(request.TargetAgentID),
+		explicitTarget:  request.ExplicitTarget,
+		started:         time.Now(),
 	}
+}
+
+func guideClassificationClaimCanProgress(status claims.ClaimLifecycleStatus) bool {
+	return status == claims.ClaimLifecycleReceived || status == claims.ClaimLifecycleProgressed
 }
 
 func (g *Guide) completeGuideClassificationClaim(ctx context.Context, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) string {
@@ -454,7 +541,7 @@ func (g *Guide) postGuideClassificationTestament(ctx context.Context, h *guideCl
 	if testamentID == "" {
 		return "", fmt.Errorf("guide classification testament generation returned empty testament id")
 	}
-	if err := h.board.PostGeneratedTestament(ctx, testamentID, "guide", claims.TestamentPostOptions{Reason: reason}); err != nil {
+	if err := postGuideGeneratedTestamentIfNeeded(ctx, h.board, generated.Testaments[0], "guide", reason); err != nil {
 		return testamentID, err
 	}
 	return testamentID, nil
@@ -515,6 +602,15 @@ func guideClassificationTestament(h *guideClassificationClaim, result *RouteResu
 			guideArtifact(h.sessionID, "confidence", formatConfidence(result.Confidence)),
 			guideArtifact(h.sessionID, "method", result.ClassificationMethod),
 		)
+		if strings.TrimSpace(result.Reason) != "" {
+			artifacts = append(artifacts, guideArtifact(h.sessionID, "route_reason", result.Reason))
+		}
+		if h != nil && h.explicitTarget {
+			artifacts = append(artifacts, guideArtifact(h.sessionID, "direct_address", firstNonEmptyString(h.requestedTarget, target)))
+			relations = append(relations, claims.Relation{
+				Related: target, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipDirectAddressed,
+			})
+		}
 	}
 	if target != "" {
 		relations = append(relations, claims.Relation{
@@ -538,16 +634,34 @@ func (g *Guide) guideSubmitTestamentAsync(sessionID string, testament claims.Tes
 		return
 	}
 	action := claims.Action{AgentID: "guide", Type: claims.ActionTypeTestament}
+	submit := func(ctx context.Context) error {
+		generated, err := board.GenerateTestamentAction(ctx, action, []claims.Testament{testament}, claims.GenerateTestamentActionOptions{
+			IdempotencyKey:  firstNonEmptyString(testament.IdempotencyKey, "guide:testament:"+sessionID+":"+testament.Summary),
+			AllowStandalone: claims.ClaimIDFromRelations(testament.Relations) == "",
+			Reason:          "guide generated testament",
+		})
+		if err != nil {
+			return err
+		}
+		if generated == nil || len(generated.Testaments) == 0 {
+			return fmt.Errorf("guide generated testament action returned no testaments")
+		}
+		testamentID := strings.TrimSpace(generated.Testaments[0].ID)
+		if testamentID == "" {
+			return fmt.Errorf("guide generated testament action returned empty testament id")
+		}
+		return postGuideGeneratedTestamentIfNeeded(ctx, board, generated.Testaments[0], "guide", "guide posted testament")
+	}
 	if g.scope != nil {
 		if err := g.scope.Go("guide_submit_testament", 5*time.Second, func(ctx context.Context) error {
-			return board.SubmitTestaments(ctx, action, []claims.Testament{testament})
+			return submit(ctx)
 		}); err != nil {
 			slog.Error("guide_submit_testament_dispatch_failed", "session", sessionID, "error", err.Error())
 			board.RecordNotificationError("guide testament dispatch: " + err.Error())
 		}
 		return
 	}
-	if err := board.SubmitTestaments(context.Background(), action, []claims.Testament{testament}); err != nil {
+	if err := submit(context.Background()); err != nil {
 		slog.Error("guide_submit_testament_failed", "session", sessionID, "error", err.Error())
 		board.RecordNotificationError("guide testament: " + err.Error())
 	}

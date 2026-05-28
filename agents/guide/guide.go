@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -915,7 +916,11 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		}
 	}
 
-	forwarded := g.buildForwardedRequest(request, classification, corrID)
+	forwarded, err := g.buildForwardedRequest(request, classification, corrID)
+	if err != nil {
+		g.pending.Remove(corrID)
+		return nil, err
+	}
 	g.attachEnrichment(ctx, request, classification, forwarded)
 	return forwarded, nil
 }
@@ -964,6 +969,26 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	g.observeUserConversationSignal(request)
 	ctx = g.augmentClassificationContext(ctx, request)
 
+	guideClassification := g.beginGuideClassificationClaim(context.Background(), request)
+	if guideClassification == nil {
+		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_handle_nil",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+		)
+	} else if classification, targetAgentID, testamentID, ok := g.replayGuideClassificationFromTestament(request, guideClassification); ok {
+		request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
+			"guide_route_testament_id": testamentID,
+		})
+		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_replayed",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"claim_id", guideClassification.claimID,
+			"testament_id", testamentID,
+			"target", targetAgentID,
+		)
+		return classification, targetAgentID, nil
+	}
+
 	// Fast-path: when an active conversation agent has high ACT-R activation
 	// and no explicit target was specified, skip LLM classification entirely.
 	// Suppressed when a plan is pending — the classifier must see plan context
@@ -977,27 +1002,16 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		(g.router == nil || !g.router.IsDSL(request.Input)) &&
 		g.conversation.PendingPlan(request.SessionID) == nil {
 		if result, target, ok := g.tryConversationFastPath(ctx, request); ok {
-			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
-				"reason", "conversation_fastpath",
-				"session_id", request.SessionID,
-				"correlation_id", request.CorrelationID,
-				"target", target,
-			)
+			g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, result, target, nil)
 			guideFileLog().Info("DEBUG: resolve_classification_fastpath_hit", "target", target, "elapsed_ms", time.Since(classStart).Milliseconds())
 			return result, target, nil
 		}
 	}
 
 	if request.TargetAgentID != "" {
-		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
-			"reason", "direct_or_explicit_target",
-			"session_id", request.SessionID,
-			"correlation_id", request.CorrelationID,
-			"target_agent_id", request.TargetAgentID,
-			"explicit_target", request.ExplicitTarget,
-		)
 		resolvedTarget, err := g.ensureExplicitTargetReady(ctx, request.TargetAgentID)
 		if err != nil && request.ExplicitTarget {
+			g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, nil, "", err)
 			return nil, "", fmt.Errorf("cannot route to @%s: %w", request.TargetAgentID, err)
 		}
 		if resolvedTarget != "" {
@@ -1033,24 +1047,8 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		if acc := claims.AccumulatorFromContext(ctx); acc != nil {
 			acc.Record("conversation_routed", targetAgentID)
 		}
+		g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, classification, targetAgentID, nil)
 		return classification, targetAgentID, nil
-	}
-
-	var guideClassification *guideClassificationClaim
-	if g.router == nil || !g.router.IsDSL(request.Input) {
-		guideClassification = g.beginGuideClassificationClaim(context.Background(), request)
-		if guideClassification == nil {
-			guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_handle_nil",
-				"session_id", request.SessionID,
-				"correlation_id", request.CorrelationID,
-			)
-		}
-	} else {
-		guideFileLog().Info("GUIDE_CLAIMS_DEBUG: classification_claim_not_started",
-			"reason", "dsl_route",
-			"session_id", request.SessionID,
-			"correlation_id", request.CorrelationID,
-		)
 	}
 
 	domainCtx := g.preclassifyDomain(ctx, request)
@@ -1059,7 +1057,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, true)
 		guideFileLog().Info("DEBUG: classify_session_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds(), "error", err)
 		if err != nil {
-			g.completeGuideClassificationClaim(context.Background(), guideClassification, nil, "", err)
+			g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, nil, "", err)
 			return nil, "", err
 		}
 		guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -1072,7 +1070,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 		guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
-		g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
+		g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, classification, targetAgentID, nil)
 		return classification, targetAgentID, nil
 	}
 
@@ -1095,7 +1093,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 		}
 		classification, targetAgentID = g.applyExcludedTargetFallback(ctx, classification, targetAgentID)
 		classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
-		g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
+		g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, classification, targetAgentID, nil)
 		return classification, targetAgentID, nil
 	}
 
@@ -1103,7 +1101,7 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	classification, targetAgentID, err := g.classifyWithSingleflight(ctx, request, domainCtx, false)
 	guideFileLog().Info("DEBUG: classify_llm_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds(), "error", err)
 	if err != nil {
-		g.completeGuideClassificationClaim(context.Background(), guideClassification, nil, "", err)
+		g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, nil, "", err)
 		return nil, "", err
 	}
 	guideFileLog().Info("DEBUG: finalize_start", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
@@ -1113,8 +1111,89 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 	guideFileLog().Info("DEBUG: finalize_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
 	classification, targetAgentID = g.applyConversationFlow(ctx, request, classification, targetAgentID)
 	guideFileLog().Info("DEBUG: conversation_flow_done", "target", targetAgentID, "elapsed_ms", time.Since(classStart).Milliseconds())
-	g.completeGuideClassificationClaim(context.Background(), guideClassification, classification, targetAgentID, nil)
+	g.completeGuideClassificationAndStamp(context.Background(), request, guideClassification, classification, targetAgentID, nil)
 	return classification, targetAgentID, nil
+}
+
+func (g *Guide) completeGuideClassificationAndStamp(ctx context.Context, request *RouteRequest, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) string {
+	testamentID := g.completeGuideClassificationClaim(ctx, h, result, targetAgentID, classifyErr)
+	if request != nil && strings.TrimSpace(testamentID) != "" {
+		request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
+			"guide_route_testament_id": testamentID,
+		})
+	}
+	return testamentID
+}
+
+func (g *Guide) replayGuideClassificationFromTestament(request *RouteRequest, h *guideClassificationClaim) (*RouteResult, string, string, bool) {
+	if h == nil || h.board == nil || strings.TrimSpace(h.claimID) == "" {
+		return nil, "", "", false
+	}
+	testament := latestValidatedRouteTestament(h.board.TestamentsByClaim(h.claimID))
+	if testament == nil {
+		return nil, "", "", false
+	}
+	result, target, ok := routeResultFromGuideTestament(testament)
+	if !ok {
+		return nil, "", "", false
+	}
+	if request != nil && request.TargetAgentID != "" && !strings.EqualFold(strings.TrimSpace(request.TargetAgentID), target) {
+		return nil, "", "", false
+	}
+	return result, target, testament.ID, true
+}
+
+func latestValidatedRouteTestament(testaments []*claims.Testament) *claims.Testament {
+	var selected *claims.Testament
+	for _, testament := range testaments {
+		if testament == nil || testament.LifecycleStatus != claims.TestamentLifecycleValidated {
+			continue
+		}
+		if strings.TrimSpace(guideArtifactReference(testament.Artifacts, "target_agent")) == "" {
+			continue
+		}
+		if selected == nil || testament.Sequence > selected.Sequence {
+			selected = testament
+		}
+	}
+	return selected
+}
+
+func routeResultFromGuideTestament(testament *claims.Testament) (*RouteResult, string, bool) {
+	if testament == nil {
+		return nil, "", false
+	}
+	target := strings.TrimSpace(guideArtifactReference(testament.Artifacts, "target_agent"))
+	if target == "" {
+		return nil, "", false
+	}
+	confidence, _ := strconv.ParseFloat(guideArtifactReference(testament.Artifacts, "confidence"), 64)
+	if confidence == 0 {
+		confidence = 1
+	}
+	intent := Intent(firstNonEmptyString(guideArtifactReference(testament.Artifacts, "intent"), string(IntentUnknown)))
+	domain := Domain(firstNonEmptyString(guideArtifactReference(testament.Artifacts, "domain"), string(DomainGeneral)))
+	result := &RouteResult{
+		TargetAgent:          TargetAgent(target),
+		Intent:               intent,
+		Domain:               domain,
+		Confidence:           confidence,
+		Action:               RouteActionExecute,
+		ClassificationMethod: firstNonEmptyString(guideArtifactReference(testament.Artifacts, "method"), "route_testament_replay"),
+		Reason:               firstNonEmptyString(guideArtifactReference(testament.Artifacts, "route_reason"), "replayed committed route testament"),
+	}
+	return result, target, true
+}
+
+func guideArtifactReference(artifacts []*claims.Artifact, kind string) string {
+	kind = strings.TrimSpace(kind)
+	for _, artifact := range artifacts {
+		if artifact == nil || strings.TrimSpace(artifact.Kind) != kind {
+			continue
+		}
+		return strings.TrimSpace(artifact.Reference)
+	}
+	return ""
 }
 
 // tryConversationFastPath checks whether the conversation flow manager has a
@@ -2172,7 +2251,7 @@ func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
 	return fmt.Sprintf("corr_%d", time.Now().UnixNano())
 }
 
-func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) *ForwardedRequest {
+func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) (*ForwardedRequest, error) {
 	metadata := mergeForwardMetadata(
 		g.conversationWorkMetadata(request.SessionID),
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
@@ -2183,15 +2262,22 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 			"session_board_id": board.BoardID(),
 		})
 		if shouldPostRoutedWorkClaim(request, metadata) {
-			if routeClaimID := g.dispatchRoutedWorkClaim(board, request, classification); routeClaimID != "" {
-				metadata = mergeForwardMetadata(metadata, map[string]any{
-					"parent_claim_id":        routeClaimID,
-					"routed_work_claim_id":   routeClaimID,
-					"claim_native_routing":   true,
-					"forwarded_execution_ok": false,
-				})
+			routeClaimID, err := g.dispatchRoutedWorkClaim(board, request, classification)
+			if err != nil {
+				return nil, err
 			}
+			if routeClaimID == "" {
+				return nil, fmt.Errorf("claim-native routed work claim was not posted")
+			}
+			metadata = mergeForwardMetadata(metadata, map[string]any{
+				"parent_claim_id":        routeClaimID,
+				"routed_work_claim_id":   routeClaimID,
+				"claim_native_routing":   true,
+				"forwarded_execution_ok": false,
+			})
 		}
+	} else if shouldPostRoutedWorkClaim(request, metadata) {
+		return nil, fmt.Errorf("claim-native routing requires a session claims board")
 	}
 
 	fwd := &ForwardedRequest{
@@ -2213,7 +2299,7 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 		ConversationHistory:  g.conversationHistory(request.SessionID, string(classification.TargetAgent)),
 		Metadata:             metadata,
 	}
-	return fwd
+	return fwd, nil
 }
 
 // mergeForwardMetadata combines classification phase metadata with request
@@ -2345,13 +2431,13 @@ const sourceAgentTUI = "tui"
 // dispatchRoutedWorkClaim generates and posts the target work claim
 // synchronously. claim.generated is an audit fact only; claim.posted is
 // the event that wakes the target agent's inbox.
-func (g *Guide) dispatchRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) string {
+func (g *Guide) dispatchRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) (string, error) {
 	claimID, err := postRoutedWorkClaim(board, request, classification)
 	if err != nil {
 		recordPromptActionFailure(context.Background(), board, request.SessionID, err)
-		return ""
+		return "", err
 	}
-	return claimID
+	return claimID, nil
 }
 
 // recordPromptActionFailure submits a testament with an error artifact
@@ -2379,8 +2465,29 @@ func recordPromptActionFailure(ctx context.Context, board *claims.ClaimsBoard, s
 		AgentID: "guide",
 		Type:    claims.ActionTypeTestament,
 	}
-	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
+	generated, err := board.GenerateTestamentAction(ctx, action, []claims.Testament{testament}, claims.GenerateTestamentActionOptions{
+		IdempotencyKey:  "guide:routed_work_post_failure:" + sessionID + ":" + actionErr.Error(),
+		AllowStandalone: true,
+		Reason:          "guide generated routed work post failure testament",
+	})
+	if err != nil {
 		// Board itself rejected the testament — last resort, log it.
+		slog.Error("guide_prompt_failure_testament_rejected",
+			"session", sessionID,
+			"original_error", actionErr.Error(),
+			"testament_error", err.Error(),
+		)
+		return
+	}
+	if generated == nil || len(generated.Testaments) == 0 || strings.TrimSpace(generated.Testaments[0].ID) == "" {
+		slog.Error("guide_prompt_failure_testament_rejected",
+			"session", sessionID,
+			"original_error", actionErr.Error(),
+			"testament_error", "empty generated testament",
+		)
+		return
+	}
+	if err := postGuideGeneratedTestamentIfNeeded(ctx, board, generated.Testaments[0], "guide", "guide posted routed work post failure testament"); err != nil {
 		slog.Error("guide_prompt_failure_testament_rejected",
 			"session", sessionID,
 			"original_error", actionErr.Error(),
@@ -2451,6 +2558,11 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 			Related: classificationClaimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim,
 		})
 	}
+	if routeTestamentID := metadataString(request.Metadata, "guide_route_testament_id"); routeTestamentID != "" {
+		workClaim.Relations = append(workClaim.Relations, claims.Relation{
+			Related: routeTestamentID, RelatedType: claims.RelatedTypeTestament, Relationship: claims.RelationshipCausedBy,
+		})
+	}
 
 	generated, err := board.GenerateClaimAction(context.Background(), action, []claims.Claim{workClaim}, claims.GenerateClaimActionOptions{
 		IdempotencyKey: "guide:routed_work:" + request.SessionID + ":" + request.CorrelationID,
@@ -2466,7 +2578,7 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 	if claimID == "" {
 		return "", nil
 	}
-	if err := board.PostGeneratedClaim(context.Background(), claimID, "guide", claims.ClaimPostOptions{Reason: "guide posted routed work claim"}); err != nil {
+	if err := postGuideGeneratedClaimIfNeeded(context.Background(), board, generated.Claims[0], "guide", "guide posted routed work claim"); err != nil {
 		return "", err
 	}
 	return claimID, nil

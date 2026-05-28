@@ -1,7 +1,10 @@
 package guide
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
 )
@@ -140,6 +143,51 @@ func TestPostRoutedWorkClaimUsesLifecycleAndDoesNotUsePromptSuppressionTag(t *te
 	}
 }
 
+func TestPostRoutedWorkClaimLinksClassificationClaimAndRouteTestament(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{SessionID: "sess", TaskID: "task"})
+	req := &RouteRequest{
+		SourceAgentID: "tui",
+		SessionID:     "sess",
+		CorrelationID: "corr-linked",
+		Input:         "build a cli",
+		Metadata: map[string]any{
+			"guide_classification_claim_id": "route-claim-1",
+			"guide_route_testament_id":      "route-testament-1",
+		},
+	}
+	result := &RouteResult{TargetAgent: TargetAgent("architect"), Intent: IntentExecute, Confidence: 0.91}
+
+	claimID, err := postRoutedWorkClaim(board, req, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		t.Fatalf("routed work claim %q not posted", claimID)
+	}
+	if !claims.HasRelation(claim.Relations, claims.RelationshipClaim, "route-claim-1") {
+		t.Fatalf("routed work claim missing classification claim relation: %+v", claim.Relations)
+	}
+	if !claims.HasRelation(claim.Relations, claims.RelationshipCausedBy, "route-testament-1") {
+		t.Fatalf("routed work claim missing route testament caused_by relation: %+v", claim.Relations)
+	}
+}
+
+func TestBuildForwardedRequestRequiresSessionBoardForClaimNativeTUIRoute(t *testing.T) {
+	g := &Guide{}
+	req := &RouteRequest{
+		SourceAgentID: "tui",
+		SessionID:     "sess",
+		CorrelationID: "corr-no-board",
+		Input:         "build a cli",
+	}
+	result := &RouteResult{TargetAgent: TargetAgent("architect"), Intent: IntentExecute, Confidence: 0.91}
+
+	if _, err := g.buildForwardedRequest(req, result, req.CorrelationID); err == nil || !strings.Contains(err.Error(), "session claims board") {
+		t.Fatalf("buildForwardedRequest error = %v, want missing session claims board", err)
+	}
+}
+
 func TestShouldSuppressForwardedExecutionOnlyForClaimNativeTUIRoutes(t *testing.T) {
 	forwarded := &ForwardedRequest{
 		SourceAgentID: sourceAgentTUI,
@@ -167,7 +215,7 @@ func TestShouldOpenGuideClassificationClaim_TUITopLevelOnly(t *testing.T) {
 	}
 }
 
-func TestShouldOpenGuideClassificationClaim_DirectAndNestedRoutesDoNotOpen(t *testing.T) {
+func TestShouldOpenGuideClassificationClaim_NestedRoutesDoNotOpen(t *testing.T) {
 	cases := []struct {
 		name string
 		req  *RouteRequest
@@ -193,15 +241,6 @@ func TestShouldOpenGuideClassificationClaim_DirectAndNestedRoutesDoNotOpen(t *te
 			},
 		},
 		{
-			name: "explicit_target",
-			req: &RouteRequest{
-				SourceAgentID:  "tui",
-				Input:          "@architect plan",
-				TargetAgentID:  "architect",
-				ExplicitTarget: true,
-			},
-		},
-		{
 			name: "fire_and_forget",
 			req: &RouteRequest{
 				SourceAgentID: "tui",
@@ -213,9 +252,164 @@ func TestShouldOpenGuideClassificationClaim_DirectAndNestedRoutesDoNotOpen(t *te
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if shouldOpenGuideClassificationClaim(tc.req) {
-				t.Fatal("nested/direct/protocol route opened a Guide classification claim")
+				t.Fatal("nested/protocol route opened a Guide classification claim")
 			}
 		})
+	}
+}
+
+func TestShouldOpenGuideClassificationClaim_DirectTargetOpens(t *testing.T) {
+	req := &RouteRequest{
+		SourceAgentID:  "tui",
+		Input:          "@architect plan",
+		TargetAgentID:  "architect",
+		ExplicitTarget: true,
+	}
+	if !shouldOpenGuideClassificationClaim(req) {
+		t.Fatal("top-level direct target route should still produce Guide route-decision lifecycle evidence")
+	}
+}
+
+func TestGuideClassificationTestamentDirectAddressIncludesArtifactAndRelation(t *testing.T) {
+	h := &guideClassificationClaim{
+		sessionID:       "sess",
+		claimID:         "classification-claim-1",
+		requestedTarget: "architect",
+		explicitTarget:  true,
+		started:         time.Now(),
+	}
+	result := &RouteResult{
+		TargetAgent:          TargetAgent("architect"),
+		Intent:               IntentPlan,
+		Domain:               DomainPlanning,
+		Confidence:           0.95,
+		ClassificationMethod: "direct_address",
+		Reason:               "user addressed @architect",
+	}
+
+	testament := guideClassificationTestament(h, result, "architect", nil)
+	if guideArtifactReference(testament.Artifacts, "direct_address") != "architect" {
+		t.Fatalf("direct address artifact missing: %+v", testament.Artifacts)
+	}
+	if !claims.HasRelation(testament.Relations, claims.RelationshipDirectAddressed, "architect") {
+		t.Fatalf("direct addressed relation missing: %+v", testament.Relations)
+	}
+	if guideArtifactReference(testament.Artifacts, "route_reason") == "" {
+		t.Fatalf("route reason artifact missing: %+v", testament.Artifacts)
+	}
+}
+
+func TestGuideClassificationReplayUsesValidatedRouteTestament(t *testing.T) {
+	ctx := context.Background()
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{SessionID: "sess", TaskID: "task"})
+	generated, err := board.GenerateClaimAction(ctx, claims.Action{AgentID: "guide", Type: claims.ActionTypePrompt}, []claims.Claim{{
+		Title:       "Classifying request",
+		Description: "build a cli",
+		ActionType:  claims.ActionTypePrompt,
+		Relations: []claims.Relation{
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: []*claims.Validation{{
+			ID:          "route-validation-1",
+			Type:        claims.ValidationTypeInspection,
+			Required:    true,
+			Description: "Guide selected route",
+			QualityBar:  "target recorded",
+		}},
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "route-classification-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID := generated.Claims[0].ID
+	if err := board.PostGeneratedClaim(ctx, claimID, "guide", claims.ClaimPostOptions{Reason: "posted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.AcknowledgeClaimReceipt(ctx, claimID, "guide"); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.UpdateClaimProgress(ctx, claimID, claims.ClaimProgressUpdate{WorkSummary: "Classifying request"}, "guide"); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &guideClassificationClaim{
+		board:        board,
+		sessionID:    "sess",
+		claimID:      claimID,
+		validationID: generated.Claims[0].Validations[0].ID,
+		input:        "build a cli",
+		started:      time.Now(),
+	}
+	expected := &RouteResult{
+		TargetAgent:          TargetAgent("architect"),
+		Intent:               IntentPlan,
+		Domain:               DomainPlanning,
+		Confidence:           0.95,
+		ClassificationMethod: "classifier",
+		Reason:               "matched planning work",
+	}
+	guide := &Guide{}
+	testamentID := guide.completeGuideClassificationClaim(ctx, h, expected, "architect", nil)
+	if testamentID == "" {
+		t.Fatal("classification completion did not post a route testament")
+	}
+
+	replayed, target, replayedTestamentID, ok := guide.replayGuideClassificationFromTestament(&RouteRequest{SessionID: "sess", Input: "build a cli"}, h)
+	if !ok {
+		t.Fatal("validated route testament was not replayed")
+	}
+	if replayedTestamentID != testamentID {
+		t.Fatalf("replayed testament id = %q, want %q", replayedTestamentID, testamentID)
+	}
+	if target != "architect" || replayed.TargetAgent != TargetAgent("architect") {
+		t.Fatalf("replayed target = %q/%q, want architect", target, replayed.TargetAgent)
+	}
+	if replayed.Intent != IntentPlan || replayed.Domain != DomainPlanning {
+		t.Fatalf("replayed classification = intent %s domain %s", replayed.Intent, replayed.Domain)
+	}
+}
+
+func TestBeginGuideClassificationClaimDoesNotRepostTerminalReplayClaim(t *testing.T) {
+	ctx := context.Background()
+	sessionID := "sess-route-replay-terminal"
+	g := &Guide{conversation: NewConversationFlowManager(ConversationFlowConfig{})}
+	req := &RouteRequest{
+		SourceAgentID: "tui",
+		SessionID:     sessionID,
+		CorrelationID: "corr-route-replay-terminal",
+		Input:         "build a cli",
+	}
+	h := g.beginGuideClassificationClaim(ctx, req)
+	if h == nil {
+		t.Fatal("classification claim was not opened")
+	}
+	result := &RouteResult{
+		TargetAgent:          TargetAgent("architect"),
+		Intent:               IntentPlan,
+		Domain:               DomainPlanning,
+		Confidence:           0.95,
+		ClassificationMethod: "classifier",
+	}
+	if testamentID := g.completeGuideClassificationClaim(ctx, h, result, "architect", nil); testamentID == "" {
+		t.Fatal("classification claim was not completed")
+	}
+
+	replayReq := &RouteRequest{
+		SourceAgentID: "tui",
+		SessionID:     sessionID,
+		CorrelationID: "corr-route-replay-terminal",
+		Input:         "build a cli",
+	}
+	replayHandle := g.beginGuideClassificationClaim(ctx, replayReq)
+	if replayHandle == nil {
+		t.Fatal("terminal classification claim replay should still return a graph handle")
+	}
+	claim, ok := h.board.CloneClaim(h.claimID)
+	if !ok {
+		t.Fatal("classification claim disappeared")
+	}
+	if claim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
+		t.Fatalf("classification claim lifecycle = %s, want satisfied; replay must not repost terminal claims", claim.LifecycleStatus)
 	}
 }
 

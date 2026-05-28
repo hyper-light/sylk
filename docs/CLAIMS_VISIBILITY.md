@@ -101,6 +101,25 @@ Presentation answers:
 - Should it replace an earlier visible artifact?
 - Where should it appear relative to the final assistant response?
 
+Per `docs/ARTIFACTS_AND_VALIDATIONS.md` §5, artifacts carry a first-class
+eight-state lifecycle. Presentation rendering may key on lifecycle
+state in addition to the static `Presentation` metadata fields: progress
+indicators driven by `artifact.validating`, completion glyphs driven
+by `artifact.validated`, error rendering driven by
+`artifact.validation_failed` or `artifact.receipt_failed`. The
+lifecycle-aware rendering does not replace the static contract; it
+augments it so terminal-state visual changes happen automatically as
+the underlying lifecycle progresses.
+
+Agents and services do not need an audience flag to access evidence.
+They use the board. Both participant categories produce presentable
+artifacts via the same `Presentation` field on the typed artifact
+record. Service-produced testaments (e.g., a guardian-denial testament
+carrying a user-visible explanation, a VFS-provisioning testament
+surfacing capacity status, a librarian consultation summary) route
+through the same `ClaimPresentationMsg` bridge path as
+agent-produced testaments.
+
 ### 3.3 Audience
 
 Audience identifies who the presentation is for. It is not an ACL.
@@ -454,10 +473,21 @@ board assigns IDs, sequences, content hashes, relations, and projection entries.
 
 ### 6.2 Delta emission
 
-The board emits the same testament and artifact activity. The bridge resolves
-the full entity from board projection or the artifact progress sink. If the
-entity has presentation metadata for a supported user-facing surface, the
-bridge emits a UI presentation message.
+The board emits canonical lifecycle deltas for every artifact and validation
+state transition per `docs/ARTIFACTS_AND_VALIDATIONS.md` §12. The bridge
+subscribes to artifact lifecycle actions (`artifact.generated`,
+`artifact.attached`, `artifact.validating`, `artifact.validated`,
+`artifact.validation_failed`, etc.) and validation lifecycle actions
+(`validation.validating`, `validation.validated`,
+`validation.validation_failed`, `validation.validating_quality_bar`, etc.)
+in addition to the testament and claim deltas defined in earlier sections.
+
+The bridge resolves the full entity from board projection or the artifact
+progress sink. If the entity has presentation metadata for a supported
+user-facing surface, the bridge emits a UI presentation message. The
+bridge does not branch on participant category (agent vs service) for
+delta consumption; the wire format is uniform per
+`docs/CLAIMS_AND_INFRASTRUCTURE.md` §6.4.
 
 ### 6.3 UI bridge conversion
 
@@ -1735,7 +1765,7 @@ Update Architect prompts:
 
 **Purpose**
 
-Make presentable artifacts useful to agents, not just the UI.
+Make presentable artifacts useful to agents, services, and the UI uniformly.
 
 **Design**
 
@@ -1746,8 +1776,17 @@ Verify the plan_markdown artifact is present, user-renderable, and matches the
 plan tasks and workflow.
 ```
 
-Evaluator agents query/traverse the board, inspect the artifact, and call
-`evaluate_validation`.
+Programmatic validators (typed Go handlers registered per
+`docs/ARTIFACTS_AND_VALIDATIONS.md` §8) read the artifact's typed `Data`
+field via the type registry and execute deterministic checks. They
+return a structured `Artifact[R]` result that captures the inspection
+evidence.
+
+Agentic evaluators (when a validation declares a non-empty `QualityBar`)
+query/traverse the board, inspect both `Data` and `Presentation`
+metadata, apply the quality bar criteria, and call `evaluate_validation`.
+Both validator disciplines access artifacts via the same board API; the
+type registry decouples typed-data access from rendering.
 
 **Acceptance criteria**
 
@@ -1857,19 +1896,55 @@ breaking current behavior.
 
 **Design**
 
-Keep `ArtifactKindResponseText`, but add default presentation:
+Keep `ArtifactKindResponseText` as the artifact `Kind`, and pair it with
+a typed `DataType` and `Data` payload per
+`docs/ARTIFACTS_AND_VALIDATIONS.md` §4.4. The canonical shape:
 
 ```go
-Presentation{
-    Audiences: []PresentationAudience{PresentationAudienceUser},
-    Surfaces: []PresentationSurface{PresentationSurfaceChat},
-    Format: PresentationFormatMarkdown,
-    Placement: PresentationPlacementAfterResponse,
+// Artifact field values for a response_text artifact
+Artifact{
+    Kind:     "response_text",
+    DataType: "response_text.markdown",  // or "response_text.plain"
+    Data:     <serialized ResponseTextPayload>,
+    Presentation: &Presentation{
+        Audiences: []PresentationAudience{PresentationAudienceUser},
+        Surfaces:  []PresentationSurface{PresentationSurfaceChat},
+        Format:    PresentationFormatMarkdown,
+        Placement: PresentationPlacementAfterResponse,
+    },
+}
+
+// Typed payload registered with the type registry
+type ResponseTextPayload struct {
+    Text       string         `json:"text"`
+    TokenCount int            `json:"token_count,omitempty"`
+    Truncated  bool           `json:"truncated,omitempty"`
+    Metadata   map[string]any `json:"metadata,omitempty"`
 }
 ```
 
-During migration, bridge may continue to route `response_text` specially. The
-long-term target is that response text is just a presentable artifact.
+**Validator binding**: `response_text` artifacts typically do not have
+programmatic validators. They are unstructured prose; deterministic
+validation of prose content is not generally meaningful. The artifact
+relies on receipt-time structural validation only (non-empty text,
+valid `DataType`, etc.).
+
+For agentic claimants that want to assess response quality, a
+validation may declare a non-empty `QualityBar` text describing the
+quality criteria (e.g., "Response addresses the user's question
+directly without hand-waving, cites specific evidence, avoids
+unnecessary qualifications"). The claimant agent's quality-bar phase
+evaluates the response against the bar per
+`docs/ARTIFACTS_AND_VALIDATIONS.md` §7.6.
+
+For non-agentic claimants (services issuing claims that receive
+response_text testaments), no quality bar is permitted; the artifact
+is treated as opaque evidence and the claim is satisfied based purely
+on the receipt validation.
+
+During migration, bridge may continue to route legacy `response_text`
+artifacts (those carrying only `Reference` without typed `Data`)
+through the existing path; new artifacts use the typed payload.
 
 **Acceptance criteria**
 

@@ -13,7 +13,9 @@ Each transition requires a durable event append to the WAL, reducer replay to re
 
 This architecture is fundamentally sequential. Only one agent acts at a time. The Inspector must handoff to the Tester, who must handoff to the Engineer, who must handoff back. Every transition is a durable protocol event. Every handoff is a full Guide route request. Every phase boundary is a terminal-action guard. The result is high latency for work that should be collaborative and parallel.
 
-We are replacing this with a **claims-based execution model** — a universal coordination primitive for the entire agent system. Claims, testaments, and artifacts replace the protocol snapshot, the reducer state machine, the mailbox obligation system, the terminal-action guards, the sequential phase ordering, and the separate challenge/consult skill mechanisms. What remains is one uniform flow: issue claims, do work, submit testaments with artifacts, validate.
+We are replacing this with a **claims-based execution model** — a universal coordination primitive for the entire agent and infrastructure system. Claims, testaments, and artifacts replace the protocol snapshot, the reducer state machine, the mailbox obligation system, the terminal-action guards, the sequential phase ordering, and the separate challenge/consult skill mechanisms. What remains is one uniform flow: issue claims, do work, submit testaments with artifacts, validate.
+
+The claims plane spans every participant in Sylk, not only LLM-driven agents. Deterministic infrastructure (VFS provisioning, knowledge graph writes, document DB ingestion, DAG allocation, identity registry, activation controller, boot sequencer, tool runtime, provider gateway, guardian gates) participates as first-class issuers, subjects, and evaluators of claims, testaments, validations, and artifacts. See `docs/CLAIMS_AND_INFRASTRUCTURE.md` for the universal participant model and `docs/ARTIFACTS_AND_VALIDATIONS.md` for the typed artifact and validation lifecycle.
 
 ---
 
@@ -64,10 +66,10 @@ Actions unify what were previously separate mechanisms (task dispatch, `challeng
 
 ### 2.3 Claim
 
-A **Claim** is a precise, atomic, specific assertion issued by one agent against another. A claim has:
+A **Claim** is a precise, atomic, specific assertion issued by one participant against another. Participants may be agents (LLM-driven), services (deterministic Go subsystems), system actors (structural runtime emitters), or external (user, CI, deploy controller). See `docs/CLAIMS_AND_INFRASTRUCTURE.md` for the participant taxonomy. A claim has:
 
-- **Issuer**: the agent that made the claim (the claimant). For initial task claims, the Inspector is the issuer — the Architect assembles the claim set during planning, but the Inspector formally issues them when the board is populated.
-- **Subject**: the agent the claim is made against — who must satisfy it.
+- **Issuer**: the participant that made the claim (the claimant). For initial task claims, the Inspector is the issuer — the Architect assembles the claim set during planning, but the Inspector formally issues them when the board is populated.
+- **Subject**: the participant the claim is made against — who must satisfy it.
 - **Validations**: the quality gates. Each validation is a single precise, atomic means of verifying the claim, paired with a quality bar statement.
 
 Claims are NOT vague task descriptions. They are specific, testable assertions about one concrete behavior or implementation detail:
@@ -111,7 +113,7 @@ Examples for the claim "Summarize architect's last context window":
 | `design` | Design review — visual, architectural, or UX. | Agent reviews design artifacts against quality bar, calls `evaluate_validation`. |
 | `regression` | No existing behavior broken. | Agent runs regression tests, inspects for regressions in artifacts, calls `evaluate_validation`. |
 
-Receipt validations are mechanical — the board auto-passes them when a testament links to the claim via a `RelationshipClaim` relation. All other validation types are **agentic** — the evaluator agent uses its full skill surface to assess the testament's artifacts against the validation's Description and QualityBar, then calls `evaluate_validation` with a pass/fail verdict and reason.
+Receipt validations are mechanical — the board auto-passes them when a testament links to the claim via a `RelationshipClaim` relation. All other validation types may be evaluated either **programmatically** (a registered typed Go handler runs deterministically against the artifact's typed data per `docs/ARTIFACTS_AND_VALIDATIONS.md`) or **agentically** (an evaluator agent uses its full skill surface to assess the testament's artifacts against the validation's Description and QualityBar). The two evaluation disciplines are not mutually exclusive: a single validation may carry both a typed handler (deterministic phase) and a non-empty `QualityBar` (agentic quality-bar phase that runs only after the deterministic phase succeeds). Non-agentic claimants cannot have validations with non-empty quality bars; this is enforced at claim-posting time.
 
 #### Validations as Agent Instructions
 
@@ -138,11 +140,11 @@ The validation's Description and QualityBar should instruct the agent about what
 
 ### 2.5 Testament
 
-A **Testament** is the uniform response to a claim. When a subject completes work on a claim, they issue a testament back to the claim's issuer with artifacts proving the claim was satisfied.
+A **Testament** is the uniform response to a claim. When a subject (agent, service, or system participant) completes work on a claim, they issue a testament back to the claim's issuer with artifacts proving the claim was satisfied. Testaments are streaming-only **closing signals** of a work cycle: the testifier always streams artifacts onto the board first (via `artifact.generated` commits) and generates the testament as the final commit when work completes or when the testifier has encountered an error. See `docs/ARTIFACTS_AND_VALIDATIONS.md` §5.5 for the streaming model and §2.7 for the closing-signal contract.
 
-- **Issuer**: the agent that created the testament (typically the claim's subject).
-- **Subject**: the agent the testament is responding to (typically the claim's issuer).
-- **Artifacts**: data, references, or other proof that the claim was satisfied.
+- **Issuer**: the participant that created the testament (typically the claim's subject).
+- **Subject**: the participant the testament is responding to (typically the claim's issuer).
+- **Artifacts**: typed data, references, or other proof that the claim was satisfied.
 
 The testament is a concrete statement of what was done:
 
@@ -155,7 +157,7 @@ The testament is a concrete statement of what was done:
 
 ### 2.6 Artifact
 
-An **Artifact** is a piece of evidence attached to a testament. Artifacts are polymorphic — the `Kind` field discriminates how to interpret the reference. **Errors are artifacts.** A failed operation does not return an error to the caller — it produces a testament with error artifacts. The issuer evaluates the testament, sees the error artifacts, and decides what to do. Nothing is silently dropped because every outcome — success or failure — is a testament with proof.
+An **Artifact** is a piece of typed evidence attached to a testament. Artifacts are polymorphic — the `Kind` field discriminates how to interpret the reference, and the `DataType` field declares the structured payload's type for type-safe deserialization by registered validators (see `docs/ARTIFACTS_AND_VALIDATIONS.md` §4.4). Artifacts carry a first-class lifecycle with eight states (generated, received, attached, validating, validated, plus three terminal failure states) committed by different parties at different transitions. See `docs/ARTIFACTS_AND_VALIDATIONS.md` §5 for the complete lifecycle. **Errors are artifacts.** A failed operation does not return an error to the caller — it produces a testament with error artifacts, or the artifact itself transitions to a terminal failure state with structured `Errors` entries. The issuer evaluates the testament, sees the error artifacts, and decides what to do. Nothing is silently dropped because every outcome — success or failure — is a testament with proof.
 
 | Kind | Example | Used By |
 |---|---|---|
@@ -385,7 +387,7 @@ Every type in the claims system (Action, Claim, Testament, Validation, Artifact)
 | Field | Type | Description | Reasoning | Example |
 |---|---|---|---|---|
 | `ID` | `string` | Globally unique identifier (UUID) | Stable identity for Relations, WAL events, and Fabric activities | `"c7a3e1b4-9f2d-4e8a-b5c1-3d7f9a2e4b6c"` |
-| `AgentID` | `string` | Specific agent instance that spawned this object | Same agent type can have multiple replicas or handoff successors. Instance-level correlation for debugging, capacity tracking, and replica identification | `"engineer-pipeline-a3f2"` |
+| `ParticipantID` | `string` | Specific participant instance that spawned this object (agent, service, system, or external). Same type can have multiple replicas or handoff successors. Instance-level correlation for debugging, capacity tracking, and replica identification. `AgentID` is preserved as a backward-compatibility alias during migration; new code should use `ParticipantID`. See `docs/CLAIMS_AND_INFRASTRUCTURE.md` §5.2 for the canonical `ParticipantRef` shape. | `"svc:vfs_provisioner:session/s1:pipeline/p1"` |
 | `SessionID` | `string` | User-facing session scope | Denormalized for Fabric queries — "show me all claims in session X" without board join | `"session_2026-04-21_a8b3"` |
 | `PipelineID` | `string` | Pipeline instance scope | Multiple pipelines run concurrently. Denormalized for cross-pipeline Fabric queries | `"pipe_jwt_auth_001"` |
 | `TaskID` | `string` | DAG task node scope | Primary filter for board-level queries and Fabric activity tagging | `"task_implement_jwt"` |
@@ -598,9 +600,9 @@ type Testament struct {
 }
 ```
 
-### 4.7 Artifact (immutable)
+### 4.7 Artifact
 
-An Artifact is evidence attached to a testament. Once created, never modified — updates produce a new artifact with a `supersedes` relation via a new testament.
+An Artifact is typed evidence attached to a testament. The artifact's content (Data, ContentHash, Kind, DataType) is immutable once committed; the artifact's lifecycle status mutates through eight states (generated, generation_failed, received, receipt_failed, attached, validating, validation_failed, validated). Updates to evidence content produce a new artifact with a `supersedes` relation via a new testament. See `docs/ARTIFACTS_AND_VALIDATIONS.md` for the complete artifact structure (typed Data field, ArtifactName, parent references, error capture, presentation hints) and lifecycle (state machine, commit ownership per transition, streaming-only model).
 
 ```go
 // Artifact is evidence attached to a testament. Immutable — once
@@ -612,59 +614,83 @@ An Artifact is evidence attached to a testament. Once created, never modified �
 // claim_action, testament_action, derived_from (source artifact).
 type Artifact struct {
     // ── Universal base (9 fields) ──
-    ID         string     `json:"id"`
+    ID            string     `json:"id"`
+    ParticipantID string     `json:"participant_id"` // formerly AgentID; preserved as alias during migration
+    SessionID     string     `json:"session_id"`
+    PipelineID    string     `json:"pipeline_id"`
+    TaskID        string     `json:"task_id"`
+    Sequence      uint64     `json:"sequence"`
+    Relations     []Relation `json:"relations"`
+    Created       time.Time  `json:"created"`
+    Accessed      time.Time  `json:"accessed"`
 
+    // ── Structural parent references ──
     // TestamentID is the structural parent — the testament this
-    // artifact belongs to. Every Artifact has exactly one parent
-    // Testament.
-    TestamentID string    `json:"testament_id"`
+    // artifact belongs to. Empty during the generated-but-unattached
+    // window; populated atomically with testament.generated.
+    TestamentID string `json:"testament_id"`
+    // ClaimID is always populated; the testifier knows the answering
+    // claim at artifact-generation time.
+    ClaimID string `json:"claim_id"`
 
-    AgentID    string     `json:"agent_id"`
-    SessionID  string     `json:"session_id"`
-    PipelineID string     `json:"pipeline_id"`
-    TaskID     string     `json:"task_id"`
-    Sequence   uint64     `json:"sequence"`
-    Relations  []Relation `json:"relations"`
-    Created    time.Time  `json:"created"`
-    Accessed   time.Time  `json:"accessed"`
+    // ── Name and type discrimination ──
+    // ArtifactName is the testifier-stamped free-form string used by
+    // Validations to bind via TargetArtifactName. Unique within the
+    // parent testament.
+    ArtifactName string `json:"artifact_name"`
 
-    // ── Artifact-specific fields ──
-
-    // Kind classifies the artifact. Free-form string — new kinds
-    // added without schema changes. Common kinds: "code_reference",
-    // "test_output", "research_paper", "reference_links",
-    // "knowledge_graph_vectors", "document_db_snippet",
-    // "ingestion_response", "design_asset", "diagnosis_report",
-    // "lint_output", "a11y_audit", "diff".
+    // Kind classifies the artifact for legacy compatibility and UI
+    // rendering. Free-form string. Common kinds: "code_reference",
+    // "test_output", "research_paper", "vfs_handle", "plan_markdown",
+    // "diagnosis_report", "lint_output", "diff".
     Kind string `json:"kind"`
 
-    // Reference is the content or pointer. Interpretation depends
-    // on Kind:
-    //   code_reference: "services/auth/jwk.go:47-89"
-    //   test_output: "TestDeserializeHS256JWK_ValidKey PASS (0.003s)"
-    //   ingestion_response: JSON of archivalist receipt
-    //   knowledge_graph_vectors: embedding ID from vector store
-    Reference string `json:"reference"`
+    // DataType declares the structured payload's type for type-safe
+    // deserialization by registered validators. Examples:
+    // "vfs_handle", "pipeline_pod_state", "test_output_v1".
+    DataType string `json:"data_type"`
 
-    // Metadata carries kind-specific structured data beyond the
-    // reference string.
+    // ── Typed data payload ──
+    // Data carries the canonical serialized form of the typed payload.
+    // Use ArtifactData[T] helpers from core/claims for typed access.
+    Data []byte `json:"data"`
+
+    // ── Compatibility carriers ──
+    // Reference is the legacy content or pointer carrier. New artifact
+    // kinds should declare a typed payload via DataType+Data rather
+    // than relying on Reference.
+    Reference string `json:"reference,omitempty"`
+
+    // Metadata carries kind-specific structured data outside the typed
+    // payload (timestamps, source IDs, immutable provenance markers).
     Metadata map[string]any `json:"metadata,omitempty"`
 
-    // ContentHash is SHA-256 of the artifact's content. Enables
-    // deduplication and integrity verification. Computed once at
-    // creation (immutable).
-    ContentHash string `json:"content_hash,omitempty"`
+    // ── Integrity ──
+    // ContentHash is SHA-256 of Data. Immutable.
+    ContentHash string `json:"content_hash"`
 
-    // Size is byte size of the artifact's content. Resource
-    // management and unbounded-growth prevention.
-    Size int64 `json:"size,omitempty"`
+    // Size is byte length of Data.
+    Size int64 `json:"size"`
 
     // Ephemeral marks artifacts that are transient (test output,
-    // build logs) vs durable (code references, design assets).
-    // Ephemeral artifacts can be evicted after the iteration completes.
+    // build logs, validation results) vs durable (code references,
+    // design assets). Ephemeral artifacts can be evicted after the
+    // iteration completes.
     Ephemeral bool `json:"ephemeral,omitempty"`
+
+    // ── Lifecycle ──
+    Status        ArtifactStatus `json:"status"`
+    StatusHistory []StatusChange `json:"status_history"`
+
+    // ── Error capture (populated on failure states) ──
+    Errors []*ArtifactError `json:"errors,omitempty"`
+
+    // ── Presentation hints (per docs/CLAIMS_VISIBILITY.md §4.1) ──
+    Presentation *Presentation `json:"presentation,omitempty"`
 }
 ```
+
+See `docs/ARTIFACTS_AND_VALIDATIONS.md` §4 for full field semantics and §5 for lifecycle states.
 
 ### 4.8 Validation (stateful)
 
@@ -680,68 +706,73 @@ A Validation is a quality gate on a claim. Validations have a lifecycle tracked 
 // reviews (artifact IDs examined during evaluation).
 type Validation struct {
     // ── Universal base (9 fields) ──
-    ID         string     `json:"id"`
+    ID            string     `json:"id"`
+    ParticipantID string     `json:"participant_id"` // formerly AgentID
+    SessionID     string     `json:"session_id"`
+    PipelineID    string     `json:"pipeline_id"`
+    TaskID        string     `json:"task_id"`
+    Sequence      uint64     `json:"sequence"`
+    Relations     []Relation `json:"relations"`
+    Created       time.Time  `json:"created"`
+    Accessed      time.Time  `json:"accessed"`
 
+    // ── Structural parent reference ──
     // ClaimID is the structural parent — the claim this validation
     // belongs to. Every Validation has exactly one parent Claim.
-    ClaimID    string     `json:"claim_id"`
+    ClaimID string `json:"claim_id"`
 
-    AgentID    string     `json:"agent_id"`
-    SessionID  string     `json:"session_id"`
-    PipelineID string     `json:"pipeline_id"`
-    TaskID     string     `json:"task_id"`
-    Sequence   uint64     `json:"sequence"`
-    Relations  []Relation `json:"relations"`
-    Created    time.Time  `json:"created"`
-    Accessed   time.Time  `json:"accessed"`
+    // ── Validation-target binding (1-1 to a specific artifact) ──
+    // TargetArtifactName matches against Artifact.ArtifactName in the
+    // testament responding to the parent claim. See
+    // docs/ARTIFACTS_AND_VALIDATIONS.md §6.3.
+    TargetArtifactName string `json:"target_artifact_name"`
 
-    // ── Validation-specific fields ──
+    // ── Handler binding ──
+    // ValidatorID is the registry key for the typed Go handler that
+    // executes the deterministic phase. See
+    // docs/ARTIFACTS_AND_VALIDATIONS.md §8.
+    ValidatorID      string `json:"validator_id"`
+    ArtifactDataType string `json:"artifact_data_type"`
+    ResultDataType   string `json:"result_data_type"`
 
-    // Description is the precise, atomic validation method.
-    // Examples:
-    //   "A JWK with a valid HS256 key deserializes successfully"
-    //   "Archivalist acknowledges receipt with status ok"
+    // ── Specification ──
     Description string `json:"description"`
 
-    // QualityBar is the standards/expectations statement.
-    // Examples:
-    //   "Returns typed JWK struct with Algorithm, KeyID, KeyBytes.
-    //    No silent fallbacks to other algorithms."
-    //   "Ingestion response with status ok and valid entry ID"
-    QualityBar string `json:"quality_bar"`
+    // QualityBar drives the agentic quality-bar phase. Non-empty
+    // quality bars are agentic-exclusive; non-agentic claimants
+    // cannot post validations with non-empty QualityBar (enforced at
+    // claim-posting time).
+    QualityBar string `json:"quality_bar,omitempty"`
 
-    // Type classifies the check: test, inspection, integration,
-    // contract, design, regression, receipt.
-    Type ValidationType `json:"type"`
+    Type     ValidationType `json:"type"`
+    Required bool           `json:"required"`
+    Weight   int            `json:"weight,omitempty"`
 
-    // Status tracks evaluation lifecycle: pending, in_progress,
-    // passed, failed, skipped.
-    Status ValidationStatus `json:"status"`
+    // Timeout bounds handler execution. Default 0 = no timeout.
+    // Agents may set per-skill. Timeout exceeded transitions the
+    // validation to validation_failed (not errored), treating the
+    // timeout as the artifact failing to process in time.
+    Timeout time.Duration `json:"timeout"`
 
-    // StatusHistory records every transition with reason. The
-    // evaluation verdict is captured here — no separate
-    // ValidationResult struct needed. The transition to passed/failed
-    // carries the evaluator's summary as Reason, and the evaluator
-    // agent is recorded in AgentID. Artifact references are captured
-    // as "reviews" Relations added at evaluation time.
-    StatusHistory []StatusChange `json:"status_history"`
-
-    // Required marks whether this validation is mandatory for claim
-    // acceptance. Advisory validations (Required=false) are evaluated
-    // and recorded but don't block acceptance.
-    Required bool `json:"required"`
-
-    // Weight indicates relative importance. Higher = more critical.
-    // Prioritizes evaluation order and surfaces the most impactful
-    // failures first in ambient context.
-    Weight int `json:"weight,omitempty"`
-
-    // Deadline is UTC time by which the evaluator should complete.
-    // Prevents validation from stalling the pipeline. Zero = no
-    // deadline.
+    // Deadline is the absolute UTC deadline derived from Created+Timeout.
     Deadline time.Time `json:"deadline,omitempty"`
+
+    // ── Lifecycle ──
+    Status        ValidationStatus `json:"status"`
+    StatusHistory []StatusChange   `json:"status_history"`
+
+    // ── Result capture ──
+    // ResultArtifactID is the ID of the typed result artifact the
+    // handler produced (Artifact[R]). Bundled into the per-claim
+    // result testament per docs/ARTIFACTS_AND_VALIDATIONS.md §9.
+    ResultArtifactID string           `json:"result_artifact_id,omitempty"`
+    Error            *ValidationError `json:"error,omitempty"`
+    EvaluatedAt      time.Time        `json:"evaluated_at,omitempty"`
+    EvaluatorRef     *ParticipantRef  `json:"evaluator_ref,omitempty"`
 }
 ```
+
+See `docs/ARTIFACTS_AND_VALIDATIONS.md` §6 for full field semantics and §7 for the ten-state validation lifecycle.
 
 ### 4.9 Enums
 
@@ -770,7 +801,16 @@ const (
     ActionStatusFailed    ActionStatus = "failed"     // terminal failure
 )
 
-// ClaimStatus tracks where a claim is in its lifecycle.
+// ClaimStatus tracks where a claim is in its lifecycle. The complete
+// expanded claim lifecycle is defined in
+// docs/CLAIMS_AND_TESTAMENTS_LIFECYCLE.md §4 with the full set:
+// generated, generation_failed, posted, post_failed, received,
+// receipt_failed, progressed, progress_failed, testament_generated,
+// testament_generation_failed, testament_acknowledged,
+// testament_acknowledgement_failed, validating, satisfied,
+// validation_incomplete, validation_failed, validation_errored. The
+// constants below remain as a coarse legacy projection; new code uses
+// the expanded states.
 type ClaimStatus string
 
 const (
@@ -782,15 +822,38 @@ const (
     ClaimStatusSuperseded ClaimStatus = "superseded"  // terminal
 )
 
-// ValidationStatus tracks a validation's evaluation lifecycle.
+// ArtifactStatus tracks the artifact's lifecycle. Defined fully in
+// docs/ARTIFACTS_AND_VALIDATIONS.md §5. Eight states.
+type ArtifactStatus string
+
+const (
+    ArtifactStatusGenerated        ArtifactStatus = "generated"
+    ArtifactStatusGenerationFailed ArtifactStatus = "generation_failed" // terminal
+    ArtifactStatusReceived         ArtifactStatus = "received"
+    ArtifactStatusReceiptFailed    ArtifactStatus = "receipt_failed"    // terminal
+    ArtifactStatusAttached         ArtifactStatus = "attached"
+    ArtifactStatusValidating       ArtifactStatus = "validating"
+    ArtifactStatusValidationFailed ArtifactStatus = "validation_failed" // terminal
+    ArtifactStatusValidated        ArtifactStatus = "validated"         // terminal
+)
+
+// ValidationStatus tracks a validation's evaluation lifecycle. Defined
+// fully in docs/ARTIFACTS_AND_VALIDATIONS.md §7. Ten states with
+// symmetric _not_required variants for each of the three failure
+// modes (validation, errored, quality_bar_validation_failed).
 type ValidationStatus string
 
 const (
-    ValidationStatusPending    ValidationStatus = "pending"
-    ValidationStatusInProgress ValidationStatus = "in_progress"
-    ValidationStatusPassed     ValidationStatus = "passed"     // terminal
-    ValidationStatusFailed     ValidationStatus = "failed"     // terminal
-    ValidationStatusSkipped    ValidationStatus = "skipped"    // terminal (waived)
+    ValidationStatusReady                                 ValidationStatus = "ready"
+    ValidationStatusValidating                            ValidationStatus = "validating"
+    ValidationStatusValidationFailed                      ValidationStatus = "validation_failed"
+    ValidationStatusValidationFailedNotRequired           ValidationStatus = "validation_failed_not_required"
+    ValidationStatusErrored                               ValidationStatus = "errored"
+    ValidationStatusErroredNotRequired                    ValidationStatus = "errored_not_required"
+    ValidationStatusValidatingQualityBar                  ValidationStatus = "validating_quality_bar"
+    ValidationStatusQualityBarValidationFailed            ValidationStatus = "quality_bar_validation_failed"
+    ValidationStatusQualityBarValidationFailedNotRequired ValidationStatus = "quality_bar_validation_failed_not_required"
+    ValidationStatusValidated                             ValidationStatus = "validated"
 )
 
 // ValidationType classifies what kind of check a validation performs.
@@ -1040,9 +1103,21 @@ Properties:
 
 ---
 
-## 5. Agent Intake and Processing
+## 5. Participant Intake and Processing
 
-The intake and processing mechanics are the universal shape every agent in the system shares. Every directed interaction an agent receives or emits flows through one discipline regardless of agent role, phase, or board scope.
+Every participant in Sylk consumes claims through one of two disciplines. Both disciplines emit identical wire-format testaments and deltas; the board, validators, bridge, and UI cannot distinguish them and must not branch on category for protocol behavior.
+
+### 5.A Agent Discipline
+
+The agent discipline applies to LLM-driven participants (agents). It is described in detail in §5.1–§5.11 below.
+
+### 5.B Service Discipline
+
+The service discipline applies to deterministic Go subsystems (services, system actors, external adapters). Services register handlers in a process-wide handler registry at boot. The dispatcher routes `claim.posted` deltas to the matching handler, invokes the handler within a tracked goroutine scope, captures the returned testament, and commits it to the board. The complete service consumption discipline is defined in `docs/CLAIMS_AND_INFRASTRUCTURE.md` §6 and §8.
+
+The two disciplines differ in consumption mechanics (LLM tool loop vs registered Go function), evaluation discipline (LLM judgment vs deterministic validator), and identity derivation (model-and-replica-keyed vs scope-keyed). They do not differ in wire format, delta envelope, lifecycle states, or board interaction.
+
+The remainder of this section (§5.1–§5.11) describes the agent discipline.
 
 ### 5.1 Three Sources, One Discipline
 
@@ -7031,6 +7106,7 @@ The Fabric itself is the observation/coordination substrate. With claims as the 
 | 10 | TUI | Protocol state display, sequential phase panels |
 | 11 | Boot, Container lifecycle | Boot pipeline phases |
 | 12 | Memory Forest, Knowledge Graph, Document DB, Fabric, Bleve | Raw activity harvesting, multi-source projection, unanchored search |
+| 13 | Infrastructure Participants (universal participant model) | Go-error return paths; opaque internal state; non-replayable infrastructure outcomes. See `docs/CLAIMS_AND_INFRASTRUCTURE.md` for the catalog of services to convert (identity registry, activation controller, DAG processor, VFS provisioners, KG read/write, doc DB read/write, guardian gates, boot sequencer, tool runtime, provider gateway, session manager, fabric subscriber, bus administrator). |
 
 **Total agents converted: 12**
 **Total sovereign systems retired: 3** (Pipeline Protocol, Coordination Service, Decision Manifest)

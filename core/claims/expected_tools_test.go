@@ -163,6 +163,34 @@ func boardWithExpectedValidation(t *testing.T, call ExpectedToolCall) (*ClaimsBo
 	return board, claim.ID, claim.Validations[0].ID
 }
 
+func assertExpectedToolTestamentLifecycle(t *testing.T, board *ClaimsBoard, result *ValidationExpectedToolExecutionResult, want TestamentLifecycleStatus) {
+	t.Helper()
+	if result.TestamentID == "" {
+		t.Fatal("expected-tool validation did not return an audit testament id")
+	}
+	testament, ok := board.CloneTestament(result.TestamentID)
+	if !ok {
+		t.Fatalf("expected-tool audit testament %q not committed", result.TestamentID)
+	}
+	if testament.LifecycleStatus != want {
+		t.Fatalf("testament lifecycle = %s, want %s", testament.LifecycleStatus, want)
+	}
+	seenReceived, seenValidating, seenTerminal := false, false, false
+	for _, entry := range testament.LifecycleHistory {
+		switch entry.To {
+		case string(TestamentLifecycleReceived):
+			seenReceived = true
+		case string(TestamentLifecycleValidating):
+			seenValidating = true
+		case string(want):
+			seenTerminal = true
+		}
+	}
+	if !seenReceived || !seenValidating || !seenTerminal {
+		t.Fatalf("testament lifecycle history missing received/validating/terminal: %+v", testament.LifecycleHistory)
+	}
+}
+
 func TestReceiptAutoPassDoesNotAutoPassInspectionValidation(t *testing.T) {
 	board := NewClaimsBoard(ClaimsBoardConfig{SessionID: "sess", TaskID: "task"})
 	if err := board.PostAction(context.Background(), Action{Type: ActionTypeConsultation, AgentID: "architect"}, []Claim{{
@@ -223,6 +251,10 @@ func TestExecuteValidationExpectedToolsSuccessProducesEvidenceAndPasses(t *testi
 	if !result.ValidationEvaluated || result.ValidationStatus != ValidationStatusPassed {
 		t.Fatalf("result validation = evaluated:%v status:%s", result.ValidationEvaluated, result.ValidationStatus)
 	}
+	if result.ValidationActorID != "architect" {
+		t.Fatalf("validation actor = %q, want issuer architect", result.ValidationActorID)
+	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidated)
 	claim, _ := board.CloneClaim(claimID)
 	if claim.Validations[0].Status != ValidationStatusPassed {
 		t.Fatalf("validation status = %s, want passed", claim.Validations[0].Status)
@@ -279,6 +311,7 @@ func TestExecuteValidationExpectedToolsFailedEvidenceRejectsClaim(t *testing.T) 
 	if claim.LifecycleStatus != ClaimLifecycleValidationFailed {
 		t.Fatalf("claim lifecycle = %s, want validation_failed", claim.LifecycleStatus)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidationFailed)
 }
 
 func TestExecuteValidationExpectedToolsMissingEvidenceMarksIncomplete(t *testing.T) {
@@ -309,6 +342,7 @@ func TestExecuteValidationExpectedToolsMissingEvidenceMarksIncomplete(t *testing
 	if claim.LifecycleStatus != ClaimLifecycleValidationIncomplete {
 		t.Fatalf("claim lifecycle = %s, want validation_incomplete", claim.LifecycleStatus)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidationIncomplete)
 }
 
 func TestExecuteValidationExpectedToolsPolicyDeniedFailsWithArtifact(t *testing.T) {
@@ -345,6 +379,7 @@ func TestExecuteValidationExpectedToolsPolicyDeniedFailsWithArtifact(t *testing.
 	if artifact.Kind != ArtifactKindPolicyDenied {
 		t.Fatalf("artifact kind = %q, want policy_denied", artifact.Kind)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidationErrored)
 }
 
 func TestExecuteValidationExpectedToolsRedactsArgumentsInAuditArtifacts(t *testing.T) {
@@ -418,6 +453,7 @@ func TestExecuteValidationExpectedToolsRequiredSkipFailsValidation(t *testing.T)
 	if result.ValidationStatus != ValidationStatusErrored {
 		t.Fatalf("validation status = %s, want errored", result.ValidationStatus)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidationErrored)
 }
 
 func TestExecuteValidationExpectedToolsOptionalSkipDoesNotFailValidation(t *testing.T) {
@@ -434,6 +470,7 @@ func TestExecuteValidationExpectedToolsOptionalSkipDoesNotFailValidation(t *test
 	if result.ValidationStatus != ValidationStatusPassed {
 		t.Fatalf("validation status = %s, want passed", result.ValidationStatus)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidated)
 }
 
 func TestExecuteValidationExpectedToolsPanicBecomesErrorArtifact(t *testing.T) {
@@ -459,6 +496,7 @@ func TestExecuteValidationExpectedToolsPanicBecomesErrorArtifact(t *testing.T) {
 	if !strings.Contains(artifact.Reference, "panicked") {
 		t.Fatalf("panic artifact reference = %q", artifact.Reference)
 	}
+	assertExpectedToolTestamentLifecycle(t, board, result, TestamentLifecycleValidationErrored)
 }
 
 func TestExecuteValidationExpectedToolsUnknownValidationIDFails(t *testing.T) {

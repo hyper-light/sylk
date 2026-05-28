@@ -13,6 +13,16 @@ consult completion path, and no hidden success or failure channel.
 
 Every lifecycle fact that matters must be posted to the board.
 
+This applies equally to agent participants (LLM-driven) and service
+participants (deterministic Go subsystems) per
+`docs/CLAIMS_AND_INFRASTRUCTURE.md`. Lifecycle states, transitions,
+deltas, and propagation rules are uniform across participant
+categories. The board, validators, bridge, and UI cannot distinguish
+agent-produced from service-produced lifecycle events at the protocol
+level. Per-artifact lifecycle is layered onto the per-testament/per-claim
+lifecycle defined here via the aggregation rules in
+`docs/ARTIFACTS_AND_VALIDATIONS.md` §11.
+
 That includes early facts such as "a claim was generated" and "a testament
 was generated." These are not local-only process events. They are durable
 board facts with explicit lifecycle statuses.
@@ -125,6 +135,30 @@ Examples:
 Posting controls delivery and downstream work. A generated object can fail
 to post without disappearing, because its failed posting status is itself a
 durable lifecycle fact.
+
+### 3.3 Aggregation From Per-Artifact Lifecycle
+
+Per `docs/ARTIFACTS_AND_VALIDATIONS.md` §11, the testament lifecycle is
+driven by aggregation over its artifacts' lifecycles, and the claim
+lifecycle is driven by aggregation over its testament's lifecycle.
+
+Specifically:
+
+- `claim.validation_incomplete` is triggered when any required
+  artifact is missing from the responding testament (no artifact
+  with matching `ArtifactName` for a declared validation's
+  `TargetArtifactName`) or when any artifact reaches
+  `artifact.receipt_failed`.
+- `claim.validation_failed` is triggered when any required artifact
+  reaches `artifact.validation_failed`.
+- `claim.validation_errored` is triggered when any required validation
+  reaches `validation.errored` (validator infrastructure failure).
+- `claim.satisfied` is triggered when all required artifacts reach
+  `artifact.validated`.
+
+The propagation is atomic: child transitions and parent transitions
+commit within the same board transaction. The claimant runtime is the
+sole party committing the propagation.
 
 ## 4. Claim Lifecycle
 
@@ -434,6 +468,40 @@ Examples:
 
 Validation errors must be captured as error artifacts.
 
+### 4.X Self-Issued Result Testaments (Asymmetric Lifecycle)
+
+Per `docs/ARTIFACTS_AND_VALIDATIONS.md` §9, the claimant generates a
+per-claim **result testament** that bundles all validation result
+artifacts produced by the deterministic validator handlers on that
+claim. This testament has an asymmetric lifecycle that is recognized
+as a valid exception to the standard testament lifecycle defined in
+§5 below.
+
+The result testament's properties:
+
+- Its `Issuer` is the claimant (the participant that issued the
+  original claim).
+- Its `ClaimID` field is set to the original claim's ID.
+- Its lifecycle terminates at `testament.posted` — it never reaches
+  `testament.received` because the claimant is both issuer and
+  recipient and there is no separate consumer to acknowledge.
+- The result artifacts inside terminate at `artifact.generated` —
+  they are evidence the claimant generated for the audit trail, not
+  work product to be consumed or re-validated.
+
+This asymmetry is not a violation of the lifecycle contract. The
+lifecycle states are reached truthfully (generated and posted are
+real states); subsequent states are simply not reachable because no
+consumer exists. The board's WAL records the truncated lifecycle.
+Replay reconstructs the result testament at `posted` and the result
+artifacts at `generated` without attempting further transitions.
+
+Result testaments do not propagate to claim transitions. The original
+claim's lifecycle is driven by the *target's* testament, not by the
+claimant's self-issued result testament. The result testament is a
+parallel evidence record that the Memory Forest and inspectors may
+harvest as audit-trail context.
+
 ## 5. Testament Lifecycle
 
 The canonical testament lifecycle is:
@@ -605,25 +673,60 @@ facts.
 
 ## 8. Receiver Semantics
 
-### Target Agent
+### Target Participant
 
-The target agent reacts to `claim.posted` or a targeted delivery projection
-derived from it.
+The target participant (agent or service) reacts to `claim.posted` or a
+targeted delivery projection derived from it.
 
 The first durable response from the target should be `claim.received` if
-the agent accepts the work for processing. If receipt fails, the system
-records `claim.receipt_failed`.
+the participant accepts the work for processing. If receipt fails, the
+system records `claim.receipt_failed`.
 
 The target then emits `claim.progressed` as useful, generates and posts a
 testament, or records progress/testament failure with error artifacts.
 
-### Source Agent
+For agent targets, receipt and progress are committed by the agent's
+ClaimsInbox and tool loop. For service targets, receipt and progress are
+committed by the service dispatcher per
+`docs/CLAIMS_AND_INFRASTRUCTURE.md` §8. The lifecycle semantics are
+identical.
 
-The source agent reacts to `testament.posted`.
+### Source Participant
+
+The source participant (claimant — the issuer of the original claim;
+agent, service, or system) reacts to `testament.posted`.
 
 It acknowledges receipt through `testament.received` and
 `claim.testament_acknowledged`, then validates the testament by transitioning
 the claim and testament through validating and terminal validation states.
+
+For agent claimants, validation orchestration runs in the agent's tool
+loop with optional agentic quality-bar assessment phases per
+`docs/ARTIFACTS_AND_VALIDATIONS.md` §7. For service claimants, validation
+orchestration runs in the service's runtime using exclusively
+deterministic typed validators (non-empty quality bars are rejected at
+claim-posting time for non-agent claimants).
+
+### Service Participant Receiver Discipline
+
+When the target or source participant is a service (deterministic Go
+subsystem), the consumption discipline is:
+
+- **claim.posted** routes to the service's registered handler via
+  `docs/CLAIMS_AND_INFRASTRUCTURE.md` §8 dispatcher. The dispatcher
+  commits `claim.received` before invoking the handler.
+- The handler executes synchronously (returning a `HandlerResult` with
+  a testament) or asynchronously (returning a `HandlerContinuation`).
+  Synchronous handlers may compress lifecycle states per §10 of the
+  infrastructure doc.
+- **testament.posted** for service-issued testaments commits via the
+  handler's return path; the dispatcher stamps `testament.generated`
+  and `testament.posted` per the streaming-only model in
+  `docs/ARTIFACTS_AND_VALIDATIONS.md` §2.7.
+- Service claimants orchestrate validation exclusively through the
+  programmatic validator registry; no agentic quality-bar phase is
+  reachable.
+- All other lifecycle deltas are identical to the agent discipline.
 
 ### UI
 
@@ -821,6 +924,13 @@ A claims/testaments lifecycle implementation is correct only if:
    returns or inferred metadata.
 9. Replay is idempotent.
 10. Direct Guide routing does not remain a second workflow authority.
+11. Infrastructure outcomes are testaments with artifacts, not Go-error
+    returns. Every deterministic subsystem that mutates board-visible
+    state participates as a service participant per
+    `docs/CLAIMS_AND_INFRASTRUCTURE.md`.
+12. Service handler dispatch follows the same lifecycle contracts as
+    agent dispatch. The wire format is identical; only the consumption
+    mechanism (registered Go function vs LLM tool loop) differs.
 
 ## 16. Phased Implementation Plan
 
