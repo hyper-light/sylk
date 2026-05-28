@@ -912,3 +912,7 @@ func validatePlanWorkflow(plan *DesignPlan) error {
 func (a *Architect) persistPlanState(plan *DesignPlan) error {
 	return a.planStore.Upsert(plan)
 }
+
+func (a *Architect) persistPlanStateSnapshot(plan *DesignPlan, snapshot *DesignPlan) error {
+	return a.planStore.UpsertSnapshot(plan, snapshot)
+}

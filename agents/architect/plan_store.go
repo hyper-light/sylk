@@ -69,13 +69,31 @@ func (s *PlanStore) Upsert(plan *DesignPlan) error {
 	if plan == nil || strings.TrimSpace(plan.ID) == "" {
 		return nil
 	}
+	if err := ensurePlanArtifactMetadata(s.baseDir, plan); err != nil {
+		return err
+	}
+	return s.UpsertSnapshot(plan, cloneDesignPlanForPersistence(plan))
+}
+
+// UpsertSnapshot stores live in memory and persists snapshot to disk.
+// Callers that mutate plans under their own locks can pass a snapshot
+// captured while holding that lock so JSON persistence never observes
+// concurrently-mutated maps or slices.
+func (s *PlanStore) UpsertSnapshot(live *DesignPlan, snapshot *DesignPlan) error {
+	plan := firstNonNilPlan(live, snapshot)
+	if plan == nil || strings.TrimSpace(plan.ID) == "" {
+		return nil
+	}
+	if snapshot == nil {
+		snapshot = cloneDesignPlanForPersistence(plan)
+	}
 	s.mu.Lock()
 	s.plans[plan.ID] = plan
 	s.mu.Unlock()
-	if err := s.persistSnapshot(plan); err != nil {
+	if err := s.persistSnapshot(snapshot); err != nil {
 		return err
 	}
-	return s.mirrorPlan(plan)
+	return s.mirrorPlan(snapshot)
 }
 
 // Get returns the plan for the given ID, or nil.
@@ -395,7 +413,7 @@ func (s *PlanStore) persistSnapshot(plan *DesignPlan) error {
 	if err := ensurePlanArtifactMetadata(s.baseDir, plan); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(plan, "", "  ")
+	encoded, err := marshalPlanSnapshot(plan)
 	if err != nil {
 		return err
 	}
@@ -409,6 +427,84 @@ func (s *PlanStore) persistSnapshot(plan *DesignPlan) error {
 		return err
 	}
 	return os.Rename(tmpPath, finalPath)
+}
+
+func firstNonNilPlan(plans ...*DesignPlan) *DesignPlan {
+	for _, plan := range plans {
+		if plan != nil {
+			return plan
+		}
+	}
+	return nil
+}
+
+func cloneDesignPlanForPersistence(plan *DesignPlan) *DesignPlan {
+	if plan == nil {
+		return nil
+	}
+	if cloned := jsonCloneDesignPlan(plan); cloned != nil {
+		return cloned
+	}
+	cloned := *plan
+	cloned.Consultations = cloneConsultationEvidenceMap(plan.Consultations)
+	cloned.EvidenceTrail = clonePlanEvidenceSlice(plan.EvidenceTrail)
+	return &cloned
+}
+
+func jsonCloneDesignPlan(plan *DesignPlan) (cloned *DesignPlan) {
+	defer func() {
+		if recover() != nil {
+			cloned = nil
+		}
+	}()
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		return nil
+	}
+	var decoded DesignPlan
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return nil
+	}
+	return &decoded
+}
+
+func cloneConsultationEvidenceMap(input map[string]*ConsultationEvidence) map[string]*ConsultationEvidence {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*ConsultationEvidence, len(input))
+	for key, value := range input {
+		if value == nil {
+			continue
+		}
+		next := *value
+		cloned[key] = &next
+	}
+	return cloned
+}
+
+func clonePlanEvidenceSlice(input []*PlanEvidence) []*PlanEvidence {
+	if len(input) == 0 {
+		return nil
+	}
+	cloned := make([]*PlanEvidence, 0, len(input))
+	for _, value := range input {
+		if value == nil {
+			continue
+		}
+		cloned = append(cloned, clonePlanEvidence(value))
+	}
+	return cloned
+}
+
+func marshalPlanSnapshot(plan *DesignPlan) (encoded []byte, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			encoded = nil
+			err = fmt.Errorf("marshal plan snapshot: %v", recovered)
+		}
+	}()
+	return json.MarshalIndent(plan, "", "  ")
 }
 
 func (s *PlanStore) mirrorPlan(plan *DesignPlan) error {

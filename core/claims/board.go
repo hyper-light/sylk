@@ -1668,7 +1668,7 @@ func (b *ClaimsBoard) Projection() *ClaimsBoardProjection {
 	// Fast path: return cached projection if not dirty.
 	if !b.projectionDirty.Load() {
 		if cached := b.cachedProjection.Load(); cached != nil {
-			return cached
+			return CloneClaimsBoardProjection(cached)
 		}
 	}
 
@@ -1692,7 +1692,7 @@ func (b *ClaimsBoard) Projection() *ClaimsBoardProjection {
 
 	b.cachedProjection.Store(p)
 	b.projectionDirty.Store(false)
-	return p
+	return CloneClaimsBoardProjection(p)
 }
 
 // invalidateProjectionCache marks the cached projection as stale.
@@ -1727,7 +1727,11 @@ func (b *ClaimsBoard) populateClaimsProjectionLocked(p *ClaimsBoardProjection) {
 		if !ok {
 			continue
 		}
-		clone := *c
+		clonePtr := CloneClaimEntity(c)
+		if clonePtr == nil {
+			continue
+		}
+		clone := *clonePtr
 		clone.StatusHistory = capStatusHistory(clone.StatusHistory)
 		p.Claims = append(p.Claims, clone)
 		p.TotalClaims++

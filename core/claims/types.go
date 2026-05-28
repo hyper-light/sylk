@@ -898,6 +898,48 @@ type ClaimsBoardProjection struct {
 	Updated time.Time `json:"updated"`
 }
 
+// CloneClaimsBoardProjection returns a defensive copy of a board
+// projection. Projection callers are allowed to keep or transform the
+// returned value without mutating board state or the projection cache.
+func CloneClaimsBoardProjection(p *ClaimsBoardProjection) *ClaimsBoardProjection {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if len(p.Actions) > 0 {
+		cp.Actions = make([]Action, len(p.Actions))
+		for i := range p.Actions {
+			cp.Actions[i] = p.Actions[i]
+			if len(p.Actions[i].Relations) > 0 {
+				cp.Actions[i].Relations = append([]Relation(nil), p.Actions[i].Relations...)
+			}
+			if len(p.Actions[i].StatusHistory) > 0 {
+				cp.Actions[i].StatusHistory = append([]StatusChange(nil), p.Actions[i].StatusHistory...)
+			}
+		}
+	}
+	if len(p.Claims) > 0 {
+		cp.Claims = make([]Claim, len(p.Claims))
+		for i := range p.Claims {
+			if clone := CloneClaimEntity(&p.Claims[i]); clone != nil {
+				cp.Claims[i] = *clone
+			}
+		}
+	}
+	if len(p.Testaments) > 0 {
+		cp.Testaments = make([]Testament, len(p.Testaments))
+		for i := range p.Testaments {
+			if clone := CloneTestamentEntity(&p.Testaments[i]); clone != nil {
+				cp.Testaments[i] = *clone
+			}
+		}
+	}
+	if len(p.NotificationErrors) > 0 {
+		cp.NotificationErrors = append([]string(nil), p.NotificationErrors...)
+	}
+	return &cp
+}
+
 // ClaimProgressUpdate is the payload for UpdateClaimProgress — how
 // subjects report incremental work before submitting a testament.
 type ClaimProgressUpdate struct {

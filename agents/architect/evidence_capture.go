@@ -439,15 +439,17 @@ func (a *Architect) attachPlanEvidence(ctx context.Context, evidence *PlanEviden
 		a.stagePlanEvidence(ctx, evidence)
 		return
 	}
+	var snapshot *DesignPlan
 	a.evidenceMu.Lock()
 	changed := appendPlanEvidence(plan, evidence)
 	if changed {
 		plan.CodebasePatterns = extractLibrarianPatterns(plan)
 		plan.UpdatedAt = time.Now()
+		snapshot = cloneDesignPlanForPersistence(plan)
 	}
 	a.evidenceMu.Unlock()
 	if changed {
-		if err := a.persistPlanState(plan); err != nil {
+		if err := a.persistPlanStateSnapshot(plan, snapshot); err != nil {
 			a.logWarn("persist consultation evidence failed", "plan_id", plan.ID, "error", err)
 		}
 	}
@@ -463,15 +465,17 @@ func (a *Architect) attachPlanInputEvidence(ctx context.Context, plan *DesignPla
 		}
 		return
 	}
+	var snapshot *DesignPlan
 	a.evidenceMu.Lock()
 	changed := mergePlanInputEvidence(plan, evidence)
 	if changed {
 		plan.CodebasePatterns = extractLibrarianPatterns(plan)
 		plan.UpdatedAt = time.Now()
+		snapshot = cloneDesignPlanForPersistence(plan)
 	}
 	a.evidenceMu.Unlock()
 	if changed {
-		if err := a.persistPlanState(plan); err != nil {
+		if err := a.persistPlanStateSnapshot(plan, snapshot); err != nil {
 			a.logWarn("persist input evidence failed", "plan_id", plan.ID, "error", err)
 		}
 	}

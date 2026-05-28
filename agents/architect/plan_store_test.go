@@ -47,6 +47,62 @@ func TestPlanStore_UpsertAndGet(t *testing.T) {
 	}
 }
 
+func TestPlanStore_UpsertSnapshotPersistsSnapshotWhileKeepingLivePlan(t *testing.T) {
+	store := testPlanStore(t)
+	defer store.Close()
+
+	plan := &DesignPlan{
+		ID:        "plan-snapshot",
+		SessionID: "sess-snapshot",
+		Status:    PlanStatusPending,
+		UpdatedAt: time.Now(),
+		EvidenceTrail: []*PlanEvidence{{
+			ID:      "consult:librarian",
+			Kind:    EvidenceKindConsult,
+			Target:  "librarian",
+			Query:   "What exists?",
+			Success: true,
+			Data:    map[string]any{"summary": "one"},
+		}},
+	}
+	plan.sm = NewPlanStateMachine(plan.ID, PlanStatusPending)
+	syncConsultationIndexFromTrail(plan)
+
+	snapshot := cloneDesignPlanForPersistence(plan)
+	plan.EvidenceTrail = append(plan.EvidenceTrail, &PlanEvidence{
+		ID:      "consult:academic",
+		Kind:    EvidenceKindConsult,
+		Target:  "academic",
+		Query:   "What risks?",
+		Success: true,
+		Data:    map[string]any{"summary": "two"},
+	})
+	syncConsultationIndexFromTrail(plan)
+
+	if err := store.UpsertSnapshot(plan, snapshot); err != nil {
+		t.Fatalf("UpsertSnapshot failed: %v", err)
+	}
+	if got := store.Get(plan.ID); got != plan {
+		t.Fatalf("stored live plan pointer = %p, want %p", got, plan)
+	}
+
+	diskPath := versionedPlanSnapshotPath(store.baseDir, plan.SessionID, plan.ID, normalizedPlanArtifactVersion(snapshot))
+	encoded, err := os.ReadFile(diskPath)
+	if err != nil {
+		t.Fatalf("read persisted snapshot: %v", err)
+	}
+	var persisted DesignPlan
+	if err := json.Unmarshal(encoded, &persisted); err != nil {
+		t.Fatalf("decode persisted snapshot: %v", err)
+	}
+	if got := len(persisted.EvidenceTrail); got != 1 {
+		t.Fatalf("persisted EvidenceTrail len = %d, want immutable snapshot len 1", got)
+	}
+	if got := len(store.Get(plan.ID).EvidenceTrail); got != 2 {
+		t.Fatalf("live EvidenceTrail len = %d, want 2", got)
+	}
+}
+
 func TestPlanStore_Get_Missing(t *testing.T) {
 	store := testPlanStore(t)
 	defer store.Close()
