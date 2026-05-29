@@ -267,6 +267,42 @@ packages:
         config:
           mockname: "ValidationExpectedToolRemediationPoster"
 
+      DAGProcessorBackend:
+        config:
+          mockname: "DAGProcessorBackend"
+
+      VFSProvisionerBackend:
+        config:
+          mockname: "VFSProvisionerBackend"
+
+      ToolRuntimeBackend:
+        config:
+          mockname: "ToolRuntimeBackend"
+
+      KnowledgeBackend:
+        config:
+          mockname: "KnowledgeBackend"
+
+      MemoryContinuityBackend:
+        config:
+          mockname: "MemoryContinuityBackend"
+
+      DocumentBackend:
+        config:
+          mockname: "DocumentBackend"
+
+      GuardianBackend:
+        config:
+          mockname: "GuardianBackend"
+
+      ProviderGatewayBackend:
+        config:
+          mockname: "ProviderGatewayBackend"
+
+      ExternalAdapterBackend:
+        config:
+          mockname: "ExternalAdapterBackend"
+
   github.com/adalundhe/sylk/ui/bridge:
     config:
       dir: "ui/bridge/mocks"

@@ -74,7 +74,6 @@ const (
 	InfrastructureStatusOK          = "ok"
 	InfrastructureStatusFailed      = "failed"
 	InfrastructureStatusInterrupted = "interrupted"
-	InfrastructureStatusFallback    = "fallback"
 )
 
 const (
@@ -108,6 +107,15 @@ type InfrastructureServiceConfig struct {
 	OutputSummaryLimit   int
 	ProviderPartialLimit int
 	Clock                ClaimsClock
+	DAGBackend           DAGProcessorBackend
+	VFSBackend           VFSProvisionerBackend
+	ToolBackend          ToolRuntimeBackend
+	KnowledgeBackend     KnowledgeBackend
+	MemoryBackend        MemoryContinuityBackend
+	DocumentBackend      DocumentBackend
+	GuardianBackend      GuardianBackend
+	ProviderBackend      ProviderGatewayBackend
+	ExternalBackend      ExternalAdapterBackend
 }
 
 type InfrastructureService struct {
@@ -118,6 +126,15 @@ type InfrastructureService struct {
 	outputSummaryLimit   int
 	providerPartialLimit int
 	clock                ClaimsClock
+	dagBackend           DAGProcessorBackend
+	vfsBackend           VFSProvisionerBackend
+	toolBackend          ToolRuntimeBackend
+	knowledgeBackend     KnowledgeBackend
+	memoryBackend        MemoryContinuityBackend
+	documentBackend      DocumentBackend
+	guardianBackend      GuardianBackend
+	providerBackend      ProviderGatewayBackend
+	externalBackend      ExternalAdapterBackend
 	dag                  *boundedInfrastructureRecords[DAGOperationArtifactData]
 	vfs                  *boundedInfrastructureRecords[VFSOperationArtifactData]
 	tool                 *boundedInfrastructureRecords[ToolRuntimeExecutionArtifactData]
@@ -149,6 +166,15 @@ func NewInfrastructureService(cfg InfrastructureServiceConfig) (*InfrastructureS
 		outputSummaryLimit:   cfg.OutputSummaryLimit,
 		providerPartialLimit: cfg.ProviderPartialLimit,
 		clock:                firstNonNilClock(cfg.Clock),
+		dagBackend:           cfg.DAGBackend,
+		vfsBackend:           cfg.VFSBackend,
+		toolBackend:          cfg.ToolBackend,
+		knowledgeBackend:     cfg.KnowledgeBackend,
+		memoryBackend:        cfg.MemoryBackend,
+		documentBackend:      cfg.DocumentBackend,
+		guardianBackend:      cfg.GuardianBackend,
+		providerBackend:      cfg.ProviderBackend,
+		externalBackend:      cfg.ExternalBackend,
 		dag:                  newBoundedInfrastructureRecords[DAGOperationArtifactData](cfg.MaxRecords),
 		vfs:                  newBoundedInfrastructureRecords[VFSOperationArtifactData](cfg.MaxRecords),
 		tool:                 newBoundedInfrastructureRecords[ToolRuntimeExecutionArtifactData](cfg.MaxRecords),
@@ -447,7 +473,13 @@ func (s *InfrastructureService) externalHandlers() map[string]infrastructureTool
 func (s *InfrastructureService) handleDAG(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeDAGOperation(ctx, call, req)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failDAGOperation(DAGOperationArtifactData{Operation: call.Tool, PipelineID: claimIDForInfrastructure(req.Claim)}, err.Error())
+	} else if s.dagBackend == nil {
+		data = failDAGOperation(data, "DAG backend not configured")
+	} else if backendData, backendErr := s.dagBackend.HandleDAGOperation(ctx, DAGOperationRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failDAGOperation(data, backendErr.Error())
+	} else {
+		data = finalizeDAGBackendData(ctx, call, req, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.dag.Upsert(infrastructureRecordKey(data.PipelineID, data.Operation, claimIDForInfrastructure(req.Claim)), data) {
@@ -464,7 +496,13 @@ func (s *InfrastructureService) handleDAG(ctx context.Context, call ExpectedTool
 func (s *InfrastructureService) handleVFS(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeVFSOperation(ctx, call, req, s.vfsScope)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failVFSOperation(VFSOperationArtifactData{Operation: call.Tool, Scope: firstNonEmpty(s.vfsScope, "workspace")}, err.Error())
+	} else if s.vfsBackend == nil {
+		data = failVFSOperation(data, "VFS backend not configured")
+	} else if backendData, backendErr := s.vfsBackend.HandleVFSOperation(ctx, VFSOperationRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failVFSOperation(data, backendErr.Error())
+	} else {
+		data = finalizeVFSBackendData(ctx, call, req, s.vfsScope, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.vfs.Upsert(infrastructureRecordKey(data.MountRef, data.Operation, claimIDForInfrastructure(req.Claim)), data) {
@@ -481,7 +519,13 @@ func (s *InfrastructureService) handleVFS(ctx context.Context, call ExpectedTool
 func (s *InfrastructureService) handleToolRuntime(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeToolRuntimeExecution(ctx, call, req, s.clock, s.outputSummaryLimit)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failToolRuntimeExecution(ToolRuntimeExecutionArtifactData{ToolName: firstNonEmpty(stringArg(call.Arguments, "tool_name"), stringArg(call.Arguments, "tool"), call.Tool)}, err.Error())
+	} else if s.toolBackend == nil {
+		data = failToolRuntimeExecution(data, "tool runtime backend not configured")
+	} else if backendData, backendErr := s.toolBackend.HandleToolRuntimeExecution(ctx, ToolRuntimeExecutionRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failToolRuntimeExecution(data, backendErr.Error())
+	} else {
+		data = finalizeToolBackendData(ctx, call, s.clock, s.outputSummaryLimit, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.tool.Upsert(infrastructureRecordKey(data.ToolName, call.ID, claimIDForInfrastructure(req.Claim)), data) {
@@ -498,7 +542,13 @@ func (s *InfrastructureService) handleToolRuntime(ctx context.Context, call Expe
 func (s *InfrastructureService) handleKnowledge(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeKnowledgeOperation(ctx, call, req)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failKnowledgeOperation(KnowledgeOperationArtifactData{Operation: call.Tool}, err.Error())
+	} else if s.knowledgeBackend == nil {
+		data = failKnowledgeOperation(data, "knowledge backend not configured")
+	} else if backendData, backendErr := s.knowledgeBackend.HandleKnowledgeOperation(ctx, KnowledgeOperationRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failKnowledgeOperation(data, backendErr.Error())
+	} else {
+		data = finalizeKnowledgeBackendData(ctx, call, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.knowledge.Upsert(infrastructureRecordKey(data.Operation, claimIDForInfrastructure(req.Claim), data.QueryShape), data) {
@@ -515,7 +565,13 @@ func (s *InfrastructureService) handleKnowledge(ctx context.Context, call Expect
 func (s *InfrastructureService) handleMemory(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeMemoryContinuity(ctx, call, req)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failMemoryContinuity(MemoryContinuityArtifactData{Operation: call.Tool, Topic: reqSessionID(req)}, err.Error())
+	} else if s.memoryBackend == nil {
+		data = failMemoryContinuity(data, "memory continuity backend not configured")
+	} else if backendData, backendErr := s.memoryBackend.HandleMemoryContinuity(ctx, MemoryContinuityRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failMemoryContinuity(data, backendErr.Error())
+	} else {
+		data = finalizeMemoryBackendData(ctx, call, req, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.memory.Upsert(infrastructureRecordKey(data.Topic, data.AgentID, data.Operation), data) {
@@ -532,7 +588,13 @@ func (s *InfrastructureService) handleMemory(ctx context.Context, call ExpectedT
 func (s *InfrastructureService) handleDocument(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeDocumentOperation(ctx, call, req)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failDocumentOperation(DocumentOperationArtifactData{Operation: call.Tool, DocumentID: stringArg(call.Arguments, "document_id")}, err.Error())
+	} else if s.documentBackend == nil {
+		data = failDocumentOperation(data, "document backend not configured")
+	} else if backendData, backendErr := s.documentBackend.HandleDocumentOperation(ctx, DocumentOperationRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failDocumentOperation(data, backendErr.Error())
+	} else {
+		data = finalizeDocumentBackendData(ctx, call, req, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.document.Upsert(infrastructureRecordKey(data.DocumentID, data.Operation, claimIDForInfrastructure(req.Claim)), data) {
@@ -549,7 +611,13 @@ func (s *InfrastructureService) handleDocument(ctx context.Context, call Expecte
 func (s *InfrastructureService) handleGuardian(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeGuardianDecision(ctx, call, req)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failGuardianDecision(GuardianDecisionArtifactData{Operation: call.Tool}, err.Error())
+	} else if s.guardianBackend == nil {
+		data = failGuardianDecision(data, "guardian backend not configured")
+	} else if backendData, backendErr := s.guardianBackend.HandleGuardianDecision(ctx, GuardianDecisionRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failGuardianDecision(data, backendErr.Error())
+	} else {
+		data = finalizeGuardianBackendData(ctx, call, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.guardian.Upsert(infrastructureRecordKey(data.ApprovalSubject, data.Operation, data.PolicyRule), data) {
@@ -566,7 +634,13 @@ func (s *InfrastructureService) handleGuardian(ctx context.Context, call Expecte
 func (s *InfrastructureService) handleProvider(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeProviderGatewayCall(ctx, call, req, s.providerPartialLimit)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failProviderGatewayCall(ProviderGatewayCallArtifactData{Operation: call.Tool, Model: stringArg(call.Arguments, "model")}, err.Error())
+	} else if s.providerBackend == nil {
+		data = failProviderGatewayCall(data, "provider gateway backend not configured")
+	} else if backendData, backendErr := s.providerBackend.HandleProviderGatewayCall(ctx, ProviderGatewayCallRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failProviderGatewayCall(data, backendErr.Error())
+	} else {
+		data = finalizeProviderBackendData(ctx, call, req, s.providerPartialLimit, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.provider.Upsert(infrastructureRecordKey(data.ProviderRequestID, data.PromptHash, claimIDForInfrastructure(req.Claim)), data) {
@@ -583,7 +657,13 @@ func (s *InfrastructureService) handleProvider(ctx context.Context, call Expecte
 func (s *InfrastructureService) handleExternal(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	data, err := normalizeExternalAdapterEvent(ctx, call, req, s.clock)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		data = failExternalAdapterEvent(ExternalAdapterEventArtifactData{Operation: call.Tool, Source: normalizedExternalSource(ParticipantRef{}, call.Arguments)}, err.Error())
+	} else if s.externalBackend == nil {
+		data = failExternalAdapterEvent(data, "external adapter backend not configured")
+	} else if backendData, backendErr := s.externalBackend.HandleExternalAdapterEvent(ctx, ExternalAdapterEventRequest{Board: req.Board, Claim: req.Claim, Delta: req.Delta, Participant: req.Participant, Call: call, Requested: data}); backendErr != nil {
+		data = failExternalAdapterEvent(data, backendErr.Error())
+	} else {
+		data = finalizeExternalBackendData(ctx, call, req, s.clock, data, backendData)
 	}
 	s.mu.Lock()
 	if !s.external.Upsert(infrastructureRecordKey(data.IdempotencyKey, data.RawEventDigest, data.Operation), data) {
@@ -715,12 +795,15 @@ func normalizeMemoryContinuity(ctx context.Context, call ExpectedToolCall, req S
 	data.AgentID = firstNonEmpty(data.AgentID, IssuerAgentID(claimRelations(req.Claim)), claimAgentID(req.Claim))
 	data.SourceIndex = normalizeStringList(data.SourceIndex)
 	data.SourceAvailable = boolArgDefault(call.Arguments, "source_available", true)
+	if data.LegacyNoWAL {
+		data.SourceAvailable = false
+	}
 	data.EvidenceDigest = firstNonEmpty(data.EvidenceDigest, stableInfrastructureHash(data.WorkingContext, data.SourceIndex, data.FromSeq, data.ThroughSeq))
 	data.ContinuityCursor = firstNonEmpty(data.ContinuityCursor, continuityCursor(data))
 	data.SessionCursor = firstNonEmpty(data.SessionCursor, reqSessionID(req))
 	data.Metadata = cloneMetadata(data.Metadata)
 	data.FailureReason = firstNonEmpty(data.FailureReason, memoryFailureReason(data))
-	data.Status = memoryStatus(data)
+	data.Status = statusFromFailure(data.FailureReason)
 	if err := ctx.Err(); err != nil {
 		data.Status = InfrastructureStatusInterrupted
 		data.FailureReason = err.Error()
@@ -823,6 +906,268 @@ func normalizeExternalAdapterEvent(ctx context.Context, call ExpectedToolCall, r
 	return data, nil
 }
 
+func finalizeDAGBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, requested, data DAGOperationArtifactData) DAGOperationArtifactData {
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.PipelineID = firstNonEmpty(data.PipelineID, requested.PipelineID, claimPipelineID(req.Claim), claimIDForInfrastructure(req.Claim))
+	if len(data.Nodes) == 0 {
+		data.Nodes = requested.Nodes
+	}
+	if len(data.Edges) == 0 {
+		data.Edges = requested.Edges
+	}
+	if len(data.RequiredNodes) == 0 {
+		data.RequiredNodes = requested.RequiredNodes
+	}
+	data.Nodes = normalizeStringList(data.Nodes)
+	data.Edges = normalizeDAGEdges(data.Edges)
+	data.RequiredNodes = normalizeStringList(data.RequiredNodes)
+	data.ScopeBoundary = firstNonNilStringMap(data.ScopeBoundary, requested.ScopeBoundary)
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.NodeCount = countOrDerived(data.NodeCount, len(data.Nodes))
+	data.EdgeCount = countOrDerived(data.EdgeCount, len(data.Edges))
+	if len(data.MissingRequiredNodes) == 0 {
+		data.MissingRequiredNodes = missingRequiredNodes(data.RequiredNodes, data.Nodes)
+	}
+	if len(data.CyclePath) == 0 {
+		data.CyclePath = dagCyclePath(data.Nodes, data.Edges)
+	}
+	data.CycleFree = len(data.CyclePath) == 0
+	data.PlannedPods = countOrDerived(data.PlannedPods, countOrDerived(requested.PlannedPods, data.NodeCount))
+	data.DAGHash = firstNonEmpty(data.DAGHash, requested.DAGHash, stableInfrastructureHash(data.Nodes, data.Edges, data.ScopeBoundary))
+	data.FailureReason = firstNonEmpty(data.FailureReason, dagFailureReason(data))
+	data.HealthSummary = firstNonEmpty(data.HealthSummary, dagHealthSummary(data))
+	data.Status = infrastructureStatus(data.FailureReason, data.CycleFree, len(data.MissingRequiredNodes) == 0)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeVFSBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, scope string, requested, data VFSOperationArtifactData) VFSOperationArtifactData {
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.Scope = firstNonEmpty(data.Scope, requested.Scope, scope, "workspace")
+	data.MountRef = firstNonEmpty(data.MountRef, requested.MountRef, data.Scope+":"+firstNonEmpty(claimPipelineID(req.Claim), claimIDForInfrastructure(req.Claim)))
+	data.ScopeBoundary = firstNonNilStringMap(data.ScopeBoundary, requested.ScopeBoundary)
+	if len(data.COWLayerChain) == 0 {
+		data.COWLayerChain = requested.COWLayerChain
+	}
+	if len(data.ConflictSet) == 0 {
+		data.ConflictSet = requested.ConflictSet
+	}
+	data.COWLayerChain = normalizeStringList(data.COWLayerChain)
+	data.ConflictSet = normalizeStringList(data.ConflictSet)
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.SnapshotHash = firstNonEmpty(data.SnapshotHash, requested.SnapshotHash, hashForSnapshot(data))
+	data.ResultingVersion = firstNonEmpty(data.ResultingVersion, requested.ResultingVersion, resultingVersionForVFS(data))
+	data.Attached = data.Attached || requested.Attached || vfsAttachedState(data)
+	data.FailureReason = firstNonEmpty(data.FailureReason, vfsFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Interrupted = true
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeToolBackendData(ctx context.Context, call ExpectedToolCall, clock ClaimsClock, limit int, requested, data ToolRuntimeExecutionArtifactData) ToolRuntimeExecutionArtifactData {
+	now := firstNonNilClock(clock).Now()
+	data.ToolName = firstNonEmpty(data.ToolName, requested.ToolName, stringArg(call.Arguments, "tool_name"), stringArg(call.Arguments, "tool"), call.Tool)
+	if data.RedactedArgs == nil {
+		data.RedactedArgs = requested.RedactedArgs
+	}
+	data.PolicyDecision = firstNonEmpty(data.PolicyDecision, requested.PolicyDecision, "allowed")
+	data.ExecutionMode = firstNonEmpty(data.ExecutionMode, requested.ExecutionMode, "sandboxed")
+	data.SandboxScope = firstNonNilStringMap(data.SandboxScope, requested.SandboxScope)
+	data.StartedAt = firstNonZeroTime(data.StartedAt, firstNonZeroTime(requested.StartedAt, now))
+	data.EndedAt = firstNonZeroTime(data.EndedAt, firstNonZeroTime(requested.EndedAt, data.StartedAt))
+	data.Duration = firstNonZeroDuration(data.Duration, firstNonZeroDuration(requested.Duration, data.EndedAt.Sub(data.StartedAt)))
+	data.OutputSummary = firstNonEmpty(data.OutputSummary, requested.OutputSummary)
+	data.OutputSummary, data.ContentTruncated = boundedOutputSummary(data.OutputSummary, limit)
+	data.ContentTruncated = data.ContentTruncated || requested.ContentTruncated
+	if len(data.OutputRefs) == 0 {
+		data.OutputRefs = requested.OutputRefs
+	}
+	if len(data.ProducedArtifactRefs) == 0 {
+		data.ProducedArtifactRefs = requested.ProducedArtifactRefs
+	}
+	data.OutputRefs = normalizeStringList(data.OutputRefs)
+	data.ProducedArtifactRefs = normalizeStringList(data.ProducedArtifactRefs)
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.FailureReason = firstNonEmpty(data.FailureReason, toolRuntimeFailureReason(data, call))
+	if data.FailureReason == "tool approval missing" {
+		data.PolicyDecision = "missing_approval"
+	}
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Interrupted = true
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeKnowledgeBackendData(ctx context.Context, call ExpectedToolCall, requested, data KnowledgeOperationArtifactData) KnowledgeOperationArtifactData {
+	backendReady := data.Ready
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	if len(data.VectorIndexRefs) == 0 {
+		data.VectorIndexRefs = requested.VectorIndexRefs
+	}
+	if len(data.MissingNodes) == 0 {
+		data.MissingNodes = requested.MissingNodes
+	}
+	if len(data.DanglingEdges) == 0 {
+		data.DanglingEdges = requested.DanglingEdges
+	}
+	data.VectorIndexRefs = normalizeStringList(data.VectorIndexRefs)
+	data.MissingNodes = normalizeStringList(data.MissingNodes)
+	data.DanglingEdges = normalizeStringList(data.DanglingEdges)
+	data.QueryShape = firstNonEmpty(data.QueryShape, requested.QueryShape, defaultKnowledgeQueryShape(data.Operation))
+	data.Backend = firstNonEmpty(data.Backend, requested.Backend, "vectorgraphdb")
+	data.FullTextBackend = firstNonEmpty(data.FullTextBackend, requested.FullTextBackend, "bleve")
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.Ready = backendReady
+	data.FailureReason = firstNonEmpty(data.FailureReason, knowledgeFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeMemoryBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, requested, data MemoryContinuityArtifactData) MemoryContinuityArtifactData {
+	sourceAvailable := data.SourceAvailable
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.Topic = firstNonEmpty(data.Topic, requested.Topic, reqSessionID(req), "default")
+	data.AgentID = firstNonEmpty(data.AgentID, requested.AgentID, IssuerAgentID(claimRelations(req.Claim)), claimAgentID(req.Claim))
+	data.LegacyNoWAL = data.LegacyNoWAL || requested.LegacyNoWAL
+	if len(data.SourceIndex) == 0 {
+		data.SourceIndex = requested.SourceIndex
+	}
+	data.SourceIndex = normalizeStringList(data.SourceIndex)
+	data.WorkingContext = firstNonEmpty(data.WorkingContext, requested.WorkingContext)
+	data.SourceAvailable = sourceAvailable
+	if data.LegacyNoWAL {
+		data.SourceAvailable = false
+	}
+	data.EvidenceDigest = firstNonEmpty(data.EvidenceDigest, requested.EvidenceDigest, stableInfrastructureHash(data.WorkingContext, data.SourceIndex, data.FromSeq, data.ThroughSeq))
+	data.ContinuityCursor = firstNonEmpty(data.ContinuityCursor, requested.ContinuityCursor, continuityCursor(data))
+	data.SessionCursor = firstNonEmpty(data.SessionCursor, requested.SessionCursor, reqSessionID(req))
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.FailureReason = firstNonEmpty(data.FailureReason, memoryFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeDocumentBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, requested, data DocumentOperationArtifactData) DocumentOperationArtifactData {
+	indexed := data.Indexed
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.DocumentID = firstNonEmpty(data.DocumentID, requested.DocumentID, stringArg(call.Arguments, "path"), claimIDForInfrastructure(req.Claim))
+	data.IndexPath = firstNonEmpty(data.IndexPath, requested.IndexPath, "bleve:"+data.DocumentID)
+	data.ContentHash = firstNonEmpty(data.ContentHash, requested.ContentHash, documentContentHash(call.Arguments))
+	data.FullTextBackend = firstNonEmpty(data.FullTextBackend, requested.FullTextBackend, "bleve")
+	if len(data.ChunkBoundaries) == 0 {
+		data.ChunkBoundaries = requested.ChunkBoundaries
+	}
+	data.ChunkCount = countOrDerived(data.ChunkCount, countOrDerived(requested.ChunkCount, len(data.ChunkBoundaries)))
+	data.ResultShape = firstNonEmpty(data.ResultShape, requested.ResultShape, defaultDocumentResultShape(data))
+	if len(data.AttachmentRefs) == 0 {
+		data.AttachmentRefs = requested.AttachmentRefs
+	}
+	data.AttachmentRefs = normalizeStringList(data.AttachmentRefs)
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.Indexed = indexed
+	data.FailureReason = firstNonEmpty(data.FailureReason, documentFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeGuardianBackendData(ctx context.Context, call ExpectedToolCall, requested, data GuardianDecisionArtifactData) GuardianDecisionArtifactData {
+	approvalPresent := data.ApprovalPresent
+	branchProtected := data.BranchProtected
+	allowed := data.Allowed
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.PolicyRule = firstNonEmpty(data.PolicyRule, requested.PolicyRule, "default")
+	data.UserDecision = strings.ToLower(firstNonEmpty(data.UserDecision, requested.UserDecision, "allow"))
+	if len(data.DiffFindings) == 0 {
+		data.DiffFindings = requested.DiffFindings
+	}
+	data.DiffFindings = normalizeStringList(data.DiffFindings)
+	data.ApprovalPresent = approvalPresent
+	data.BranchProtected = branchProtected
+	data.Allowed = allowed
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.FailureReason = firstNonEmpty(data.FailureReason, guardianFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeProviderBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, partialLimit int, requested, data ProviderGatewayCallArtifactData) ProviderGatewayCallArtifactData {
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	data.Identity = firstNonEmpty(data.Identity, requested.Identity, claimAgentID(req.Claim), IssuerAgentID(claimRelations(req.Claim)))
+	data.TaskRef = firstNonEmpty(data.TaskRef, requested.TaskRef, claimTaskID(req.Claim))
+	data.Model = firstNonEmpty(data.Model, requested.Model)
+	data.PromptHash = firstNonEmpty(data.PromptHash, requested.PromptHash)
+	data.StreamingMode = firstNonEmpty(data.StreamingMode, requested.StreamingMode)
+	data.TotalTokens = countOrDerived(data.TotalTokens, data.InputTokens+data.OutputTokens)
+	data.ProviderRequestID = firstNonEmpty(data.ProviderRequestID, requested.ProviderRequestID, stableInfrastructureHash(data.Model, data.PromptHash, data.TaskRef))
+	if len(data.PartialSummaries) == 0 {
+		data.PartialSummaries = requested.PartialSummaries
+	}
+	data.PartialSummaries = boundedStringList(data.PartialSummaries, partialLimit)
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.FailureReason = firstNonEmpty(data.FailureReason, providerFailureReason(data))
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+	}
+	return data
+}
+
+func finalizeExternalBackendData(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest, clock ClaimsClock, requested, data ExternalAdapterEventArtifactData) ExternalAdapterEventArtifactData {
+	fresh := data.Fresh
+	valid := data.Valid
+	now := firstNonNilClock(clock).Now()
+	data.Operation = firstNonEmpty(data.Operation, requested.Operation, call.Tool)
+	if data.Source.UID == "" {
+		data.Source = requested.Source
+	}
+	data.Source = normalizedExternalSource(data.Source, call.Arguments)
+	data.IdempotencyKey = firstNonEmpty(data.IdempotencyKey, requested.IdempotencyKey, call.ID, stableInfrastructureHash(data.Source.UID, data.RawEventDigest, data.Operation))
+	data.RawEventDigest = firstNonEmpty(data.RawEventDigest, requested.RawEventDigest, rawEventDigest(call.Arguments, data.ParsedPayload))
+	data.ReceivedAt = firstNonZeroTime(data.ReceivedAt, firstNonZeroTime(requested.ReceivedAt, now))
+	data.Fresh = fresh
+	data.ReferencedClaimID = firstNonEmpty(strings.TrimSpace(data.ReferencedClaimID), requested.ReferencedClaimID)
+	data.Valid = valid
+	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.FailureReason = firstNonEmpty(data.FailureReason, externalFailureReason(data, req.Board))
+	data.Rejected = data.FailureReason != ""
+	data.Valid = data.Valid && !data.Rejected
+	data.Status = statusFromFailure(data.FailureReason)
+	if err := ctx.Err(); err != nil {
+		data.Status = InfrastructureStatusInterrupted
+		data.FailureReason = err.Error()
+		data.Rejected = true
+		data.Valid = false
+	}
+	return data
+}
+
 func dagOperationArtifact(data DAGOperationArtifactData) (*Artifact, error) {
 	return infrastructureArtifact("dag_operation", ArtifactKindDAGOperation, data.DAGHash, data.FailureReason, data)
 }
@@ -879,6 +1224,9 @@ func infrastructureArtifact[T any](name, kind, reference, failure string, data T
 	if err := SetArtifactData(artifact, data); err != nil {
 		return nil, err
 	}
+	if failure != "" {
+		artifact.Errors = append(artifact.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: failure, OccurredAt: time.Now().UTC()})
+	}
 	return artifact, nil
 }
 
@@ -904,6 +1252,13 @@ func normalizeInfrastructureServiceConfig(cfg InfrastructureServiceConfig) Infra
 		cfg.ProviderPartialLimit = defaultInfrastructureProviderPartials
 	}
 	return cfg
+}
+
+func firstNonNilStringMap(primary, fallback map[string]string) map[string]string {
+	if len(primary) != 0 {
+		return cloneStringMap(primary)
+	}
+	return cloneStringMap(fallback)
 }
 
 func validateInfrastructureService(s *InfrastructureService) error {
@@ -1262,6 +1617,9 @@ func knowledgeFailureReason(data KnowledgeOperationArtifactData) string {
 }
 
 func memoryFailureReason(data MemoryContinuityArtifactData) string {
+	if data.LegacyNoWAL {
+		return "durable carry-forward WAL missing"
+	}
 	if !data.SourceAvailable {
 		return "carry-forward source unavailable"
 	}
@@ -1272,13 +1630,6 @@ func memoryFailureReason(data MemoryContinuityArtifactData) string {
 		return "continuity contradicted"
 	}
 	return ""
-}
-
-func memoryStatus(data MemoryContinuityArtifactData) string {
-	if data.LegacyNoWAL && data.FailureReason == "" {
-		return InfrastructureStatusFallback
-	}
-	return statusFromFailure(data.FailureReason)
 }
 
 func continuityCursor(data MemoryContinuityArtifactData) string {

@@ -9,7 +9,9 @@ import (
 )
 
 func TestInfrastructureServicePhase6DAGVFSAndToolArtifacts(t *testing.T) {
-	dag := NewDAGProcessorService(InfrastructureServiceConfig{})
+	dag := NewDAGProcessorService(InfrastructureServiceConfig{DAGBackend: dagBackendFunc(func(_ context.Context, req DAGOperationRequest) (DAGOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	dagResult, err := dag.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(DAGProcessorToolAllocatePipeline, map[string]any{
 		"pipeline_id":    "pipe-1",
 		"nodes":          []string{"plan", "build"},
@@ -44,7 +46,9 @@ func TestInfrastructureServicePhase6DAGVFSAndToolArtifacts(t *testing.T) {
 		t.Fatalf("cyclic data/artifact = %+v/%s, want structured failure artifact", cyclicData, cyclicResult.Artifacts[0].Kind)
 	}
 
-	vfs := NewVFSProvisionerService("tool", InfrastructureServiceConfig{})
+	vfs := NewVFSProvisionerService("tool", InfrastructureServiceConfig{VFSBackend: vfsBackendFunc(func(_ context.Context, req VFSOperationRequest) (VFSOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	vfsResult, err := vfs.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(VFSProvisionerToolSnapshot, map[string]any{
 		"mount_ref":             "tool:pipe-1:go-test",
 		"capacity_budget_bytes": float64(128),
@@ -81,7 +85,9 @@ func TestInfrastructureServicePhase6DAGVFSAndToolArtifacts(t *testing.T) {
 		t.Fatalf("conflict data = %+v, want merge conflict failure", conflictData)
 	}
 
-	tool := NewToolRuntimeService(InfrastructureServiceConfig{OutputSummaryLimit: len("short")})
+	tool := NewToolRuntimeService(InfrastructureServiceConfig{OutputSummaryLimit: len("short"), ToolBackend: toolBackendFunc(func(_ context.Context, req ToolRuntimeExecutionRequest) (ToolRuntimeExecutionArtifactData, error) {
+		return req.Requested, nil
+	})})
 	toolResult, err := tool.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(ToolRuntimeToolExecute, map[string]any{
 		"tool_name":       "go_test",
 		"args":            map[string]any{"token": "secret", "package": "./core/claims"},
@@ -104,7 +110,9 @@ func TestInfrastructureServicePhase6DAGVFSAndToolArtifacts(t *testing.T) {
 }
 
 func TestInfrastructureServicePhase7KnowledgeMemoryAndDocumentArtifacts(t *testing.T) {
-	knowledge := NewKnowledgeService(InfrastructureServiceConfig{})
+	knowledge := NewKnowledgeService(InfrastructureServiceConfig{KnowledgeBackend: knowledgeBackendFunc(func(_ context.Context, req KnowledgeOperationRequest) (KnowledgeOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	knowledgeResult, err := knowledge.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(KnowledgeToolUpdateEmbeddings, map[string]any{
 		"node_count":                   float64(2),
 		"edge_count":                   float64(1),
@@ -123,7 +131,9 @@ func TestInfrastructureServicePhase7KnowledgeMemoryAndDocumentArtifacts(t *testi
 		t.Fatalf("knowledge data = %+v, want VectorDB/Bleve readiness", knowledgeData)
 	}
 
-	memory := NewMemoryForestService(InfrastructureServiceConfig{})
+	memory := NewMemoryForestService(InfrastructureServiceConfig{MemoryBackend: memoryBackendFunc(func(_ context.Context, req MemoryContinuityRequest) (MemoryContinuityArtifactData, error) {
+		return req.Requested, nil
+	})})
 	memoryResult, err := memory.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(MemoryToolCarryForwardAdvance, map[string]any{
 		"topic":           "claims-infra",
 		"agent_id":        "librarian",
@@ -154,11 +164,16 @@ func TestInfrastructureServicePhase7KnowledgeMemoryAndDocumentArtifacts(t *testi
 	if err != nil {
 		t.Fatalf("legacy memory data: %v", err)
 	}
-	if legacyData.Status != InfrastructureStatusFallback || !legacyData.LegacyNoWAL {
-		t.Fatalf("legacy data = %+v, want fallback artifact", legacyData)
+	if legacyData.Status != InfrastructureStatusFailed || !legacyData.LegacyNoWAL || legacyData.SourceAvailable {
+		t.Fatalf("legacy data = %+v, want failed no-WAL artifact", legacyData)
+	}
+	if legacyData.FailureReason != "durable carry-forward WAL missing" {
+		t.Fatalf("legacy failure reason = %q, want durable WAL missing", legacyData.FailureReason)
 	}
 
-	document := NewDocumentService(InfrastructureServiceConfig{})
+	document := NewDocumentService(InfrastructureServiceConfig{DocumentBackend: documentBackendFunc(func(_ context.Context, req DocumentOperationRequest) (DocumentOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	documentResult, err := document.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(DocumentToolIngest, map[string]any{
 		"document_id":       "docs/CLAIMS_AND_INFRASTRUCTURE.md",
 		"content":           "claims infrastructure",
@@ -179,7 +194,9 @@ func TestInfrastructureServicePhase7KnowledgeMemoryAndDocumentArtifacts(t *testi
 }
 
 func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *testing.T) {
-	guardian := NewGuardianService(InfrastructureServiceConfig{})
+	guardian := NewGuardianService(InfrastructureServiceConfig{GuardianBackend: guardianBackendFunc(func(_ context.Context, req GuardianDecisionRequest) (GuardianDecisionArtifactData, error) {
+		return req.Requested, nil
+	})})
 	guardianResult, err := guardian.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(GuardianToolCommandGate, map[string]any{
 		"policy_rule":      "command.requires_approval",
 		"approval_subject": "rm -rf build",
@@ -196,7 +213,9 @@ func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *test
 		t.Fatalf("guardian data/artifact = %+v/%s, want policy-denied testament artifact", guardianData, guardianResult.Artifacts[0].Kind)
 	}
 
-	provider := NewProviderGatewayService(InfrastructureServiceConfig{})
+	provider := NewProviderGatewayService(InfrastructureServiceConfig{ProviderBackend: providerBackendFunc(func(_ context.Context, req ProviderGatewayCallRequest) (ProviderGatewayCallArtifactData, error) {
+		return req.Requested, nil
+	})})
 	providerResult, err := provider.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(ProviderGatewayToolCompleteStreaming, map[string]any{
 		"model":             "test-model",
 		"identity":          "engineer",
@@ -220,7 +239,9 @@ func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *test
 	}
 
 	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "external-board", SessionID: "external-session", TaskID: "task"})
-	external := NewExternalAdapterService(InfrastructureServiceConfig{})
+	external := NewExternalAdapterService(InfrastructureServiceConfig{ExternalBackend: externalBackendFunc(func(_ context.Context, req ExternalAdapterEventRequest) (ExternalAdapterEventArtifactData, error) {
+		return req.Requested, nil
+	})})
 	externalResult, err := external.HandleServiceClaim(context.Background(), ServiceClaimRequest{Board: board, Claim: infrastructureServiceClaim(ExternalAdapterToolCIResult, map[string]any{
 		"source_id":           "ci/github",
 		"schema":              "ci.result.v1",
@@ -237,6 +258,98 @@ func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *test
 	}
 	if externalData.Valid || !externalData.Rejected || externalData.Source.Category != string(ParticipantCategoryExternal) {
 		t.Fatalf("external data = %+v, want rejected external participant evidence", externalData)
+	}
+}
+
+func TestInfrastructureServicesMissingBackendEmitFailureArtifacts(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func() (*Artifact, error)
+		want string
+	}{
+		{
+			name: "dag",
+			run: func() (*Artifact, error) {
+				result, err := NewDAGProcessorService(InfrastructureServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(DAGProcessorToolAllocatePipeline, map[string]any{"pipeline_id": "pipe-missing", "nodes": []string{"n"}})})
+				return result.Artifacts[0], err
+			},
+			want: "DAG backend not configured",
+		},
+		{
+			name: "provider",
+			run: func() (*Artifact, error) {
+				result, err := NewProviderGatewayService(InfrastructureServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(ProviderGatewayToolComplete, map[string]any{"model": "m", "identity": "guide", "response_summary": "ok"})})
+				return result.Artifacts[0], err
+			},
+			want: "provider gateway backend not configured",
+		},
+		{
+			name: "guardian",
+			run: func() (*Artifact, error) {
+				result, err := NewGuardianService(InfrastructureServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(GuardianToolPolicyCheck, map[string]any{"approval_subject": "cmd"})})
+				return result.Artifacts[0], err
+			},
+			want: "guardian backend not configured",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			artifact, err := tt.run()
+			if err != nil {
+				t.Fatalf("HandleServiceClaim: %v", err)
+			}
+			if artifact.Kind != ArtifactKindErrorDiagnostic && artifact.Kind != ArtifactKindPolicyDenied {
+				t.Fatalf("artifact kind = %s, want failure artifact", artifact.Kind)
+			}
+			if len(artifact.Errors) == 0 || artifact.Errors[0].Description != tt.want {
+				t.Fatalf("artifact errors = %+v, want %q", artifact.Errors, tt.want)
+			}
+		})
+	}
+}
+
+func TestInfrastructureBackendFalseStatesAreAuthoritative(t *testing.T) {
+	memory := NewMemoryForestService(InfrastructureServiceConfig{MemoryBackend: memoryBackendFunc(func(_ context.Context, req MemoryContinuityRequest) (MemoryContinuityArtifactData, error) {
+		data := req.Requested
+		data.SourceAvailable = false
+		return data, nil
+	})})
+	memoryResult, err := memory.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(MemoryToolCarryForwardAdvance, map[string]any{
+		"topic":            "claims-infra",
+		"working_context":  "source was removed",
+		"source_available": true,
+	})})
+	if err != nil {
+		t.Fatalf("memory HandleServiceClaim: %v", err)
+	}
+	memoryData, err := ArtifactData[MemoryContinuityArtifactData](memoryResult.Artifacts[0])
+	if err != nil {
+		t.Fatalf("memory data: %v", err)
+	}
+	if memoryData.SourceAvailable || memoryData.Status != InfrastructureStatusFailed || memoryData.FailureReason != "carry-forward source unavailable" {
+		t.Fatalf("memory data = %+v, want backend source unavailable failure", memoryData)
+	}
+
+	guardian := NewGuardianService(InfrastructureServiceConfig{GuardianBackend: guardianBackendFunc(func(_ context.Context, req GuardianDecisionRequest) (GuardianDecisionArtifactData, error) {
+		data := req.Requested
+		data.Allowed = false
+		data.UserDecision = "allow"
+		data.ApprovalPresent = false
+		return data, nil
+	})})
+	guardianResult, err := guardian.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(GuardianToolApprovalCheck, map[string]any{
+		"approval_subject": "deploy",
+		"user_decision":    "allow",
+	})})
+	if err != nil {
+		t.Fatalf("guardian HandleServiceClaim: %v", err)
+	}
+	guardianData, err := ArtifactData[GuardianDecisionArtifactData](guardianResult.Artifacts[0])
+	if err != nil {
+		t.Fatalf("guardian data: %v", err)
+	}
+	if guardianData.Allowed || guardianData.Status != InfrastructureStatusFailed || guardianData.FailureReason != "approval missing" {
+		t.Fatalf("guardian data = %+v, want backend denial to remain authoritative", guardianData)
 	}
 }
 
@@ -287,7 +400,9 @@ func TestRegisterDefaultInfrastructureValidators(t *testing.T) {
 }
 
 func TestInfrastructureServiceConcurrentVFSAllocationsRemainIsolated(t *testing.T) {
-	service := NewVFSProvisionerService("tool", InfrastructureServiceConfig{})
+	service := NewVFSProvisionerService("tool", InfrastructureServiceConfig{VFSBackend: vfsBackendFunc(func(_ context.Context, req VFSOperationRequest) (VFSOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	const workers = 32
 	errs := make(chan error, workers)
 	var wg sync.WaitGroup
@@ -317,7 +432,9 @@ func TestInfrastructureServiceConcurrentVFSAllocationsRemainIsolated(t *testing.
 }
 
 func TestInfrastructureVFSShutdownRecordsDetachArtifacts(t *testing.T) {
-	service := NewVFSProvisionerService("tool", InfrastructureServiceConfig{})
+	service := NewVFSProvisionerService("tool", InfrastructureServiceConfig{VFSBackend: vfsBackendFunc(func(_ context.Context, req VFSOperationRequest) (VFSOperationArtifactData, error) {
+		return req.Requested, nil
+	})})
 	if _, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(VFSProvisionerToolProvision, map[string]any{
 		"mount_ref": "tool:pipe:shutdown",
 	})}); err != nil {
@@ -367,7 +484,9 @@ func TestInfrastructureServiceE2EDispatchPostsServiceTestament(t *testing.T) {
 	if err := board.PostGeneratedClaim(context.Background(), claimID, "orchestrator", ClaimPostOptions{Reason: "dag"}); err != nil {
 		t.Fatalf("PostGeneratedClaim: %v", err)
 	}
-	dispatcher, err := NewServiceDispatcher(ServiceDispatcherConfig{Board: board, Scope: immediateScope{}, Participant: participant, Handler: NewDAGProcessorService(InfrastructureServiceConfig{})})
+	dispatcher, err := NewServiceDispatcher(ServiceDispatcherConfig{Board: board, Scope: immediateScope{}, Participant: participant, Handler: NewDAGProcessorService(InfrastructureServiceConfig{DAGBackend: dagBackendFunc(func(_ context.Context, req DAGOperationRequest) (DAGOperationArtifactData, error) {
+		return req.Requested, nil
+	})})})
 	if err != nil {
 		t.Fatalf("NewServiceDispatcher: %v", err)
 	}
@@ -391,7 +510,7 @@ func TestInfrastructureServiceE2EDispatchPostsServiceTestament(t *testing.T) {
 	}
 }
 
-func TestRecordInfrastructureEvidenceSynthesizesClaimAndTestament(t *testing.T) {
+func TestRecordInfrastructureEvidenceRecordsSystemClaimAndTestament(t *testing.T) {
 	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "infra-evidence", SessionID: "infra-session", TaskID: "task"})
 	artifact, err := vfsOperationArtifact(VFSOperationArtifactData{Operation: VFSProvisionerToolDetach, Scope: "tool", MountRef: "tool:old", Status: InfrastructureStatusOK})
 	if err != nil {
@@ -399,9 +518,9 @@ func TestRecordInfrastructureEvidenceSynthesizesClaimAndTestament(t *testing.T) 
 	}
 	result, err := RecordInfrastructureEvidence(context.Background(), InfrastructureEvidenceOptions{
 		Board:     board,
-		ActorID:   "legacy-vfs-caller",
+		ActorID:   "sys:vfs_tool_provisioner",
 		SubjectID: "sys:vfs_tool_provisioner",
-		Operation: "legacy_detach",
+		Operation: "vfs_detach",
 		Artifact:  artifact,
 	})
 	if err != nil {
@@ -410,7 +529,7 @@ func TestRecordInfrastructureEvidenceSynthesizesClaimAndTestament(t *testing.T) 
 	assertServiceClaimLifecycle(t, board, result.ClaimID, ClaimLifecycleSatisfied)
 	testaments := board.TestamentsByClaim(result.ClaimID)
 	if len(testaments) != 1 || testaments[0].ID != result.TestamentID {
-		t.Fatalf("testaments = %+v, want synthesized testament %s", testaments, result.TestamentID)
+		t.Fatalf("testaments = %+v, want system evidence testament %s", testaments, result.TestamentID)
 	}
 }
 
@@ -427,4 +546,58 @@ func infrastructureServiceClaim(tool string, args map[string]any) *Claim {
 		},
 		ExpectedToolCalls: []ExpectedToolCall{{ID: "call-" + tool, Tool: tool, Arguments: args}},
 	}
+}
+
+type dagBackendFunc func(context.Context, DAGOperationRequest) (DAGOperationArtifactData, error)
+
+func (fn dagBackendFunc) HandleDAGOperation(ctx context.Context, req DAGOperationRequest) (DAGOperationArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type vfsBackendFunc func(context.Context, VFSOperationRequest) (VFSOperationArtifactData, error)
+
+func (fn vfsBackendFunc) HandleVFSOperation(ctx context.Context, req VFSOperationRequest) (VFSOperationArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type toolBackendFunc func(context.Context, ToolRuntimeExecutionRequest) (ToolRuntimeExecutionArtifactData, error)
+
+func (fn toolBackendFunc) HandleToolRuntimeExecution(ctx context.Context, req ToolRuntimeExecutionRequest) (ToolRuntimeExecutionArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type knowledgeBackendFunc func(context.Context, KnowledgeOperationRequest) (KnowledgeOperationArtifactData, error)
+
+func (fn knowledgeBackendFunc) HandleKnowledgeOperation(ctx context.Context, req KnowledgeOperationRequest) (KnowledgeOperationArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type memoryBackendFunc func(context.Context, MemoryContinuityRequest) (MemoryContinuityArtifactData, error)
+
+func (fn memoryBackendFunc) HandleMemoryContinuity(ctx context.Context, req MemoryContinuityRequest) (MemoryContinuityArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type documentBackendFunc func(context.Context, DocumentOperationRequest) (DocumentOperationArtifactData, error)
+
+func (fn documentBackendFunc) HandleDocumentOperation(ctx context.Context, req DocumentOperationRequest) (DocumentOperationArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type guardianBackendFunc func(context.Context, GuardianDecisionRequest) (GuardianDecisionArtifactData, error)
+
+func (fn guardianBackendFunc) HandleGuardianDecision(ctx context.Context, req GuardianDecisionRequest) (GuardianDecisionArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type providerBackendFunc func(context.Context, ProviderGatewayCallRequest) (ProviderGatewayCallArtifactData, error)
+
+func (fn providerBackendFunc) HandleProviderGatewayCall(ctx context.Context, req ProviderGatewayCallRequest) (ProviderGatewayCallArtifactData, error) {
+	return fn(ctx, req)
+}
+
+type externalBackendFunc func(context.Context, ExternalAdapterEventRequest) (ExternalAdapterEventArtifactData, error)
+
+func (fn externalBackendFunc) HandleExternalAdapterEvent(ctx context.Context, req ExternalAdapterEventRequest) (ExternalAdapterEventArtifactData, error) {
+	return fn(ctx, req)
 }

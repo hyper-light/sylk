@@ -357,7 +357,7 @@ func (CarryForwardSourceAvailabilityValidator) ValidateArtifact(_ context.Contex
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.SourceAvailable || data.LegacyNoWAL {
+	if data.SourceAvailable {
 		return infrastructureValidatorPass("carry-forward source available")
 	}
 	return infrastructureValidatorFailure(req, "carry-forward source unavailable", map[string]any{"topic": data.Topic})
@@ -379,7 +379,7 @@ func (CarryForwardDigestConsistencyValidator) ValidateArtifact(_ context.Context
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if strings.TrimSpace(data.EvidenceDigest) != "" || data.LegacyNoWAL {
+	if strings.TrimSpace(data.EvidenceDigest) != "" {
 		return infrastructureValidatorPass("carry-forward digest present")
 	}
 	return infrastructureValidatorFailure(req, "carry-forward evidence digest missing", map[string]any{"topic": data.Topic})

@@ -34,12 +34,19 @@ func TestInfrastructureServiceE2EWithMockeryBusAndScope(t *testing.T) {
 		}
 	}).Return(nil).Once()
 
+	providerBackend := &claimsmocks.ProviderGatewayBackend{}
+	providerBackend.On("HandleProviderGatewayCall", mock.Anything, mock.MatchedBy(func(req claims.ProviderGatewayCallRequest) bool {
+		return req.Call.Tool == claims.ProviderGatewayToolComplete && req.Requested.Model == "mock-model"
+	})).Return(func(_ context.Context, req claims.ProviderGatewayCallRequest) claims.ProviderGatewayCallArtifactData {
+		return req.Requested
+	}, nil).Once()
+
 	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{
 		Board:       board,
 		Subscriber:  subscriber,
 		Scope:       scope,
 		Participant: participant,
-		Handler:     claims.NewProviderGatewayService(claims.InfrastructureServiceConfig{}),
+		Handler:     claims.NewProviderGatewayService(claims.InfrastructureServiceConfig{ProviderBackend: providerBackend}),
 	})
 	if err != nil {
 		t.Fatalf("NewServiceDispatcher: %v", err)
@@ -85,6 +92,7 @@ func TestInfrastructureServiceE2EWithMockeryBusAndScope(t *testing.T) {
 	subscriber.AssertExpectations(t)
 	subscription.AssertExpectations(t)
 	scope.AssertExpectations(t)
+	providerBackend.AssertExpectations(t)
 }
 
 func TestInfrastructureValidatorDispatcherWithMockeryHandler(t *testing.T) {
