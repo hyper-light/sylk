@@ -26,6 +26,7 @@ const (
 	ArtifactDataTypeIdentityAllocation         = "sylk.identity_allocation.v1"
 	ArtifactDataTypeIdentityLineage            = "sylk.identity_lineage.v1"
 	ArtifactDataTypeActivationRecord           = "sylk.activation_record.v1"
+	ArtifactDataTypeProductionReadiness        = "sylk.production_readiness.v1"
 )
 
 var (
@@ -287,6 +288,30 @@ type ActivationRecordArtifactData struct {
 	Duration        time.Duration `json:"duration,omitempty"`
 }
 
+type ProductionReadinessArtifactData struct {
+	Ready     bool                          `json:"ready"`
+	Missing   []string                      `json:"missing,omitempty"`
+	Evidence  []ProductionReadinessEvidence `json:"evidence"`
+	Waivers   []ProductionReadinessWaiver   `json:"waivers,omitempty"`
+	OpenRisks []string                      `json:"open_risks,omitempty"`
+	Metadata  map[string]any                `json:"metadata,omitempty"`
+}
+
+type ProductionReadinessEvidence struct {
+	Category  string         `json:"category"`
+	Reference string         `json:"reference"`
+	Status    string         `json:"status"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+}
+
+type ProductionReadinessWaiver struct {
+	Owner               string    `json:"owner"`
+	Scope               string    `json:"scope"`
+	Reason              string    `json:"reason"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	CompensatingControl string    `json:"compensating_control"`
+}
+
 func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 	if registry == nil {
 		return fmt.Errorf("type registry is required")
@@ -310,6 +335,7 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeIdentityAllocation, IdentityAllocationArtifactData{}},
 		{ArtifactDataTypeIdentityLineage, IdentityLineageArtifactData{}},
 		{ArtifactDataTypeActivationRecord, ActivationRecordArtifactData{}},
+		{ArtifactDataTypeProductionReadiness, ProductionReadinessArtifactData{}},
 		{ArtifactDataTypeDAGOperation, DAGOperationArtifactData{}},
 		{ArtifactDataTypeVFSOperation, VFSOperationArtifactData{}},
 		{ArtifactDataTypeToolRuntimeExecution, ToolRuntimeExecutionArtifactData{}},

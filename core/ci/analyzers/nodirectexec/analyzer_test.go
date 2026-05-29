@@ -49,6 +49,8 @@ func TestIsAllowedPackage_CoversDocumentedBoundaries(t *testing.T) {
 		"github.com/adalundhe/sylk/ui/fonts",
 		"github.com/adalundhe/sylk/ui/editor/register",
 		"github.com/adalundhe/sylk/core/boot",
+		"github.com/adalundhe/sylk/core/mcp/transport",
+		"github.com/adalundhe/sylk/core/substrate/sandbox",
 	}
 	for _, path := range covered {
 		if !isAllowedPackage(path) {

@@ -99,6 +99,8 @@ func TestRolloutConfigFromEnv(t *testing.T) {
 		EnvClaimsKnowledgeMirror:     "authoritative",
 		EnvRecallForwardCrossSession: "off",
 		EnvScribeContinuityNarration: "no",
+		EnvClaimsInfraVFS:            "shadow",
+		EnvClaimsInfraProvider:       "disabled",
 	}
 	cfg := RolloutConfigFromEnv(func(key string) string { return values[key] })
 	if cfg.DurableSessionClaims || cfg.ClaimsOutbox || cfg.RecallForwardCrossSession || cfg.ScribeContinuityNarration {
@@ -106,5 +108,11 @@ func TestRolloutConfigFromEnv(t *testing.T) {
 	}
 	if cfg.ClaimsKnowledgeMirror != ProjectionRolloutAuthoritative || !cfg.ProjectionWarningsAuthoritative() {
 		t.Fatalf("mirror rollout mode not parsed as authoritative: %+v", cfg)
+	}
+	if cfg.InfrastructureMode("vfs") != InfrastructureRolloutShadow || !cfg.InfrastructureDispatchEnabled("vfs") {
+		t.Fatalf("vfs infrastructure mode not parsed: %+v", cfg)
+	}
+	if cfg.InfrastructureMode("provider") != InfrastructureRolloutDisabled || cfg.InfrastructureDispatchEnabled("provider") {
+		t.Fatalf("provider infrastructure mode not parsed: %+v", cfg)
 	}
 }

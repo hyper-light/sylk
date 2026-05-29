@@ -1402,6 +1402,7 @@ strings:
 | Identity allocation evidence | `sylk.identity_allocation.v1` |
 | Identity lineage evidence | `sylk.identity_lineage.v1` |
 | Activation readiness record | `sylk.activation_record.v1` |
+| Production readiness report | `sylk.production_readiness.v1` |
 | DAG processor operation evidence | `sylk.infrastructure.dag_operation.v1` |
 | VFS provisioner operation evidence | `sylk.infrastructure.vfs_operation.v1` |
 | Tool runtime execution evidence | `sylk.infrastructure.tool_runtime_execution.v1` |

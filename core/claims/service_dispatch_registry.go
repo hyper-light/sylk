@@ -18,6 +18,14 @@ type ServiceDispatcherRegistry struct {
 	dispatchers map[string]*ServiceDispatcher
 }
 
+type ServiceDispatcherRegistrySnapshot struct {
+	SessionID   string                   `json:"session_id,omitempty"`
+	Dispatchers []ServiceDispatcherStats `json:"dispatchers,omitempty"`
+	QueueDepth  int                      `json:"queue_depth"`
+	Inflight    int                      `json:"inflight"`
+	Capacity    int                      `json:"capacity"`
+}
+
 func NewServiceDispatcherRegistry() *ServiceDispatcherRegistry {
 	return &ServiceDispatcherRegistry{dispatchers: make(map[string]*ServiceDispatcher)}
 }
@@ -111,6 +119,55 @@ func (r *ServiceDispatcherRegistry) SessionParticipantUIDs(sessionID string) []s
 	}
 	sort.Strings(uids)
 	return uids
+}
+
+func (r *ServiceDispatcherRegistry) Snapshot(sessionID string) ServiceDispatcherRegistrySnapshot {
+	if r == nil {
+		return ServiceDispatcherRegistrySnapshot{}
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	r.mu.RLock()
+	dispatchers := make([]*ServiceDispatcher, 0, len(r.dispatchers))
+	for key, dispatcher := range r.dispatchers {
+		if sessionID == "" || strings.HasPrefix(key, sessionID+"|") {
+			dispatchers = append(dispatchers, dispatcher)
+		}
+	}
+	r.mu.RUnlock()
+	out := ServiceDispatcherRegistrySnapshot{SessionID: sessionID}
+	for _, dispatcher := range dispatchers {
+		stats := dispatcher.Stats()
+		out.Dispatchers = append(out.Dispatchers, stats)
+		out.Inflight += stats.Inflight
+		out.QueueDepth += stats.SeenCount
+		out.Capacity += stats.Capacity
+	}
+	sort.Slice(out.Dispatchers, func(i, j int) bool {
+		return out.Dispatchers[i].Participant.UID < out.Dispatchers[j].Participant.UID
+	})
+	return out
+}
+
+func (r *ServiceDispatcherRegistry) CancelClaim(sessionID, claimID string) int {
+	if r == nil {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	r.mu.RLock()
+	dispatchers := make([]*ServiceDispatcher, 0, len(r.dispatchers))
+	for key, dispatcher := range r.dispatchers {
+		if sessionID == "" || strings.HasPrefix(key, sessionID+"|") {
+			dispatchers = append(dispatchers, dispatcher)
+		}
+	}
+	r.mu.RUnlock()
+	count := 0
+	for _, dispatcher := range dispatchers {
+		if dispatcher.CancelClaim(claimID) {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *ServiceDispatcherRegistry) swap(key string, dispatcher *ServiceDispatcher) *ServiceDispatcher {

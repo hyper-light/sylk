@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,20 @@ type ProgrammaticValidatorDispatcher struct {
 	clock    ClaimsClock
 	scope    ScopeProvider
 	workers  sync.WaitGroup
+}
+
+type ValidatorDispatcherStats struct {
+	Registered int                      `json:"registered"`
+	Validators []ValidatorQueueSnapshot `json:"validators,omitempty"`
+}
+
+type ValidatorQueueSnapshot struct {
+	ValidatorID       string             `json:"validator_id,omitempty"`
+	ValidationType    ValidationType     `json:"validation_type,omitempty"`
+	ActionType        ActionType         `json:"action_type,omitempty"`
+	Determinism       HandlerDeterminism `json:"determinism,omitempty"`
+	Inflight          int                `json:"inflight"`
+	ConcurrencyBudget int                `json:"concurrency_budget"`
 }
 
 func NewValidatorRegistry() *ValidatorRegistry {
@@ -128,6 +143,22 @@ func (r *ValidatorRegistry) Lookup(claim *Claim, validation *Validation) (Valida
 	return r.lookupLocked(claim, validation)
 }
 
+func (r *ValidatorRegistry) List() []ValidatorRegistration {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	out := make([]ValidatorRegistration, 0, len(r.records))
+	for _, reg := range r.records {
+		out = append(out, reg)
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		return validatorRegistrationKey(out[i]) < validatorRegistrationKey(out[j])
+	})
+	return out
+}
+
 func NewProgrammaticValidatorDispatcher(registry *ValidatorRegistry, clock ClaimsClock) *ProgrammaticValidatorDispatcher {
 	return newProgrammaticValidatorDispatcher(registry, clock, nil)
 }
@@ -146,6 +177,26 @@ func (d *ProgrammaticValidatorDispatcher) Wait() {
 		return
 	}
 	d.workers.Wait()
+}
+
+func (d *ProgrammaticValidatorDispatcher) Stats() ValidatorDispatcherStats {
+	if d == nil || d.registry == nil {
+		return ValidatorDispatcherStats{}
+	}
+	regs := d.registry.List()
+	out := ValidatorDispatcherStats{Registered: len(regs)}
+	for _, reg := range regs {
+		limit := d.limitFor(reg)
+		out.Validators = append(out.Validators, ValidatorQueueSnapshot{
+			ValidatorID:       reg.ValidatorID,
+			ValidationType:    reg.ValidationType,
+			ActionType:        reg.ActionType,
+			Determinism:       reg.Determinism,
+			Inflight:          len(limit),
+			ConcurrencyBudget: cap(limit),
+		})
+	}
+	return out
 }
 
 func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
@@ -608,6 +659,7 @@ type BoardValidatorDispatcher struct {
 	approvedValidatorIDs map[string]bool
 	mu                   sync.Mutex
 	inFlight             map[string]struct{}
+	active               map[string]context.CancelFunc
 }
 
 func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardValidatorDispatcher, error) {
@@ -633,6 +685,7 @@ func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardVali
 		maxOutputBytes:       cfg.MaxOutputBytes,
 		approvedValidatorIDs: copyBoolMap(cfg.ApprovedValidatorIDs),
 		inFlight:             make(map[string]struct{}),
+		active:               make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -660,6 +713,50 @@ func (d *BoardValidatorDispatcher) DispatchValidation(ctx context.Context, req V
 	return d.dispatchAcquiredValidation(ctxOrBackground(ctx), req)
 }
 
+func (d *BoardValidatorDispatcher) RecoverValidationByID(ctx context.Context, claimID, validationID string) (ValidationDispatchResult, error) {
+	req, err := d.recoveryRequestForValidation(claimID, validationID)
+	if err != nil {
+		return d.recoverInvalidValidationRequest(ctxOrBackground(ctx), req, validationID, err)
+	}
+	if req.Validation.Status == ValidationStatusReady {
+		return d.DispatchValidation(ctx, req)
+	}
+	if !d.acquire(req.Validation.ID) {
+		result := validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.now())
+		return result, ErrValidatorConcurrencyExhausted
+	}
+	defer d.release(req.Validation.ID)
+	return d.recoverAcquiredValidation(ctxOrBackground(ctx), req)
+}
+
+func (d *BoardValidatorDispatcher) CancelValidation(validationID string) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	cancel := d.active[strings.TrimSpace(validationID)]
+	delete(d.active, strings.TrimSpace(validationID))
+	d.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func (d *BoardValidatorDispatcher) CancelClaimValidations(claim *Claim) int {
+	if d == nil || claim == nil {
+		return 0
+	}
+	cancelled := 0
+	for _, validation := range claim.Validations {
+		if validation != nil && d.CancelValidation(validation.ID) {
+			cancelled++
+		}
+	}
+	return cancelled
+}
+
 func (d *BoardValidatorDispatcher) dispatchAcquiredValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
 	reg, ok := d.registry.Lookup(req.Claim, req.Validation)
 	if !ok {
@@ -678,7 +775,33 @@ func (d *BoardValidatorDispatcher) dispatchAcquiredValidation(ctx context.Contex
 		return d.commitDispatchResult(ctx, req, reg, result)
 	}
 	handlerCtx, cancel := d.handlerContext(ctx, req.Validation)
-	defer cancel()
+	d.trackActive(req.Validation.ID, cancel)
+	defer d.untrackActive(req.Validation.ID)
+	result, err := d.programmatic.DispatchValidation(handlerCtx, req)
+	if err != nil {
+		result = validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now())
+	}
+	result = d.enforceOutputLimit(reg, req, result)
+	return d.commitDispatchResult(ctx, req, reg, result)
+}
+
+func (d *BoardValidatorDispatcher) recoverAcquiredValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
+	reg, ok := d.registry.Lookup(req.Claim, req.Validation)
+	if !ok {
+		return d.commitRecoveryDispatchError(ctx, req, ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error())
+	}
+	if !validationRecoveryMayRedispatch(reg) {
+		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryDispatcher, "validator recovery requires pure/content determinism")
+	}
+	if err := validateDispatchInput(d.registry.typeRegistry(), reg, req); err != nil {
+		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryArtifactType, err.Error())
+	}
+	if err := d.validateBoundedInput(req.Artifact); err != nil {
+		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryDispatcher, err.Error())
+	}
+	handlerCtx, cancel := d.handlerContext(ctx, req.Validation)
+	d.trackActive(req.Validation.ID, cancel)
+	defer d.untrackActive(req.Validation.ID)
 	result, err := d.programmatic.DispatchValidation(handlerCtx, req)
 	if err != nil {
 		result = validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.now())
@@ -696,6 +819,14 @@ func (d *BoardValidatorDispatcher) dispatchMissingTarget(ctx context.Context, re
 	return d.commitDispatchError(ctx, req, ValidationErrorCategoryDispatcher, reason)
 }
 
+func (d *BoardValidatorDispatcher) recoverInvalidValidationRequest(ctx context.Context, req ValidationDispatchRequest, validationID string, cause error) (ValidationDispatchResult, error) {
+	if req.Claim != nil && req.Validation != nil {
+		return d.commitRecoveryDispatchError(ctx, req, ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, ValidationErrorCategoryDispatcher, cause.Error())
+	}
+	fallback := ValidationDispatchRequest{Validation: &Validation{ID: validationID, Required: true}}
+	return validationDispatchError(fallback, ValidationErrorCategoryDispatcher, cause.Error(), d.now()), cause
+}
+
 func (d *BoardValidatorDispatcher) requestForValidation(claimID, validationID string) (ValidationDispatchRequest, error) {
 	validation, claim, ok := d.board.CloneValidation(strings.TrimSpace(validationID))
 	if !ok || claim.ID != strings.TrimSpace(claimID) {
@@ -706,6 +837,20 @@ func (d *BoardValidatorDispatcher) requestForValidation(claimID, validationID st
 		return ValidationDispatchRequest{Claim: claim, Validation: validation}, fmt.Errorf("target artifact %q not found", validation.TargetArtifactName)
 	}
 	return ValidationDispatchRequest{Claim: claim, Validation: validation, Artifact: artifact, StartedAt: d.now()}, nil
+}
+
+func (d *BoardValidatorDispatcher) recoveryRequestForValidation(claimID, validationID string) (ValidationDispatchRequest, error) {
+	validation, claim, ok := d.board.CloneValidation(strings.TrimSpace(validationID))
+	if !ok || claim.ID != strings.TrimSpace(claimID) {
+		return ValidationDispatchRequest{}, fmt.Errorf("validation %q not found on claim %q", validationID, claimID)
+	}
+	req := ValidationDispatchRequest{Claim: claim, Validation: validation, StartedAt: d.now()}
+	artifact, ok := d.board.cloneValidationTargetArtifact(claim.ID, validation)
+	if !ok {
+		return req, fmt.Errorf("target artifact %q not found", validation.TargetArtifactName)
+	}
+	req.Artifact = artifact
+	return req, validateRecoveryValidationStatus(validation)
 }
 
 func (d *BoardValidatorDispatcher) validateRequest(req ValidationDispatchRequest) error {
@@ -722,6 +867,18 @@ func (d *BoardValidatorDispatcher) validateRequest(req ValidationDispatchRequest
 		return err
 	}
 	return nil
+}
+
+func validateRecoveryValidationStatus(validation *Validation) error {
+	if validation == nil {
+		return fmt.Errorf("%w: validation is required", ErrValidatorDispatchInvalid)
+	}
+	switch validation.Status {
+	case ValidationStatusReady, ValidationStatusValidating, ValidationStatusValidatingQualityBar:
+		return nil
+	default:
+		return fmt.Errorf("%w: validation %q is %q, want recoverable state", ErrValidatorDispatchInvalid, validation.ID, validation.Status)
+	}
 }
 
 func (d *BoardValidatorDispatcher) validateBoardParentage(req ValidationDispatchRequest) error {
@@ -826,6 +983,15 @@ func (d *BoardValidatorDispatcher) commitDispatchError(ctx context.Context, req 
 	return d.commitDispatchResult(ctx, req, ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, validationDispatchError(req, category, description, d.now()))
 }
 
+func (d *BoardValidatorDispatcher) commitRecoveryDispatchError(ctx context.Context, req ValidationDispatchRequest, reg ValidatorRegistration, category ValidationErrorCategory, description string) (ValidationDispatchResult, error) {
+	if req.Validation != nil && req.Validation.Status == ValidationStatusReady {
+		_ = d.board.BeginValidation(ctx, req.Claim.ID, req.Validation.ID, firstNonEmpty(reg.ValidatorID, validationAgentID(req.Validation)), dispatchArtifactID(req.Artifact))
+	}
+	result := validationDispatchError(req, category, description, d.now())
+	result.Status = validationRecoveryFailureStatus(req.Validation, result.Status)
+	return d.commitDispatchResult(ctx, req, reg, result)
+}
+
 func (d *BoardValidatorDispatcher) commitDispatchResult(ctx context.Context, req ValidationDispatchRequest, reg ValidatorRegistration, result ValidationDispatchResult) (ValidationDispatchResult, error) {
 	if result.Error != nil && result.ResultArtifact == nil {
 		result.ResultArtifact = validatorErrorArtifact(reg, req, result.Error, nil)
@@ -844,6 +1010,28 @@ func (d *BoardValidatorDispatcher) handlerContext(ctx context.Context, validatio
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, validation.Timeout)
+}
+
+func (d *BoardValidatorDispatcher) trackActive(validationID string, cancel context.CancelFunc) {
+	if d == nil || cancel == nil {
+		return
+	}
+	d.mu.Lock()
+	d.active[strings.TrimSpace(validationID)] = cancel
+	d.mu.Unlock()
+}
+
+func (d *BoardValidatorDispatcher) untrackActive(validationID string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	cancel := d.active[strings.TrimSpace(validationID)]
+	delete(d.active, strings.TrimSpace(validationID))
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (d *BoardValidatorDispatcher) acquire(validationID string) bool {
@@ -889,6 +1077,16 @@ func validationResultReason(result ValidationDispatchResult) string {
 	return string(result.Status)
 }
 
+func validationRecoveryFailureStatus(validation *Validation, fallback ValidationStatus) ValidationStatus {
+	if validation == nil || validation.Status != ValidationStatusValidatingQualityBar {
+		return fallback
+	}
+	if validation.Required {
+		return ValidationStatusQualityBarValidationFailed
+	}
+	return ValidationStatusQualityBarValidationFailedNotRequired
+}
+
 func dispatchArtifactID(artifact *Artifact) string {
 	if artifact == nil {
 		return ""
@@ -912,4 +1110,8 @@ func firstNonNilClock(clock ClaimsClock) ClaimsClock {
 		return SystemClock{}
 	}
 	return clock
+}
+
+func validationRecoveryMayRedispatch(reg ValidatorRegistration) bool {
+	return reg.Determinism == HandlerDeterminismPure || reg.Determinism == HandlerDeterminismContent
 }

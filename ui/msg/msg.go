@@ -836,12 +836,15 @@ type ClaimsProjectionMsg struct {
 // Status=Acting vs Status=Idle / Success / Error — no other code path
 // writes Status (UI_DESIGN.md §7 P7.1).
 type ClaimsAgentStatusMsg struct {
-	AgentID   string
-	SessionID string
-	Active    bool   // true on cycle open; false on cycle close (drain or handoff)
-	CycleID   string // root claim ID anchoring this cycle (empty when Active=false from session reset)
-	OpenCount int    // count of open subject claims for the owner (debugging)
-	Reason    string
+	AgentID             string
+	SessionID           string
+	Active              bool   // true on cycle open; false on cycle close (drain or handoff)
+	CycleID             string // root claim ID anchoring this cycle (empty when Active=false from session reset)
+	OpenCount           int    // count of open subject claims for the owner (debugging)
+	Reason              string
+	ParticipantUID      string
+	ParticipantCategory string
+	ParticipantRoute    string
 
 	// State is the categorical agent activity state to use for this
 	// cycle edge when the claim carries a UI-specific state that is
@@ -892,14 +895,17 @@ type ClaimsAgentStatusMsg struct {
 // status line refreshes without creating a new row. See
 // docs/CLAIMS_UI.md.
 type ClaimContextMsg struct {
-	SessionID         string
-	ClaimID           string
-	OwnerAgentID      string
-	CycleID           string
-	ParentRowID       string
-	Context           string
-	ContextTransition int64
-	SuppressChat      bool
+	SessionID                string
+	ClaimID                  string
+	OwnerAgentID             string
+	OwnerParticipantUID      string
+	OwnerParticipantCategory string
+	OwnerParticipantRoute    string
+	CycleID                  string
+	ParentRowID              string
+	Context                  string
+	ContextTransition        int64
+	SuppressChat             bool
 	// State is the categorical agent activity state (the canonical
 	// taxonomy from agents/shared.AgentActivityState — "tool_executing",
 	// "awaiting_peer_response", "challenging_peer", "awaiting_guardian",
@@ -915,21 +921,27 @@ type ClaimContextMsg struct {
 // consult/challenge/guardian rows are rendered from the claim graph rather
 // than inferred from tool-call arguments or streaming metadata.
 type ClaimPeerInteractionMsg struct {
-	SessionID      string
-	CycleID        string
-	ClaimID        string
-	ActionType     string // "consultation" | "challenge" | "guardian_check"
-	IssuerAgentID  string
-	SubjectAgentID string
-	Title          string
-	Context        string
-	Status         string // "pending" | "done" | "failed"
-	TestamentID    string
-	ValidationID   string
-	Sequence       uint64
-	DeltaKey       string
-	OccurredAt     time.Time
-	SuppressChat   bool
+	SessionID                  string
+	CycleID                    string
+	ClaimID                    string
+	ActionType                 string // "consultation" | "challenge" | "guardian_check"
+	IssuerAgentID              string
+	SubjectAgentID             string
+	IssuerParticipantUID       string
+	IssuerParticipantCategory  string
+	IssuerParticipantRoute     string
+	SubjectParticipantUID      string
+	SubjectParticipantCategory string
+	SubjectParticipantRoute    string
+	Title                      string
+	Context                    string
+	Status                     string // "pending" | "done" | "failed"
+	TestamentID                string
+	ValidationID               string
+	Sequence                   uint64
+	DeltaKey                   string
+	OccurredAt                 time.Time
+	SuppressChat               bool
 }
 
 // TestamentContextMsg updates an in-flight testament's developing-
@@ -942,15 +954,18 @@ type ClaimPeerInteractionMsg struct {
 // boundary. See docs/CLAIMS_UI.md "Accumulator-anchored testament
 // context".
 type TestamentContextMsg struct {
-	SessionID         string
-	AccumulatorID     string
-	TestamentID       string
-	ClaimID           string
-	AgentID           string
-	CycleID           string
-	ParentRowID       string
-	Context           string
-	ContextTransition int64
+	SessionID           string
+	AccumulatorID       string
+	TestamentID         string
+	ClaimID             string
+	AgentID             string
+	ParticipantUID      string
+	ParticipantCategory string
+	ParticipantRoute    string
+	CycleID             string
+	ParentRowID         string
+	Context             string
+	ContextTransition   int64
 }
 
 // ClaimArtifactAddedMsg opens a row in the chat tree. Emitted by the
@@ -958,19 +973,28 @@ type TestamentContextMsg struct {
 // chat panel renders mechanically: top-level rows are keyed by
 // CycleID, nested rows are keyed by ParentRowID — no relation walking.
 type ClaimArtifactAddedMsg struct {
-	ArtifactID     string         // unique ID — the row key
-	CycleID        string         // which top-level cycle this row lives under
-	ParentRowID    string         // immediate parent within the cycle (artifact ID, or empty for cycle-root rows)
-	ClaimID        string         // claim this artifact's testament responds to
-	OwnerAgentID   string         // canonical owner of the parent claim
-	OwnerAgentType string         // type label rendered in child-agent blocks ("guardian", "tester-pipeline", ...)
-	TargetAgentID  string         // target of the parent claim (subject)
-	AgentID        string         // record-issuing agent (Artifact.AgentID — replica/instance)
-	Kind           string         // "tool_started" | "llm_started" | "cycle_root" | diagnostic artifact kind
-	Reference      string         // tool name, consult title, etc.
-	Metadata       map[string]any // kind-specific structured detail
-	CreatedAt      time.Time
-	SuppressChat   bool
+	ArtifactID                  string // unique ID — the row key
+	CycleID                     string // which top-level cycle this row lives under
+	ParentRowID                 string // immediate parent within the cycle (artifact ID, or empty for cycle-root rows)
+	ClaimID                     string // claim this artifact's testament responds to
+	OwnerAgentID                string // canonical owner of the parent claim
+	OwnerAgentType              string // type label rendered in child-agent blocks ("guardian", "tester-pipeline", ...)
+	TargetAgentID               string // target of the parent claim (subject)
+	AgentID                     string // record-issuing agent (Artifact.AgentID — replica/instance)
+	OwnerParticipantUID         string
+	OwnerParticipantCategory    string
+	OwnerParticipantRoute       string
+	TargetParticipantUID        string
+	TargetParticipantCategory   string
+	TargetParticipantRoute      string
+	ArtifactParticipantUID      string
+	ArtifactParticipantCategory string
+	ArtifactParticipantRoute    string
+	Kind                        string         // "tool_started" | "llm_started" | "cycle_root" | diagnostic artifact kind
+	Reference                   string         // tool name, consult title, etc.
+	Metadata                    map[string]any // kind-specific structured detail
+	CreatedAt                   time.Time
+	SuppressChat                bool
 }
 
 // ClaimResponseTextMsg carries the agent's final assistant message
@@ -981,14 +1005,17 @@ type ClaimArtifactAddedMsg struct {
 // as the visible artifact lifecycle; response_text falls outside
 // that lifecycle and needs its own delivery path.
 type ClaimResponseTextMsg struct {
-	SessionID    string
-	CycleID      string
-	ClaimID      string
-	ParentRowID  string
-	AgentID      string
-	Content      string
-	CreatedAt    time.Time
-	SuppressChat bool
+	SessionID           string
+	CycleID             string
+	ClaimID             string
+	ParentRowID         string
+	AgentID             string
+	ParticipantUID      string
+	ParticipantCategory string
+	ParticipantRoute    string
+	Content             string
+	CreatedAt           time.Time
+	SuppressChat        bool
 }
 
 // ClaimPresentationMsg carries user-facing content projected from a
@@ -997,21 +1024,24 @@ type ClaimResponseTextMsg struct {
 // state; Metadata["synthetic"] marks that case. The board remains the
 // source of truth.
 type ClaimPresentationMsg struct {
-	SessionID   string
-	CycleID     string
-	ClaimID     string
-	SourceType  string // "testament" | "artifact" | "synthetic"
-	SourceID    string
-	TestamentID string
-	AgentID     string
-	Title       string
-	Content     string
-	Format      string
-	Placement   string
-	ReplaceKey  string
-	Metadata    map[string]any
-	CreatedAt   time.Time
-	Sequence    uint64
+	SessionID           string
+	CycleID             string
+	ClaimID             string
+	SourceType          string // "testament" | "artifact" | "synthetic"
+	SourceID            string
+	TestamentID         string
+	AgentID             string
+	ParticipantUID      string
+	ParticipantCategory string
+	ParticipantRoute    string
+	Title               string
+	Content             string
+	Format              string
+	Placement           string
+	ReplaceKey          string
+	Metadata            map[string]any
+	CreatedAt           time.Time
+	Sequence            uint64
 }
 
 // ClaimArtifactCompletedMsg closes a row in the chat tree. Emitted by

@@ -3,6 +3,13 @@
 
 ## Sylk - Multi-Agent Coding Application
 
+
+### BANNED: Preserving legacy behavior and fallbacks
+
+When the user instructs you to refactor something that would overwrite an
+existing system, you are to replace, not leavy overly complicated fallbacks
+or fallback logic.
+
 ### BANNED: SQLite Extensions (Requires Explicit User Authorization)
 
 **THE FOLLOWING ARE BANNED. DO NOT implement, install, suggest, or add ANY of the following UNLESS the user EXPLICITLY authorizes them in the conversation:**

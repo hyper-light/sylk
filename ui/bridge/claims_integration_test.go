@@ -2133,6 +2133,54 @@ func TestBridgeIntegration_ClaimContextRoutesToUI(t *testing.T) {
 	}
 }
 
+func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.T) {
+	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-service-participant")
+	defer cleanup()
+	serviceRoute := "sys:provider_gateway"
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title:      "service-backed work",
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: serviceRoute, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{Description: "receipt", QualityBar: "received", Type: claims.ValidationTypeReceipt, Required: true}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction: %v", err)
+	}
+	claimID := board.Projection().Claims[0].ID
+	drainBridge(t, prog, "service claim open")
+
+	br.OnArtifactAdded(claimID, serviceRoute, board.SessionID(), &claims.Artifact{
+		ID:        "service-tool-started",
+		AgentID:   serviceRoute,
+		Kind:      "tool_started",
+		Reference: "provider_gateway.complete",
+		Created:   time.Now().UTC(),
+	})
+	drainBridge(t, prog, "service artifact")
+
+	var got *msg.ClaimArtifactAddedMsg
+	for _, m := range prog.Snapshot() {
+		if artifact, ok := m.(msg.ClaimArtifactAddedMsg); ok && artifact.ArtifactID == "service-tool-started" {
+			got = &artifact
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("expected service artifact message")
+	}
+	if got.TargetParticipantCategory != string(claims.ParticipantCategoryService) || got.TargetParticipantRoute != serviceRoute {
+		t.Fatalf("target participant = category %q route %q, want service %q", got.TargetParticipantCategory, got.TargetParticipantRoute, serviceRoute)
+	}
+	if got.ArtifactParticipantCategory != string(claims.ParticipantCategoryService) || got.ArtifactParticipantRoute != serviceRoute {
+		t.Fatalf("artifact participant = category %q route %q, want service %q", got.ArtifactParticipantCategory, got.ArtifactParticipantRoute, serviceRoute)
+	}
+}
+
 // TestBridgeIntegration_ClaimContextSuppressedAfterTerminal verifies the
 // claim Context is sealed when the claim reaches a terminal status —
 // late narration arriving after acceptance/rejection must be dropped

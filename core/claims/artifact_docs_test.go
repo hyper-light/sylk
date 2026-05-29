@@ -48,6 +48,7 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeIdentityAllocation,
 		ArtifactDataTypeIdentityLineage,
 		ArtifactDataTypeActivationRecord,
+		ArtifactDataTypeProductionReadiness,
 		ArtifactDataTypeDAGOperation,
 		ArtifactDataTypeVFSOperation,
 		ArtifactDataTypeToolRuntimeExecution,

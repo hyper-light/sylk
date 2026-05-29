@@ -27,19 +27,28 @@ const (
 )
 
 type claimMeta struct {
-	ClaimID             string
-	SessionID           string
-	CycleID             string
-	OwnerAgentID        string
-	OwnerAgentType      string
-	TargetAgentID       string
-	TargetAgentType     string
-	IssuerAgentID       string
-	ActionType          string
-	Title               string
-	StreamCorrelationID string
-	SuppressChat        bool
-	UIState             string
+	ClaimID                   string
+	SessionID                 string
+	CycleID                   string
+	OwnerAgentID              string
+	OwnerAgentType            string
+	OwnerParticipantUID       string
+	OwnerParticipantCategory  string
+	OwnerParticipantRoute     string
+	TargetAgentID             string
+	TargetAgentType           string
+	TargetParticipantUID      string
+	TargetParticipantCategory string
+	TargetParticipantRoute    string
+	IssuerAgentID             string
+	IssuerParticipantUID      string
+	IssuerParticipantCategory string
+	IssuerParticipantRoute    string
+	ActionType                string
+	Title                     string
+	StreamCorrelationID       string
+	SuppressChat              bool
+	UIState                   string
 }
 
 type claimContextEvent struct {
@@ -501,10 +510,22 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 			}
 		}
 	case claims.ClaimContextDelta:
-		b.debug("legacy_claim_context_delta_ignored", "session_id", sessionID, "claim_id", delta.ClaimID)
+		b.updateClaimMetaFromClaimContextDelta(delta)
+		b.handleClaimContext(sessionID, claimContextEvent{
+			ClaimID:           delta.ClaimID,
+			AgentID:           delta.OwnerAgentID,
+			Context:           delta.Context,
+			ContextTransition: delta.TransitionID,
+		})
 	case *claims.ClaimContextDelta:
 		if delta != nil {
-			b.debug("legacy_claim_context_delta_ignored", "session_id", sessionID, "claim_id", delta.ClaimID)
+			b.updateClaimMetaFromClaimContextDelta(*delta)
+			b.handleClaimContext(sessionID, claimContextEvent{
+				ClaimID:           delta.ClaimID,
+				AgentID:           delta.OwnerAgentID,
+				Context:           delta.Context,
+				ContextTransition: delta.TransitionID,
+			})
 		}
 	case claims.TestamentContextDelta:
 		b.handleTestamentContext(sessionID, testamentContextEvent{
@@ -532,6 +553,7 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 
 func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claims.ClaimsBoard, entry *claims.GraphEntryPoint, delta claims.CanonicalDelta) {
 	claimID := strings.TrimSpace(delta.ClaimID())
+	b.updateClaimMetaFromCanonicalDelta(claimID, delta)
 	switch delta.Action {
 	case claims.DeltaActionClaimGenerated:
 		b.handleEntryClaim(sessionID, board, entry, claimID)
@@ -582,6 +604,55 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 			ContextTransition: canonicalProgressTransition(delta),
 		})
 	}
+}
+
+func (b *ClaimsBridge) updateClaimMetaFromCanonicalDelta(claimID string, delta claims.CanonicalDelta) {
+	claimID = strings.TrimSpace(claimID)
+	if b == nil || claimID == "" {
+		return
+	}
+	actorRef := participantDisplayFromAgentRef(delta.Actor)
+	targetRef := participantDisplayFromDelivery(delta.Delivery)
+	b.mu.Lock()
+	meta := b.claimMeta[claimID]
+	meta.ClaimID = claimID
+	meta.SessionID = firstNonBlank(meta.SessionID, delta.SessionID, b.activeSession)
+	if action := strings.TrimSpace(string(delta.ClaimActionType())); action != "" {
+		meta.ActionType = action
+	}
+	meta = applyCanonicalClaimParticipantRefs(meta, delta.Action, actorRef, targetRef)
+	b.claimMeta[claimID] = meta
+	b.mu.Unlock()
+}
+
+func applyCanonicalClaimParticipantRefs(meta claimMeta, action claims.DeltaAction, actorRef, targetRef participantDisplayRef) claimMeta {
+	if action == claims.DeltaActionClaimPosted || action == claims.DeltaActionClaimGenerated {
+		meta = withIssuerParticipant(meta, actorRef)
+	}
+	if targetRef.UID != "" {
+		meta = withTargetParticipant(meta, targetRef)
+	}
+	if meta.OwnerParticipantUID == "" {
+		meta = withOwnerParticipant(meta, actorRef)
+	}
+	return meta
+}
+
+func (b *ClaimsBridge) updateClaimMetaFromClaimContextDelta(delta claims.ClaimContextDelta) {
+	claimID := strings.TrimSpace(delta.ClaimID)
+	if b == nil || claimID == "" {
+		return
+	}
+	b.mu.Lock()
+	meta := b.claimMeta[claimID]
+	meta.ClaimID = claimID
+	meta.SessionID = firstNonBlank(meta.SessionID, delta.SessionID, b.activeSession)
+	meta.ActionType = firstNonBlank(meta.ActionType, string(delta.ActionKind))
+	meta = withOwnerParticipant(meta, participantDisplayFromRelationID(delta.OwnerAgentID))
+	meta = withTargetParticipant(meta, participantDisplayFromRelationID(delta.SubjectAgentID))
+	meta = withIssuerParticipant(meta, participantDisplayFromRelationID(delta.IssuerAgentID))
+	b.claimMeta[claimID] = meta
+	b.mu.Unlock()
 }
 
 func canonicalValidationAutoAccepted(delta claims.CanonicalDelta) bool {
@@ -745,6 +816,108 @@ func canonicalProgressTransition(delta claims.CanonicalDelta) int64 {
 	}
 }
 
+type participantDisplayRef struct {
+	AgentID  string
+	UID      string
+	Category string
+	Route    string
+}
+
+func participantDisplayFromAgentRef(ref claims.AgentRef) participantDisplayRef {
+	ref = ref.Normalized()
+	route := firstNonBlank(ref.Name, ref.Type, ref.RouteKey())
+	agentID := firstNonBlank(ref.RouteKey(), route)
+	category := normalizeParticipantDisplayCategory(ref.Category, agentID)
+	return participantDisplayRef{
+		AgentID:  agentID,
+		UID:      firstNonBlank(ref.UID, agentID),
+		Category: category,
+		Route:    firstNonBlank(route, agentID),
+	}
+}
+
+func participantDisplayFromDelivery(delivery *claims.DeltaDelivery) participantDisplayRef {
+	if delivery == nil || len(delivery.To) == 0 {
+		return participantDisplayRef{}
+	}
+	return participantDisplayFromAgentRef(delivery.To[0])
+}
+
+func participantDisplayFromArtifact(art *claims.Artifact) participantDisplayRef {
+	if art == nil {
+		return participantDisplayRef{}
+	}
+	ref := participantDisplayFromRelationID(firstNonBlank(art.ParticipantID, art.AgentID))
+	ref.AgentID = firstNonBlank(strings.TrimSpace(art.AgentID), ref.AgentID)
+	ref.Route = firstNonBlank(strings.TrimSpace(art.AgentID), ref.Route)
+	return ref
+}
+
+func participantDisplayFromRelationID(agentID string) participantDisplayRef {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return participantDisplayRef{}
+	}
+	return participantDisplayRef{
+		AgentID:  agentID,
+		UID:      agentID,
+		Category: normalizeParticipantDisplayCategory("", agentID),
+		Route:    participantRouteFromRelationID(agentID),
+	}
+}
+
+func participantRouteFromRelationID(agentID string) string {
+	parts := strings.Split(agentID, ":")
+	if len(parts) >= 3 && parts[0] == "participant" {
+		return parts[2]
+	}
+	return agentID
+}
+
+func normalizeParticipantDisplayCategory(category, agentID string) string {
+	category = strings.TrimSpace(category)
+	if claims.ParticipantCategory(category).Valid() {
+		return category
+	}
+	return inferredParticipantCategory(agentID)
+}
+
+func inferredParticipantCategory(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	switch {
+	case strings.HasPrefix(agentID, "participant:service:"):
+		return string(claims.ParticipantCategoryService)
+	case strings.HasPrefix(agentID, "participant:system:"):
+		return string(claims.ParticipantCategorySystem)
+	case strings.HasPrefix(agentID, "participant:external:"):
+		return string(claims.ParticipantCategoryExternal)
+	case strings.HasPrefix(agentID, "external:"):
+		return string(claims.ParticipantCategoryExternal)
+	case knownServiceRoute(agentID):
+		return string(claims.ParticipantCategoryService)
+	default:
+		return string(claims.ParticipantCategoryAgent)
+	}
+}
+
+func knownServiceRoute(agentID string) bool {
+	switch strings.TrimSpace(agentID) {
+	case "sys:dag_processor",
+		"sys:vfs_tool_provisioner",
+		"sys:tool_runtime",
+		"sys:knowledge_graph",
+		"sys:memory_forest",
+		"sys:document_db",
+		"sys:guardian_gate",
+		"sys:provider_gateway",
+		"sys:external_adapter",
+		"activation_controller":
+		return true
+	default:
+		return false
+	}
+}
+
 func (b *ClaimsBridge) currentBoard() (*claims.ClaimsBoard, string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -860,9 +1033,12 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 
 	issuer := strings.TrimSpace(claims.IssuerAgentID(c.Relations))
 	subject := strings.TrimSpace(claims.SubjectAgentID(c.Relations))
+	issuerRef := participantDisplayFromRelationID(issuer)
+	subjectRef := participantDisplayFromRelationID(subject)
 	causedBy := relationID(c.Relations, claims.RelationshipCausedBy)
 	handoffFrom := claims.HandoffFromClaimID(c.Relations)
 	ownerForResolver := cycleOwnerForClaim(c)
+	ownerRef := participantDisplayFromRelationID(ownerForResolver)
 
 	var toEmit []any
 	b.mu.Lock()
@@ -901,19 +1077,28 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 	uiState := claimInitialUIState(c)
 	panelReason := claimPanelReason(c)
 	meta := claimMeta{
-		ClaimID:             c.ID,
-		SessionID:           sessionID,
-		CycleID:             cycleID,
-		OwnerAgentID:        cycleOwner,
-		OwnerAgentType:      agentTypeFromID(cycleOwner),
-		TargetAgentID:       subject,
-		TargetAgentType:     agentTypeFromID(subject),
-		IssuerAgentID:       issuer,
-		ActionType:          string(c.ActionType),
-		Title:               strings.TrimSpace(c.Title),
-		StreamCorrelationID: claimUIStreamCorrelation(c),
-		SuppressChat:        suppressChat,
-		UIState:             uiState,
+		ClaimID:                   c.ID,
+		SessionID:                 sessionID,
+		CycleID:                   cycleID,
+		OwnerAgentID:              cycleOwner,
+		OwnerAgentType:            agentTypeFromID(cycleOwner),
+		OwnerParticipantUID:       firstNonBlank(ownerRef.UID, cycleOwner),
+		OwnerParticipantCategory:  ownerRef.Category,
+		OwnerParticipantRoute:     firstNonBlank(ownerRef.Route, cycleOwner),
+		TargetAgentID:             subject,
+		TargetAgentType:           agentTypeFromID(subject),
+		TargetParticipantUID:      firstNonBlank(subjectRef.UID, subject),
+		TargetParticipantCategory: subjectRef.Category,
+		TargetParticipantRoute:    firstNonBlank(subjectRef.Route, subject),
+		IssuerAgentID:             issuer,
+		IssuerParticipantUID:      firstNonBlank(issuerRef.UID, issuer),
+		IssuerParticipantCategory: issuerRef.Category,
+		IssuerParticipantRoute:    firstNonBlank(issuerRef.Route, issuer),
+		ActionType:                string(c.ActionType),
+		Title:                     strings.TrimSpace(c.Title),
+		StreamCorrelationID:       claimUIStreamCorrelation(c),
+		SuppressChat:              suppressChat,
+		UIState:                   uiState,
 	}
 	b.claimMeta[c.ID] = meta
 
@@ -940,6 +1125,9 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 			CycleID:             outcome.CycleOpened.CycleID,
 			OpenCount:           len(outcome.CycleOpened.openClaims),
 			Reason:              panelReason,
+			ParticipantUID:      meta.OwnerParticipantUID,
+			ParticipantCategory: meta.OwnerParticipantCategory,
+			ParticipantRoute:    meta.OwnerParticipantRoute,
 			State:               uiState,
 			SuppressChat:        suppressChat,
 			ActionType:          string(c.ActionType),
@@ -989,6 +1177,11 @@ func (b *ClaimsBridge) handleClaimClosed(claimID, outcome string) {
 	}
 	if st := b.resolver.onClaimClosed(claimID); st != nil {
 		m := claimsAgentClosedMsg(b.activeSession, st, outcome)
+		if meta := b.claimMeta[claimID]; meta.ClaimID != "" {
+			m.ParticipantUID = meta.OwnerParticipantUID
+			m.ParticipantCategory = meta.OwnerParticipantCategory
+			m.ParticipantRoute = meta.OwnerParticipantRoute
+		}
 		m.SuppressChat = suppressChat
 		m.State = uiState
 		closeMsg = &m
@@ -1114,21 +1307,27 @@ func (b *ClaimsBridge) claimPeerInteractionMsgLocked(sessionID, claimID string, 
 	}
 	b.claimToPeerRow[claimID] = rowID
 	return &msg.ClaimPeerInteractionMsg{
-		SessionID:      firstNonBlank(strings.TrimSpace(sessionID), meta.SessionID, b.activeSession),
-		CycleID:        meta.CycleID,
-		ClaimID:        claimID,
-		ActionType:     meta.ActionType,
-		IssuerAgentID:  issuer,
-		SubjectAgentID: subject,
-		Title:          meta.Title,
-		Context:        strings.TrimSpace(contextValue),
-		Status:         firstNonBlank(strings.TrimSpace(status), "pending"),
-		TestamentID:    strings.TrimSpace(testamentID),
-		ValidationID:   strings.TrimSpace(validationID),
-		Sequence:       sequence,
-		DeltaKey:       strings.TrimSpace(deltaKey),
-		OccurredAt:     occurredAt,
-		SuppressChat:   meta.SuppressChat,
+		SessionID:                  firstNonBlank(strings.TrimSpace(sessionID), meta.SessionID, b.activeSession),
+		CycleID:                    meta.CycleID,
+		ClaimID:                    claimID,
+		ActionType:                 meta.ActionType,
+		IssuerAgentID:              issuer,
+		SubjectAgentID:             subject,
+		IssuerParticipantUID:       meta.IssuerParticipantUID,
+		IssuerParticipantCategory:  meta.IssuerParticipantCategory,
+		IssuerParticipantRoute:     meta.IssuerParticipantRoute,
+		SubjectParticipantUID:      meta.TargetParticipantUID,
+		SubjectParticipantCategory: meta.TargetParticipantCategory,
+		SubjectParticipantRoute:    meta.TargetParticipantRoute,
+		Title:                      meta.Title,
+		Context:                    strings.TrimSpace(contextValue),
+		Status:                     firstNonBlank(strings.TrimSpace(status), "pending"),
+		TestamentID:                strings.TrimSpace(testamentID),
+		ValidationID:               strings.TrimSpace(validationID),
+		Sequence:                   sequence,
+		DeltaKey:                   strings.TrimSpace(deltaKey),
+		OccurredAt:                 occurredAt,
+		SuppressChat:               meta.SuppressChat,
 	}
 }
 
@@ -1178,15 +1377,18 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 		actor := claimContextActor(meta, event.AgentID)
 		parentRowID := b.parentRowIDForClaimLocked(claimID)
 		out = &msg.ClaimContextMsg{
-			SessionID:         sessionID,
-			ClaimID:           claimID,
-			OwnerAgentID:      actor,
-			CycleID:           meta.CycleID,
-			ParentRowID:       parentRowID,
-			Context:           event.Context,
-			ContextTransition: event.ContextTransition,
-			SuppressChat:      meta.SuppressChat,
-			State:             state,
+			SessionID:                sessionID,
+			ClaimID:                  claimID,
+			OwnerAgentID:             actor,
+			OwnerParticipantUID:      participantUIDForActor(meta, actor),
+			OwnerParticipantCategory: participantCategoryForActor(meta, actor),
+			OwnerParticipantRoute:    participantRouteForActor(meta, actor),
+			CycleID:                  meta.CycleID,
+			ParentRowID:              parentRowID,
+			Context:                  event.Context,
+			ContextTransition:        event.ContextTransition,
+			SuppressChat:             meta.SuppressChat,
+			State:                    state,
 		}
 	}
 	b.mu.Unlock()
@@ -1224,15 +1426,18 @@ func (b *ClaimsBridge) handleTestamentContext(sessionID string, event testamentC
 	meta := b.metaForClaimLocked(claimID)
 	if meta.CycleID != "" {
 		out = &msg.TestamentContextMsg{
-			SessionID:         sessionID,
-			AccumulatorID:     strings.TrimSpace(event.AccumulatorID),
-			TestamentID:       strings.TrimSpace(event.TestamentID),
-			ClaimID:           claimID,
-			AgentID:           strings.TrimSpace(event.AgentID),
-			CycleID:           meta.CycleID,
-			ParentRowID:       b.parentRowIDForClaimLocked(claimID),
-			Context:           event.Context,
-			ContextTransition: event.ContextTransition,
+			SessionID:           sessionID,
+			AccumulatorID:       strings.TrimSpace(event.AccumulatorID),
+			TestamentID:         strings.TrimSpace(event.TestamentID),
+			ClaimID:             claimID,
+			AgentID:             strings.TrimSpace(event.AgentID),
+			ParticipantUID:      participantUIDForActor(meta, event.AgentID),
+			ParticipantCategory: participantCategoryForActor(meta, event.AgentID),
+			ParticipantRoute:    participantRouteForActor(meta, event.AgentID),
+			CycleID:             meta.CycleID,
+			ParentRowID:         b.parentRowIDForClaimLocked(claimID),
+			Context:             event.Context,
+			ContextTransition:   event.ContextTransition,
 		}
 	}
 	b.mu.Unlock()
@@ -1397,23 +1602,34 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 	if meta.OwnerAgentID == "" {
 		meta.OwnerAgentID = cycle.OwnerAgentID
 		meta.OwnerAgentType = agentTypeFromID(cycle.OwnerAgentID)
+		meta = withOwnerParticipant(meta, participantDisplayFromRelationID(cycle.OwnerAgentID))
 	}
 	parentRowID := b.parentRowIDForClaimLocked(claimID)
+	artifactRef := participantDisplayFromArtifact(art)
 	b.emittedStartedArtifacts[artifactID] = struct{}{}
 	return &msg.ClaimArtifactAddedMsg{
-		ArtifactID:     artifactID,
-		CycleID:        meta.CycleID,
-		ParentRowID:    parentRowID,
-		ClaimID:        claimID,
-		OwnerAgentID:   meta.OwnerAgentID,
-		OwnerAgentType: meta.OwnerAgentType,
-		TargetAgentID:  meta.TargetAgentID,
-		AgentID:        firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		Kind:           strings.TrimSpace(art.Kind),
-		Reference:      strings.TrimSpace(art.Reference),
-		Metadata:       cloneMetadata(art.Metadata),
-		CreatedAt:      art.Created,
-		SuppressChat:   meta.SuppressChat,
+		ArtifactID:                  artifactID,
+		CycleID:                     meta.CycleID,
+		ParentRowID:                 parentRowID,
+		ClaimID:                     claimID,
+		OwnerAgentID:                meta.OwnerAgentID,
+		OwnerAgentType:              meta.OwnerAgentType,
+		TargetAgentID:               meta.TargetAgentID,
+		AgentID:                     firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		OwnerParticipantUID:         meta.OwnerParticipantUID,
+		OwnerParticipantCategory:    meta.OwnerParticipantCategory,
+		OwnerParticipantRoute:       meta.OwnerParticipantRoute,
+		TargetParticipantUID:        meta.TargetParticipantUID,
+		TargetParticipantCategory:   meta.TargetParticipantCategory,
+		TargetParticipantRoute:      meta.TargetParticipantRoute,
+		ArtifactParticipantUID:      artifactRef.UID,
+		ArtifactParticipantCategory: artifactRef.Category,
+		ArtifactParticipantRoute:    artifactRef.Route,
+		Kind:                        strings.TrimSpace(art.Kind),
+		Reference:                   strings.TrimSpace(art.Reference),
+		Metadata:                    cloneMetadata(art.Metadata),
+		CreatedAt:                   art.Created,
+		SuppressChat:                meta.SuppressChat,
 	}
 }
 
@@ -1481,14 +1697,17 @@ func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string,
 		return nil
 	}
 	return []any{msg.ClaimContextMsg{
-		SessionID:    sessionID,
-		ClaimID:      claimID,
-		OwnerAgentID: claimContextActor(meta, agentID),
-		CycleID:      meta.CycleID,
-		ParentRowID:  b.parentRowIDForClaimLocked(claimID),
-		Context:      detail,
-		State:        state,
-		SuppressChat: meta.SuppressChat,
+		SessionID:                sessionID,
+		ClaimID:                  claimID,
+		OwnerAgentID:             claimContextActor(meta, agentID),
+		OwnerParticipantUID:      participantUIDForActor(meta, claimContextActor(meta, agentID)),
+		OwnerParticipantCategory: participantCategoryForActor(meta, claimContextActor(meta, agentID)),
+		OwnerParticipantRoute:    participantRouteForActor(meta, claimContextActor(meta, agentID)),
+		CycleID:                  meta.CycleID,
+		ParentRowID:              b.parentRowIDForClaimLocked(claimID),
+		Context:                  detail,
+		State:                    state,
+		SuppressChat:             meta.SuppressChat,
 	}}
 }
 
@@ -1505,14 +1724,17 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 		return nil
 	}
 	return &msg.ClaimResponseTextMsg{
-		SessionID:    sessionID,
-		CycleID:      meta.CycleID,
-		ClaimID:      claimID,
-		ParentRowID:  b.parentRowIDForClaimLocked(claimID),
-		AgentID:      firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		Content:      content,
-		CreatedAt:    nonZeroTime(art.Created),
-		SuppressChat: meta.SuppressChat,
+		SessionID:           sessionID,
+		CycleID:             meta.CycleID,
+		ClaimID:             claimID,
+		ParentRowID:         b.parentRowIDForClaimLocked(claimID),
+		AgentID:             firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		ParticipantUID:      participantDisplayFromArtifact(art).UID,
+		ParticipantCategory: participantDisplayFromArtifact(art).Category,
+		ParticipantRoute:    participantDisplayFromArtifact(art).Route,
+		Content:             content,
+		CreatedAt:           nonZeroTime(art.Created),
+		SuppressChat:        meta.SuppressChat,
 	}
 }
 
@@ -1584,21 +1806,25 @@ func (b *ClaimsBridge) claimPresentationMsgForTestamentLocked(sessionID, claimID
 		return nil, nil
 	}
 	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), presentationFormat(p), "")
+	participantRef := participantDisplayFromRelationID(firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID))
 	return &msg.ClaimPresentationMsg{
-		SessionID:   sessionID,
-		CycleID:     cycleID,
-		ClaimID:     claimID,
-		SourceType:  "testament",
-		SourceID:    sourceID,
-		TestamentID: sourceID,
-		AgentID:     firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		Title:       presentationTitle(p, "Testament"),
-		Content:     content,
-		Format:      presentationFormat(p),
-		Placement:   presentationPlacement(p),
-		ReplaceKey:  presentationReplaceKey(p),
-		CreatedAt:   nonZeroTime(t.Created),
-		Sequence:    t.Sequence,
+		SessionID:           sessionID,
+		CycleID:             cycleID,
+		ClaimID:             claimID,
+		SourceType:          "testament",
+		SourceID:            sourceID,
+		TestamentID:         sourceID,
+		AgentID:             participantRef.AgentID,
+		ParticipantUID:      participantRef.UID,
+		ParticipantCategory: participantRef.Category,
+		ParticipantRoute:    participantRef.Route,
+		Title:               presentationTitle(p, "Testament"),
+		Content:             content,
+		Format:              presentationFormat(p),
+		Placement:           presentationPlacement(p),
+		ReplaceKey:          presentationReplaceKey(p),
+		CreatedAt:           nonZeroTime(t.Created),
+		Sequence:            t.Sequence,
 	}, nil
 }
 
@@ -1649,22 +1875,26 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 	}
 	content = safeClaimPresentationContent(sourceID, content, format)
 	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), format, "")
+	participantRef := participantDisplayFromArtifact(art)
 	return &msg.ClaimPresentationMsg{
-		SessionID:   sessionID,
-		CycleID:     cycleID,
-		ClaimID:     claimID,
-		SourceType:  "artifact",
-		SourceID:    sourceID,
-		TestamentID: strings.TrimSpace(art.TestamentID),
-		AgentID:     firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		Title:       presentationTitle(p, strings.TrimSpace(art.Kind)),
-		Content:     content,
-		Format:      format,
-		Placement:   presentationPlacement(p),
-		ReplaceKey:  presentationReplaceKey(p),
-		Metadata:    safePresentationMetadata(art.Metadata),
-		CreatedAt:   nonZeroTime(art.Created),
-		Sequence:    art.Sequence,
+		SessionID:           sessionID,
+		CycleID:             cycleID,
+		ClaimID:             claimID,
+		SourceType:          "artifact",
+		SourceID:            sourceID,
+		TestamentID:         strings.TrimSpace(art.TestamentID),
+		AgentID:             firstNonBlank(participantRef.AgentID, claimContextActor(meta, ""), meta.OwnerAgentID),
+		ParticipantUID:      participantRef.UID,
+		ParticipantCategory: participantRef.Category,
+		ParticipantRoute:    participantRef.Route,
+		Title:               presentationTitle(p, strings.TrimSpace(art.Kind)),
+		Content:             content,
+		Format:              format,
+		Placement:           presentationPlacement(p),
+		ReplaceKey:          presentationReplaceKey(p),
+		Metadata:            safePresentationMetadata(art.Metadata),
+		CreatedAt:           nonZeroTime(art.Created),
+		Sequence:            art.Sequence,
 	}, diagnostics
 }
 
@@ -1841,14 +2071,17 @@ func (b *ClaimsBridge) claimTestamentResponseMsg(sessionID, claimID string, t *c
 		return nil
 	}
 	return &msg.ClaimResponseTextMsg{
-		SessionID:    sessionID,
-		CycleID:      meta.CycleID,
-		ClaimID:      claimID,
-		ParentRowID:  parentRowID,
-		AgentID:      firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		Content:      content,
-		CreatedAt:    nonZeroTime(t.Created),
-		SuppressChat: meta.SuppressChat,
+		SessionID:           sessionID,
+		CycleID:             meta.CycleID,
+		ClaimID:             claimID,
+		ParentRowID:         parentRowID,
+		AgentID:             firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		ParticipantUID:      participantDisplayFromRelationID(firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID)).UID,
+		ParticipantCategory: participantDisplayFromRelationID(firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID)).Category,
+		ParticipantRoute:    participantDisplayFromRelationID(firstNonBlank(strings.TrimSpace(t.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID)).Route,
+		Content:             content,
+		CreatedAt:           nonZeroTime(t.Created),
+		SuppressChat:        meta.SuppressChat,
 	}
 }
 
@@ -1880,6 +2113,63 @@ func (b *ClaimsBridge) metaForClaimLocked(claimID string) claimMeta {
 	return meta
 }
 
+func withOwnerParticipant(meta claimMeta, ref participantDisplayRef) claimMeta {
+	meta.OwnerAgentID = firstNonBlank(meta.OwnerAgentID, ref.AgentID)
+	meta.OwnerAgentType = firstNonBlank(meta.OwnerAgentType, agentTypeFromID(meta.OwnerAgentID))
+	meta.OwnerParticipantUID = firstNonBlank(meta.OwnerParticipantUID, ref.UID, meta.OwnerAgentID)
+	meta.OwnerParticipantCategory = firstNonBlank(meta.OwnerParticipantCategory, ref.Category)
+	meta.OwnerParticipantRoute = firstNonBlank(meta.OwnerParticipantRoute, ref.Route, meta.OwnerAgentID)
+	return meta
+}
+
+func withTargetParticipant(meta claimMeta, ref participantDisplayRef) claimMeta {
+	meta.TargetAgentID = firstNonBlank(meta.TargetAgentID, ref.AgentID)
+	meta.TargetAgentType = firstNonBlank(meta.TargetAgentType, agentTypeFromID(meta.TargetAgentID))
+	meta.TargetParticipantUID = firstNonBlank(meta.TargetParticipantUID, ref.UID, meta.TargetAgentID)
+	meta.TargetParticipantCategory = firstNonBlank(meta.TargetParticipantCategory, ref.Category)
+	meta.TargetParticipantRoute = firstNonBlank(meta.TargetParticipantRoute, ref.Route, meta.TargetAgentID)
+	return meta
+}
+
+func withIssuerParticipant(meta claimMeta, ref participantDisplayRef) claimMeta {
+	meta.IssuerAgentID = firstNonBlank(meta.IssuerAgentID, ref.AgentID)
+	meta.IssuerParticipantUID = firstNonBlank(meta.IssuerParticipantUID, ref.UID, meta.IssuerAgentID)
+	meta.IssuerParticipantCategory = firstNonBlank(meta.IssuerParticipantCategory, ref.Category)
+	meta.IssuerParticipantRoute = firstNonBlank(meta.IssuerParticipantRoute, ref.Route, meta.IssuerAgentID)
+	return meta
+}
+
+func participantUIDForActor(meta claimMeta, actor string) string {
+	return participantRefForActor(meta, actor).UID
+}
+
+func participantCategoryForActor(meta claimMeta, actor string) string {
+	return participantRefForActor(meta, actor).Category
+}
+
+func participantRouteForActor(meta claimMeta, actor string) string {
+	return participantRefForActor(meta, actor).Route
+}
+
+func participantRefForActor(meta claimMeta, actor string) participantDisplayRef {
+	actor = strings.TrimSpace(actor)
+	if actor == "" || participantMatches(meta.OwnerAgentID, meta.OwnerParticipantUID, meta.OwnerParticipantRoute, actor) {
+		return participantDisplayRef{AgentID: meta.OwnerAgentID, UID: meta.OwnerParticipantUID, Category: meta.OwnerParticipantCategory, Route: meta.OwnerParticipantRoute}
+	}
+	if participantMatches(meta.TargetAgentID, meta.TargetParticipantUID, meta.TargetParticipantRoute, actor) {
+		return participantDisplayRef{AgentID: meta.TargetAgentID, UID: meta.TargetParticipantUID, Category: meta.TargetParticipantCategory, Route: meta.TargetParticipantRoute}
+	}
+	if participantMatches(meta.IssuerAgentID, meta.IssuerParticipantUID, meta.IssuerParticipantRoute, actor) {
+		return participantDisplayRef{AgentID: meta.IssuerAgentID, UID: meta.IssuerParticipantUID, Category: meta.IssuerParticipantCategory, Route: meta.IssuerParticipantRoute}
+	}
+	return participantDisplayFromRelationID(actor)
+}
+
+func participantMatches(agentID, uid, route, actor string) bool {
+	actor = strings.TrimSpace(actor)
+	return actor != "" && (actor == strings.TrimSpace(agentID) || actor == strings.TrimSpace(uid) || actor == strings.TrimSpace(route))
+}
+
 func (b *ClaimsBridge) enrichMetaFromProjectionLocked(claimID string, meta claimMeta) claimMeta {
 	if strings.TrimSpace(claimID) == "" || b.board == nil {
 		return meta
@@ -1892,13 +2182,16 @@ func (b *ClaimsBridge) enrichMetaFromProjectionLocked(claimID string, meta claim
 		meta.OwnerAgentID = cycleOwnerForClaim(c)
 		meta.OwnerAgentType = agentTypeFromID(meta.OwnerAgentID)
 	}
+	meta = withOwnerParticipant(meta, participantDisplayFromRelationID(meta.OwnerAgentID))
 	if meta.TargetAgentID == "" {
 		meta.TargetAgentID = strings.TrimSpace(claims.SubjectAgentID(c.Relations))
 		meta.TargetAgentType = agentTypeFromID(meta.TargetAgentID)
 	}
+	meta = withTargetParticipant(meta, participantDisplayFromRelationID(meta.TargetAgentID))
 	if meta.IssuerAgentID == "" {
 		meta.IssuerAgentID = strings.TrimSpace(claims.IssuerAgentID(c.Relations))
 	}
+	meta = withIssuerParticipant(meta, participantDisplayFromRelationID(meta.IssuerAgentID))
 	if meta.ActionType == "" {
 		meta.ActionType = string(c.ActionType)
 	}
@@ -2065,12 +2358,15 @@ func claimsAgentClosedMsg(sessionID string, st *cycleState, outcome string) msg.
 		return msg.ClaimsAgentStatusMsg{}
 	}
 	return msg.ClaimsAgentStatusMsg{
-		AgentID:         st.OwnerAgentID,
-		SessionID:       sessionID,
-		Active:          false,
-		CycleID:         st.CycleID,
-		OpenCount:       len(st.openClaims),
-		TerminalOutcome: outcome,
+		AgentID:             st.OwnerAgentID,
+		SessionID:           sessionID,
+		Active:              false,
+		CycleID:             st.CycleID,
+		OpenCount:           len(st.openClaims),
+		ParticipantUID:      participantDisplayFromRelationID(st.OwnerAgentID).UID,
+		ParticipantCategory: participantDisplayFromRelationID(st.OwnerAgentID).Category,
+		ParticipantRoute:    participantDisplayFromRelationID(st.OwnerAgentID).Route,
+		TerminalOutcome:     outcome,
 	}
 }
 

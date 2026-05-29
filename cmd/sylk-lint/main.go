@@ -1,5 +1,6 @@
 // sylk-lint is the umbrella linter command for Sylk's in-tree analyzers.
-// Currently bundles: nodirectexec (strict-disk broker mandate).
+// Currently bundles: claimsops (claims infrastructure invariants) and
+// nodirectexec (strict-disk broker mandate).
 //
 // Usage:
 //
@@ -10,12 +11,14 @@
 package main
 
 import (
+	"github.com/adalundhe/sylk/core/ci/analyzers/claimsops"
 	"github.com/adalundhe/sylk/core/ci/analyzers/nodirectexec"
 	"golang.org/x/tools/go/analysis/multichecker"
 )
 
 func main() {
 	multichecker.Main(
+		claimsops.Analyzer,
 		nodirectexec.Analyzer,
 	)
 }

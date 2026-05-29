@@ -224,6 +224,28 @@ func (r *ParticipantRegistry) Lookup(uid string) (ParticipantRegistration, bool)
 	return cloneParticipantRegistration(reg), ok
 }
 
+func (r *ParticipantRegistry) List() []ParticipantRegistration {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	out := make([]ParticipantRegistration, 0, len(r.records))
+	for _, reg := range r.records {
+		out = append(out, cloneParticipantRegistration(reg))
+	}
+	r.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Category != out[j].Category {
+			return out[i].Category < out[j].Category
+		}
+		if out[i].RouteKey != out[j].RouteKey {
+			return out[i].RouteKey < out[j].RouteKey
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out
+}
+
 func normalizeParticipantRegistration(reg ParticipantRegistration) (ParticipantRegistration, error) {
 	reg.UID = strings.TrimSpace(reg.UID)
 	reg.RouteKey = strings.TrimSpace(reg.RouteKey)

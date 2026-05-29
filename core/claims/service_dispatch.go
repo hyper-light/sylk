@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 
@@ -67,9 +68,21 @@ type ServiceDispatcher struct {
 	seen          map[string]struct{}
 	seenOrder     []string
 	inflight      chan struct{}
+	active        map[string]context.CancelFunc
 	subscriptions []DeltaSubscription
 	started       bool
 	closed        bool
+}
+
+type ServiceDispatcherStats struct {
+	SessionID      string                  `json:"session_id,omitempty"`
+	Participant    ParticipantRegistration `json:"participant"`
+	Started        bool                    `json:"started"`
+	Closed         bool                    `json:"closed"`
+	SeenCount      int                     `json:"seen_count"`
+	Inflight       int                     `json:"inflight"`
+	Capacity       int                     `json:"capacity"`
+	ActiveClaimIDs []string                `json:"active_claim_ids,omitempty"`
 }
 
 func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, error) {
@@ -89,6 +102,7 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 		sessionID:   firstNonEmpty(strings.TrimSpace(cfg.SessionID), cfg.Board.SessionID()),
 		seen:        make(map[string]struct{}, participant.QueueCapacity),
 		inflight:    make(chan struct{}, participant.ConcurrencyBudget),
+		active:      make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
 	}, nil
 }
 
@@ -134,6 +148,47 @@ func (d *ServiceDispatcher) Participant() ParticipantRegistration {
 	return cloneParticipantRegistration(d.participant)
 }
 
+func (d *ServiceDispatcher) Stats() ServiceDispatcherStats {
+	if d == nil {
+		return ServiceDispatcherStats{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	active := make([]string, 0, len(d.active))
+	for claimID := range d.active {
+		active = append(active, claimID)
+	}
+	sort.Strings(active)
+	return ServiceDispatcherStats{
+		SessionID:      d.sessionID,
+		Participant:    cloneParticipantRegistration(d.participant),
+		Started:        d.started,
+		Closed:         d.closed,
+		SeenCount:      len(d.seen),
+		Inflight:       len(d.inflight),
+		Capacity:       cap(d.inflight),
+		ActiveClaimIDs: active,
+	}
+}
+
+func (d *ServiceDispatcher) CancelClaim(claimID string) bool {
+	if d == nil {
+		return false
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return false
+	}
+	d.mu.Lock()
+	cancel := d.active[claimID]
+	d.mu.Unlock()
+	if cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 func (d *ServiceDispatcher) SubscriptionTopics() []string {
 	if d == nil {
 		return nil
@@ -155,6 +210,9 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 		return d.recordOverflow(ctx, delta)
 	}
 	if err := d.scope.Go("claims.service."+d.participant.RouteKey, d.participant.HandlerTimeout, func(runCtx context.Context) error {
+		runCtx, cancel := context.WithCancel(runCtx)
+		d.trackActive(delta.ClaimID(), cancel)
+		defer d.untrackActive(delta.ClaimID())
 		defer d.release()
 		return d.invoke(runCtx, delta)
 	}); err != nil {
@@ -357,6 +415,9 @@ func (d *ServiceDispatcher) closeSubscriptions() []DeltaSubscription {
 		return nil
 	}
 	d.closed = true
+	for _, cancel := range d.active {
+		cancel()
+	}
 	subs := append([]DeltaSubscription(nil), d.subscriptions...)
 	d.subscriptions = nil
 	return subs
@@ -393,6 +454,26 @@ func (d *ServiceDispatcher) acquire(delta CanonicalDelta) bool {
 
 func (d *ServiceDispatcher) release() {
 	<-d.inflight
+}
+
+func (d *ServiceDispatcher) trackActive(claimID string, cancel context.CancelFunc) {
+	claimID = strings.TrimSpace(claimID)
+	if d == nil || claimID == "" || cancel == nil {
+		return
+	}
+	d.mu.Lock()
+	d.active[claimID] = cancel
+	d.mu.Unlock()
+}
+
+func (d *ServiceDispatcher) untrackActive(claimID string) {
+	claimID = strings.TrimSpace(claimID)
+	if d == nil || claimID == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.active, claimID)
+	d.mu.Unlock()
 }
 
 func (d *ServiceDispatcher) remember(deltaKey string) bool {

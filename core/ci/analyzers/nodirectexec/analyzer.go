@@ -73,6 +73,13 @@ var allowedPathPrefixes = []string{
 	"github.com/adalundhe/sylk/core/search/git",
 	"github.com/adalundhe/sylk/core/vectorgraphdb/vamana/embedder",
 	"github.com/adalundhe/sylk/core/storage/sylkdir",
+
+	// MCP and substrate sandbox boundaries launch supervised helper
+	// processes as infrastructure services, not agent-dispatched project
+	// commands. They are outside the strict-disk broker's workspace-write
+	// contract and must remain narrow.
+	"github.com/adalundhe/sylk/core/mcp/transport",
+	"github.com/adalundhe/sylk/core/substrate/sandbox",
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
