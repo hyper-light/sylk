@@ -56,6 +56,9 @@ const (
 	bootTaskID             = "boot"
 	phase0BoardIDPrefix    = "boot.phase0"
 	processScopeSegment    = "proc"
+	bootServiceQueueFloor  = 4
+	bootServiceConcurrency = 1
+	bootServiceTimeout     = time.Second
 
 	artifactKindBootReadiness = "boot_readiness"
 	artifactKindBootFailure   = "boot_failure"
@@ -92,15 +95,23 @@ type Phase0Result struct {
 }
 
 type OperationsConfig struct {
-	Board           *claims.ClaimsBoard
-	ProcessIdentity ProcessIdentity
-	ProcessUID      string
+	Board                     *claims.ClaimsBoard
+	ProcessIdentity           ProcessIdentity
+	ProcessUID                string
+	ServiceDispatcherRegistry *claims.ServiceDispatcherRegistry
+	ServiceSubscriber         claims.DeltaSubscriber
+	ServiceScope              claims.ScopeProvider
+	ServiceDispatchers        []ServiceDispatcherBootRegistration
 }
 
 type OperationsSequencer struct {
-	board    *claims.ClaimsBoard
-	identity ProcessIdentity
-	mu       sync.Mutex
+	board                     *claims.ClaimsBoard
+	identity                  ProcessIdentity
+	serviceDispatcherRegistry *claims.ServiceDispatcherRegistry
+	serviceSubscriber         claims.DeltaSubscriber
+	serviceScope              claims.ScopeProvider
+	serviceDispatchers        []ServiceDispatcherBootRegistration
+	mu                        sync.Mutex
 }
 
 type Phase1Status struct {
@@ -177,6 +188,17 @@ type PhaseCommitResult struct {
 	ParticipantTestamentIDs []string
 }
 
+type ServiceDispatcherBootRegistration struct {
+	Phase         BootOperationPhase
+	ParticipantID string
+	Participant   claims.ParticipantRegistration
+	Handler       claims.ServiceHandler
+	Subscriber    claims.DeltaSubscriber
+	Scope         claims.ScopeProvider
+	Optional      bool
+	Context       map[string]any
+}
+
 type bootClaimSpec struct {
 	actionType            claims.ActionType
 	key                   string
@@ -206,6 +228,7 @@ type readinessPhaseConfig struct {
 	context        map[string]any
 	defaultSubject string
 	summary        string
+	extraArtifacts []*claims.Artifact
 }
 
 func NewOperationsSequencer(cfg OperationsConfig) (*OperationsSequencer, error) {
@@ -216,7 +239,23 @@ func NewOperationsSequencer(cfg OperationsConfig) (*OperationsSequencer, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &OperationsSequencer{board: cfg.Board, identity: identity}, nil
+	registry := cfg.ServiceDispatcherRegistry
+	if registry == nil {
+		registry = claims.NewServiceDispatcherRegistry()
+	}
+	scope := cfg.ServiceScope
+	if scope == nil {
+		scope = bootInlineScope{}
+	}
+	seq := &OperationsSequencer{
+		board:                     cfg.Board,
+		identity:                  identity,
+		serviceDispatcherRegistry: registry,
+		serviceSubscriber:         cfg.ServiceSubscriber,
+		serviceScope:              scope,
+	}
+	seq.serviceDispatchers = seq.normalizeServiceDispatcherSpecs(cfg.ServiceDispatchers)
+	return seq, nil
 }
 
 func InitializePhase0(cfg Phase0Config) (Phase0Result, error) {
@@ -439,6 +478,13 @@ func (s *OperationsSequencer) BootHealth() BootHealth {
 	return BootHealthFromBoard(s.board)
 }
 
+func (s *OperationsSequencer) Close() error {
+	if s == nil || s.serviceDispatcherRegistry == nil || s.board == nil {
+		return nil
+	}
+	return s.serviceDispatcherRegistry.CloseSession(s.board.SessionID())
+}
+
 func BootHealthFromBoard(board *claims.ClaimsBoard) BootHealth {
 	if board == nil {
 		return BootHealth{}
@@ -459,6 +505,10 @@ func (s *OperationsSequencer) commitReadinessPhase(ctx context.Context, cfg read
 		return PhaseCommitResult{Phase: cfg.phase}, err
 	}
 	if existing := s.phaseResultIfSatisfied(cfg.phase); existing.ClaimID != "" {
+		_, err := s.registerServiceDispatchersForPhase(ctx, cfg, nil)
+		if err != nil {
+			return existing, err
+		}
 		return existing, nil
 	}
 	participants, err := validatePhaseParticipants(cfg.phase, cfg.participants, cfg.requiredIDs)
@@ -469,6 +519,11 @@ func (s *OperationsSequencer) commitReadinessPhase(ctx context.Context, cfg read
 	if err != nil {
 		return s.commitPhaseFailure(ctx, cfg, participantClaimIDs, participantTestamentIDs, err)
 	}
+	dispatcherArtifacts, err := s.registerServiceDispatchersForPhase(ctx, cfg, participants)
+	if err != nil {
+		return s.commitPhaseFailure(ctx, cfg, participantClaimIDs, participantTestamentIDs, err)
+	}
+	cfg.extraArtifacts = dispatcherArtifacts
 	start := time.Now()
 	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(cfg.phase, cfg.order, s.identity.BootSequencerUID))
 	if err != nil {
@@ -513,6 +568,62 @@ func (s *OperationsSequencer) commitPhaseParticipant(ctx context.Context, cfg re
 	}
 	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, participantSuccessTestamentSpec(cfg.phase, participant, s.identity.BootSequencerUID))
 	return claim.ID, testamentID, err
+}
+
+func (s *OperationsSequencer) registerServiceDispatchersForPhase(ctx context.Context, cfg readinessPhaseConfig, participants []SystemParticipantActivation) ([]*claims.Artifact, error) {
+	specs := s.serviceDispatcherSpecsForPhase(cfg.phase)
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	byParticipant := participantsByID(participants)
+	artifacts := make([]*claims.Artifact, 0, len(specs))
+	for _, spec := range specs {
+		artifact, err := s.ensureServiceDispatcher(ctx, spec, byParticipant)
+		if err != nil && !spec.Optional {
+			return artifacts, err
+		}
+		if err != nil {
+			artifact = dispatcherFailureArtifact(s.identity.BootSequencerUID, cfg.phase, spec, err)
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts, nil
+}
+
+func (s *OperationsSequencer) ensureServiceDispatcher(ctx context.Context, spec ServiceDispatcherBootRegistration, participants map[string]SystemParticipantActivation) (*claims.Artifact, error) {
+	spec = s.normalizeServiceDispatcherSpec(spec)
+	participant, err := serviceDispatcherParticipant(spec)
+	if err != nil {
+		return nil, err
+	}
+	if dispatcher, ok := s.serviceDispatcherRegistry.Lookup(s.board.SessionID(), participant.UID); ok {
+		return dispatcherReadinessArtifact(s.identity.BootSequencerUID, spec.Phase, dispatcher, "existing", spec, participants), nil
+	}
+	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{
+		Board:       s.board,
+		Subscriber:  firstNonNilSubscriber(spec.Subscriber, s.serviceSubscriber),
+		Scope:       firstNonNilScope(spec.Scope, s.serviceScope),
+		Participant: participant,
+		Handler:     spec.Handler,
+		SessionID:   s.board.SessionID(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.serviceDispatcherRegistry.Register(s.board.SessionID(), dispatcher); err != nil {
+		_ = dispatcher.Close()
+		if errors.Is(err, claims.ErrServiceDispatcherAlreadyRegistered) {
+			existing, _ := s.serviceDispatcherRegistry.Lookup(s.board.SessionID(), participant.UID)
+			return dispatcherReadinessArtifact(s.identity.BootSequencerUID, spec.Phase, existing, "existing", spec, participants), nil
+		}
+		return nil, err
+	}
+	if err := dispatcher.Start(ctx); err != nil {
+		s.serviceDispatcherRegistry.Remove(s.board.SessionID(), participant.UID)
+		_ = dispatcher.Close()
+		return nil, err
+	}
+	return dispatcherReadinessArtifact(s.identity.BootSequencerUID, spec.Phase, dispatcher, "registered", spec, participants), nil
 }
 
 func (s *OperationsSequencer) ensureClaimActive(ctx context.Context, spec bootClaimSpec) (*claims.Claim, error) {
@@ -796,13 +907,15 @@ func phase2TestamentSpec(status Phase2Status, dur time.Duration, identity Proces
 }
 
 func phaseReadinessTestamentSpec(cfg readinessPhaseConfig, participants []SystemParticipantActivation, dur time.Duration, identity ProcessIdentity) bootTestamentSpec {
+	artifacts := phaseReadinessArtifacts(cfg.phase, participants, dur, identity)
+	artifacts = append(artifacts, cfg.extraArtifacts...)
 	return bootTestamentSpec{
 		key:         phaseTestamentKey(cfg.phase, "complete"),
 		agentID:     identity.BootSequencerUID,
 		validatorID: identity.BootSequencerUID,
 		summary:     cfg.summary,
 		duration:    dur,
-		artifacts:   phaseReadinessArtifacts(cfg.phase, participants, dur, identity),
+		artifacts:   artifacts,
 	}
 }
 
@@ -869,6 +982,59 @@ func phaseReadinessArtifacts(phase BootOperationPhase, participants []SystemPart
 	return artifacts
 }
 
+func dispatcherReadinessArtifact(agentID string, phase BootOperationPhase, dispatcher *claims.ServiceDispatcher, outcome string, spec ServiceDispatcherBootRegistration, participants map[string]SystemParticipantActivation) *claims.Artifact {
+	participant := claims.ParticipantRegistration{}
+	if dispatcher != nil {
+		participant = dispatcher.Participant()
+	}
+	metadata := dispatcherMetadata(phase, participant, outcome, spec, participants)
+	return readinessArtifact(agentID, "service_dispatcher."+sanitizeKeyPart(dispatcherParticipantID(spec, participant)), true, metadata)
+}
+
+func dispatcherFailureArtifact(agentID string, phase BootOperationPhase, spec ServiceDispatcherBootRegistration, cause error) *claims.Artifact {
+	metadata := mergeMetadata(spec.Context, map[string]any{
+		"phase":              string(phase),
+		"participant_id":     strings.TrimSpace(spec.ParticipantID),
+		"service_dispatcher": true,
+		"registration":       "failed",
+		"ready":              false,
+	})
+	return failureArtifact(agentID, cause, metadata)
+}
+
+func dispatcherMetadata(phase BootOperationPhase, participant claims.ParticipantRegistration, outcome string, spec ServiceDispatcherBootRegistration, participants map[string]SystemParticipantActivation) map[string]any {
+	participantID := dispatcherParticipantID(spec, participant)
+	metadata := mergeMetadata(spec.Context, map[string]any{
+		"phase":              string(phase),
+		"participant_id":     participantID,
+		"participant_uid":    participant.UID,
+		"route_key":          participant.RouteKey,
+		"category":           string(participant.Category),
+		"service_dispatcher": true,
+		"registration":       outcome,
+		"topics":             dispatcherTopicsFor(participant, spec),
+	})
+	if readiness, ok := participants[participantID]; ok {
+		metadata["participant_type"] = readiness.ParticipantType
+		metadata["participant_ready"] = readiness.Ready
+	}
+	return metadata
+}
+
+func dispatcherTopicsFor(participant claims.ParticipantRegistration, spec ServiceDispatcherBootRegistration) []string {
+	sessionID := ""
+	if value, ok := spec.Context["session_id"].(string); ok {
+		sessionID = value
+	}
+	if sessionID == "" {
+		sessionID = participant.ScopeKeys["session_id"]
+	}
+	if participant.UID == "" {
+		return nil
+	}
+	return []string{claims.CanonicalAgentRefTopic(sessionID, participant.AgentRef(), claims.DeltaActionClaimPosted)}
+}
+
 func readinessArtifact(agentID, name string, ready bool, metadata map[string]any) *claims.Artifact {
 	return &claims.Artifact{
 		Kind:      artifactKindBootReadiness,
@@ -914,6 +1080,64 @@ func validatePhaseParticipants(phase BootOperationPhase, participants []SystemPa
 		return nil, fmt.Errorf("%w: %s", ErrBootReadinessIncomplete, strings.Join(missing, ", "))
 	}
 	return normalizeParticipantSubjects(phase, normalized), nil
+}
+
+func (s *OperationsSequencer) normalizeServiceDispatcherSpecs(overrides []ServiceDispatcherBootRegistration) []ServiceDispatcherBootRegistration {
+	defaults := s.defaultServiceDispatcherSpecs()
+	byKey := make(map[string]ServiceDispatcherBootRegistration, len(defaults)+len(overrides))
+	for _, spec := range defaults {
+		byKey[serviceDispatcherSpecKey(spec)] = spec
+	}
+	for _, spec := range overrides {
+		spec = s.normalizeServiceDispatcherSpec(spec)
+		byKey[serviceDispatcherSpecKey(spec)] = spec
+	}
+	keys := make([]string, 0, len(byKey))
+	for key := range byKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]ServiceDispatcherBootRegistration, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, byKey[key])
+	}
+	return out
+}
+
+func (s *OperationsSequencer) defaultServiceDispatcherSpecs() []ServiceDispatcherBootRegistration {
+	specs := []ServiceDispatcherBootRegistration{
+		s.identityRegistryDispatcherSpec(),
+		s.activationControllerDispatcherSpec(),
+	}
+	specs = append(specs, s.readinessDispatcherSpecs(BootPhaseKnowledgeBackends, RequiredKnowledgeBackends())...)
+	specs = append(specs, s.readinessDispatcherSpecs(BootPhaseInfrastructure, RequiredInfrastructureServices())...)
+	specs = append(specs, s.readinessDispatcherSpecs(BootPhaseUserSurfaces, RequiredUserFacingSurfaces())...)
+	return specs
+}
+
+func (s *OperationsSequencer) identityRegistryDispatcherSpec() ServiceDispatcherBootRegistration {
+	participant := mustBootParticipant(claims.ParticipantCategorySystem, IdentityRegistryAgentID, processScopeKeys(s.identity), claims.HandlerDeterminismPure, []claims.ActionType{claims.ActionTypeTask})
+	return ServiceDispatcherBootRegistration{Phase: BootPhaseSystemParticipants, ParticipantID: IdentityRegistryAgentID, Participant: participant, Handler: claims.NewIdentityRegistryService(claims.IdentityRegistryServiceConfig{}), Context: s.bootServiceContext(IdentityRegistryAgentID)}
+}
+
+func (s *OperationsSequencer) activationControllerDispatcherSpec() ServiceDispatcherBootRegistration {
+	participant := mustBootParticipant(claims.ParticipantCategoryService, ActivationControllerAgentID, sessionScopeKeys(s.board, s.identity), claims.HandlerDeterminismSideEffect, []claims.ActionType{claims.ActionTypeTask})
+	return ServiceDispatcherBootRegistration{Phase: BootPhaseSystemParticipants, ParticipantID: ActivationControllerAgentID, Participant: participant, Handler: claims.NewActivationControllerService(claims.ActivationControllerServiceConfig{}), Context: s.bootServiceContext(ActivationControllerAgentID)}
+}
+
+func (s *OperationsSequencer) readinessDispatcherSpecs(phase BootOperationPhase, participants []SystemParticipantActivation) []ServiceDispatcherBootRegistration {
+	out := make([]ServiceDispatcherBootRegistration, 0, len(participants))
+	for _, participant := range participants {
+		reg := mustBootParticipant(claims.ParticipantCategoryService, participant.ParticipantID, sessionScopeKeys(s.board, s.identity), bootServiceDeterminism(participant.ParticipantID), []claims.ActionType{claims.ActionTypeTask})
+		out = append(out, ServiceDispatcherBootRegistration{Phase: phase, ParticipantID: participant.ParticipantID, Participant: reg, Handler: bootReadinessServiceHandler{ParticipantID: participant.ParticipantID, ParticipantType: participant.ParticipantType}, Context: s.bootServiceContext(participant.ParticipantID)})
+	}
+	return out
+}
+
+func (s *OperationsSequencer) normalizeServiceDispatcherSpec(spec ServiceDispatcherBootRegistration) ServiceDispatcherBootRegistration {
+	spec.ParticipantID = firstNonEmptyString(spec.ParticipantID, spec.Participant.RouteKey, spec.Participant.UID)
+	spec.Context = mergeMetadata(s.bootServiceContext(spec.ParticipantID), spec.Context)
+	return spec
 }
 
 func normalizeParticipants(participants []SystemParticipantActivation, requiredIDs []string) []SystemParticipantActivation {
@@ -1110,6 +1334,112 @@ func requiredParticipantIDs(phase BootOperationPhase) []string {
 	default:
 		return nil
 	}
+}
+
+func (s *OperationsSequencer) serviceDispatcherSpecsForPhase(phase BootOperationPhase) []ServiceDispatcherBootRegistration {
+	if s == nil {
+		return nil
+	}
+	out := make([]ServiceDispatcherBootRegistration, 0)
+	for _, spec := range s.serviceDispatchers {
+		if spec.Phase == phase {
+			out = append(out, spec)
+		}
+	}
+	return out
+}
+
+func serviceDispatcherParticipant(spec ServiceDispatcherBootRegistration) (claims.ParticipantRegistration, error) {
+	if err := spec.Participant.Validate(); err != nil {
+		return claims.ParticipantRegistration{}, err
+	}
+	return spec.Participant, nil
+}
+
+func serviceDispatcherSpecKey(spec ServiceDispatcherBootRegistration) string {
+	return string(spec.Phase) + "|" + sanitizeKeyPart(firstNonEmptyString(spec.ParticipantID, spec.Participant.RouteKey, spec.Participant.UID))
+}
+
+func dispatcherParticipantID(spec ServiceDispatcherBootRegistration, participant claims.ParticipantRegistration) string {
+	return firstNonEmptyString(spec.ParticipantID, participant.RouteKey, participant.UID, "unknown")
+}
+
+func participantsByID(participants []SystemParticipantActivation) map[string]SystemParticipantActivation {
+	out := make(map[string]SystemParticipantActivation, len(participants))
+	for _, participant := range participants {
+		if participant.ParticipantID != "" {
+			out[participant.ParticipantID] = participant
+		}
+	}
+	return out
+}
+
+func mustBootParticipant(category claims.ParticipantCategory, routeKey string, scope map[string]string, determinism claims.HandlerDeterminism, actions []claims.ActionType) claims.ParticipantRegistration {
+	participant, err := claims.NewParticipantRegistration(category, routeKey, scope, bootServiceQueueCapacity(actions), bootServiceConcurrency, bootServiceTimeout, determinism, actions)
+	if err != nil {
+		panic(err)
+	}
+	return participant
+}
+
+func bootServiceQueueCapacity(actions []claims.ActionType) int {
+	capacity := len(actions) + len(actions) + bootServiceQueueFloor
+	if capacity < bootServiceQueueFloor {
+		return bootServiceQueueFloor
+	}
+	return capacity
+}
+
+func bootServiceDeterminism(participantID string) claims.HandlerDeterminism {
+	switch participantID {
+	case SystemProviderGatewayID:
+		return claims.HandlerDeterminismNondeterministic
+	case SystemVFSPipelineProvisionerID, SystemVFSToolProvisionerID, SystemVFSGlobalProvisionerID, SystemDAGProcessorID, SystemToolRuntimeID, SystemGuardianServiceID:
+		return claims.HandlerDeterminismSideEffect
+	default:
+		return claims.HandlerDeterminismContent
+	}
+}
+
+func (s *OperationsSequencer) bootServiceContext(participantID string) map[string]any {
+	return map[string]any{
+		"participant_id": participantID,
+		"process_uid":    s.identity.ProcessUID,
+		"session_id":     s.board.SessionID(),
+	}
+}
+
+func processScopeKeys(identity ProcessIdentity) map[string]string {
+	return map[string]string{"process_uid": identity.ProcessUID}
+}
+
+func sessionScopeKeys(board *claims.ClaimsBoard, identity ProcessIdentity) map[string]string {
+	sessionID := ""
+	if board != nil {
+		sessionID = board.SessionID()
+	}
+	if sessionID == "" {
+		return processScopeKeys(identity)
+	}
+	return map[string]string{"session_id": sessionID}
+}
+
+func firstNonNilSubscriber(values ...claims.DeltaSubscriber) claims.DeltaSubscriber {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func firstNonNilScope(values ...claims.ScopeProvider) claims.ScopeProvider {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }
 
 func participantIDs(participants []SystemParticipantActivation) []string {
@@ -1359,4 +1689,47 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+type bootInlineScope struct{}
+
+func (bootInlineScope) Go(_ string, _ time.Duration, fn func(context.Context) error) error {
+	return fn(context.Background())
+}
+
+type bootReadinessServiceHandler struct {
+	ParticipantID   string
+	ParticipantType string
+}
+
+func (h bootReadinessServiceHandler) HandleServiceClaim(_ context.Context, req claims.ServiceClaimRequest) (claims.ServiceClaimResult, error) {
+	participantID := firstNonEmptyString(h.ParticipantID, req.Participant.RouteKey)
+	participantType := firstNonEmptyString(h.ParticipantType, participantID)
+	artifact := &claims.Artifact{
+		ArtifactName: "service_readiness",
+		Kind:         claims.ArtifactKindReadiness,
+		Reference:    participantID + " ready",
+		Metadata: map[string]any{
+			"participant_id":   participantID,
+			"participant_type": participantType,
+			"claim_id":         claimIDForReadiness(req.Claim),
+		},
+	}
+	err := claims.SetArtifactData(artifact, claims.KnowledgeReadinessArtifactData{
+		Component:  participantID,
+		QualityBar: "service_dispatch.ready",
+		Reference:  artifact.Reference,
+		Metadata:   artifact.Metadata,
+	})
+	if err != nil {
+		return claims.ServiceClaimResult{}, err
+	}
+	return claims.ServiceClaimResult{Summary: "service readiness " + participantID, Artifacts: []*claims.Artifact{artifact}}, nil
+}
+
+func claimIDForReadiness(claim *claims.Claim) string {
+	if claim == nil {
+		return ""
+	}
+	return claim.ID
 }

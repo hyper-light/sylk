@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,6 +17,13 @@ import (
 type SessionBoardRegistry struct {
 	mu     sync.RWMutex
 	boards map[string]*ClaimsBoard
+}
+
+type SessionRegistryEvidenceOptions struct {
+	Board    *ClaimsBoard
+	ActorID  string
+	Reason   string
+	Metadata map[string]any
 }
 
 var defaultRegistry = &SessionBoardRegistry{
@@ -64,6 +72,14 @@ func (r *SessionBoardRegistry) Register(sessionID string, board *ClaimsBoard) er
 	return nil
 }
 
+func (r *SessionBoardRegistry) RegisterWithEvidence(ctx context.Context, sessionID string, board *ClaimsBoard, evidence SessionRegistryEvidenceOptions) error {
+	if err := r.Register(sessionID, board); err != nil {
+		return err
+	}
+	_, err := recordSessionRegistryEvidence(ctx, sessionID, "create", board, evidence)
+	return err
+}
+
 // ReplaceForReason atomically replaces an existing registration. The
 // reason argument is required and surfaced to telemetry — it documents
 // why a replacement is legitimate (e.g. session restart, manual
@@ -86,6 +102,13 @@ func (r *SessionBoardRegistry) ReplaceForReason(sessionID string, board *ClaimsB
 	r.mu.Lock()
 	r.boards[sessionID] = board
 	r.mu.Unlock()
+}
+
+func (r *SessionBoardRegistry) ReplaceForReasonWithEvidence(ctx context.Context, sessionID string, board *ClaimsBoard, reason string, evidence SessionRegistryEvidenceOptions) error {
+	r.ReplaceForReason(sessionID, board, reason)
+	evidence.Reason = firstNonEmpty(evidence.Reason, reason)
+	_, err := recordSessionRegistryEvidence(ctx, sessionID, "recover", board, evidence)
+	return err
 }
 
 // Lookup returns the board for the given session, or nil.
@@ -136,4 +159,40 @@ func (r *SessionBoardRegistry) Remove(sessionID string) {
 	r.mu.Lock()
 	delete(r.boards, sessionID)
 	r.mu.Unlock()
+}
+
+func (r *SessionBoardRegistry) RemoveWithEvidence(ctx context.Context, sessionID string, evidence SessionRegistryEvidenceOptions) error {
+	board := firstNonNilBoard(evidence.Board, r.Lookup(sessionID))
+	r.Remove(sessionID)
+	if board == nil {
+		return nil
+	}
+	_, err := recordSessionRegistryEvidence(ctx, sessionID, "close", board, evidence)
+	return err
+}
+
+func recordSessionRegistryEvidence(ctx context.Context, sessionID, operation string, board *ClaimsBoard, evidence SessionRegistryEvidenceOptions) (SystemEvidenceResult, error) {
+	board = firstNonNilBoard(evidence.Board, board)
+	metadata := mergeMetadata(evidence.Metadata, map[string]any{"reason": evidence.Reason})
+	return RecordSystemEvidence(ctx, SystemEvidenceOptions{
+		Board:        board,
+		ActorID:      firstNonEmpty(evidence.ActorID, systemEvidenceDefaultActor),
+		SubjectID:    firstNonEmpty(evidence.ActorID, systemEvidenceDefaultActor),
+		SessionID:    sessionID,
+		Operation:    "session_" + operation,
+		Status:       "recorded",
+		ArtifactKind: SystemEvidenceKindSession,
+		ArtifactName: "session_" + operation,
+		Reference:    "session " + operation,
+		Metadata:     metadata,
+	})
+}
+
+func firstNonNilBoard(values ...*ClaimsBoard) *ClaimsBoard {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
 }

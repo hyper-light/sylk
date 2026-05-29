@@ -117,6 +117,20 @@ func (d *ServiceDispatcher) Close() error {
 	return unsubscribeAll(d.closeSubscriptions())
 }
 
+func (d *ServiceDispatcher) Participant() ParticipantRegistration {
+	if d == nil {
+		return ParticipantRegistration{}
+	}
+	return cloneParticipantRegistration(d.participant)
+}
+
+func (d *ServiceDispatcher) SubscriptionTopics() []string {
+	if d == nil {
+		return nil
+	}
+	return d.subscriptionTopics()
+}
+
 func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDelta) error {
 	if err := d.acceptDelta(delta); err != nil {
 		return err
@@ -130,10 +144,14 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 	if !d.acquire(delta) {
 		return d.recordOverflow(ctx, delta)
 	}
-	return d.scope.Go("claims.service."+d.participant.RouteKey, d.participant.HandlerTimeout, func(runCtx context.Context) error {
+	if err := d.scope.Go("claims.service."+d.participant.RouteKey, d.participant.HandlerTimeout, func(runCtx context.Context) error {
 		defer d.release()
 		return d.invoke(runCtx, delta)
-	})
+	}); err != nil {
+		d.release()
+		return err
+	}
+	return nil
 }
 
 func (d *ServiceDispatcher) ingest(ctx context.Context, delta Delta) {

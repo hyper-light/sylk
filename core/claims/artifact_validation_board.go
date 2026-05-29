@@ -24,6 +24,46 @@ type ValidationLifecycleOptions struct {
 	EvaluatorRef     *ParticipantRef
 }
 
+func (b *ClaimsBoard) GenerateArtifact(ctx context.Context, artifact Artifact, actorID string, opts ArtifactLifecycleOptions) (*Artifact, error) {
+	return b.generateArtifactLifecycle(ctx, artifact, ArtifactStatusGenerated, actorID, opts)
+}
+
+func (b *ClaimsBoard) RecordArtifactGenerationFailure(ctx context.Context, artifact Artifact, actorID string, artifactErr *ArtifactError) (*Artifact, error) {
+	return b.generateArtifactLifecycle(ctx, artifact, ArtifactStatusGenerationFailed, actorID, ArtifactLifecycleOptions{Reason: "artifact generation failed", Error: artifactErr})
+}
+
+func (b *ClaimsBoard) generateArtifactLifecycle(ctx context.Context, artifact Artifact, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions) (*Artifact, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	now := time.Now().UTC()
+	stamped := CloneArtifact(&artifact)
+	b.stampGeneratedArtifactLocked(stamped, to, actorID, opts, now)
+	if existing := b.artifacts[stamped.ID]; existing != nil {
+		b.mu.Unlock()
+		return CloneArtifact(existing), nil
+	}
+	payload := artifactLifecyclePayload(stamped.ID, to, actorID, opts, now)
+	payload["artifact"] = stamped
+	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, payload, []ClaimsOutboxRecord{b.outboxRecordLocked(stamped.Sequence, RelatedTypeArtifact, stamped.ID, string(mustArtifactLifecycleDeltaAction(to)), now)}); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
+	b.indexArtifactLocked(stamped)
+	claimSnapshot := CloneClaimEntity(b.claims[stamped.ClaimID])
+	artifactSnapshot := CloneArtifact(stamped)
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+	b.projectDurableOutbox(ctx)
+	b.amplifier.PublishCanonicalArtifactLifecycle(ctx, artifactSnapshot, nil, claimSnapshot, to, actorID, now)
+	b.notifySubscribers()
+	return artifactSnapshot, nil
+}
+
 func (b *ClaimsBoard) TransitionArtifactLifecycle(ctx context.Context, artifactID string, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -194,6 +234,10 @@ func (b *ClaimsBoard) recordValidationClaimOutcomeLocked(claim *Claim, status Cl
 
 func (b *ClaimsBoard) findArtifactForMutationLocked(id string) (*Artifact, *Testament, *Claim, bool) {
 	id = strings.TrimSpace(id)
+	if artifact := b.artifacts[id]; artifact != nil {
+		testament := b.testaments[artifact.TestamentID]
+		return artifact, testament, b.claims[artifactClaimID(artifact, testament)], true
+	}
 	for _, testament := range b.testaments {
 		artifact, ok := artifactOnTestament(testament, id)
 		if !ok {
@@ -266,7 +310,38 @@ func artifactClaimID(artifact *Artifact, testament *Testament) string {
 	if artifact == nil {
 		return ""
 	}
+	if testament == nil {
+		return strings.TrimSpace(artifact.ClaimID)
+	}
 	return firstNonEmpty(artifact.ClaimID, ClaimIDFromRelations(testament.Relations))
+}
+
+func (b *ClaimsBoard) stampGeneratedArtifactLocked(artifact *Artifact, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions, now time.Time) {
+	if artifact.ID == "" {
+		artifact.ID = uuid.NewString()
+	}
+	artifact.AgentID = firstNonEmpty(artifact.AgentID, actorID)
+	artifact.ParticipantID = firstNonEmpty(artifact.ParticipantID, artifact.AgentID, actorID)
+	artifact.SessionID = b.sessionID
+	artifact.PipelineID = b.pipelineID
+	artifact.TaskID = b.taskID
+	if artifact.Sequence == 0 {
+		artifact.Sequence = b.nextSeq()
+	}
+	artifact.ClaimID = firstNonEmpty(artifact.ClaimID, ClaimIDFromRelations(artifact.Relations))
+	artifact.Created = firstNonZeroTime(artifact.Created, now)
+	artifact.Accessed = now
+	artifact.Status = to
+	artifact.StatusHistory = capStatusHistory(append(artifact.StatusHistory, statusChange("", to, firstNonEmpty(actorID, artifact.ParticipantID, artifact.AgentID), firstNonEmpty(opts.Reason, string(to)), now)))
+	if opts.Error != nil {
+		artifact.Errors = append(artifact.Errors, cloneArtifactError(opts.Error))
+	}
+	if len(artifact.Data) != 0 && artifact.ContentHash == "" {
+		artifact.ContentHash = ArtifactContentHash(artifact.Data)
+	}
+	artifact.Size = artifactSize(artifact)
+	ApplyDefaultArtifactPresentation(artifact)
+	artifact.Presentation = NormalizePresentation(artifact.Presentation)
 }
 
 func artifactLifecyclePayload(artifactID string, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions, changed time.Time) map[string]any {

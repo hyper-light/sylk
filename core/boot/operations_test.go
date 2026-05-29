@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
+	claimsmocks "github.com/adalundhe/sylk/core/claims/mocks"
+	"github.com/stretchr/testify/mock"
 )
 
 func TestInitializePhase0CreatesProcessScopedIdentityAndInMemoryBoard(t *testing.T) {
@@ -184,6 +186,125 @@ func TestOperationsPhases3Through7CommitFullBootLifecycle(t *testing.T) {
 	}
 }
 
+func TestOperationsPhase4RegistersDispatchersAndClosesRegistry(t *testing.T) {
+	cfg := operationsDurableConfig(t)
+	db, err := claims.OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatalf("OpenDurableBoard: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	registry := claims.NewServiceDispatcherRegistry()
+	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessIdentity: testProcessIdentity(), ServiceDispatcherRegistry: registry})
+	if err != nil {
+		t.Fatalf("NewOperationsSequencer: %v", err)
+	}
+	commitPhase1And2(t, db.Board(), seq)
+	if _, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()}); err != nil {
+		t.Fatalf("CommitPhase3: %v", err)
+	}
+	phase4, err := seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()})
+	if err != nil {
+		t.Fatalf("CommitPhase4: %v", err)
+	}
+	wantDispatchers := len(RequiredKnowledgeBackends()) + len(RequiredInfrastructureServices()) + 2
+	if got := len(registry.SessionParticipantUIDs(db.Board().SessionID())); got != wantDispatchers {
+		t.Fatalf("registered dispatchers = %d, want %d", got, wantDispatchers)
+	}
+	assertPhaseTestamentHasDispatcherReadiness(t, db.Board(), phase4.TestamentID, len(RequiredInfrastructureServices()))
+	again, err := seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()})
+	if err != nil {
+		t.Fatalf("CommitPhase4 replay: %v", err)
+	}
+	if again.ClaimID != phase4.ClaimID || again.TestamentID != phase4.TestamentID {
+		t.Fatalf("phase4 replay = (%s,%s), want (%s,%s)", again.ClaimID, again.TestamentID, phase4.ClaimID, phase4.TestamentID)
+	}
+	if got := len(registry.SessionParticipantUIDs(db.Board().SessionID())); got != wantDispatchers {
+		t.Fatalf("registered dispatchers after replay = %d, want %d", got, wantDispatchers)
+	}
+	if err := seq.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := registry.SessionParticipantUIDs(db.Board().SessionID()); len(got) != 0 {
+		t.Fatalf("registered dispatchers after Close = %v, want empty", got)
+	}
+}
+
+func TestOperationsServiceDispatcherRegistrationFailureFailsPhaseAndBlocksLater(t *testing.T) {
+	db, err := claims.OpenDurableBoard(operationsDurableConfig(t))
+	if err != nil {
+		t.Fatalf("OpenDurableBoard: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	badSpec := ServiceDispatcherBootRegistration{
+		Phase:         BootPhaseInfrastructure,
+		ParticipantID: SystemDAGProcessorID,
+		Participant:   claims.ParticipantRegistration{},
+	}
+	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessIdentity: testProcessIdentity(), ServiceDispatchers: []ServiceDispatcherBootRegistration{badSpec}})
+	if err != nil {
+		t.Fatalf("NewOperationsSequencer: %v", err)
+	}
+	commitPhase1And2(t, db.Board(), seq)
+	if _, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()}); err != nil {
+		t.Fatalf("CommitPhase3: %v", err)
+	}
+	result, err := seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()})
+	if !errors.Is(err, claims.ErrParticipantRegistrationInvalid) {
+		t.Fatalf("CommitPhase4 error = %v, want participant registration invalid", err)
+	}
+	assertClaimLifecycle(t, db.Board(), result.ClaimID, claims.ClaimLifecycleValidationFailed)
+	if _, err := seq.CommitPhase5(context.Background(), Phase5Status{Agents: RequiredAlwaysHotAgents()}); !errors.Is(err, ErrBootPhaseNotSatisfied) {
+		t.Fatalf("CommitPhase5 after failed phase4 error = %v, want ErrBootPhaseNotSatisfied", err)
+	}
+}
+
+func TestOperationsServiceDispatcherRegistrationUsesMockerySubscriber(t *testing.T) {
+	cfg := operationsDurableConfig(t)
+	db, err := claims.OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatalf("OpenDurableBoard: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	participant := testBootServiceParticipant(t, db.Board(), SystemProviderGatewayID)
+	sub := &claimsmocks.DeltaSubscription{}
+	sub.On("Unsubscribe").Return(nil).Once()
+	subscriber := &claimsmocks.DeltaSubscriber{}
+	wantTopic := claims.CanonicalAgentRefTopic(db.Board().SessionID(), participant.AgentRef(), claims.DeltaActionClaimPosted)
+	subscriber.On("SubscribeDelta", wantTopic, mock.Anything).Return(sub, nil).Once()
+	handler := &claimsmocks.ServiceHandler{}
+	scope := &claimsmocks.ScopeProvider{}
+	spec := ServiceDispatcherBootRegistration{
+		Phase:         BootPhaseInfrastructure,
+		ParticipantID: SystemProviderGatewayID,
+		Participant:   participant,
+		Subscriber:    subscriber,
+		Scope:         scope,
+		Handler:       handler,
+	}
+	registry := claims.NewServiceDispatcherRegistry()
+	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessIdentity: testProcessIdentity(), ServiceDispatcherRegistry: registry, ServiceDispatchers: []ServiceDispatcherBootRegistration{spec}})
+	if err != nil {
+		t.Fatalf("NewOperationsSequencer: %v", err)
+	}
+	commitPhase1And2(t, db.Board(), seq)
+	if _, err := seq.CommitPhase3(context.Background(), Phase3Status{Backends: RequiredKnowledgeBackends()}); err != nil {
+		t.Fatalf("CommitPhase3: %v", err)
+	}
+	if _, err := seq.CommitPhase4(context.Background(), Phase4Status{Services: RequiredInfrastructureServices()}); err != nil {
+		t.Fatalf("CommitPhase4: %v", err)
+	}
+	if _, ok := registry.Lookup(db.Board().SessionID(), participant.UID); !ok {
+		t.Fatal("mockery-registered dispatcher not found")
+	}
+	if err := seq.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	subscriber.AssertExpectations(t)
+	sub.AssertExpectations(t)
+	handler.AssertNotCalled(t, "HandleServiceClaim", mock.Anything, mock.Anything)
+	scope.AssertNotCalled(t, "Go", mock.Anything, mock.Anything, mock.Anything)
+}
+
 func TestOperationsPhase3RequiresPhase2Satisfied(t *testing.T) {
 	db, seq := openOperationsBoard(t, operationsDurableConfig(t))
 	t.Cleanup(func() { _ = db.Close() })
@@ -325,6 +446,24 @@ func openOperationsBoard(t *testing.T, cfg claims.ClaimsBoardConfig) (*claims.Du
 	return db, seq
 }
 
+func testBootServiceParticipant(t *testing.T, board *claims.ClaimsBoard, participantID string) claims.ParticipantRegistration {
+	t.Helper()
+	participant, err := claims.NewParticipantRegistration(
+		claims.ParticipantCategoryService,
+		participantID,
+		sessionScopeKeys(board, testProcessIdentity()),
+		bootServiceQueueFloor,
+		bootServiceConcurrency,
+		bootServiceTimeout,
+		claims.HandlerDeterminismNondeterministic,
+		[]claims.ActionType{claims.ActionTypeTask},
+	)
+	if err != nil {
+		t.Fatalf("NewParticipantRegistration: %v", err)
+	}
+	return participant
+}
+
 func testProcessIdentity() ProcessIdentity {
 	return ProcessIdentity{
 		ProcessUID:          "testproc",
@@ -430,4 +569,24 @@ func assertTestamentLifecycle(t *testing.T, board *claims.ClaimsBoard, testament
 		t.Fatalf("testament %s summary = %q, want %q", testamentID, testament.Summary, summary)
 	}
 	return testament
+}
+
+func assertPhaseTestamentHasDispatcherReadiness(t *testing.T, board *claims.ClaimsBoard, testamentID string, want int) {
+	t.Helper()
+	testament, ok := board.CloneTestament(testamentID)
+	if !ok {
+		t.Fatalf("testament %s not found", testamentID)
+	}
+	got := 0
+	for _, artifact := range testament.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		if ready, _ := artifact.Metadata["service_dispatcher"].(bool); ready {
+			got++
+		}
+	}
+	if got != want {
+		t.Fatalf("service dispatcher readiness artifacts = %d, want %d", got, want)
+	}
 }

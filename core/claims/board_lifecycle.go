@@ -323,9 +323,11 @@ func (b *ClaimsBoard) GenerateTestamentAction(ctx context.Context, action Action
 				if artifact == nil {
 					continue
 				}
-				dispatches = append(dispatches,
-					b.amplifier.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusGenerated, result.Action.AgentID, now)...,
-				)
+				if artifactGeneratedInBatch(artifact, now) {
+					dispatches = append(dispatches,
+						b.amplifier.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusGenerated, result.Action.AgentID, now)...,
+					)
+				}
 				dispatches = append(dispatches,
 					b.amplifier.buildArtifactLifecycleDeltas(ctx, artifact, testament, claim, ArtifactStatusAttached, result.Action.AgentID, now)...,
 				)
@@ -1069,26 +1071,33 @@ func (b *ClaimsBoard) validateGenerateTestamentActionLocked(action Action, testa
 				}
 			}
 		}
-		if err := validateGeneratedTestamentArtifacts(testament, opts); err != nil {
+		if err := b.validateGeneratedTestamentArtifactsLocked(testament, opts); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateGeneratedTestamentArtifacts(testament *Testament, opts GenerateTestamentActionOptions) error {
+func (b *ClaimsBoard) validateGeneratedTestamentArtifactsLocked(testament *Testament, opts GenerateTestamentActionOptions) error {
 	for _, artifact := range testament.Artifacts {
 		if artifact == nil {
 			return fmt.Errorf("generated testament %q has nil artifact", firstNonEmpty(testament.ID, testament.Summary))
 		}
-		if strings.TrimSpace(artifact.Kind) == "" {
+		candidate := artifact
+		if existing := b.existingArtifactForAttachmentLocked(artifact, testament); existing != nil {
+			if strings.TrimSpace(existing.TestamentID) != "" {
+				return fmt.Errorf("generated testament %q artifact %q is already attached", firstNonEmpty(testament.ID, testament.Summary), existing.ID)
+			}
+			candidate = existing
+		}
+		if strings.TrimSpace(candidate.Kind) == "" {
 			return fmt.Errorf("generated testament %q artifact kind is required", firstNonEmpty(testament.ID, testament.Summary))
 		}
-		if !opts.AllowEmptyArtifactReference && strings.TrimSpace(artifact.Reference) == "" && strings.TrimSpace(artifact.ContentHash) == "" {
-			return fmt.Errorf("generated testament %q artifact %q requires reference or content hash", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(artifact.ID, artifact.Kind))
+		if !opts.AllowEmptyArtifactReference && strings.TrimSpace(candidate.Reference) == "" && strings.TrimSpace(candidate.ContentHash) == "" {
+			return fmt.Errorf("generated testament %q artifact %q requires reference or content hash", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(candidate.ID, candidate.Kind))
 		}
-		if artifact.Size < 0 {
-			return fmt.Errorf("generated testament %q artifact %q has negative size", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(artifact.ID, artifact.Kind))
+		if candidate.Size < 0 {
+			return fmt.Errorf("generated testament %q artifact %q has negative size", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(candidate.ID, candidate.Kind))
 		}
 	}
 	return nil
@@ -1199,6 +1208,7 @@ func (b *ClaimsBoard) storeGeneratedTestamentActionLocked(action *Action, testam
 		b.indexRelations(testament.ID, testament.Relations)
 		for _, artifact := range testament.Artifacts {
 			if artifact != nil {
+				b.indexArtifactLocked(artifact)
 				b.indexRelations(artifact.ID, artifact.Relations)
 			}
 		}
@@ -1260,10 +1270,10 @@ func (b *ClaimsBoard) outboxRecordsForGeneratedTestamentActionLocked(testaments 
 			if artifact == nil {
 				continue
 			}
-			records = append(records,
-				b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactGenerated), now),
-				b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactAttached), now),
-			)
+			if artifactGeneratedInBatch(artifact, now) {
+				records = append(records, b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactGenerated), now))
+			}
+			records = append(records, b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(DeltaActionArtifactAttached), now))
 		}
 	}
 	return records
@@ -1279,6 +1289,18 @@ func (b *ClaimsBoard) outboxRecordsForClaimLifecycleLocked(claims []Claim, statu
 		records = append(records, b.outboxRecordLocked(claims[i].Sequence, "claim", claims[i].ID, string(action), now))
 	}
 	return records
+}
+
+func artifactGeneratedInBatch(artifact *Artifact, now time.Time) bool {
+	if artifact == nil {
+		return false
+	}
+	for _, change := range artifact.StatusHistory {
+		if ArtifactStatus(change.To) == ArtifactStatusGenerated {
+			return change.Changed.Equal(now)
+		}
+	}
+	return false
 }
 
 func (b *ClaimsBoard) outboxRecordsForClaimLifecyclePtrLocked(claims []*Claim, status ClaimLifecycleStatus, now time.Time) []ClaimsOutboxRecord {

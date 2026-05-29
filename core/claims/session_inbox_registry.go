@@ -1,6 +1,8 @@
 package claims
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -22,6 +24,8 @@ type SessionInboxRegistry struct {
 var defaultInboxRegistry = &SessionInboxRegistry{
 	inboxes: make(map[string]*ClaimsInbox),
 }
+
+var ErrSessionInboxAlreadyRegistered = fmt.Errorf("claims: session inbox already registered for this session and agent")
 
 // DefaultSessionInboxRegistry returns the process-wide registry.
 func DefaultSessionInboxRegistry() *SessionInboxRegistry { return defaultInboxRegistry }
@@ -51,6 +55,23 @@ func (r *SessionInboxRegistry) Register(sessionID, agentID string, inbox *Claims
 	r.mu.Unlock()
 }
 
+func (r *SessionInboxRegistry) RegisterWithEvidence(ctx context.Context, sessionID, agentID string, inbox *ClaimsInbox, evidence SessionRegistryEvidenceOptions) error {
+	if r.Lookup(sessionID, agentID) != nil && strings.TrimSpace(evidence.Reason) == "" {
+		return ErrSessionInboxAlreadyRegistered
+	}
+	r.Register(sessionID, agentID, inbox)
+	return recordInboxRegistryEvidence(ctx, sessionID, agentID, "attach", evidence)
+}
+
+func (r *SessionInboxRegistry) ReplaceForReasonWithEvidence(ctx context.Context, sessionID, agentID string, inbox *ClaimsInbox, reason string, evidence SessionRegistryEvidenceOptions) error {
+	if strings.TrimSpace(reason) == "" {
+		panic("claims.SessionInboxRegistry.ReplaceForReasonWithEvidence: empty reason")
+	}
+	evidence.Reason = firstNonEmpty(evidence.Reason, reason)
+	r.Register(sessionID, agentID, inbox)
+	return recordInboxRegistryEvidence(ctx, sessionID, agentID, "recover", evidence)
+}
+
 // Lookup returns the inbox for (sessionID, agentID), or nil. Empty
 // IDs return nil.
 func (r *SessionInboxRegistry) Lookup(sessionID, agentID string) *ClaimsInbox {
@@ -72,4 +93,19 @@ func (r *SessionInboxRegistry) Remove(sessionID, agentID string) {
 	r.mu.Lock()
 	delete(r.inboxes, inboxKey(sessionID, agentID))
 	r.mu.Unlock()
+}
+
+func (r *SessionInboxRegistry) RemoveWithEvidence(ctx context.Context, sessionID, agentID string, evidence SessionRegistryEvidenceOptions) error {
+	existing := r.Lookup(sessionID, agentID)
+	r.Remove(sessionID, agentID)
+	if existing == nil && evidence.Board == nil {
+		return nil
+	}
+	return recordInboxRegistryEvidence(ctx, sessionID, agentID, "detach", evidence)
+}
+
+func recordInboxRegistryEvidence(ctx context.Context, sessionID, agentID, operation string, evidence SessionRegistryEvidenceOptions) error {
+	metadata := mergeMetadata(evidence.Metadata, map[string]any{"agent_id": agentID, "reason": evidence.Reason})
+	_, err := RecordFabricSubscriptionEvidence(ctx, evidence.Board, operation, sessionID, metadata)
+	return err
 }

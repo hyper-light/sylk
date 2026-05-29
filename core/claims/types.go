@@ -1431,6 +1431,28 @@ func cloneAnyMap(in map[string]any) map[string]any {
 	return out
 }
 
+func cloneMetadata(in map[string]any) map[string]any {
+	return cloneAnyMap(in)
+}
+
+func mergeMetadata(base map[string]any, overlay map[string]any) map[string]any {
+	out := cloneMetadata(base)
+	if len(overlay) == 0 {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]any, len(overlay))
+	}
+	for key, value := range overlay {
+		key = strings.TrimSpace(key)
+		if key == "" || value == nil {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Relation helpers
 // ────────────────────────────────────────────────────────────────────

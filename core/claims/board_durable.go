@@ -63,6 +63,7 @@ type walCheckpoint struct {
 	Claims     map[string]*Claim     `json:"claims"`
 	ClaimOrder []string              `json:"claim_order"`
 	Testaments map[string]*Testament `json:"testaments"`
+	Artifacts  map[string]*Artifact  `json:"artifacts,omitempty"`
 	Seq        uint64                `json:"seq"`
 	UpdatedAt  time.Time             `json:"updated_at"`
 }
@@ -214,6 +215,7 @@ func (db *DurableBoard) SaveSnapshot() error {
 		Claims:     b.claims,
 		ClaimOrder: b.claimOrder,
 		Testaments: b.testaments,
+		Artifacts:  b.artifacts,
 		Seq:        db.seq,
 		UpdatedAt:  time.Now().UTC(),
 	}
@@ -514,6 +516,10 @@ func (db *DurableBoard) loadSnapshot(cfg ClaimsBoardConfig) (*ClaimsBoard, uint6
 	if checkpoint.Testaments != nil {
 		board.testaments = checkpoint.Testaments
 	}
+	if checkpoint.Artifacts != nil {
+		board.artifacts = checkpoint.Artifacts
+	}
+	board.ensureArtifactIndexLocked()
 
 	return board, checkpoint.Seq, nil
 }
@@ -805,6 +811,9 @@ func (db *DurableBoard) applyTestamentActionGenerated(event *walEvent) error {
 			continue
 		}
 		b.testaments[t.ID] = t
+		for _, artifact := range t.Artifacts {
+			b.indexArtifactLocked(artifact)
+		}
 	}
 	return nil
 }
@@ -882,6 +891,9 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 	for i := range payload.Testaments {
 		t := &payload.Testaments[i]
 		b.testaments[t.ID] = t
+		for _, artifact := range t.Artifacts {
+			b.indexArtifactLocked(artifact)
+		}
 		claimRel := FindRelation(t.Relations, RelationshipClaim)
 		if claimRel != nil {
 			if c, ok := b.claims[claimRel.Related]; ok && !c.Status.IsTerminal() {
@@ -909,6 +921,7 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 func (db *DurableBoard) applyArtifactLifecycleTransition(event *walEvent) error {
 	var payload struct {
 		ArtifactID   string         `json:"artifact_id"`
+		Artifact     *Artifact      `json:"artifact,omitempty"`
 		To           ArtifactStatus `json:"to"`
 		AgentID      string         `json:"agent_id"`
 		Reason       string         `json:"reason"`
@@ -920,14 +933,22 @@ func (db *DurableBoard) applyArtifactLifecycleTransition(event *walEvent) error 
 		return err
 	}
 	artifact, _, _, ok := db.board.findArtifactForMutationLocked(payload.ArtifactID)
+	createdFromPayload := false
 	if !ok {
-		return replayMissingReference("artifact", payload.ArtifactID)
+		if payload.Artifact == nil || !artifactGenerationReplayStatus(payload.To) {
+			return replayMissingReference("artifact", payload.ArtifactID)
+		}
+		db.board.indexArtifactLocked(payload.Artifact)
+		artifact = payload.Artifact
+		createdFromPayload = true
 	}
 	changed := firstNonZeroTime(payload.Changed, event.CreatedAt)
-	if _, err := TransitionArtifactStatus(artifact, payload.To, payload.AgentID, payload.Reason, changed); err != nil {
-		return err
+	if artifact.Status != payload.To {
+		if _, err := TransitionArtifactStatus(artifact, payload.To, payload.AgentID, payload.Reason, changed); err != nil {
+			return err
+		}
 	}
-	if payload.Error != nil {
+	if payload.Error != nil && !createdFromPayload {
 		artifact.Errors = append(artifact.Errors, cloneArtifactError(payload.Error))
 	}
 	artifact.Accessed = changed
@@ -973,13 +994,23 @@ func (db *DurableBoard) applyValidationLifecycleTransition(event *walEvent) erro
 		EvaluatorRef:     payload.EvaluatorRef,
 	}
 	resultArtifactID := db.board.recordValidationLifecycleMutationLocked(claim, validation, to, payload.AgentID, opts, changed)
+	accepted := claimAcceptedAfterValidation(claim, validation.ID, to)
+	claimStatus, claimLifecycle, hasClaimOutcome := validationClaimOutcome(claim, validation, to, accepted)
+	db.board.recordValidationClaimOutcomeLocked(claim, claimStatus, claimLifecycle, hasClaimOutcome, payload.AgentID, payload.Reason, changed)
 	records := []ClaimsOutboxRecord{db.board.outboxRecordLocked(event.Sequence, RelatedTypeValidation, validation.ID, string(mustValidationLifecycleDeltaAction(to)), event.CreatedAt)}
 	if payload.ResultArtifact != nil {
 		artifactID := firstNonEmpty(resultArtifactID, payload.ResultArtifact.ID)
 		records = append(records, db.board.outboxRecordLocked(event.Sequence, RelatedTypeArtifact, artifactID, string(DeltaActionArtifactGenerated), event.CreatedAt))
 	}
+	if hasClaimOutcome {
+		records = append(records, validationClaimOutcomeOutboxRecordLocked(db.board, claim, claimStatus, event.CreatedAt))
+	}
 	db.insertReplayOutbox(records)
 	return nil
+}
+
+func artifactGenerationReplayStatus(status ArtifactStatus) bool {
+	return status == ArtifactStatusGenerated || status == ArtifactStatusGenerationFailed
 }
 
 func (db *DurableBoard) applyValidationEvaluated(event *walEvent) error {

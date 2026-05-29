@@ -77,7 +77,12 @@ func (s *IdentityRegistryService) storeAllocation(normalized IdentityAllocationA
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing, ok := s.byUID[normalized.UID]; ok {
-		return mergeIdentityGeneration(existing, normalized)
+		merged, err := mergeIdentityGeneration(existing, normalized)
+		if err != nil {
+			return IdentityAllocationArtifactData{}, err
+		}
+		s.byUID[normalized.UID] = merged
+		return merged, nil
 	}
 	if len(s.byUID) >= s.maxRecords {
 		return IdentityAllocationArtifactData{}, fmt.Errorf("%w: max records reached", ErrIdentityRegistryServiceInvalid)

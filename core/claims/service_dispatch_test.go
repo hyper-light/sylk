@@ -196,6 +196,77 @@ func TestServiceDispatcherOverflowRecordsFailureWithoutLaunchingHandler(t *testi
 	assertServiceClaimLifecycle(t, board, secondClaimID, ClaimLifecycleValidationErrored)
 }
 
+func TestServiceDispatcherRegistryRegisterReplaceCloseAndRemove(t *testing.T) {
+	board, _ := serviceDispatchBoard(t)
+	participant := serviceDispatchParticipant(t)
+	firstSub := &recordingSubscription{}
+	firstSubscriber := &recordingSubscriber{sub: firstSub}
+	first := newRegistryDispatcher(t, board, participant, firstSubscriber)
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("Start first: %v", err)
+	}
+	registry := NewServiceDispatcherRegistry()
+	if err := registry.Register(board.SessionID(), first); err != nil {
+		t.Fatalf("Register first: %v", err)
+	}
+	if err := registry.Register(board.SessionID(), first); !errors.Is(err, ErrServiceDispatcherAlreadyRegistered) {
+		t.Fatalf("duplicate Register error = %v, want already registered", err)
+	}
+	secondSub := &recordingSubscription{}
+	secondSubscriber := &recordingSubscriber{sub: secondSub}
+	second := newRegistryDispatcher(t, board, participant, secondSubscriber)
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatalf("Start second: %v", err)
+	}
+	if err := registry.ReplaceForReason(board.SessionID(), second, "session restart"); err != nil {
+		t.Fatalf("ReplaceForReason: %v", err)
+	}
+	if firstSub.calls.Load() != 1 {
+		t.Fatalf("first unsubscribe calls = %d, want 1", firstSub.calls.Load())
+	}
+	got, ok := registry.Lookup(board.SessionID(), participant.UID)
+	if !ok || got != second {
+		t.Fatalf("Lookup after replace = %p ok=%v, want second %p", got, ok, second)
+	}
+	uids := registry.SessionParticipantUIDs(board.SessionID())
+	if len(uids) != 1 || uids[0] != participant.UID {
+		t.Fatalf("SessionParticipantUIDs = %v, want [%s]", uids, participant.UID)
+	}
+	if err := registry.CloseSession(board.SessionID()); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	if secondSub.calls.Load() != 1 {
+		t.Fatalf("second unsubscribe calls = %d, want 1", secondSub.calls.Load())
+	}
+	if _, ok := registry.Lookup(board.SessionID(), participant.UID); ok {
+		t.Fatal("Lookup after CloseSession succeeded")
+	}
+}
+
+func TestServiceDispatcherRegistryCloseDoesNotHoldRegistryLock(t *testing.T) {
+	board, _ := serviceDispatchBoard(t)
+	participant := serviceDispatchParticipant(t)
+	registry := NewServiceDispatcherRegistry()
+	sub := &lookupOnUnsubscribeSubscription{registry: registry, sessionID: board.SessionID(), participantUID: participant.UID}
+	dispatcher := newRegistryDispatcher(t, board, participant, &recordingSubscriber{sub: sub})
+	if err := dispatcher.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := registry.Register(board.SessionID(), dispatcher); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- registry.CloseSession(board.SessionID()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("CloseSession: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CloseSession deadlocked while subscription re-entered registry")
+	}
+}
+
 func serviceDispatchBoard(t *testing.T) (*ClaimsBoard, string) {
 	t.Helper()
 	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "service-board", SessionID: "service-session", TaskID: "service-task"})
@@ -244,6 +315,23 @@ func serviceDispatchParticipant(t *testing.T) ParticipantRegistration {
 func newTestServiceDispatcher(t *testing.T, board *ClaimsBoard, participant ParticipantRegistration, handler ServiceHandler) *ServiceDispatcher {
 	t.Helper()
 	dispatcher, err := NewServiceDispatcher(ServiceDispatcherConfig{Board: board, Scope: immediateScope{}, Participant: participant, Handler: handler})
+	if err != nil {
+		t.Fatalf("NewServiceDispatcher: %v", err)
+	}
+	return dispatcher
+}
+
+func newRegistryDispatcher(t *testing.T, board *ClaimsBoard, participant ParticipantRegistration, subscriber DeltaSubscriber) *ServiceDispatcher {
+	t.Helper()
+	dispatcher, err := NewServiceDispatcher(ServiceDispatcherConfig{
+		Board:       board,
+		Subscriber:  subscriber,
+		Scope:       immediateScope{},
+		Participant: participant,
+		Handler: serviceHandlerFunc(func(context.Context, ServiceClaimRequest) (ServiceClaimResult, error) {
+			return ServiceClaimResult{Summary: "ok"}, nil
+		}),
+	})
 	if err != nil {
 		t.Fatalf("NewServiceDispatcher: %v", err)
 	}
@@ -307,7 +395,7 @@ func (s *asyncServiceScope) wait() {
 
 type recordingSubscriber struct {
 	mu           sync.Mutex
-	sub          *recordingSubscription
+	sub          DeltaSubscription
 	patternsSeen []string
 	handlers     []DeltaHandler
 }
@@ -317,7 +405,9 @@ func (s *recordingSubscriber) SubscribeDelta(pattern string, handler DeltaHandle
 	defer s.mu.Unlock()
 	s.patternsSeen = append(s.patternsSeen, pattern)
 	s.handlers = append(s.handlers, handler)
-	s.sub.topic = pattern
+	if sub, ok := s.sub.(*recordingSubscription); ok {
+		sub.topic = pattern
+	}
 	return s.sub, nil
 }
 
@@ -338,6 +428,19 @@ func (s *recordingSubscription) Topic() string { return s.topic }
 func (s *recordingSubscription) Unsubscribe() error {
 	s.calls.Add(1)
 	return s.err
+}
+
+type lookupOnUnsubscribeSubscription struct {
+	registry       *ServiceDispatcherRegistry
+	sessionID      string
+	participantUID string
+}
+
+func (s *lookupOnUnsubscribeSubscription) Topic() string { return "lookup-on-unsubscribe" }
+
+func (s *lookupOnUnsubscribeSubscription) Unsubscribe() error {
+	_, _ = s.registry.Lookup(s.sessionID, s.participantUID)
+	return nil
 }
 
 func TestServiceDispatcherPanicFailureStackIsBounded(t *testing.T) {

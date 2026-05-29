@@ -12,7 +12,7 @@ import (
 
 var (
 	ErrValidatorRegistrationInvalid  = errors.New("validator registration invalid")
-	ErrValidatorRegistrationConflict = errors.New("validator id is already registered")
+	ErrValidatorRegistrationConflict = errors.New("validator registration conflicts with existing immutable metadata")
 	ErrValidatorNotRegistered        = errors.New("validator is not registered")
 	ErrValidatorConcurrencyExhausted = errors.New("validator concurrency budget exhausted")
 	ErrValidatorDispatchInvalid      = errors.New("validator dispatch invalid")
@@ -60,6 +60,7 @@ type ProgrammaticValidatorDispatcher struct {
 	limits   map[string]chan struct{}
 	clock    ClaimsClock
 	scope    ScopeProvider
+	workers  sync.WaitGroup
 }
 
 func NewValidatorRegistry() *ValidatorRegistry {
@@ -83,11 +84,16 @@ func (r *ValidatorRegistry) Register(reg ValidatorRegistration) (ValidatorRegist
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if existing, ok := r.registrationWithValidatorIDLocked(normalized.ValidatorID); ok {
+	key := validatorRegistrationKey(normalized)
+	existing, ok := r.records[key]
+	if !ok {
+		r.records[key] = normalized
+		return normalized, nil
+	}
+	if !validatorImmutableFieldsEqual(existing, normalized) {
 		return existing, ErrValidatorRegistrationConflict
 	}
-	r.records[validatorRegistrationKey(normalized)] = normalized
-	return normalized, nil
+	return existing, nil
 }
 
 func RegisterValidator[T, R any](registry *ValidatorRegistry, config ValidatorConfig, handler Validator[T, R]) (ValidatorRegistration, error) {
@@ -135,6 +141,13 @@ func newProgrammaticValidatorDispatcher(registry *ValidatorRegistry, clock Claim
 	}
 }
 
+func (d *ProgrammaticValidatorDispatcher) Wait() {
+	if d == nil {
+		return
+	}
+	d.workers.Wait()
+}
+
 func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
 	if d == nil || d.registry == nil {
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error(), time.Now().UTC()), ErrValidatorNotRegistered
@@ -150,30 +163,41 @@ func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context
 	if !d.acquire(reg) {
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.clock.Now()), nil
 	}
-	defer d.release(reg)
-	return d.invoke(ctx, types, reg, req)
+	return d.invoke(ctx, types, reg, req, func() { d.release(reg) })
 }
 
-func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest) (ValidationDispatchResult, error) {
+func (d *ProgrammaticValidatorDispatcher) invoke(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, release func()) (ValidationDispatchResult, error) {
 	started := firstNonZeroTime(req.StartedAt, d.clock.Now())
 	if d.scope != nil {
-		return d.invokeTracked(ctx, types, reg, req, started)
+		return d.invokeTracked(ctx, types, reg, req, started, release)
 	}
-	return d.invokeDirect(ctx, types, reg, req, started)
+	return d.invokeDirect(ctx, types, reg, req, started, release)
 }
 
-func (d *ProgrammaticValidatorDispatcher) invokeDirect(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time) (ValidationDispatchResult, error) {
+func (d *ProgrammaticValidatorDispatcher) invokeDirect(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time, release func()) (ValidationDispatchResult, error) {
 	runCtx, cancel := context.WithTimeout(ctxOrBackground(ctx), reg.Timeout)
 	defer cancel()
-	outcome := d.callValidatorHandler(runCtx, reg, req, started)
-	return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
+	done := make(chan validatorHandlerOutcome, 1)
+	d.workers.Add(1)
+	go func() {
+		defer d.workers.Done()
+		defer release()
+		done <- d.callValidatorHandler(runCtx, reg, req, started)
+	}()
+	select {
+	case outcome := <-done:
+		return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
+	case <-runCtx.Done():
+		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
+	}
 }
 
-func (d *ProgrammaticValidatorDispatcher) invokeTracked(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time) (ValidationDispatchResult, error) {
+func (d *ProgrammaticValidatorDispatcher) invokeTracked(ctx context.Context, types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, started time.Time, release func()) (ValidationDispatchResult, error) {
 	runCtx, cancel := context.WithTimeout(ctxOrBackground(ctx), reg.Timeout)
 	defer cancel()
 	done := make(chan validatorHandlerOutcome, 1)
 	if err := d.scope.Go("claims_validator_handler", reg.Timeout, func(scopeCtx context.Context) error {
+		defer release()
 		outcome := d.callValidatorHandler(runCtx, reg, req, started)
 		select {
 		case done <- outcome:
@@ -181,6 +205,7 @@ func (d *ProgrammaticValidatorDispatcher) invokeTracked(ctx context.Context, typ
 		}
 		return nil
 	}); err != nil {
+		release()
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, err.Error(), d.clock.Now()), nil
 	}
 	select {
@@ -258,18 +283,11 @@ func (r *ValidatorRegistry) lookupLocked(claim *Claim, validation *Validation) (
 	candidates := []string{
 		validatorRegistrationKeyFor(validation.ValidatorID, validation.Type, claimActionType(claim)),
 		validatorRegistrationKeyFor(validation.ValidatorID, validation.Type, ""),
+		validatorRegistrationKeyFor("", validation.Type, claimActionType(claim)),
+		validatorRegistrationKeyFor("", validation.Type, ""),
 	}
 	for _, key := range candidates {
 		if reg, ok := r.records[key]; ok {
-			return reg, true
-		}
-	}
-	return ValidatorRegistration{}, false
-}
-
-func (r *ValidatorRegistry) registrationWithValidatorIDLocked(validatorID string) (ValidatorRegistration, bool) {
-	for _, reg := range r.records {
-		if reg.ValidatorID == validatorID {
 			return reg, true
 		}
 	}
@@ -295,8 +313,8 @@ func normalizeValidatorRegistration(reg ValidatorRegistration, types *TypeRegist
 }
 
 func validateValidatorRegistration(reg ValidatorRegistration, types *TypeRegistry) error {
-	if reg.ValidatorID == "" || reg.ValidationType == "" || !reg.Determinism.valid() || reg.Handler == nil {
-		return fmt.Errorf("%w: validator id, validation type, determinism, and handler are required", ErrValidatorRegistrationInvalid)
+	if reg.ValidationType == "" || !reg.Determinism.valid() || reg.Handler == nil {
+		return fmt.Errorf("%w: validation type, determinism, and handler are required", ErrValidatorRegistrationInvalid)
 	}
 	if reg.Timeout <= 0 || reg.ConcurrencyBudget <= 0 {
 		return fmt.Errorf("%w: timeout and concurrency budget must be bounded positive values", ErrValidatorRegistrationInvalid)
@@ -313,6 +331,18 @@ func validateValidatorRegistration(reg ValidatorRegistration, types *TypeRegistr
 		}
 	}
 	return nil
+}
+
+func validatorImmutableFieldsEqual(a, b ValidatorRegistration) bool {
+	return a.ValidatorID == b.ValidatorID &&
+		a.ValidationType == b.ValidationType &&
+		a.ActionType == b.ActionType &&
+		a.Determinism == b.Determinism &&
+		a.Timeout == b.Timeout &&
+		a.ConcurrencyBudget == b.ConcurrencyBudget &&
+		a.TargetArtifactName == b.TargetArtifactName &&
+		a.ArtifactDataType == b.ArtifactDataType &&
+		a.ResultDataType == b.ResultDataType
 }
 
 func validatorRegistrationFromConfig(config ValidatorConfig, inputDataType, outputDataType string, handler ValidatorHandler) (ValidatorRegistration, error) {
@@ -472,7 +502,7 @@ func validationStatusForValidationError(validation *Validation, err *ValidationE
 		category = err.Category
 	}
 	switch category {
-	case ValidationErrorCategoryHandler, ValidationErrorCategoryTimeout:
+	case ValidationErrorCategoryArtifactType:
 		if validation != nil && !validation.Required {
 			return ValidationStatusValidationFailedNotRequired
 		}
@@ -687,6 +717,27 @@ func (d *BoardValidatorDispatcher) validateRequest(req ValidationDispatchRequest
 	}
 	if req.Validation.Status != ValidationStatusReady {
 		return fmt.Errorf("%w: validation %q is %q, want %q", ErrValidatorDispatchInvalid, req.Validation.ID, req.Validation.Status, ValidationStatusReady)
+	}
+	if err := d.validateBoardParentage(req); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *BoardValidatorDispatcher) validateBoardParentage(req ValidationDispatchRequest) error {
+	storedValidation, storedClaim, ok := d.board.CloneValidation(req.Validation.ID)
+	if !ok || storedClaim == nil || storedClaim.ID != req.Claim.ID {
+		return fmt.Errorf("%w: validation %q is not parented to claim %q", ErrValidatorDispatchInvalid, req.Validation.ID, req.Claim.ID)
+	}
+	if storedValidation.Status != ValidationStatusReady {
+		return fmt.Errorf("%w: stored validation %q is %q, want %q", ErrValidatorDispatchInvalid, storedValidation.ID, storedValidation.Status, ValidationStatusReady)
+	}
+	storedArtifact, ok := d.board.cloneValidationTargetArtifact(storedClaim.ID, storedValidation)
+	if !ok || storedArtifact.ID != req.Artifact.ID {
+		return fmt.Errorf("%w: artifact %q is not the board target for validation %q", ErrValidatorDispatchInvalid, req.Artifact.ID, req.Validation.ID)
+	}
+	if storedArtifact.TestamentID == "" || storedArtifact.Status != ArtifactStatusAttached {
+		return fmt.Errorf("%w: artifact %q is not attached and ready for validation", ErrValidatorDispatchInvalid, storedArtifact.ID)
 	}
 	return nil
 }

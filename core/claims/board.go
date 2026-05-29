@@ -26,9 +26,9 @@ const (
 // agents work against collaboratively. Thread-safe for concurrent reads
 // (RLock) and atomic writes (Lock).
 //
-// Structural ownership: Claims own Validations. Testaments own Artifacts.
-// No separate maps for validations or artifacts — they are accessed
-// through their parent entity.
+// Structural ownership: Claims own Validations. Testaments own attached
+// Artifacts. The artifacts map is an index over generated artifacts so
+// the board can model the generated-but-unattached lifecycle window.
 type ClaimsBoard struct {
 	mu sync.RWMutex
 
@@ -46,6 +46,7 @@ type ClaimsBoard struct {
 	actions                   map[string]*Action
 	claims                    map[string]*Claim
 	testaments                map[string]*Testament
+	artifacts                 map[string]*Artifact
 	claimOrder                []string
 	phaseLog                  []StatusChange
 	claimGenerationKeys       map[string]string
@@ -132,6 +133,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		actions:                   make(map[string]*Action),
 		claims:                    make(map[string]*Claim),
 		testaments:                make(map[string]*Testament),
+		artifacts:                 make(map[string]*Artifact),
 		claimGenerationKeys:       make(map[string]string),
 		singleClaimGenerationKeys: make(map[string]string),
 		testamentGenerationKeys:   make(map[string]string),
@@ -834,7 +836,14 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		})
 	}
 
-	for _, artifact := range t.Artifacts {
+	for idx, artifact := range t.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		if existing := b.existingArtifactForAttachmentLocked(artifact, t); existing != nil {
+			artifact = existing
+			t.Artifacts[idx] = artifact
+		}
 		if artifact.ID == "" {
 			artifact.ID = uuid.NewString()
 		}
@@ -845,8 +854,10 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		artifact.SessionID = b.sessionID
 		artifact.PipelineID = b.pipelineID
 		artifact.TaskID = b.taskID
-		artifact.Sequence = b.nextSeq()
-		artifact.Created = now
+		if artifact.Sequence == 0 {
+			artifact.Sequence = b.nextSeq()
+		}
+		artifact.Created = firstNonZeroTime(artifact.Created, now)
 		artifact.Accessed = now
 		actorID := firstNonEmpty(artifact.ParticipantID, artifact.AgentID, t.AgentID)
 		if artifact.Status == "" {
@@ -864,6 +875,7 @@ func (b *ClaimsBoard) stampTestamentLocked(t *Testament, action *Action, now tim
 		}
 		ApplyDefaultArtifactPresentation(artifact)
 		artifact.Presentation = NormalizePresentation(artifact.Presentation)
+		b.indexArtifactLocked(artifact)
 	}
 }
 
@@ -2303,6 +2315,11 @@ func (b *ClaimsBoard) CloneArtifact(id string) (*Artifact, bool) {
 func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	if b.artifacts != nil {
+		if artifact := b.artifacts[strings.TrimSpace(id)]; artifact != nil {
+			return CloneArtifact(artifact), true
+		}
+	}
 	for _, t := range b.testaments {
 		for _, a := range t.Artifacts {
 			if a == nil || a.ID != id {
@@ -2312,6 +2329,52 @@ func (b *ClaimsBoard) cloneArtifact(id string) (*Artifact, bool) {
 		}
 	}
 	return nil, false
+}
+
+func (b *ClaimsBoard) indexArtifactLocked(artifact *Artifact) {
+	if b == nil || artifact == nil || strings.TrimSpace(artifact.ID) == "" {
+		return
+	}
+	if b.artifacts == nil {
+		b.artifacts = make(map[string]*Artifact)
+	}
+	b.artifacts[artifact.ID] = artifact
+}
+
+func (b *ClaimsBoard) ensureArtifactIndexLocked() {
+	if b == nil {
+		return
+	}
+	if b.artifacts == nil {
+		b.artifacts = make(map[string]*Artifact)
+	}
+	for _, testament := range b.testaments {
+		if testament == nil {
+			continue
+		}
+		for _, artifact := range testament.Artifacts {
+			b.indexArtifactLocked(artifact)
+		}
+	}
+}
+
+func (b *ClaimsBoard) existingArtifactForAttachmentLocked(candidate *Artifact, testament *Testament) *Artifact {
+	if b == nil || candidate == nil || b.artifacts == nil {
+		return nil
+	}
+	if strings.TrimSpace(candidate.ID) != "" {
+		return b.artifacts[candidate.ID]
+	}
+	claimID := firstNonEmpty(candidate.ClaimID, ClaimIDFromRelations(testament.Relations))
+	for _, artifact := range b.artifacts {
+		if artifact == nil || artifact.TestamentID != "" || artifact.ClaimID != claimID {
+			continue
+		}
+		if strings.TrimSpace(artifact.ArtifactName) != "" && artifact.ArtifactName == candidate.ArtifactName {
+			return artifact
+		}
+	}
+	return nil
 }
 
 // CloneValidation returns a defensive copy of the validation and its parent claim.
@@ -2428,7 +2491,14 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	standaloneArtifacts := make([]*Artifact, 0)
+	for _, artifact := range b.artifacts {
+		if artifact != nil && strings.TrimSpace(artifact.TestamentID) == "" {
+			standaloneArtifacts = append(standaloneArtifacts, artifact)
+		}
+	}
 	b.relationsIdx = newRelationsIndex()
+	b.artifacts = make(map[string]*Artifact)
 	b.claimGenerationKeys = make(map[string]string)
 	b.singleClaimGenerationKeys = make(map[string]string)
 	b.testamentGenerationKeys = make(map[string]string)
@@ -2499,11 +2569,19 @@ func (b *ClaimsBoard) rebuildDerivedState() {
 		}
 		for _, a := range t.Artifacts {
 			if a != nil {
+				b.indexArtifactLocked(a)
 				b.indexRelations(a.ID, a.Relations)
 			}
 			if a != nil && a.Sequence > high {
 				high = a.Sequence
 			}
+		}
+	}
+	for _, artifact := range standaloneArtifacts {
+		b.indexArtifactLocked(artifact)
+		b.indexRelations(artifact.ID, artifact.Relations)
+		if artifact.Sequence > high {
+			high = artifact.Sequence
 		}
 	}
 	if b.seq.Load() < high {
