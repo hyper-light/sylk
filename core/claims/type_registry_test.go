@@ -140,6 +140,15 @@ func TestBuiltinArtifactDataCatalog(t *testing.T) {
 		ArtifactDataTypeIdentityAllocation,
 		ArtifactDataTypeIdentityLineage,
 		ArtifactDataTypeActivationRecord,
+		ArtifactDataTypeDAGOperation,
+		ArtifactDataTypeVFSOperation,
+		ArtifactDataTypeToolRuntimeExecution,
+		ArtifactDataTypeKnowledgeOperation,
+		ArtifactDataTypeMemoryContinuity,
+		ArtifactDataTypeDocumentOperation,
+		ArtifactDataTypeGuardianDecision,
+		ArtifactDataTypeProviderGatewayCall,
+		ArtifactDataTypeExternalAdapterEvent,
 	} {
 		if _, err := registry.LookupArtifactType(dataType); err != nil {
 			t.Fatalf("builtin %s missing: %v", dataType, err)

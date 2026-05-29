@@ -310,6 +310,15 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeIdentityAllocation, IdentityAllocationArtifactData{}},
 		{ArtifactDataTypeIdentityLineage, IdentityLineageArtifactData{}},
 		{ArtifactDataTypeActivationRecord, ActivationRecordArtifactData{}},
+		{ArtifactDataTypeDAGOperation, DAGOperationArtifactData{}},
+		{ArtifactDataTypeVFSOperation, VFSOperationArtifactData{}},
+		{ArtifactDataTypeToolRuntimeExecution, ToolRuntimeExecutionArtifactData{}},
+		{ArtifactDataTypeKnowledgeOperation, KnowledgeOperationArtifactData{}},
+		{ArtifactDataTypeMemoryContinuity, MemoryContinuityArtifactData{}},
+		{ArtifactDataTypeDocumentOperation, DocumentOperationArtifactData{}},
+		{ArtifactDataTypeGuardianDecision, GuardianDecisionArtifactData{}},
+		{ArtifactDataTypeProviderGatewayCall, ProviderGatewayCallArtifactData{}},
+		{ArtifactDataTypeExternalAdapterEvent, ExternalAdapterEventArtifactData{}},
 	}
 	for _, entry := range entries {
 		if err := registry.Register(entry.dataType, entry.sample, codec); err != nil {

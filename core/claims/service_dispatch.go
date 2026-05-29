@@ -31,9 +31,19 @@ type ServiceClaimResult struct {
 	Metadata  map[string]any
 }
 
+type ServiceShutdownRequest struct {
+	Board       *ClaimsBoard
+	Participant ParticipantRegistration
+	SessionID   string
+}
+
 //go:generate mockery --name=ServiceHandler --output=./mocks --outpkg=mocks
 type ServiceHandler interface {
 	HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error)
+}
+
+type serviceShutdownHandler interface {
+	ShutdownService(ctx context.Context, req ServiceShutdownRequest) (ServiceClaimResult, error)
 }
 
 type ServiceDispatcherConfig struct {
@@ -114,7 +124,7 @@ func (d *ServiceDispatcher) Close() error {
 	if d == nil {
 		return nil
 	}
-	return unsubscribeAll(d.closeSubscriptions())
+	return errors.Join(unsubscribeAll(d.closeSubscriptions()), d.recordServiceShutdown(context.Background()))
 }
 
 func (d *ServiceDispatcher) Participant() ParticipantRegistration {
@@ -249,6 +259,32 @@ func claimValidationActorID(claim *Claim) string {
 
 func (d *ServiceDispatcher) recordOverflow(ctx context.Context, delta CanonicalDelta) error {
 	return d.recordFailure(ctx, delta, ValidationErrorCategoryDispatcher, ErrServiceDispatchOverflow.Error(), nil)
+}
+
+func (d *ServiceDispatcher) recordServiceShutdown(ctx context.Context) error {
+	handler, ok := d.handler.(serviceShutdownHandler)
+	if !ok {
+		return nil
+	}
+	result, err := handler.ShutdownService(ctx, ServiceShutdownRequest{Board: d.board, Participant: d.participant, SessionID: d.sessionID})
+	if err != nil {
+		return err
+	}
+	var out error
+	for _, artifact := range result.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		_, err = RecordInfrastructureEvidence(ctx, InfrastructureEvidenceOptions{
+			Board:     d.board,
+			ActorID:   d.participant.RouteKey,
+			SubjectID: d.participant.RouteKey,
+			Operation: firstNonEmpty(strings.TrimSpace(result.Summary), "service_shutdown"),
+			Artifact:  artifact,
+		})
+		out = errors.Join(out, err)
+	}
+	return out
 }
 
 func (d *ServiceDispatcher) recordFailure(ctx context.Context, delta CanonicalDelta, category ValidationErrorCategory, reason string, stack []byte) error {

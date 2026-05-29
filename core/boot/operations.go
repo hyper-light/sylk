@@ -1129,7 +1129,11 @@ func (s *OperationsSequencer) readinessDispatcherSpecs(phase BootOperationPhase,
 	out := make([]ServiceDispatcherBootRegistration, 0, len(participants))
 	for _, participant := range participants {
 		reg := mustBootParticipant(claims.ParticipantCategoryService, participant.ParticipantID, sessionScopeKeys(s.board, s.identity), bootServiceDeterminism(participant.ParticipantID), []claims.ActionType{claims.ActionTypeTask})
-		out = append(out, ServiceDispatcherBootRegistration{Phase: phase, ParticipantID: participant.ParticipantID, Participant: reg, Handler: bootReadinessServiceHandler{ParticipantID: participant.ParticipantID, ParticipantType: participant.ParticipantType}, Context: s.bootServiceContext(participant.ParticipantID)})
+		handler := claims.NewDefaultInfrastructureServiceHandler(participant.ParticipantID)
+		if handler == nil {
+			handler = bootReadinessServiceHandler{ParticipantID: participant.ParticipantID, ParticipantType: participant.ParticipantType}
+		}
+		out = append(out, ServiceDispatcherBootRegistration{Phase: phase, ParticipantID: participant.ParticipantID, Participant: reg, Handler: handler, Context: s.bootServiceContext(participant.ParticipantID)})
 	}
 	return out
 }

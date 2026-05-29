@@ -1402,6 +1402,15 @@ strings:
 | Identity allocation evidence | `sylk.identity_allocation.v1` |
 | Identity lineage evidence | `sylk.identity_lineage.v1` |
 | Activation readiness record | `sylk.activation_record.v1` |
+| DAG processor operation evidence | `sylk.infrastructure.dag_operation.v1` |
+| VFS provisioner operation evidence | `sylk.infrastructure.vfs_operation.v1` |
+| Tool runtime execution evidence | `sylk.infrastructure.tool_runtime_execution.v1` |
+| Knowledge graph service evidence | `sylk.infrastructure.knowledge_operation.v1` |
+| Memory continuity evidence | `sylk.infrastructure.memory_continuity.v1` |
+| Document service evidence | `sylk.infrastructure.document_operation.v1` |
+| Guardian decision evidence | `sylk.infrastructure.guardian_decision.v1` |
+| Provider gateway call evidence | `sylk.infrastructure.provider_gateway_call.v1` |
+| External adapter event evidence | `sylk.infrastructure.external_adapter_event.v1` |
 
 Registration of a typed validator via `RegisterValidator[T, R]`
 implicitly registers `T` and `R` with the type registry if not

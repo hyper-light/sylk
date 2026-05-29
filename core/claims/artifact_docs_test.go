@@ -48,6 +48,15 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeIdentityAllocation,
 		ArtifactDataTypeIdentityLineage,
 		ArtifactDataTypeActivationRecord,
+		ArtifactDataTypeDAGOperation,
+		ArtifactDataTypeVFSOperation,
+		ArtifactDataTypeToolRuntimeExecution,
+		ArtifactDataTypeKnowledgeOperation,
+		ArtifactDataTypeMemoryContinuity,
+		ArtifactDataTypeDocumentOperation,
+		ArtifactDataTypeGuardianDecision,
+		ArtifactDataTypeProviderGatewayCall,
+		ArtifactDataTypeExternalAdapterEvent,
 	} {
 		if !strings.Contains(body, dataType) {
 			t.Fatalf("ARTIFACTS_AND_VALIDATIONS.md missing data type %s", dataType)
