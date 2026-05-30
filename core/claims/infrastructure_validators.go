@@ -79,20 +79,20 @@ type TopicNameValidator struct{}
 type CapacityWithinBudgetValidator struct{}
 
 var infrastructureValidatorTargetArtifactNames = map[string]string{
-	ArtifactDataTypeIdentityAllocation:     "identity_allocation",
-	ArtifactDataTypeActivationRecord:       "activation_record",
-	ArtifactDataTypeDAGOperation:           "dag_operation",
-	ArtifactDataTypeVFSOperation:           "vfs_operation",
-	ArtifactDataTypeToolRuntimeExecution:   "tool_runtime_execution",
-	ArtifactDataTypeKnowledgeOperation:     "knowledge_operation",
-	ArtifactDataTypeMemoryContinuity:       "memory_continuity",
-	ArtifactDataTypeDocumentOperation:      "document_operation",
-	ArtifactDataTypeGuardianDecision:       "guardian_decision",
-	ArtifactDataTypeProviderGatewayCall:    "provider_gateway_call",
-	ArtifactDataTypeExternalAdapterEvent:   "external_adapter_event",
-	ArtifactDataTypeSessionLifecycle:       "session_lifecycle",
-	ArtifactDataTypeFabricSubscription:     "fabric_subscription",
-	ArtifactDataTypeBusTransport:           "bus_transport",
+	ArtifactDataTypeIdentityAllocation:   "identity_allocation",
+	ArtifactDataTypeActivationRecord:     "activation_record",
+	ArtifactDataTypeDAGOperation:         "dag_operation",
+	ArtifactDataTypeVFSOperation:         "vfs_operation",
+	ArtifactDataTypeToolRuntimeExecution: "tool_runtime_execution",
+	ArtifactDataTypeKnowledgeOperation:   "knowledge_operation",
+	ArtifactDataTypeMemoryContinuity:     "memory_continuity",
+	ArtifactDataTypeDocumentOperation:    "document_operation",
+	ArtifactDataTypeGuardianDecision:     "guardian_decision",
+	ArtifactDataTypeProviderGatewayCall:  "provider_gateway_call",
+	ArtifactDataTypeExternalAdapterEvent: "external_adapter_event",
+	ArtifactDataTypeSessionLifecycle:     "session_lifecycle",
+	ArtifactDataTypeFabricSubscription:   "fabric_subscription",
+	ArtifactDataTypeBusTransport:         "bus_transport",
 }
 
 func RegisterDefaultInfrastructureValidators(registry *ValidatorRegistry) error {

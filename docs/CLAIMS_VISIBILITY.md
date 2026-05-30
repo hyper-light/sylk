@@ -503,6 +503,13 @@ bridge does not branch on participant category (agent vs service) for
 delta consumption; the wire format is uniform per
 `docs/CLAIMS_AND_INFRASTRUCTURE.md` §6.4.
 
+In this visibility model, service-produced testaments carry presentation metadata through the same
+artifact and testament fields as agent-produced testaments. The same rule
+holds for validation: programmatic validators read artifacts via the same board API as agentic validators,
+so infrastructure evidence can become visible without a special UI path.
+A guardian-denial testament with a user-visible explanation is therefore
+a first-class presentation case, not a side-channel error.
+
 ### 6.3 UI bridge conversion
 
 The bridge maps presentable entities into display messages:

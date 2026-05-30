@@ -2119,7 +2119,7 @@ not against the bus itself.
 | Determinism | side_effect |
 | Common actions | `task` (register_topic, adjust_capacity, drain) |
 | Artifact kinds | `topic_registration`, `capacity_record`, `drain_outcome` |
-| Programmatic validators | `TopicNameValidatior`, `CapacityWithinBudgetValidator` |
+| Programmatic validators | `TopicNameValidator`, `CapacityWithinBudgetValidator` |
 
 ## 15. Invariants
 
