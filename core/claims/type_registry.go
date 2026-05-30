@@ -338,6 +338,7 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeProductionReadiness, ProductionReadinessArtifactData{}},
 		{ArtifactDataTypeDAGOperation, DAGOperationArtifactData{}},
 		{ArtifactDataTypeVFSOperation, VFSOperationArtifactData{}},
+		{ArtifactDataTypeBootPhase, BootPhaseArtifactData{}},
 		{ArtifactDataTypeToolRuntimeExecution, ToolRuntimeExecutionArtifactData{}},
 		{ArtifactDataTypeKnowledgeOperation, KnowledgeOperationArtifactData{}},
 		{ArtifactDataTypeMemoryContinuity, MemoryContinuityArtifactData{}},

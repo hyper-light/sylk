@@ -143,6 +143,7 @@ func TestBuiltinArtifactDataCatalog(t *testing.T) {
 		ArtifactDataTypeProductionReadiness,
 		ArtifactDataTypeDAGOperation,
 		ArtifactDataTypeVFSOperation,
+		ArtifactDataTypeBootPhase,
 		ArtifactDataTypeToolRuntimeExecution,
 		ArtifactDataTypeKnowledgeOperation,
 		ArtifactDataTypeMemoryContinuity,

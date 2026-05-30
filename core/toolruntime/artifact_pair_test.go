@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,38 @@ func TestRecordToolCallEnd_PairsViaCompletesRelation(t *testing.T) {
 	}
 	if got := completed.Metadata["outcome"]; got != "success" {
 		t.Fatalf("outcome = %v, want success", got)
+	}
+	data, err := claims.ArtifactData[claims.ToolRuntimeExecutionArtifactData](completed)
+	if err != nil {
+		t.Fatalf("typed tool execution data: %v", err)
+	}
+	if data.ToolName != "read_file" || data.Status != claims.InfrastructureStatusOK || data.OutputSummary == "" {
+		t.Fatalf("typed execution data = %+v, want successful read_file summary", data)
+	}
+}
+
+func TestRecordToolCall_RedactsArgsAndBoundsTypedOutput(t *testing.T) {
+	ctx, acc := newAccumulatorOnContext(t)
+	inv := toolInvocation("deploy")
+	inv.ToolCall.Arguments = `{"token":"secret","path":"./cmd"}`
+	trace := recordToolCallStart(ctx, inv, "tester-agent")
+	started := acc.Artifacts()[0]
+	args, ok := started.Metadata["args"].(map[string]any)
+	if !ok {
+		t.Fatalf("started args metadata = %#v, want map", started.Metadata["args"])
+	}
+	if args["token"] != "[redacted]" || args["path"] != "./cmd" {
+		t.Fatalf("redacted args = %+v, want token redacted and path retained", args)
+	}
+
+	recordToolCallEnd(ctx, "tester-agent", trace, "deploy", strings.Repeat("x", toolCallOutputSummaryLimit+len("x")), nil, time.Now().UTC())
+	completed := acc.Artifacts()[1]
+	data, err := claims.ArtifactData[claims.ToolRuntimeExecutionArtifactData](completed)
+	if err != nil {
+		t.Fatalf("typed execution data: %v", err)
+	}
+	if data.RedactedArgs["token"] != "[redacted]" || !data.ContentTruncated {
+		t.Fatalf("typed data = %+v, want redacted truncated output", data)
 	}
 }
 

@@ -1405,6 +1405,7 @@ strings:
 | Production readiness report | `sylk.production_readiness.v1` |
 | DAG processor operation evidence | `sylk.infrastructure.dag_operation.v1` |
 | VFS provisioner operation evidence | `sylk.infrastructure.vfs_operation.v1` |
+| Boot sequencer phase evidence | `sylk.infrastructure.boot_phase.v1` |
 | Tool runtime execution evidence | `sylk.infrastructure.tool_runtime_execution.v1` |
 | Knowledge graph service evidence | `sylk.infrastructure.knowledge_operation.v1` |
 | Memory continuity evidence | `sylk.infrastructure.memory_continuity.v1` |

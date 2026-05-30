@@ -261,6 +261,108 @@ func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *test
 	}
 }
 
+func TestInfrastructureServicePhase12GuardianActionsAndAliasValidators(t *testing.T) {
+	guardian := NewGuardianService(InfrastructureServiceConfig{GuardianBackend: guardianBackendFunc(func(_ context.Context, req GuardianDecisionRequest) (GuardianDecisionArtifactData, error) {
+		return req.Requested, nil
+	})})
+	for _, tc := range []struct {
+		name string
+		tool string
+		args map[string]any
+		kind string
+	}{
+		{name: "fetch approval allowed", tool: GuardianToolFetchApproval, args: map[string]any{"policy_rule": "fetch.allowed", "approval_subject": "https://example.invalid", "user_decision": "allow"}, kind: ArtifactKindGuardianDecision},
+		{name: "content scan finding denied", tool: GuardianToolScanContent, args: map[string]any{"policy_rule": "content.scan", "approval_subject": "patch", "diff_findings": []string{"secret"}}, kind: ArtifactKindPolicyDenied},
+		{name: "git gate branch violation denied", tool: GuardianToolGateGit, args: map[string]any{"policy_rule": "git.protected", "approval_subject": "main", "branch_state": "unprotected"}, kind: ArtifactKindPolicyDenied},
+		{name: "rollback receipt allowed", tool: GuardianToolRollback, args: map[string]any{"policy_rule": "rollback.allowed", "rollback_receipt": "receipt-1", "user_decision": "allow"}, kind: ArtifactKindGuardianDecision},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := guardian.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(tc.tool, tc.args)})
+			if err != nil {
+				t.Fatalf("HandleServiceClaim: %v", err)
+			}
+			if result.Artifacts[0].Kind != tc.kind {
+				t.Fatalf("artifact kind = %q, want %q", result.Artifacts[0].Kind, tc.kind)
+			}
+			data, err := ArtifactData[GuardianDecisionArtifactData](result.Artifacts[0])
+			if err != nil {
+				t.Fatalf("guardian data: %v", err)
+			}
+			if data.Operation != tc.tool || data.PolicyRule == "" {
+				t.Fatalf("guardian data = %+v, want operation and policy evidence", data)
+			}
+		})
+	}
+
+	allowedArtifact, err := NewGuardianDecisionArtifact(GuardianDecisionArtifactData{
+		Operation:       GuardianToolFetchApproval,
+		PolicyRule:      "fetch.allowed",
+		UserDecision:    "allow",
+		Allowed:         true,
+		ApprovalPresent: true,
+		BranchProtected: true,
+		Status:          InfrastructureStatusOK,
+	})
+	if err != nil {
+		t.Fatalf("NewGuardianDecisionArtifact: %v", err)
+	}
+	for _, validator := range []ValidatorHandler{
+		GuardianPolicyMatchValidator{ExpectedRule: "fetch.allowed"},
+		UserApprovalPresentValidator{},
+		BranchProtectionValidator{},
+		DiffFindingsAbsentValidator{},
+	} {
+		result, err := validator.ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: allowedArtifact})
+		if err != nil || result.Error != nil {
+			t.Fatalf("%T validation result = %+v err=%v, want pass", validator, result, err)
+		}
+	}
+}
+
+func TestInfrastructureServicePhase14ToolRuntimeActionsAndValidators(t *testing.T) {
+	tool := NewToolRuntimeService(InfrastructureServiceConfig{ToolBackend: toolBackendFunc(func(_ context.Context, req ToolRuntimeExecutionRequest) (ToolRuntimeExecutionArtifactData, error) {
+		data := req.Requested
+		data.OutputSummary = firstNonEmpty(data.OutputSummary, "validated")
+		return data, nil
+	})})
+	for _, action := range []string{ToolRuntimeToolExecuteTool, ToolRuntimeToolValidateInvocation, ToolRuntimeToolQueryPolicy} {
+		result, err := tool.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(action, map[string]any{
+			"tool_name":       "go_test",
+			"policy_decision": "allowed",
+			"execution_mode":  "sandboxed",
+			"sandbox_scope":   map[string]string{"session_id": "session"},
+		})})
+		if err != nil {
+			t.Fatalf("%s HandleServiceClaim: %v", action, err)
+		}
+		data, err := ArtifactData[ToolRuntimeExecutionArtifactData](result.Artifacts[0])
+		if err != nil {
+			t.Fatalf("%s artifact data: %v", action, err)
+		}
+		if data.ToolName != "go_test" || data.Status != InfrastructureStatusOK || data.OutputSummary == "" {
+			t.Fatalf("%s data = %+v, want successful tool runtime evidence", action, data)
+		}
+	}
+
+	deniedArtifact, err := NewToolRuntimeExecutionArtifact(ToolRuntimeExecutionArtifactData{
+		ToolName:       "danger",
+		PolicyDecision: "denied",
+		ExecutionMode:  "sandboxed",
+		Status:         InfrastructureStatusFailed,
+		FailureReason:  "policy denied",
+	})
+	if err != nil {
+		t.Fatalf("NewToolRuntimeExecutionArtifact: %v", err)
+	}
+	result, err := ToolPolicyAllowValidator{}.ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: deniedArtifact})
+	if err != nil {
+		t.Fatalf("ToolPolicyAllowValidator: %v", err)
+	}
+	if result.Error == nil {
+		t.Fatal("policy validator passed denied tool evidence")
+	}
+}
+
 func TestInfrastructureServicesMissingBackendEmitFailureArtifacts(t *testing.T) {
 	tests := []struct {
 		name string

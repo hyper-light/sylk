@@ -897,7 +897,7 @@ func phase1TestamentSpec(status Phase1Status, dur time.Duration, identity Proces
 		summary:     "boot.phase_1_complete",
 		duration:    dur,
 		artifacts: []*claims.Artifact{
-			phaseTimingArtifact(string(BootPhaseDurableSubstrate), dur),
+			phaseTimingArtifactForAgent(identity.BootSequencerUID, string(BootPhaseDurableSubstrate), dur),
 			readinessArtifact(identity.BootSequencerUID, "claims_wal", status.WALOpened, phase1Metadata(status, identity)),
 			readinessArtifact(identity.BootSequencerUID, "guide_event_bus", status.GuideBusOpened, processMetadata(identity)),
 			readinessArtifact(identity.BootSequencerUID, "wal_replay", status.WALReplayed, mergeMetadata(processMetadata(identity), map[string]any{"replay_sequence": status.ReplaySequence})),
@@ -930,7 +930,7 @@ func phase7TestamentSpec(status Phase7Status, dur time.Duration, identity Proces
 		summary:     "boot.satisfied",
 		duration:    dur,
 		artifacts: []*claims.Artifact{
-			phaseTimingArtifact(string(BootPhaseComplete), dur),
+			phaseTimingArtifactForAgent(identity.BootSequencerUID, string(BootPhaseComplete), dur),
 			readinessArtifact(identity.BootSequencerUID, "boot_complete", true, mergeMetadata(status.Context, map[string]any{
 				"phase_count": len(phases),
 				"phases":      bootPhaseHealthMetadata(phases),
@@ -978,7 +978,7 @@ func participantFailureTestamentSpec(phase BootOperationPhase, participant Syste
 }
 
 func phaseReadinessArtifacts(phase BootOperationPhase, participants []SystemParticipantActivation, dur time.Duration, identity ProcessIdentity) []*claims.Artifact {
-	artifacts := []*claims.Artifact{phaseTimingArtifact(string(phase), dur)}
+	artifacts := []*claims.Artifact{phaseTimingArtifactForAgent(identity.BootSequencerUID, string(phase), dur)}
 	for _, participant := range participants {
 		artifacts = append(artifacts, readinessArtifact(identity.BootSequencerUID, participant.ParticipantID, participant.Ready, mergeMetadata(participantMetadata(participant), processMetadata(identity))))
 	}

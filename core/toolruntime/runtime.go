@@ -2,6 +2,8 @@ package toolruntime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +19,11 @@ import (
 )
 
 const (
-	SearchToolName      = "search_skills"
-	defaultSearchLimit  = 5
-	maxSearchResults    = 10
-	maxDescriptionItems = 2
+	SearchToolName             = "search_skills"
+	defaultSearchLimit         = 5
+	maxSearchResults           = 10
+	maxDescriptionItems        = 2
+	toolCallOutputSummaryLimit = 4096
 )
 
 type Config struct {
@@ -382,6 +385,10 @@ func (r *Runtime) ExecuteRaw(ctx context.Context, inv Invocation) (RawExecutionR
 type toolCallTrace struct {
 	startedArtifactID string
 	callID            string
+	toolName          string
+	redactedArgs      map[string]any
+	correlationID     string
+	capabilityScope   string
 }
 
 func recordToolCallStart(ctx context.Context, inv Invocation, agentID string) toolCallTrace {
@@ -394,22 +401,31 @@ func recordToolCallStart(ctx context.Context, inv Invocation, agentID string) to
 		callID = uuid.NewString()
 	}
 	startedID := uuid.NewString()
+	toolName := strings.TrimSpace(inv.ToolCall.Name)
+	redactedArgs := redactedInvocationArgs(inv.ToolCall.Arguments)
 	acc.RecordArtifact(&claims.Artifact{
 		ID:        startedID,
 		AgentID:   agentID,
 		Kind:      "tool_started",
-		Reference: strings.TrimSpace(inv.ToolCall.Name),
+		Reference: toolName,
 		Metadata: map[string]any{
 			"call_id":          callID,
-			"tool_name":        strings.TrimSpace(inv.ToolCall.Name),
-			"args":             inv.ToolCall.Arguments,
+			"tool_name":        toolName,
+			"args":             redactedArgs,
 			"correlation_id":   strings.TrimSpace(inv.CorrelationID),
 			"capability_scope": strings.TrimSpace(inv.CapabilityScope),
 			"started_at":       time.Now().UTC().Format(time.RFC3339Nano),
 		},
 		Ephemeral: true,
 	})
-	return toolCallTrace{startedArtifactID: startedID, callID: callID}
+	return toolCallTrace{
+		startedArtifactID: startedID,
+		callID:            callID,
+		toolName:          toolName,
+		redactedArgs:      redactedArgs,
+		correlationID:     strings.TrimSpace(inv.CorrelationID),
+		capabilityScope:   strings.TrimSpace(inv.CapabilityScope),
+	}
 }
 
 // recordToolCallEnd appends a tool_completed artifact paired with its
@@ -444,16 +460,10 @@ func recordToolCallEnd(ctx context.Context, agentID string, trace toolCallTrace,
 		metadata["error"] = execErr.Error()
 	}
 	if output != nil {
-		// Render output to a compact summary for the artifact reference.
-		// Full output is in the testament's artifact metadata for audit;
-		// the reference is what the chat row renders.
-		switch v := output.(type) {
-		case string:
-			metadata["output"] = truncateForRef(v, 4096)
-		default:
-			if blob, err := json.Marshal(v); err == nil {
-				metadata["output"] = truncateForRef(string(blob), 4096)
-			}
+		summary, truncated := toolCallOutputSummary(output)
+		if summary != "" {
+			metadata["output"] = summary
+			metadata["content_truncated"] = truncated
 		}
 	}
 	artifact := &claims.Artifact{
@@ -463,6 +473,36 @@ func recordToolCallEnd(ctx context.Context, agentID string, trace toolCallTrace,
 		Reference: strings.TrimSpace(toolName),
 		Metadata:  metadata,
 		Ephemeral: true,
+	}
+	data := claims.ToolRuntimeExecutionArtifactData{
+		ToolName:         strings.TrimSpace(toolName),
+		RedactedArgs:     cloneAnyMap(trace.redactedArgs),
+		PolicyDecision:   "allowed",
+		ExecutionMode:    "local",
+		StartedAt:        started.UTC(),
+		EndedAt:          now,
+		Duration:         now.Sub(started),
+		OutputSummary:    stringMetadata(metadata, "output"),
+		ContentTruncated: boolMetadata(metadata, "content_truncated"),
+		Status:           claims.InfrastructureStatusOK,
+		FailureReason:    errorString(execErr),
+		Interrupted:      errors.Is(execErr, context.Canceled),
+		TimedOut:         errors.Is(execErr, context.DeadlineExceeded),
+		Metadata: map[string]any{
+			"call_id":          trace.callID,
+			"started_artifact": trace.startedArtifactID,
+			"correlation_id":   trace.correlationID,
+			"capability_scope": trace.capabilityScope,
+		},
+	}
+	if execErr != nil {
+		data.Status = claims.InfrastructureStatusFailed
+	}
+	if errors.Is(execErr, context.Canceled) || errors.Is(execErr, context.DeadlineExceeded) {
+		data.Status = claims.InfrastructureStatusInterrupted
+	}
+	if err := claims.SetArtifactData(artifact, data); err != nil {
+		artifact.Metadata["artifact_data_error"] = err.Error()
 	}
 	if trace.startedArtifactID != "" {
 		artifact.Relations = []claims.Relation{
@@ -484,6 +524,86 @@ func truncateForRef(s string, max int) string {
 		return s
 	}
 	return s[:max] + "...(truncated)"
+}
+
+func toolCallOutputSummary(output any) (string, bool) {
+	var text string
+	switch value := output.(type) {
+	case string:
+		text = value
+	default:
+		if blob, err := json.Marshal(value); err == nil {
+			text = string(blob)
+		}
+	}
+	if text == "" {
+		return "", false
+	}
+	if len(text) <= toolCallOutputSummaryLimit {
+		return text, false
+	}
+	return truncateForRef(text, toolCallOutputSummaryLimit), true
+}
+
+func redactedInvocationArgs(raw string) map[string]any {
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return map[string]any{"raw_json_hash": shortToolDigest(raw)}
+	}
+	return redactToolArgs(decoded)
+}
+
+func redactToolArgs(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		if sensitiveToolArgKey(key) {
+			out[key] = "[redacted]"
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func sensitiveToolArgKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	return strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "password")
+}
+
+func shortToolDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func stringMetadata(metadata map[string]any, key string) string {
+	value, ok := metadata[key].(string)
+	if !ok {
+		return ""
+	}
+	return value
+}
+
+func boolMetadata(metadata map[string]any, key string) bool {
+	value, ok := metadata[key].(bool)
+	return ok && value
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (r *Runtime) executeRaw(

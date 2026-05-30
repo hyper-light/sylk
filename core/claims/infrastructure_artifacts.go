@@ -5,6 +5,7 @@ import "time"
 const (
 	ArtifactDataTypeDAGOperation         = "sylk.infrastructure.dag_operation.v1"
 	ArtifactDataTypeVFSOperation         = "sylk.infrastructure.vfs_operation.v1"
+	ArtifactDataTypeBootPhase            = "sylk.infrastructure.boot_phase.v1"
 	ArtifactDataTypeToolRuntimeExecution = "sylk.infrastructure.tool_runtime_execution.v1"
 	ArtifactDataTypeKnowledgeOperation   = "sylk.infrastructure.knowledge_operation.v1"
 	ArtifactDataTypeMemoryContinuity     = "sylk.infrastructure.memory_continuity.v1"
@@ -18,6 +19,14 @@ const (
 const (
 	ArtifactKindDAGOperation         = "dag_operation"
 	ArtifactKindVFSOperation         = "vfs_operation"
+	ArtifactKindBootPhase            = "boot_phase"
+	ArtifactKindBootSetupComplete    = "setup_complete"
+	ArtifactKindBootDetectResult     = "detect_result"
+	ArtifactKindBootAllocateOutcome  = "allocate_outcome"
+	ArtifactKindBootIngestStatus     = "ingest_status"
+	ArtifactKindBootCommitRef        = "commit_ref"
+	ArtifactKindBootFinalizeSignal   = "finalize_signal"
+	ArtifactKindBootFailure          = "boot_failure"
 	ArtifactKindToolRuntimeExecution = "tool_runtime_execution"
 	ArtifactKindKnowledgeOperation   = "knowledge_operation"
 	ArtifactKindMemoryContinuity     = "memory_continuity"
@@ -73,6 +82,24 @@ type VFSOperationArtifactData struct {
 	Status              string            `json:"status,omitempty"`
 	FailureReason       string            `json:"failure_reason,omitempty"`
 	Metadata            map[string]any    `json:"metadata,omitempty"`
+}
+
+type BootPhaseArtifactData struct {
+	Phase           string         `json:"phase"`
+	PhaseOrder      int            `json:"phase_order"`
+	ProcessUID      string         `json:"process_uid,omitempty"`
+	StartedAt       time.Time      `json:"started_at,omitempty"`
+	EndedAt         time.Time      `json:"ended_at,omitempty"`
+	Duration        time.Duration  `json:"duration,omitempty"`
+	Ready           bool           `json:"ready"`
+	Skipped         bool           `json:"skipped,omitempty"`
+	CommitRef       string         `json:"commit_ref,omitempty"`
+	ArtifactRefs    []string       `json:"artifact_refs,omitempty"`
+	PriorPhases     []string       `json:"prior_phases,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	FailureReason   string         `json:"failure_reason,omitempty"`
+	ValidationNotes []string       `json:"validation_notes,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
 }
 
 type ToolRuntimeExecutionArtifactData struct {

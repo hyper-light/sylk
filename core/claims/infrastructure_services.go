@@ -28,7 +28,10 @@ const (
 	VFSProvisionerToolMerge     = "vfs_merge"
 	VFSProvisionerToolRollback  = "vfs_rollback"
 
-	ToolRuntimeToolExecute = "tool_runtime_execute"
+	ToolRuntimeToolExecute            = "tool_runtime_execute"
+	ToolRuntimeToolExecuteTool        = "execute_tool"
+	ToolRuntimeToolValidateInvocation = "validate_invocation"
+	ToolRuntimeToolQueryPolicy        = "query_policy"
 
 	KnowledgeToolIngestNodes      = "knowledge_ingest_nodes"
 	KnowledgeToolIngestEdges      = "knowledge_ingest_edges"
@@ -60,6 +63,13 @@ const (
 	GuardianToolDiffReview            = "guardian_diff_review"
 	GuardianToolRollbackAuthorization = "guardian_rollback_authorization"
 	GuardianToolCommandGate           = "guardian_command_gate"
+	GuardianToolApproveCommand        = "approve_command"
+	GuardianToolApprovePlan           = "approve_plan"
+	GuardianToolScanContent           = "scan_content"
+	GuardianToolContentScan           = "content_scan"
+	GuardianToolGateGit               = "gate_git"
+	GuardianToolFetchApproval         = "fetch_approval"
+	GuardianToolRollback              = "rollback"
 
 	ProviderGatewayToolComplete          = "provider_complete"
 	ProviderGatewayToolCompleteStreaming = "provider_complete_streaming"
@@ -390,7 +400,7 @@ func (s *InfrastructureService) handlers() map[string]infrastructureToolHandler 
 	case InfrastructureServiceKindVFS:
 		return s.vfsHandlers()
 	case InfrastructureServiceKindTool:
-		return map[string]infrastructureToolHandler{ToolRuntimeToolExecute: s.handleToolRuntime}
+		return s.toolRuntimeHandlers()
 	case InfrastructureServiceKindKnowledge:
 		return s.knowledgeHandlers()
 	case InfrastructureServiceKindMemory:
@@ -405,6 +415,15 @@ func (s *InfrastructureService) handlers() map[string]infrastructureToolHandler 
 		return s.externalHandlers()
 	default:
 		return nil
+	}
+}
+
+func (s *InfrastructureService) toolRuntimeHandlers() map[string]infrastructureToolHandler {
+	return map[string]infrastructureToolHandler{
+		ToolRuntimeToolExecute:            s.handleToolRuntime,
+		ToolRuntimeToolExecuteTool:        s.handleToolRuntime,
+		ToolRuntimeToolValidateInvocation: s.handleToolRuntime,
+		ToolRuntimeToolQueryPolicy:        s.handleToolRuntime,
 	}
 }
 
@@ -474,6 +493,13 @@ func (s *InfrastructureService) guardianHandlers() map[string]infrastructureTool
 		GuardianToolDiffReview:            s.handleGuardian,
 		GuardianToolRollbackAuthorization: s.handleGuardian,
 		GuardianToolCommandGate:           s.handleGuardian,
+		GuardianToolApproveCommand:        s.handleGuardian,
+		GuardianToolApprovePlan:           s.handleGuardian,
+		GuardianToolScanContent:           s.handleGuardian,
+		GuardianToolContentScan:           s.handleGuardian,
+		GuardianToolGateGit:               s.handleGuardian,
+		GuardianToolFetchApproval:         s.handleGuardian,
+		GuardianToolRollback:              s.handleGuardian,
 	}
 }
 
@@ -1205,12 +1231,21 @@ func NewVFSOperationArtifact(data VFSOperationArtifactData) (*Artifact, error) {
 	return vfsOperationArtifact(data)
 }
 
+func NewBootPhaseArtifact(data BootPhaseArtifactData) (*Artifact, error) {
+	kind := bootPhaseArtifactKind(data)
+	return infrastructureArtifact("boot_phase", kind, data.Phase, data.FailureReason, data)
+}
+
 func toolRuntimeExecutionArtifact(data ToolRuntimeExecutionArtifactData) (*Artifact, error) {
 	kind := ArtifactKindToolRuntimeExecution
 	if data.PolicyDecision == "denied" || data.PolicyDecision == "missing_approval" {
 		kind = ArtifactKindPolicyDenied
 	}
 	return infrastructureArtifact("tool_runtime_execution", kind, data.ToolName, data.FailureReason, data)
+}
+
+func NewToolRuntimeExecutionArtifact(data ToolRuntimeExecutionArtifactData) (*Artifact, error) {
+	return toolRuntimeExecutionArtifact(data)
 }
 
 func knowledgeOperationArtifact(data KnowledgeOperationArtifactData) (*Artifact, error) {
@@ -1237,6 +1272,10 @@ func guardianDecisionArtifact(data GuardianDecisionArtifactData) (*Artifact, err
 	return infrastructureArtifact("guardian_decision", kind, data.Operation, data.FailureReason, data)
 }
 
+func NewGuardianDecisionArtifact(data GuardianDecisionArtifactData) (*Artifact, error) {
+	return guardianDecisionArtifact(data)
+}
+
 func providerGatewayCallArtifact(data ProviderGatewayCallArtifactData) (*Artifact, error) {
 	return infrastructureArtifact("provider_gateway_call", ArtifactKindProviderGatewayCall, data.ProviderRequestID, data.FailureReason, data)
 }
@@ -1257,6 +1296,28 @@ func infrastructureArtifact[T any](name, kind, reference, failure string, data T
 		artifact.Errors = append(artifact.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: failure, OccurredAt: time.Now().UTC()})
 	}
 	return artifact, nil
+}
+
+func bootPhaseArtifactKind(data BootPhaseArtifactData) string {
+	if data.FailureReason != "" || data.Status == InfrastructureStatusFailed || data.Status == InfrastructureStatusInterrupted {
+		return ArtifactKindBootFailure
+	}
+	switch strings.TrimSpace(data.Phase) {
+	case "setup":
+		return ArtifactKindBootSetupComplete
+	case "detect":
+		return ArtifactKindBootDetectResult
+	case "allocate":
+		return ArtifactKindBootAllocateOutcome
+	case "ingest":
+		return ArtifactKindBootIngestStatus
+	case "commit":
+		return ArtifactKindBootCommitRef
+	case "finalize":
+		return ArtifactKindBootFinalizeSignal
+	default:
+		return ArtifactKindBootPhase
+	}
 }
 
 func infrastructureServiceCall(claim *Claim, handlers map[string]infrastructureToolHandler) (ExpectedToolCall, error) {

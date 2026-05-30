@@ -50,8 +50,11 @@ type DocumentFullTextBackendReadinessValidator struct{}
 
 type GuardianPolicyMatchValidator struct{ ExpectedRule string }
 type GuardianUserApprovalPresentValidator struct{}
+type UserApprovalPresentValidator = GuardianUserApprovalPresentValidator
 type GuardianBranchProtectionValidator struct{}
+type BranchProtectionValidator = GuardianBranchProtectionValidator
 type GuardianDiffFindingsAbsentValidator struct{}
+type DiffFindingsAbsentValidator = GuardianDiffFindingsAbsentValidator
 type GuardianRollbackReceiptValidator struct{}
 
 type ProviderResponsePresentValidator struct{}
@@ -500,7 +503,7 @@ func (GuardianRollbackReceiptValidator) ValidateArtifact(_ context.Context, req 
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.Operation != GuardianToolRollbackAuthorization || data.RollbackReceipt != "" {
+	if !guardianRollbackOperation(data.Operation) || data.RollbackReceipt != "" {
 		return infrastructureValidatorPass("guardian rollback receipt valid")
 	}
 	return infrastructureValidatorFailure(req, "guardian rollback receipt missing", map[string]any{"operation": data.Operation})
@@ -678,6 +681,15 @@ func referencedClaimExists(board *ClaimsBoard, claimID string) bool {
 	}
 	_, ok := board.CloneClaim(claimID)
 	return ok
+}
+
+func guardianRollbackOperation(operation string) bool {
+	switch strings.TrimSpace(operation) {
+	case GuardianToolRollbackAuthorization, GuardianToolRollback:
+		return true
+	default:
+		return false
+	}
 }
 
 func infrastructureValidationErrorf(req ValidatorHandlerRequest, format string, args ...any) (ValidatorHandlerResult, error) {
