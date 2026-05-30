@@ -239,6 +239,9 @@ func (v ToolExecutionModeValidator) ValidateArtifact(_ context.Context, req Vali
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
+	if strings.TrimSpace(data.ExecutionMode) == "" {
+		return infrastructureValidatorFailure(req, "tool execution mode missing", map[string]any{"tool": data.ToolName})
+	}
 	if strings.TrimSpace(v.ExpectedMode) == "" || data.ExecutionMode == strings.TrimSpace(v.ExpectedMode) {
 		return infrastructureValidatorPass("tool execution mode valid")
 	}
@@ -470,10 +473,10 @@ func (GuardianUserApprovalPresentValidator) ValidateArtifact(_ context.Context, 
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.ApprovalPresent && data.UserDecision == "allow" {
+	if data.ApprovalPresent && data.Allowed && strings.EqualFold(data.UserDecision, "allow") && data.FailureReason == "" {
 		return infrastructureValidatorPass("guardian approval present")
 	}
-	return infrastructureValidatorFailure(req, "guardian approval missing or denied", map[string]any{"decision": data.UserDecision})
+	return infrastructureValidatorFailure(req, "guardian approval missing or denied", map[string]any{"decision": data.UserDecision, "allowed": data.Allowed, "reason": data.FailureReason})
 }
 
 func (GuardianBranchProtectionValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
@@ -481,10 +484,10 @@ func (GuardianBranchProtectionValidator) ValidateArtifact(_ context.Context, req
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.BranchProtected {
+	if data.BranchProtected && data.Allowed && data.FailureReason == "" {
 		return infrastructureValidatorPass("guardian branch protected")
 	}
-	return infrastructureValidatorFailure(req, "guardian branch protection failed", map[string]any{"branch_state": data.BranchState})
+	return infrastructureValidatorFailure(req, "guardian branch protection failed", map[string]any{"branch_state": data.BranchState, "allowed": data.Allowed, "reason": data.FailureReason})
 }
 
 func (GuardianDiffFindingsAbsentValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
@@ -492,10 +495,10 @@ func (GuardianDiffFindingsAbsentValidator) ValidateArtifact(_ context.Context, r
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if len(data.DiffFindings) == 0 {
+	if len(data.DiffFindings) == 0 && data.Allowed && data.FailureReason == "" {
 		return infrastructureValidatorPass("guardian diff clean")
 	}
-	return infrastructureValidatorFailure(req, "guardian diff findings present", map[string]any{"findings": data.DiffFindings})
+	return infrastructureValidatorFailure(req, "guardian diff findings present", map[string]any{"findings": data.DiffFindings, "allowed": data.Allowed, "reason": data.FailureReason})
 }
 
 func (GuardianRollbackReceiptValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {

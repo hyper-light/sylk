@@ -386,6 +386,7 @@ func (b *ClaimsBoard) PostGeneratedTestaments(ctx context.Context, testamentIDs 
 	b.projectDurableOutbox(ctx)
 	b.publishPostedTestaments(ctx, testamentSnapshots, resolutions)
 	b.notifySubscribers()
+	b.autoValidatePostedTestaments(ctx, testamentSnapshots)
 	return nil
 }
 

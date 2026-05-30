@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -148,13 +149,9 @@ func (o *ArtifactOrchestrator) dispatchArtifactValidationsTracked(ctx context.Co
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	workers := boundedWorkerCount(o.concurrencyBudget, len(validations))
-	tasks := make(chan *Validation, len(validations))
 	results := make(chan artifactWorkerResult, len(validations)+workers)
-	for _, validation := range validations {
-		tasks <- validation
-	}
-	close(tasks)
-	o.startArtifactValidationWorkers(runCtx, workers, claim, artifact, tasks, results, cancel)
+	scheduler := newArtifactValidationScheduler(validations)
+	o.startArtifactValidationWorkers(runCtx, workers, claim, artifact, scheduler, results, cancel)
 	outcome := collectArtifactWorkerResults(results, workers)
 	outcome.ClaimID = claim.ID
 	outcome.TestamentID = artifact.TestamentID
@@ -162,17 +159,51 @@ func (o *ArtifactOrchestrator) dispatchArtifactValidationsTracked(ctx context.Co
 	return outcome
 }
 
+type artifactValidationScheduler struct {
+	mu          sync.Mutex
+	validations []*Validation
+	next        int
+	stopped     bool
+}
+
+func newArtifactValidationScheduler(validations []*Validation) *artifactValidationScheduler {
+	return &artifactValidationScheduler{validations: validations}
+}
+
+func (s *artifactValidationScheduler) Next(ctx context.Context) *Validation {
+	if s == nil || ctx.Err() != nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped || s.next >= len(s.validations) {
+		return nil
+	}
+	validation := s.validations[s.next]
+	s.next++
+	return validation
+}
+
+func (s *artifactValidationScheduler) Stop() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+}
+
 type artifactWorkerResult struct {
 	Result ValidationDispatchResult
 	Done   bool
 }
 
-func (o *ArtifactOrchestrator) startArtifactValidationWorkers(ctx context.Context, workers int, claim *Claim, artifact *Artifact, tasks <-chan *Validation, results chan<- artifactWorkerResult, cancel context.CancelFunc) {
+func (o *ArtifactOrchestrator) startArtifactValidationWorkers(ctx context.Context, workers int, claim *Claim, artifact *Artifact, scheduler *artifactValidationScheduler, results chan<- artifactWorkerResult, cancel context.CancelFunc) {
 	for idx := 0; idx < workers; idx++ {
 		workerID := idx
 		if err := o.scope.Go("claims_artifact_validation", o.timeout, func(workerCtx context.Context) error {
 			defer func() { results <- artifactWorkerResult{Done: true} }()
-			o.runArtifactValidationWorker(workerCtx, claim, artifact, tasks, results, cancel)
+			o.runArtifactValidationWorker(workerCtx, claim, artifact, scheduler, results, cancel)
 			return nil
 		}); err != nil {
 			results <- artifactWorkerResult{Result: scopeLaunchValidationError(claim, artifact, workerID, err)}
@@ -181,14 +212,16 @@ func (o *ArtifactOrchestrator) startArtifactValidationWorkers(ctx context.Contex
 	}
 }
 
-func (o *ArtifactOrchestrator) runArtifactValidationWorker(ctx context.Context, claim *Claim, artifact *Artifact, tasks <-chan *Validation, results chan<- artifactWorkerResult, cancel context.CancelFunc) {
-	for validation := range tasks {
-		if ctx.Err() != nil {
+func (o *ArtifactOrchestrator) runArtifactValidationWorker(ctx context.Context, claim *Claim, artifact *Artifact, scheduler *artifactValidationScheduler, results chan<- artifactWorkerResult, cancel context.CancelFunc) {
+	for {
+		validation := scheduler.Next(ctx)
+		if validation == nil {
 			return
 		}
 		result := o.dispatchOneValidation(ctx, claim, artifact, validation)
 		results <- artifactWorkerResult{Result: result}
 		if artifactDispatchBlocks(validation, result) {
+			scheduler.Stop()
 			cancel()
 			return
 		}
@@ -216,6 +249,43 @@ func (o *ArtifactOrchestrator) dispatchOneValidation(ctx context.Context, claim 
 	}
 	if result.Status == ValidationStatusValidatingQualityBar && o.qualityBar != nil {
 		return o.dispatchQualityBar(ctx, claim, artifact, validation, result)
+	}
+	if result.Status == ValidationStatusValidatingQualityBar {
+		return o.dispatchMissingQualityBar(ctx, claim, artifact, validation)
+	}
+	return result
+}
+
+func (o *ArtifactOrchestrator) dispatchMissingQualityBar(ctx context.Context, claim *Claim, artifact *Artifact, validation *Validation) ValidationDispatchResult {
+	err := fmt.Errorf("quality-bar dispatcher is required for validation %q", validationIDFromRequest(ValidationDispatchRequest{Validation: validation}))
+	result := dispatchErrorResult(validation, artifact, err)
+	result.ResultArtifact = validatorErrorArtifact(ValidatorRegistration{ValidatorID: "quality_bar"}, ValidationDispatchRequest{Claim: claim, Artifact: artifact, Validation: validation}, result.Error, nil)
+	commitErr := o.board.CompleteValidationLifecycle(ctx, claim.ID, validation.ID, firstNonEmpty(o.actorID, validationAgentID(validation)), result.Status, ValidationLifecycleOptions{
+		Reason:           validationResultReason(result),
+		TargetArtifactID: artifact.ID,
+		ResultArtifact:   result.ResultArtifact,
+		Error:            result.Error,
+	})
+	if commitErr != nil {
+		return dispatchErrorResult(validation, artifact, commitErr)
+	}
+	return o.withCommittedDispatchResult(validation, result)
+}
+
+func (o *ArtifactOrchestrator) withCommittedDispatchResult(validation *Validation, result ValidationDispatchResult) ValidationDispatchResult {
+	if o == nil || o.board == nil || validation == nil {
+		return result
+	}
+	stored, _, ok := o.board.CloneValidation(validation.ID)
+	if !ok || stored == nil {
+		return result
+	}
+	result.ResultArtifactID = firstNonEmpty(stored.ResultArtifactID, result.ResultArtifactID)
+	if result.ResultArtifactID == "" {
+		return result
+	}
+	if artifact, ok := o.board.CloneArtifact(result.ResultArtifactID); ok {
+		result.ResultArtifact = artifact
 	}
 	return result
 }
@@ -274,10 +344,25 @@ func artifactValidationError(result ValidationDispatchResult) *ArtifactError {
 		return nil
 	}
 	return &ArtifactError{
-		Category:    ArtifactErrorCategoryValidation,
+		Category:    artifactErrorCategoryForValidation(result.Error.Category),
 		Description: result.Error.Description,
 		Source:      result.Error.Source,
 		OccurredAt:  firstNonZeroTime(result.Error.OccurredAt, time.Now().UTC()),
+	}
+}
+
+func artifactErrorCategoryForValidation(category ValidationErrorCategory) ArtifactErrorCategory {
+	switch category {
+	case ValidationErrorCategoryTimeout:
+		return ArtifactErrorCategoryTimeout
+	case ValidationErrorCategoryPanic:
+		return ArtifactErrorCategoryPanic
+	case ValidationErrorCategoryInterruption:
+		return ArtifactErrorCategoryInterruption
+	case ValidationErrorCategoryDispatcher, ValidationErrorCategoryDependency, ValidationErrorCategoryInternal:
+		return ArtifactErrorCategoryInternal
+	default:
+		return ArtifactErrorCategoryValidation
 	}
 }
 

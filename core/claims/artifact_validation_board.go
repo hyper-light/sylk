@@ -81,38 +81,18 @@ func (b *ClaimsBoard) TransitionArtifactLifecycle(ctx context.Context, artifactI
 		b.mu.Unlock()
 		return fmt.Errorf("artifact %q not found", artifactID)
 	}
-	from := artifact.Status
-	if from == to {
+	if artifact.Status == to {
 		b.mu.Unlock()
 		return nil
 	}
-	if !CanTransitionArtifactStatus(from, to) {
-		b.mu.Unlock()
-		return newArtifactLifecycleTransitionError(artifact.ID, from, to, actorID, "artifact status transition is not allowed")
-	}
-	now := time.Now().UTC()
-	action := mustArtifactLifecycleDeltaAction(to)
-	outboxRecords := []ClaimsOutboxRecord{b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(action), now)}
-	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, artifactLifecyclePayload(artifact.ID, to, actorID, opts, now), outboxRecords); err != nil {
+	result, err := b.transitionArtifactLifecycleMutationLocked(artifact, testament, claim, to, actorID, opts)
+	if err != nil {
 		b.mu.Unlock()
 		return err
 	}
-	if _, err := TransitionArtifactStatus(artifact, to, actorID, opts.Reason, now); err != nil {
-		b.mu.Unlock()
-		return err
-	}
-	if opts.Error != nil {
-		artifact.Errors = append(artifact.Errors, cloneArtifactError(opts.Error))
-	}
-	artifact.Accessed = now
-	artifactSnapshot := CloneArtifact(artifact)
-	testamentSnapshot := CloneTestamentEntity(testament)
-	claimSnapshot := CloneClaimEntity(claim)
 	b.invalidateProjectionCache()
 	b.mu.Unlock()
-	b.projectDurableOutbox(ctx)
-	b.amplifier.PublishCanonicalArtifactLifecycle(ctx, artifactSnapshot, testamentSnapshot, claimSnapshot, to, actorID, now)
-	b.notifySubscribers()
+	b.publishArtifactLifecycleMutation(ctx, result)
 	return nil
 }
 
@@ -125,26 +105,94 @@ func (b *ClaimsBoard) RecordArtifactReceiptFailure(ctx context.Context, artifact
 }
 
 func (b *ClaimsBoard) ReceiveArtifact(ctx context.Context, artifactID, receiverID string) (*Artifact, error) {
-	artifact, _, _, ok := b.cloneArtifactWithParents(artifactID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	artifact, testament, claim, ok := b.findArtifactForMutationLocked(artifactID)
 	if !ok {
+		b.mu.Unlock()
 		return nil, fmt.Errorf("artifact %q not found", artifactID)
 	}
 	if artifactReceiptAlreadySettled(artifact.Status) {
-		return artifact, nil
+		settled := CloneArtifact(artifact)
+		b.mu.Unlock()
+		return settled, nil
 	}
 	if artifact.Status != ArtifactStatusGenerated {
-		return artifact, fmt.Errorf("artifact %q status %q cannot be received", artifact.ID, artifact.Status)
+		current := CloneArtifact(artifact)
+		b.mu.Unlock()
+		return current, fmt.Errorf("artifact %q status %q cannot be received", artifact.ID, artifact.Status)
 	}
-	if err := b.validateArtifactReceipt(artifact); err != nil {
+	if err := b.validateArtifactReceiptLocked(artifact); err != nil {
 		receiptErr := artifactReceiptError(artifact, receiverID, err)
-		_ = b.RecordArtifactReceiptFailure(ctx, artifact.ID, receiverID, receiptErr)
-		return b.cloneArtifactAfterReceiptFailure(artifact.ID, err)
+		result, transitionErr := b.transitionArtifactLifecycleMutationLocked(artifact, testament, claim, ArtifactStatusReceiptFailed, receiverID, ArtifactLifecycleOptions{Reason: "artifact receipt failed", Error: receiptErr})
+		if transitionErr != nil {
+			failed := CloneArtifact(artifact)
+			b.mu.Unlock()
+			return failed, fmt.Errorf("%w: receipt failure transition: %v", err, transitionErr)
+		}
+		b.invalidateProjectionCache()
+		b.mu.Unlock()
+		b.publishArtifactLifecycleMutation(ctx, result)
+		return result.Artifact, err
 	}
-	if err := b.AcknowledgeArtifactReceipt(ctx, artifact.ID, receiverID); err != nil {
-		return artifact, err
+	result, err := b.transitionArtifactLifecycleMutationLocked(artifact, testament, claim, ArtifactStatusReceived, receiverID, ArtifactLifecycleOptions{Reason: "artifact received"})
+	if err != nil {
+		current := CloneArtifact(artifact)
+		b.mu.Unlock()
+		return current, err
 	}
-	received, _, _, _ := b.cloneArtifactWithParents(artifact.ID)
-	return received, nil
+	b.invalidateProjectionCache()
+	b.mu.Unlock()
+	b.publishArtifactLifecycleMutation(ctx, result)
+	return result.Artifact, nil
+}
+
+type artifactLifecycleMutation struct {
+	Artifact  *Artifact
+	Testament *Testament
+	Claim     *Claim
+	Status    ArtifactStatus
+	ActorID   string
+	At        time.Time
+}
+
+func (b *ClaimsBoard) transitionArtifactLifecycleMutationLocked(artifact *Artifact, testament *Testament, claim *Claim, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions) (artifactLifecycleMutation, error) {
+	from := artifact.Status
+	if !CanTransitionArtifactStatus(from, to) {
+		return artifactLifecycleMutation{}, newArtifactLifecycleTransitionError(artifact.ID, from, to, actorID, "artifact status transition is not allowed")
+	}
+	now := time.Now().UTC()
+	action := mustArtifactLifecycleDeltaAction(to)
+	records := []ClaimsOutboxRecord{b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(action), now)}
+	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, artifactLifecyclePayload(artifact.ID, to, actorID, opts, now), records); err != nil {
+		return artifactLifecycleMutation{}, err
+	}
+	if _, err := TransitionArtifactStatus(artifact, to, actorID, opts.Reason, now); err != nil {
+		return artifactLifecycleMutation{}, err
+	}
+	if opts.Error != nil {
+		artifact.Errors = append(artifact.Errors, cloneArtifactError(opts.Error))
+	}
+	artifact.Accessed = now
+	return artifactLifecycleMutation{
+		Artifact:  CloneArtifact(artifact),
+		Testament: CloneTestamentEntity(testament),
+		Claim:     CloneClaimEntity(claim),
+		Status:    to,
+		ActorID:   actorID,
+		At:        now,
+	}, nil
+}
+
+func (b *ClaimsBoard) publishArtifactLifecycleMutation(ctx context.Context, result artifactLifecycleMutation) {
+	b.projectDurableOutbox(ctx)
+	b.amplifier.PublishCanonicalArtifactLifecycle(ctx, result.Artifact, result.Testament, result.Claim, result.Status, result.ActorID, result.At)
+	b.notifySubscribers()
 }
 
 func (b *ClaimsBoard) BeginArtifactValidation(ctx context.Context, artifactID, actorID string) error {
@@ -230,28 +278,26 @@ func artifactReceiptAlreadySettled(status ArtifactStatus) bool {
 		status == ArtifactStatusReceiptFailed
 }
 
-func (b *ClaimsBoard) validateArtifactReceipt(artifact *Artifact) error {
+func (b *ClaimsBoard) validateArtifactReceiptLocked(artifact *Artifact) error {
 	if err := validateGeneratedArtifactShape(artifact); err != nil {
 		return err
 	}
 	if err := ValidateArtifactDataPayload(artifact); err != nil {
 		return err
 	}
-	if duplicate := b.duplicateReceiptArtifactName(artifact); duplicate != nil {
+	if duplicate := b.duplicateReceiptArtifactNameLocked(artifact); duplicate != nil {
 		return fmt.Errorf("artifact %q duplicates received name %q on claim %q", artifact.ID, artifact.ArtifactName, artifact.ClaimID)
 	}
 	return nil
 }
 
-func (b *ClaimsBoard) duplicateReceiptArtifactName(artifact *Artifact) *Artifact {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (b *ClaimsBoard) duplicateReceiptArtifactNameLocked(artifact *Artifact) *Artifact {
 	for _, existing := range b.artifacts {
 		if existing == nil || existing.ID == artifact.ID {
 			continue
 		}
 		if existing.ClaimID == artifact.ClaimID && existing.ArtifactName == artifact.ArtifactName {
-			return CloneArtifact(existing)
+			return existing
 		}
 	}
 	return nil

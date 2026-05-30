@@ -124,7 +124,8 @@ func TestBatchSemaphore_LimitEnforcement(t *testing.T) {
 // TestBatchSemaphore_GoroutineCount verifies that the number of active goroutines
 // stays bounded even under high load.
 func TestBatchSemaphore_GoroutineCount(t *testing.T) {
-	t.Parallel()
+	// Don't run parallel - goroutine counting is process-global and
+	// unreliable while other batch semaphore tests are active.
 
 	const maxConcurrent = 4
 	config := IndexConfig{

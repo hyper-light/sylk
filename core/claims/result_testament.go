@@ -115,23 +115,23 @@ func (b *ClaimsBoard) validateResultTestamentRequestLocked(req ResultTestamentRe
 			return fmt.Errorf("%w: source testament %q not found", ErrResultTestamentInvalid, req.SourceTestamentID)
 		}
 	}
-	return validateResultArtifacts(req)
+	return b.validateResultArtifactsLocked(req)
 }
 
-func validateResultArtifacts(req ResultTestamentRequest) error {
+func (b *ClaimsBoard) validateResultArtifactsLocked(req ResultTestamentRequest) error {
 	seen := make(map[string]struct{}, len(req.Artifacts))
 	for _, artifact := range req.Artifacts {
 		if artifact == nil {
 			return fmt.Errorf("%w: nil result artifact", ErrResultTestamentInvalid)
 		}
-		if err := validateResultArtifact(req, artifact, seen); err != nil {
+		if err := b.validateResultArtifactLocked(req, artifact, seen); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateResultArtifact(req ResultTestamentRequest, artifact *Artifact, seen map[string]struct{}) error {
+func (b *ClaimsBoard) validateResultArtifactLocked(req ResultTestamentRequest, artifact *Artifact, seen map[string]struct{}) error {
 	if strings.TrimSpace(artifact.ID) != "" {
 		if _, ok := seen[artifact.ID]; ok {
 			return fmt.Errorf("%w: duplicate result artifact %q", ErrResultTestamentInvalid, artifact.ID)
@@ -140,6 +140,25 @@ func validateResultArtifact(req ResultTestamentRequest, artifact *Artifact, seen
 	}
 	if strings.TrimSpace(artifact.ClaimID) != "" && artifact.ClaimID != req.ClaimID {
 		return fmt.Errorf("%w: artifact %q belongs to claim %q, want %q", ErrResultTestamentInvalid, artifact.ID, artifact.ClaimID, req.ClaimID)
+	}
+	if artifact.Status != "" && artifact.Status != ArtifactStatusGenerated {
+		return fmt.Errorf("%w: result artifact %q status %q cannot be posted", ErrResultTestamentInvalid, artifact.ID, artifact.Status)
+	}
+	if existing := b.artifacts[strings.TrimSpace(artifact.ID)]; existing != nil {
+		return validateExistingResultArtifact(req, existing)
+	}
+	return nil
+}
+
+func validateExistingResultArtifact(req ResultTestamentRequest, artifact *Artifact) error {
+	if strings.TrimSpace(artifact.ClaimID) != "" && artifact.ClaimID != req.ClaimID {
+		return fmt.Errorf("%w: artifact %q belongs to claim %q, want %q", ErrResultTestamentInvalid, artifact.ID, artifact.ClaimID, req.ClaimID)
+	}
+	if strings.TrimSpace(artifact.TestamentID) != "" {
+		return fmt.Errorf("%w: result artifact %q already belongs to testament %q", ErrResultTestamentInvalid, artifact.ID, artifact.TestamentID)
+	}
+	if artifact.Status != "" && artifact.Status != ArtifactStatusGenerated {
+		return fmt.Errorf("%w: result artifact %q status %q cannot be posted", ErrResultTestamentInvalid, artifact.ID, artifact.Status)
 	}
 	return nil
 }
@@ -220,8 +239,10 @@ func (b *ClaimsBoard) stampResultTestamentArtifactLocked(artifact *Artifact, req
 	}
 	artifact.Created = firstNonZeroTime(artifact.Created, now)
 	artifact.Accessed = now
-	artifact.Status = ArtifactStatusGenerated
-	artifact.StatusHistory = capStatusHistory(append(artifact.StatusHistory, statusChange("", ArtifactStatusGenerated, req.ActorID, "validation result artifact generated", now)))
+	if artifact.Status == "" {
+		artifact.Status = ArtifactStatusGenerated
+		artifact.StatusHistory = capStatusHistory(append(artifact.StatusHistory, statusChange("", ArtifactStatusGenerated, req.ActorID, "validation result artifact generated", now)))
+	}
 	artifact.Size = artifactSize(artifact)
 	return artifact
 }

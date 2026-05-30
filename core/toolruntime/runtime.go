@@ -389,6 +389,9 @@ type toolCallTrace struct {
 	redactedArgs      map[string]any
 	correlationID     string
 	capabilityScope   string
+	policyDecision    string
+	policyRule        string
+	executionMode     string
 }
 
 func recordToolCallStart(ctx context.Context, inv Invocation, agentID string) toolCallTrace {
@@ -474,11 +477,13 @@ func recordToolCallEnd(ctx context.Context, agentID string, trace toolCallTrace,
 		Metadata:  metadata,
 		Ephemeral: true,
 	}
+	policyDecision := firstToolTraceString(trace.policyDecision, "allowed")
 	data := claims.ToolRuntimeExecutionArtifactData{
 		ToolName:         strings.TrimSpace(toolName),
 		RedactedArgs:     cloneAnyMap(trace.redactedArgs),
-		PolicyDecision:   "allowed",
-		ExecutionMode:    "local",
+		PolicyDecision:   policyDecision,
+		PolicyRule:       trace.policyRule,
+		ExecutionMode:    firstToolTraceString(trace.executionMode, "local"),
 		StartedAt:        started.UTC(),
 		EndedAt:          now,
 		Duration:         now.Sub(started),
@@ -606,7 +611,29 @@ func errorString(err error) string {
 	return err.Error()
 }
 
+func firstToolTraceString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
 func (r *Runtime) executeRaw(
+	ctx context.Context,
+	inv Invocation,
+	approvedGrant *GuardianControlGrant,
+	transientActive map[string]struct{},
+	restricted bool,
+) (rawResult RawExecutionResult, retErr error) {
+	if raw, err, handled := r.executeRawServiceClaim(ctx, inv, approvedGrant, transientActive, restricted); handled {
+		return raw, err
+	}
+	return r.executeRawDirect(ctx, inv, approvedGrant, transientActive, restricted)
+}
+
+func (r *Runtime) executeRawDirect(
 	ctx context.Context,
 	inv Invocation,
 	approvedGrant *GuardianControlGrant,
@@ -647,10 +674,17 @@ func (r *Runtime) executeRaw(
 	}()
 	name, policy, err := r.validateInvocation(inv)
 	if err != nil {
+		toolCallTrace.policyDecision = "denied"
+		toolCallTrace.policyRule = err.Error()
 		return RawExecutionResult{}, err
 	}
+	toolCallTrace.policyDecision = "allowed"
+	toolCallTrace.policyRule = policyRule(policy)
+	toolCallTrace.executionMode = string(policy.Execution)
 	resolvedToolName = name
 	if !r.isActive(name, transientActive, restricted) {
+		toolCallTrace.policyDecision = "denied"
+		toolCallTrace.policyRule = "inactive_tool"
 		return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 	}
 
@@ -703,20 +737,31 @@ func (r *Runtime) executeRaw(
 		}
 		if !hookResult.Continue {
 			if hookResult.Error != nil {
+				toolCallTrace.policyDecision = "denied"
+				toolCallTrace.policyRule = hookResult.Error.Error()
 				return RawExecutionResult{}, hookResult.Error
 			}
+			toolCallTrace.policyDecision = "denied"
+			toolCallTrace.policyRule = "pre_hook_blocked"
 			return RawExecutionResult{}, fmt.Errorf("tool call blocked: %s", toolData.ToolName)
 		}
 
 		name = strings.TrimSpace(toolData.ToolName)
 		nextPolicy, ok := r.manifest.Policy(name)
 		if !ok {
+			toolCallTrace.policyDecision = "denied"
+			toolCallTrace.policyRule = "manifest_denied"
 			return RawExecutionResult{}, fmt.Errorf("SECURITY VIOLATION: agent %q is not permitted to execute tool %q", inv.AgentID, name)
 		}
 		policy = nextPolicy
 		if !r.isActive(name, transientActive, restricted) {
+			toolCallTrace.policyDecision = "denied"
+			toolCallTrace.policyRule = "inactive_tool"
 			return RawExecutionResult{}, fmt.Errorf("tool %q is outside the active tool set for capability scope %q", name, r.manifest.CapabilityScope)
 		}
+		toolCallTrace.policyDecision = "allowed"
+		toolCallTrace.policyRule = policyRule(policy)
+		toolCallTrace.executionMode = string(policy.Execution)
 		// A pre-hook may have rewritten the tool name. Update the
 		// resolved name so the deferred end-recorder pairs the
 		// completion artifact under the actual tool that ran.
@@ -750,6 +795,8 @@ func (r *Runtime) executeRaw(
 				return RawExecutionResult{}, err
 			}
 		} else if err := r.obtainGuardianGrant(ctx, inv, policy, raw, toolData.Input); err != nil {
+			toolCallTrace.policyDecision = "missing_approval"
+			toolCallTrace.policyRule = err.Error()
 			payload, _ := skills.DelegatedPayload(err)
 			if postErr := r.runPostHooks(ctx, toolData, payload, err); postErr != nil {
 				return RawExecutionResult{}, postErr

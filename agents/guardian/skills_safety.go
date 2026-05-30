@@ -72,9 +72,17 @@ func gitSafetySkill(g *Guardian) *skills.Skill {
 				"available":   true,
 			}, nil
 		},
-		"protect_check": func(_ context.Context, p *gitSafetyInput) (any, error) {
+		"protect_check": func(ctx context.Context, p *gitSafetyInput) (any, error) {
 			if p.Branch == "" {
 				return nil, fmt.Errorf("branch is required for protect_check")
+			}
+			if board := g.guardianBoard(); board != nil {
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolGateGit, map[string]any{
+					"policy_rule":      "git.branch_protection",
+					"approval_subject": p.Branch,
+					"branch":           p.Branch,
+				})
+				return guardianBranchServiceResult(data, g.config.ProtectedBranches), err
 			}
 			protected := false
 			if g.gitObserver != nil {
@@ -120,6 +128,17 @@ func gitSafetySkill(g *Guardian) *skills.Skill {
 			fn, ok := dispatch[params.Action]
 			if !ok {
 				return nil, fmt.Errorf("unknown git_safety action: %q", params.Action)
+			}
+			if board := g.guardianBoard(); board != nil && params.Action == "protect_check" {
+				if params.Branch == "" {
+					return nil, fmt.Errorf("branch is required for protect_check")
+				}
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolGateGit, map[string]any{
+					"policy_rule":      "git.branch_protection",
+					"approval_subject": params.Branch,
+					"branch":           params.Branch,
+				})
+				return guardianBranchServiceResult(data, g.config.ProtectedBranches), err
 			}
 
 			sessionID := g.activeSessionID
@@ -171,11 +190,18 @@ func rollbackSkill(g *Guardian) *skills.Skill {
 			if p.SnapshotRef == "" {
 				return nil, fmt.Errorf("snapshot_ref is required for rollback")
 			}
+			if board := g.guardianBoard(); board != nil {
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolRollback, map[string]any{
+					"policy_rule":      "rollback.allowed",
+					"approval_subject": p.SnapshotRef,
+				})
+				return guardianRollbackServiceResult(data, p.SnapshotRef), err
+			}
 			// Rollback requires user approval.
 			proposal := &GitMutationProposal{
-				Op:     "rollback",
-				Reason: fmt.Sprintf("Rollback to snapshot %q requested. This will reset uncommitted changes. Approve?", p.SnapshotRef),
-				Params: map[string]any{"snapshot_ref": p.SnapshotRef},
+				Op:        "rollback",
+				Reason:    fmt.Sprintf("Rollback to snapshot %q requested. This will reset uncommitted changes. Approve?", p.SnapshotRef),
+				Params:    map[string]any{"snapshot_ref": p.SnapshotRef},
 				RiskLevel: SeverityHigh,
 			}
 			approved, err := g.requestApproval(ctx, proposal)
@@ -215,6 +241,16 @@ func rollbackSkill(g *Guardian) *skills.Skill {
 			fn, ok := dispatch[params.Action]
 			if !ok {
 				return nil, fmt.Errorf("unknown rollback action: %q", params.Action)
+			}
+			if board := g.guardianBoard(); board != nil && params.Action == "rollback" {
+				if params.SnapshotRef == "" {
+					return nil, fmt.Errorf("snapshot_ref is required for rollback")
+				}
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolRollback, map[string]any{
+					"policy_rule":      "rollback.allowed",
+					"approval_subject": params.SnapshotRef,
+				})
+				return guardianRollbackServiceResult(data, params.SnapshotRef), err
 			}
 
 			sessionID := g.activeSessionID

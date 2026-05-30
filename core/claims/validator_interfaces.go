@@ -23,6 +23,7 @@ type ValidationDispatchRequest struct {
 type ValidationDispatchResult struct {
 	ValidationID     string
 	Status           ValidationStatus
+	ResultArtifactID string
 	ResultArtifact   *Artifact
 	Error            *ValidationError
 	CompletedAt      time.Time

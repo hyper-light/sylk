@@ -42,16 +42,56 @@ func (b *ClaimsBackend) HandleToolRuntimeExecution(ctx context.Context, req clai
 		data.FailureReason = err.Error()
 		return data, nil
 	}
+	switch req.Call.Tool {
+	case claims.ToolRuntimeToolValidateInvocation:
+		return b.validate(ctx, inv, data), nil
+	case claims.ToolRuntimeToolQueryPolicy:
+		return b.queryPolicy(data, inv), nil
+	}
 	return b.execute(ctx, req, inv, data), nil
+}
+
+func (b *ClaimsBackend) validate(ctx context.Context, inv Invocation, data claims.ToolRuntimeExecutionArtifactData) claims.ToolRuntimeExecutionArtifactData {
+	started := firstClaimsToolTime(data.StartedAt, b.clock())
+	data.StartedAt = started
+	if err := b.surface.ValidateBatch([]Invocation{inv}); err != nil {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
+		return b.finish(data, started, "", err)
+	}
+	if !b.surface.Allows(inv.ToolCall.Name) {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
+		return b.finish(data, started, "", fmt.Errorf("tool %q is not allowed", inv.ToolCall.Name))
+	}
+	data.PolicyDecision = firstClaimsToolString(data.PolicyDecision, "allowed")
+	data.ExecutionMode = firstClaimsToolString(data.ExecutionMode, "policy_validated")
+	return b.finish(data, started, "validated", claimsToolContextErr(ctx))
+}
+
+func (b *ClaimsBackend) queryPolicy(data claims.ToolRuntimeExecutionArtifactData, inv Invocation) claims.ToolRuntimeExecutionArtifactData {
+	started := firstClaimsToolTime(data.StartedAt, b.clock())
+	data.StartedAt = started
+	if !b.surface.Allows(inv.ToolCall.Name) {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
+		return b.finish(data, started, "", fmt.Errorf("tool %q is not allowed", inv.ToolCall.Name))
+	}
+	data.PolicyDecision = firstClaimsToolString(data.PolicyDecision, "allowed")
+	data.ExecutionMode = firstClaimsToolString(data.ExecutionMode, "policy_query")
+	return b.finish(data, started, "policy allows "+inv.ToolCall.Name, nil)
 }
 
 func (b *ClaimsBackend) execute(ctx context.Context, req claims.ToolRuntimeExecutionRequest, inv Invocation, data claims.ToolRuntimeExecutionArtifactData) claims.ToolRuntimeExecutionArtifactData {
 	started := firstClaimsToolTime(data.StartedAt, b.clock())
 	data.StartedAt = started
+	if strings.TrimSpace(data.FailureReason) != "" || strings.TrimSpace(data.PolicyDecision) == "denied" {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
+		return b.finish(data, started, "", fmt.Errorf("%s", firstClaimsToolString(data.FailureReason, "tool policy denied")))
+	}
 	if err := b.surface.ValidateBatch([]Invocation{inv}); err != nil {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
 		return b.finish(data, started, "", err)
 	}
 	if !b.surface.Allows(inv.ToolCall.Name) {
+		data.PolicyDecision = claimsToolDeniedDecision(data.PolicyDecision)
 		return b.finish(data, started, "", fmt.Errorf("tool %q is not allowed", inv.ToolCall.Name))
 	}
 	execCtx, acc := claimsToolContext(ctx, req, inv.AgentID)
@@ -163,6 +203,21 @@ func boundedClaimsToolText(text string, limit int) string {
 
 func claimsToolFailureExitStatus() int {
 	return 1
+}
+
+func claimsToolDeniedDecision(current string) string {
+	current = strings.TrimSpace(current)
+	if current != "" && current != "allowed" {
+		return current
+	}
+	return "denied"
+}
+
+func claimsToolContextErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
 
 func firstClaimsToolClock(clock func() time.Time) func() time.Time {

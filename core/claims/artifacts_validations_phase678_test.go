@@ -45,6 +45,31 @@ func TestPhase7StreamingArtifactReceiptAndAtomicAttachment(t *testing.T) {
 	}
 }
 
+func TestPhase7ReceiveArtifactIsIdempotentAfterAttachment(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase7-receipt-race", SessionID: "phase7", TaskID: "task"})
+	claimID := phase678PostedClaim(t, board, "architect", "engineer", "")
+	generated := phase678GeneratedArtifact(t, board, claimID, "plan", "engineer")
+	action, err := board.GenerateTestamentAction(context.Background(), claims.Action{AgentID: "engineer", Type: claims.ActionTypeTestament}, []claims.Testament{{
+		AgentID:   "engineer",
+		Summary:   "plan ready",
+		Relations: []claims.Relation{{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim}},
+		Artifacts: []*claims.Artifact{{ID: generated.ID, ArtifactName: generated.ArtifactName}},
+	}}, claims.GenerateTestamentActionOptions{IdempotencyKey: "phase7-receipt-race:" + claimID})
+	if err != nil {
+		t.Fatalf("GenerateTestamentAction: %v", err)
+	}
+	if action.Testaments[0].Artifacts[0].Status != claims.ArtifactStatusAttached {
+		t.Fatalf("attached status = %s", action.Testaments[0].Artifacts[0].Status)
+	}
+	received, err := board.ReceiveArtifact(context.Background(), generated.ID, "architect")
+	if err != nil {
+		t.Fatalf("ReceiveArtifact after attachment: %v", err)
+	}
+	if received.Status != claims.ArtifactStatusAttached || received.TestamentID == "" {
+		t.Fatalf("received attached artifact = %+v", received)
+	}
+}
+
 func TestPhase7AttachmentRejectsWrongClaimWithoutPartialAttach(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase7-atomic-board", SessionID: "phase7", TaskID: "task"})
 	claimID := phase678PostedClaim(t, board, "architect", "engineer", "")
@@ -201,6 +226,100 @@ func TestPhase6ResultTestamentBuilderPostsGeneratedResultArtifacts(t *testing.T)
 	}
 }
 
+func TestPhase6RuntimeValidationPostsSingleCommittedResultArtifact(t *testing.T) {
+	registry := phase678PlanRegistry(t)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "phase6-runtime",
+		SessionID: "phase6",
+		TaskID:    "task",
+		ValidationRuntime: &claims.ClaimsValidationRuntimeConfig{
+			Registry:                     registry,
+			AutoValidatePostedTestaments: true,
+			ConcurrencyBudget:            1,
+			MaxInputBytes:                4096,
+			MaxOutputBytes:               4096,
+		},
+	})
+	claimID := phase678PostedClaim(t, board, "architect", "engineer", "")
+	artifactID := phase678AttachedPlanArtifact(t, board, claimID, "engineer")
+	validation := phase678OnlyValidation(t, board, claimID)
+	if validation.Status != claims.ValidationStatusValidated || validation.ResultArtifactID == "" {
+		t.Fatalf("validation after runtime = %+v", validation)
+	}
+	resultArtifact, ok := board.CloneArtifact(validation.ResultArtifactID)
+	if !ok {
+		t.Fatalf("result artifact %q not indexed", validation.ResultArtifactID)
+	}
+	if resultArtifact.TestamentID == "" || resultArtifact.Status != claims.ArtifactStatusGenerated {
+		t.Fatalf("result artifact = %+v", resultArtifact)
+	}
+	resultTestaments := phase678ResultTestamentsForArtifact(board, claimID, validation.ResultArtifactID)
+	if len(resultTestaments) != 1 {
+		t.Fatalf("result testament count = %d, want 1", len(resultTestaments))
+	}
+	sourceArtifact, ok := board.CloneArtifact(artifactID)
+	if !ok || sourceArtifact.Status != claims.ArtifactStatusValidated {
+		t.Fatalf("source artifact = %+v ok=%v", sourceArtifact, ok)
+	}
+}
+
+func TestPhase6RuntimeMissingQualityBarDoesNotValidateArtifact(t *testing.T) {
+	registry := phase678PlanRegistry(t)
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "phase6-runtime-qb-missing",
+		SessionID: "phase6",
+		TaskID:    "task",
+		ValidationRuntime: &claims.ClaimsValidationRuntimeConfig{
+			Registry:                     registry,
+			AutoValidatePostedTestaments: true,
+			ConcurrencyBudget:            1,
+			MaxInputBytes:                4096,
+			MaxOutputBytes:               4096,
+		},
+	})
+	claimID := phase678PostedClaim(t, board, "architect", "engineer", "requires agent judgment")
+	artifactID := phase678AttachedPlanArtifact(t, board, claimID, "engineer")
+	validation := phase678OnlyValidation(t, board, claimID)
+	if validation.Status != claims.ValidationStatusErrored || validation.ResultArtifactID == "" {
+		t.Fatalf("validation with missing quality bar = %+v", validation)
+	}
+	artifact, ok := board.CloneArtifact(artifactID)
+	if !ok || artifact.Status != claims.ArtifactStatusValidationFailed {
+		t.Fatalf("artifact with missing quality bar = %+v ok=%v", artifact, ok)
+	}
+	source, ok := board.CloneTestament(artifact.TestamentID)
+	if !ok {
+		t.Fatalf("source testament %q not found", artifact.TestamentID)
+	}
+	if source.LifecycleStatus != claims.TestamentLifecycleValidationErrored {
+		t.Fatalf("testament lifecycle = %s", source.LifecycleStatus)
+	}
+}
+
+func TestPhase7AccumulatorStreamsTypedArtifactsBeforeTestament(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase7-accumulator", SessionID: "phase7", TaskID: "task"})
+	claimID := phase678PostedClaim(t, board, "architect", "engineer", "")
+	acc := claims.NewTestamentAccumulator("engineer", "phase7").WithResponseClaimID(claimID)
+	acc.RecordArtifact(phase678PlanArtifact(t, "", "engineer"))
+	if err := acc.FlushBlocking(context.Background(), board); err != nil {
+		t.Fatalf("FlushBlocking: %v", err)
+	}
+	testament := phase678OnlyTestament(t, board, claimID)
+	var plan *claims.Artifact
+	for _, artifact := range testament.Artifacts {
+		if artifact != nil && artifact.ArtifactName == "plan" {
+			plan = artifact
+			break
+		}
+	}
+	if plan == nil {
+		t.Fatalf("streamed plan artifact not attached: %+v", testament.Artifacts)
+	}
+	if plan.Status != claims.ArtifactStatusAttached || plan.ContentHash == "" {
+		t.Fatalf("streamed artifact = %+v", plan)
+	}
+}
+
 func TestPhase8QualityBarMalformedVerdictRecordsErroredValidation(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase8-malformed", SessionID: "phase8", TaskID: "task"})
 	claimID := phase678PostedClaim(t, board, "architect", "engineer", "strict")
@@ -297,6 +416,26 @@ func phase678Validation(id, qualityBar string) *claims.Validation {
 	}
 }
 
+func phase678PlanRegistry(t *testing.T) *claims.ValidatorRegistry {
+	t.Helper()
+	registry := claims.NewValidatorRegistry()
+	if _, err := claims.RegisterValidator[claims.PlanMarkdownArtifactData, claims.PresentationEvidenceArtifactData](registry, claims.ValidatorConfig{
+		ID:                 "phase8.plan",
+		ValidationType:     claims.ValidationTypeInspection,
+		ActionType:         claims.ActionTypeTask,
+		Determinism:        claims.HandlerDeterminismPure,
+		Timeout:            time.Second,
+		ConcurrencyBudget:  1,
+		TargetArtifactName: "plan",
+	}, func(_ context.Context, data claims.PlanMarkdownArtifactData) (*claims.Artifact, error) {
+		result := &claims.Artifact{ArtifactName: "plan.validation", Kind: claims.ArtifactKindReadiness, Reference: data.Title}
+		return result, claims.SetArtifactData(result, claims.PresentationEvidenceArtifactData{Kind: "validation", Reference: data.Markdown})
+	}); err != nil {
+		t.Fatalf("RegisterValidator: %v", err)
+	}
+	return registry
+}
+
 func phase678PlanArtifact(t *testing.T, claimID, participant string) *claims.Artifact {
 	t.Helper()
 	artifact := &claims.Artifact{ClaimID: claimID, ArtifactName: "plan", Kind: claims.ArtifactKindPlanMarkdown, AgentID: participant, ParticipantID: participant, Reference: "# Plan"}
@@ -362,6 +501,18 @@ func phase678ProjectionHasArtifact(proj *claims.ClaimsBoardProjection, artifactI
 		}
 	}
 	return false
+}
+
+func phase678ResultTestamentsForArtifact(board *claims.ClaimsBoard, claimID, artifactID string) []*claims.Testament {
+	var out []*claims.Testament
+	for _, testament := range board.TestamentsByClaim(claimID) {
+		for _, artifact := range testament.Artifacts {
+			if artifact != nil && artifact.ID == artifactID {
+				out = append(out, testament)
+			}
+		}
+	}
+	return out
 }
 
 func phase678Ref(uid string, category claims.ParticipantCategory) claims.AgentRef {

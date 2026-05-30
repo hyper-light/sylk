@@ -1014,6 +1014,11 @@ type ClaimsBoardConfig struct {
 	// scoped child of the parent (e.g., pipeline board as child of
 	// session board). Stored as metadata on the board.
 	ParentBoardID string
+
+	// ValidationRuntime optionally wires generated/posted testaments
+	// into the artifact and claim validation orchestrators. Nil keeps
+	// the board storage-only and preserves legacy explicit validation.
+	ValidationRuntime *ClaimsValidationRuntimeConfig
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

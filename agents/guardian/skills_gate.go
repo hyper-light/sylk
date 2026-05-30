@@ -43,9 +43,9 @@ type reviewGateInput struct {
 	// single call covering every task in the plan, receives a unified
 	// attestation back. Replaces the previous per-task RPC loop the
 	// orchestrator ran post-approval.
-	PlanRevision    int                       `json:"plan_revision,omitempty"`
-	PlanContentHash string                    `json:"plan_content_hash,omitempty"`
-	Tasks           []preflightPlanTaskInput  `json:"tasks,omitempty"`
+	PlanRevision    int                      `json:"plan_revision,omitempty"`
+	PlanContentHash string                   `json:"plan_content_hash,omitempty"`
+	Tasks           []preflightPlanTaskInput `json:"tasks,omitempty"`
 }
 
 // preflightPlanTaskInput carries one task's preflight-relevant fields.
@@ -74,6 +74,14 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 			if p.DiffContent == "" {
 				return nil, fmt.Errorf("diff_content is required for review_diff")
 			}
+			if board := g.guardianBoard(); board != nil {
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolDiffReview, map[string]any{
+					"policy_rule":      "diff.review",
+					"approval_subject": p.TaskID,
+					"diff":             p.DiffContent,
+				})
+				return guardianDiffServiceResult(data), err
+			}
 			result := g.diffGate.ReviewDiff(p.DiffContent)
 			if lm := shared.LogMetaFromContext(ctx); lm.EventLogger != nil {
 				verdict := "clean"
@@ -93,6 +101,14 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 		"pre_commit_check": func(ctx context.Context, p *reviewGateInput) (any, error) {
 			if p.DiffContent == "" {
 				return nil, fmt.Errorf("diff_content is required for pre_commit_check")
+			}
+			if board := g.guardianBoard(); board != nil {
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolDiffReview, map[string]any{
+					"policy_rule":      "diff.pre_commit",
+					"approval_subject": p.TaskID,
+					"diff":             p.DiffContent,
+				})
+				return guardianDiffServiceResult(data), err
 			}
 			readFile := func(path string) (string, error) {
 				if g.fileAccess == nil {
@@ -173,6 +189,17 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown review_gate action: %q", params.Action)
 			}
+			if board := g.guardianBoard(); board != nil && reviewGateActionUsesGuardianService(params.Action) {
+				if err := validateReviewGateServiceInput(params); err != nil {
+					return nil, err
+				}
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolDiffReview, map[string]any{
+					"policy_rule":      "diff." + params.Action,
+					"approval_subject": params.TaskID,
+					"diff":             params.DiffContent,
+				})
+				return guardianDiffServiceResult(data), err
+			}
 
 			// Post claim: review gate evaluation.
 			sessionID := g.activeSessionID
@@ -207,6 +234,16 @@ func reviewGateSkill(g *Guardian) *skills.Skill {
 			return result, err
 		}).
 		Build()
+}
+
+func validateReviewGateServiceInput(params reviewGateInput) error {
+	switch params.Action {
+	case "review_diff", "pre_commit_check":
+		if params.DiffContent == "" {
+			return fmt.Errorf("diff_content is required for %s", params.Action)
+		}
+	}
+	return nil
 }
 
 type taskPreflightResult struct {

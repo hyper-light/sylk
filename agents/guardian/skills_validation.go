@@ -126,6 +126,18 @@ func contentScanSkill(g *Guardian) *skills.Skill {
 			if !ok {
 				return nil, fmt.Errorf("unknown content_scan action: %q", params.Action)
 			}
+			if board := g.guardianBoard(); board != nil {
+				if err := validateContentScanServiceInput(params); err != nil {
+					return nil, err
+				}
+				data, err := g.invokeGuardianDecisionService(ctx, board, claims.GuardianToolContentScan, map[string]any{
+					"policy_rule":      "content.scan",
+					"approval_subject": params.Action,
+					"content":          params.Content,
+					"paths":            params.Paths,
+				})
+				return guardianScanServiceResult(data), err
+			}
 
 			// Post claim: content validation request.
 			sessionID := g.activeSessionID
@@ -161,4 +173,18 @@ func contentScanSkill(g *Guardian) *skills.Skill {
 			return result, err
 		}).
 		Build()
+}
+
+func validateContentScanServiceInput(params contentScanInput) error {
+	switch params.Action {
+	case "scan_output", "detect_injection":
+		if params.Content == "" {
+			return fmt.Errorf("content is required for %s", params.Action)
+		}
+	case "scan_staged":
+		if len(params.Paths) == 0 {
+			return fmt.Errorf("paths required for scan_staged")
+		}
+	}
+	return nil
 }

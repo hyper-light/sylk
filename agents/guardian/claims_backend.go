@@ -35,6 +35,10 @@ type claimsGuardianArgs struct {
 	PipelineID      string                         `json:"pipeline_id,omitempty"`
 	Branch          string                         `json:"branch,omitempty"`
 	Diff            string                         `json:"diff,omitempty"`
+	Content         string                         `json:"content,omitempty"`
+	ContentType     string                         `json:"content_type,omitempty"`
+	URL             string                         `json:"url,omitempty"`
+	Paths           []string                       `json:"paths,omitempty"`
 	RollbackReceipt string                         `json:"rollback_receipt,omitempty"`
 	ApprovalPolicy  commandapproval.ApprovalPolicy `json:"approval_policy,omitempty"`
 }
@@ -55,28 +59,33 @@ func (b *ClaimsBackend) HandleGuardianDecision(ctx context.Context, req claims.G
 		return data, nil
 	}
 	switch data.Operation {
-	case claims.GuardianToolCommandGate:
+	case claims.GuardianToolCommandGate, claims.GuardianToolApproveCommand, claims.GuardianToolFetchApproval:
 		return b.commandGate(ctx, data, args), nil
-	case claims.GuardianToolBranchProtection:
+	case claims.GuardianToolBranchProtection, claims.GuardianToolGateGit:
 		return b.branchProtection(data, args), nil
 	case claims.GuardianToolDiffReview:
 		return b.diffReview(data, args), nil
-	case claims.GuardianToolRollbackAuthorization:
+	case claims.GuardianToolScanContent, claims.GuardianToolContentScan:
+		return b.contentScan(data, args), nil
+	case claims.GuardianToolRollbackAuthorization, claims.GuardianToolRollback:
 		return b.rollback(ctx, data, args), nil
 	default:
+		data.FailureReason = "unsupported guardian operation: " + data.Operation
 		return data, nil
 	}
 }
 
 func (b *ClaimsBackend) commandGate(ctx context.Context, data claims.GuardianDecisionArtifactData, args claimsGuardianArgs) claims.GuardianDecisionArtifactData {
-	eval, err := b.guardian.evaluateCommandApproval(ctx, commandApprovalRequest(data, args))
+	eval, err := b.guardian.evaluateCommandApprovalDirect(withGuardianServiceClaim(ctx), commandApprovalRequest(data, args))
 	if err != nil {
 		data.FailureReason = err.Error()
 		return data
 	}
 	data.Allowed = eval.Decision == commandapproval.DecisionAllow
+	data.ApprovalPresent = data.Allowed || eval.Source != commandapproval.MatchSourceInteractive || strings.TrimSpace(eval.UserDecision) != ""
 	data.UserDecision = firstClaimsGuardianString(eval.UserDecision, string(eval.Decision))
 	data.DenialReason = claimsGuardianDenial(data.Allowed, eval.Reason)
+	data.Metadata = mergeClaimsGuardianMetadata(data.Metadata, map[string]any{"source": string(eval.Source)})
 	return data
 }
 
@@ -99,6 +108,25 @@ func (b *ClaimsBackend) diffReview(data claims.GuardianDecisionArtifactData, arg
 	}
 	review := b.guardian.diffGate.ReviewDiff(args.Diff)
 	data.DiffFindings = claimsGuardianFindingTitles(review.Findings)
+	data.Allowed = len(data.DiffFindings) == 0
+	return data
+}
+
+func (b *ClaimsBackend) contentScan(data claims.GuardianDecisionArtifactData, args claimsGuardianArgs) claims.GuardianDecisionArtifactData {
+	findings := make([]Finding, 0)
+	if len(args.Paths) != 0 && b.guardian.contentValidator != nil {
+		findings = append(findings, b.guardian.contentValidator.ScanPaths(args.Paths, b.guardian.readClaimsServiceFile)...)
+	}
+	if b.guardian.contentSafety != nil {
+		findings = append(findings, b.guardian.contentSafety.Validate([]byte(args.Content), args.ContentType, args.URL)...)
+	}
+	if b.guardian.contentValidator != nil {
+		findings = append(findings, b.guardian.contentValidator.ScanContent(args.Content)...)
+	}
+	if b.guardian.externalScanner != nil {
+		findings = append(findings, b.guardian.externalScanner.ScanExternalContent(args.Content, args.ContentType)...)
+	}
+	data.DiffFindings = claimsGuardianFindingTitles(findings)
 	data.Allowed = len(data.DiffFindings) == 0
 	return data
 }
@@ -155,6 +183,20 @@ func claimsGuardianDenial(allowed bool, reason string) string {
 		return ""
 	}
 	return firstClaimsGuardianString(reason, "guardian denied request")
+}
+
+func mergeClaimsGuardianMetadata(left, right map[string]any) map[string]any {
+	if len(left) == 0 && len(right) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(left)+len(right))
+	for key, value := range left {
+		out[strings.TrimSpace(key)] = value
+	}
+	for key, value := range right {
+		out[strings.TrimSpace(key)] = value
+	}
+	return out
 }
 
 func decodeClaimsGuardianArgs(args map[string]any) (claimsGuardianArgs, error) {

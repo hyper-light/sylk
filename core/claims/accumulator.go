@@ -739,16 +739,22 @@ func submitAccumulatorFlush(ctx context.Context, board *ClaimsBoard, p *accumula
 	// that explicitly opted in through WithResponseClaimID get a
 	// RelationshipClaim on the submitted testament.
 	claimID := p.claimID
+	responseClaimID := strings.TrimSpace(p.responseClaimID)
 	relations := []Relation{
 		{Related: p.agentID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
 	}
-	if responseClaimID := strings.TrimSpace(p.responseClaimID); responseClaimID != "" {
+	if responseClaimID != "" {
 		relations = append(relations, Relation{
 			Related:      responseClaimID,
 			RelatedType:  RelatedTypeClaim,
 			Relationship: RelationshipClaim,
 		})
 	}
+	streamedArtifacts, err := streamAccumulatorArtifacts(ctx, board, p, responseClaimID, artifacts)
+	if err != nil {
+		return err
+	}
+	artifacts = streamedArtifacts
 
 	// Pre-stamp the testament ID so the post-submit final
 	// TestamentContextDelta can carry it. The board's
@@ -793,6 +799,48 @@ func submitAccumulatorFlush(ctx context.Context, board *ClaimsBoard, p *accumula
 		})
 	}
 	return nil
+}
+
+func streamAccumulatorArtifacts(ctx context.Context, board *ClaimsBoard, p *accumulatorFlushPayload, claimID string, artifacts []*Artifact) ([]*Artifact, error) {
+	if claimID == "" {
+		return artifacts, nil
+	}
+	out := make([]*Artifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		streamed, err := streamAccumulatorArtifact(ctx, board, p, claimID, artifact)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, streamed)
+	}
+	return out, nil
+}
+
+func streamAccumulatorArtifact(ctx context.Context, board *ClaimsBoard, p *accumulatorFlushPayload, claimID string, artifact *Artifact) (*Artifact, error) {
+	if !artifactCanStreamBeforeTestament(artifact) {
+		return artifact, nil
+	}
+	candidate := CloneArtifact(artifact)
+	candidate.ClaimID = claimID
+	candidate.AgentID = firstNonEmpty(candidate.AgentID, p.agentID)
+	candidate.ParticipantID = firstNonEmpty(candidate.ParticipantID, candidate.AgentID, p.agentID)
+	candidate.SessionID = firstNonEmpty(candidate.SessionID, p.sessionID)
+	generated, err := board.GenerateArtifact(ctx, *candidate, p.agentID, ArtifactLifecycleOptions{Reason: "accumulator artifact streamed before testament"})
+	if err != nil {
+		return nil, err
+	}
+	return &Artifact{ID: generated.ID, ArtifactName: generated.ArtifactName}, nil
+}
+
+func artifactCanStreamBeforeTestament(artifact *Artifact) bool {
+	return artifact != nil &&
+		strings.TrimSpace(artifact.ID) == "" &&
+		strings.TrimSpace(artifact.ClaimID) == "" &&
+		strings.TrimSpace(artifact.TestamentID) == "" &&
+		strings.TrimSpace(artifact.ArtifactName) != "" &&
+		strings.TrimSpace(artifact.Kind) != "" &&
+		strings.TrimSpace(artifact.DataType) != "" &&
+		len(artifact.Data) != 0
 }
 
 // Flush submits the accumulated artifacts as a single composite

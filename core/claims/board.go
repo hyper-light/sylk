@@ -61,10 +61,11 @@ type ClaimsBoard struct {
 
 	seq atomic.Uint64
 
-	amplifier        *BoardAmplifier
-	scope            ScopeProvider // nil = synchronous (tests)
-	agentRefResolver AgentRefResolver
-	claimPostPolicy  ClaimPostPolicy
+	amplifier         *BoardAmplifier
+	scope             ScopeProvider // nil = synchronous (tests)
+	agentRefResolver  AgentRefResolver
+	claimPostPolicy   ClaimPostPolicy
+	validationRuntime *ClaimsValidationRuntimeConfig
 
 	// Cached projection: recomputed only when projectionDirty is set.
 	// Multiple readers share the same immutable pointer.
@@ -142,6 +143,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		scope:                     cfg.Scope,
 		agentRefResolver:          cfg.AgentRefResolver,
 		claimPostPolicy:           cfg.ClaimPostPolicy,
+		validationRuntime:         cloneClaimsValidationRuntimeConfig(cfg.ValidationRuntime),
 		legacySessionNoWAL:        cfg.LegacySessionNoWAL,
 		rollout:                   boardRolloutConfig(cfg.Rollout),
 	}

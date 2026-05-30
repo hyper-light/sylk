@@ -21,10 +21,12 @@ func newBootBoard(scope claims.ScopeProvider) *claims.ClaimsBoard {
 	if scope == nil {
 		return nil
 	}
+	boardID := "boot-" + uuid.NewString()
 	return claims.NewClaimsBoard(claims.ClaimsBoardConfig{
-		BoardID: "boot-" + uuid.NewString(),
-		TaskID:  "boot",
-		Scope:   scope,
+		BoardID:   boardID,
+		SessionID: boardID,
+		TaskID:    "boot",
+		Scope:     scope,
 	})
 }
 
@@ -34,7 +36,8 @@ func postBootPhaseClaim(board *claims.ClaimsBoard, phase string, order int) stri
 	if board == nil {
 		return ""
 	}
-	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: bootClaimsAgent, Type: claims.ActionTypeBoot, Priority: order}, []claims.Claim{newPipelineBootClaim(board, phase, order)}, claims.GenerateClaimActionOptions{
+	actorID := bootClaimsAgentID(board)
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: actorID, Type: claims.ActionTypeBoot, Priority: order}, []claims.Claim{newPipelineBootClaim(board, phase, order)}, claims.GenerateClaimActionOptions{
 		IdempotencyKey: pipelineBootClaimKey(phase),
 		Reason:         "boot sequencer phase claim generated",
 	})
@@ -94,18 +97,17 @@ func acceptBootClaims(board *claims.ClaimsBoard) {
 }
 
 func newPipelineBootClaim(board *claims.ClaimsBoard, phase string, order int) claims.Claim {
-	processUID := ""
-	if board != nil {
-		processUID = firstNonEmptyString(board.SessionID(), board.BoardID())
-	}
+	processUID := bootClaimsProcessUID(board)
+	actorID := bootClaimsAgentID(board)
 	return claims.Claim{
+		AgentID:     actorID,
 		Title:       fmt.Sprintf("Boot phase: %s", phase),
 		Description: fmt.Sprintf("Boot pipeline phase %d: %s", order, phase),
 		ActionType:  claims.ActionTypeBoot,
 		Priority:    order,
 		Relations: []claims.Relation{
-			{Related: bootClaimsAgent, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-			{Related: bootClaimsAgent, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			{Related: actorID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: actorID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 		},
 		ExpectedToolCalls: []claims.ExpectedToolCall{{
 			Tool: BootPhaseToolFor(phase),
@@ -125,6 +127,55 @@ func newPipelineBootClaim(board *claims.ClaimsBoard, phase string, order int) cl
 	}
 }
 
+func pipelineBootServiceClaim(board *claims.ClaimsBoard, phase string, data claims.BootPhaseArtifactData) *claims.Claim {
+	if board == nil {
+		return &claims.Claim{ExpectedToolCalls: []claims.ExpectedToolCall{{Tool: BootPhaseToolFor(phase), Arguments: bootPhaseArguments(data)}}}
+	}
+	claimID := ""
+	for _, claim := range board.ClaimsByLifecycleStatus(claims.ClaimLifecycleProgressed) {
+		if claim != nil && claimExpectedBootPhase(claim, phase) {
+			claimID = claim.ID
+			break
+		}
+	}
+	claim, ok := board.CloneClaim(claimID)
+	if !ok {
+		fallback := newPipelineBootClaim(board, phase, data.PhaseOrder)
+		claim = &fallback
+	}
+	claim.ExpectedToolCalls = []claims.ExpectedToolCall{{Tool: BootPhaseToolFor(phase), Arguments: bootPhaseArguments(data)}}
+	return claim
+}
+
+func claimExpectedBootPhase(claim *claims.Claim, phase string) bool {
+	if claim == nil {
+		return false
+	}
+	for _, call := range claim.ExpectedToolCalls {
+		if bootPhaseForTool(call.Tool) == phase || bootPhaseStringArg(call.Arguments, "phase") == phase {
+			return true
+		}
+	}
+	return false
+}
+
+func bootPhaseArguments(data claims.BootPhaseArtifactData) map[string]any {
+	return map[string]any{
+		"phase":          data.Phase,
+		"phase_order":    data.PhaseOrder,
+		"process_uid":    data.ProcessUID,
+		"started_at":     data.StartedAt,
+		"ended_at":       data.EndedAt,
+		"duration":       data.Duration,
+		"ready":          data.Ready,
+		"prior_phases":   data.PriorPhases,
+		"artifact_refs":  data.ArtifactRefs,
+		"status":         data.Status,
+		"failure_reason": data.FailureReason,
+		"metadata":       data.Metadata,
+	}
+}
+
 func postPipelineBootClaim(ctx context.Context, board *claims.ClaimsBoard, claimID string) error {
 	if err := postPipelineClaimIfGenerated(ctx, board, claimID); err != nil {
 		return err
@@ -140,7 +191,7 @@ func postPipelineClaimIfGenerated(ctx context.Context, board *claims.ClaimsBoard
 	if !ok || claim.LifecycleStatus != claims.ClaimLifecycleGenerated {
 		return nil
 	}
-	err := board.PostGeneratedClaim(ctx, claimID, bootClaimsAgent, claims.ClaimPostOptions{Reason: "boot sequencer phase claim posted"})
+	err := board.PostGeneratedClaim(ctx, claimID, bootClaimsAgentID(board), claims.ClaimPostOptions{Reason: "boot sequencer phase claim posted"})
 	return ignorePostRace(err, func() bool { return pipelineClaimBeyond(board, claimID, claims.ClaimLifecycleGenerated) })
 }
 
@@ -149,7 +200,7 @@ func acknowledgePipelineClaimIfPosted(ctx context.Context, board *claims.ClaimsB
 	if !ok || claim.LifecycleStatus != claims.ClaimLifecyclePosted {
 		return nil
 	}
-	err := board.AcknowledgeClaimReceipt(ctx, claimID, bootClaimsAgent)
+	err := board.AcknowledgeClaimReceipt(ctx, claimID, bootClaimsAgentID(board))
 	return ignorePostRace(err, func() bool { return pipelineClaimBeyond(board, claimID, claims.ClaimLifecyclePosted) })
 }
 
@@ -158,7 +209,7 @@ func progressPipelineClaimIfOpen(ctx context.Context, board *claims.ClaimsBoard,
 	if !ok || claim.Status.IsTerminal() || claim.LifecycleStatus == claims.ClaimLifecycleProgressed {
 		return nil
 	}
-	err := board.UpdateClaimProgress(ctx, claimID, claims.ClaimProgressUpdate{WorkSummary: "boot phase in progress"}, bootClaimsAgent)
+	err := board.UpdateClaimProgress(ctx, claimID, claims.ClaimProgressUpdate{WorkSummary: "boot phase in progress"}, bootClaimsAgentID(board))
 	return ignorePostRace(err, func() bool { return pipelineClaimBeyond(board, claimID, claims.ClaimLifecycleReceived) })
 }
 
@@ -170,12 +221,9 @@ func pipelineBootPhaseArtifacts(ctx context.Context, board *claims.ClaimsBoard, 
 		status = claims.InfrastructureStatusFailed
 		ready = false
 	}
-	processUID := ""
-	if board != nil {
-		processUID = firstNonEmptyString(board.SessionID(), board.BoardID())
-	}
+	processUID := bootClaimsProcessUID(board)
 	service := NewBootSequencerService(BootSequencerServiceConfig{ProcessUID: processUID})
-	result, err := service.RecordPhase(ctx, claims.BootPhaseArtifactData{
+	data := claims.BootPhaseArtifactData{
 		Phase:         phase,
 		PhaseOrder:    bootPhaseOrder(phase),
 		ProcessUID:    processUID,
@@ -191,16 +239,33 @@ func pipelineBootPhaseArtifacts(ctx context.Context, board *claims.ClaimsBoard, 
 			"phase":       phase,
 			"duration_ns": dur.Nanoseconds(),
 		},
-	}, extra)
+	}
+	claim := pipelineBootServiceClaim(board, phase, data)
+	result, err := service.HandleServiceClaim(ctx, claims.ServiceClaimRequest{Board: board, Claim: claim})
 	if err != nil {
 		return nil, err
 	}
-	return result.Artifacts, nil
+	artifacts := make([]*claims.Artifact, 0, len(result.Artifacts)+len(extra))
+	for _, artifact := range result.Artifacts {
+		if artifact == nil {
+			continue
+		}
+		artifact = scopeBootArtifact(board, artifact)
+		artifacts = append(artifacts, artifact)
+	}
+	for _, artifact := range extra {
+		if artifact == nil {
+			continue
+		}
+		artifacts = append(artifacts, scopeBootArtifact(board, artifact))
+	}
+	return artifacts, nil
 }
 
 func submitPipelineBootPhaseTestament(ctx context.Context, board *claims.ClaimsBoard, phase, claimID string, dur time.Duration, validationStatus claims.ValidationStatus, testamentStatus claims.TestamentLifecycleStatus, artifacts []*claims.Artifact) error {
-	generated, err := board.GenerateTestamentAction(ctx, claims.Action{AgentID: bootClaimsAgent, Type: claims.ActionTypeTestament, Status: claims.ActionStatusComplete}, []claims.Testament{{
-		AgentID:        bootClaimsAgent,
+	actorID := bootClaimsAgentID(board)
+	generated, err := board.GenerateTestamentAction(ctx, claims.Action{AgentID: actorID, Type: claims.ActionTypeTestament, Status: claims.ActionStatusComplete}, []claims.Testament{{
+		AgentID:        actorID,
 		Summary:        pipelineBootSummary(phase, validationStatus, artifacts),
 		Confidence:     "deterministic",
 		Duration:       dur,
@@ -226,7 +291,7 @@ func postPipelineTestamentIfGenerated(ctx context.Context, board *claims.ClaimsB
 	if !ok || testament.LifecycleStatus != claims.TestamentLifecycleGenerated {
 		return nil
 	}
-	err := board.PostGeneratedTestament(ctx, testamentID, bootClaimsAgent, claims.TestamentPostOptions{Reason: "boot sequencer phase testament posted"})
+	err := board.PostGeneratedTestament(ctx, testamentID, bootClaimsAgentID(board), claims.TestamentPostOptions{Reason: "boot sequencer phase testament posted"})
 	return ignorePostRace(err, func() bool { return pipelineTestamentBeyond(board, testamentID, claims.TestamentLifecycleGenerated) })
 }
 
@@ -244,7 +309,7 @@ func validatePipelineBootTestament(ctx context.Context, board *claims.ClaimsBoar
 	if !ok || testament.LifecycleStatus != claims.TestamentLifecycleValidating {
 		return terminalTestamentError(testament)
 	}
-	return board.CompleteTestamentValidation(ctx, testamentID, bootClaimsAgent, testamentStatus, "boot phase validation completed")
+	return board.CompleteTestamentValidation(ctx, testamentID, bootClaimsAgentID(board), testamentStatus, "boot phase validation completed")
 }
 
 func acknowledgePipelineTestamentIfPosted(ctx context.Context, board *claims.ClaimsBoard, testamentID string) error {
@@ -252,7 +317,7 @@ func acknowledgePipelineTestamentIfPosted(ctx context.Context, board *claims.Cla
 	if !ok || testament.LifecycleStatus != claims.TestamentLifecyclePosted {
 		return nil
 	}
-	err := board.AcknowledgeTestamentReceipt(ctx, testamentID, bootClaimsAgent)
+	err := board.AcknowledgeTestamentReceipt(ctx, testamentID, bootClaimsAgentID(board))
 	return ignorePostRace(err, func() bool { return pipelineTestamentBeyond(board, testamentID, claims.TestamentLifecyclePosted) })
 }
 
@@ -261,7 +326,7 @@ func beginPipelineTestamentValidationIfReceived(ctx context.Context, board *clai
 	if !ok || testament.LifecycleStatus != claims.TestamentLifecycleReceived {
 		return nil
 	}
-	err := board.BeginTestamentValidation(ctx, testamentID, bootClaimsAgent)
+	err := board.BeginTestamentValidation(ctx, testamentID, bootClaimsAgentID(board))
 	return ignorePostRace(err, func() bool { return pipelineTestamentBeyond(board, testamentID, claims.TestamentLifecycleReceived) })
 }
 
@@ -277,7 +342,7 @@ func evaluatePipelineReceiptValidations(ctx context.Context, board *claims.Claim
 		if validation.Status.IsTerminal() {
 			continue
 		}
-		if err := board.EvaluateValidation(ctx, claimID, validation.ID, claims.StatusChange{AgentID: bootClaimsAgent, To: string(status), Reason: "boot phase testament received"}); err != nil {
+		if err := board.EvaluateValidation(ctx, claimID, validation.ID, claims.StatusChange{AgentID: bootClaimsAgentID(board), To: string(status), Reason: "boot phase testament received"}); err != nil {
 			return err
 		}
 	}
@@ -342,6 +407,51 @@ func artifactRefs(artifacts []*claims.Artifact) []string {
 
 func phaseTimingArtifact(phase string, dur time.Duration) *claims.Artifact {
 	return phaseTimingArtifactForAgent(bootClaimsAgent, phase, dur)
+}
+
+func scopeBootArtifact(board *claims.ClaimsBoard, artifact *claims.Artifact) *claims.Artifact {
+	if artifact == nil {
+		return nil
+	}
+	actorID := bootClaimsAgentID(board)
+	artifact.AgentID = firstNonEmptyString(artifact.AgentID, actorID)
+	artifact.ParticipantID = firstNonEmptyString(artifact.ParticipantID, actorID)
+	if data, err := claims.ArtifactData[claims.BootPhaseArtifactData](artifact); err == nil {
+		data.ProcessUID = firstNonEmptyString(data.ProcessUID, bootClaimsProcessUID(board))
+		if setErr := claims.SetArtifactData(artifact, data); setErr != nil {
+			artifact.Metadata = mergeBootMetadata(artifact.Metadata, map[string]any{"boot_artifact_data_error": setErr.Error()})
+		}
+	}
+	return artifact
+}
+
+func mergeBootMetadata(left, right map[string]any) map[string]any {
+	if len(left) == 0 && len(right) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(left)+len(right))
+	for key, value := range left {
+		out[strings.TrimSpace(key)] = value
+	}
+	for key, value := range right {
+		out[strings.TrimSpace(key)] = value
+	}
+	return out
+}
+
+func bootClaimsAgentID(board *claims.ClaimsBoard) string {
+	processUID := bootClaimsProcessUID(board)
+	if processUID == "" {
+		return bootClaimsAgent
+	}
+	return processScopedAgentID(bootClaimsAgent, processUID)
+}
+
+func bootClaimsProcessUID(board *claims.ClaimsBoard) string {
+	if board == nil {
+		return ""
+	}
+	return firstNonEmptyString(board.SessionID(), board.BoardID())
 }
 
 func phaseTimingArtifactForAgent(agentID, phase string, dur time.Duration) *claims.Artifact {

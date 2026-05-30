@@ -1007,7 +1007,25 @@ func (d *BoardValidatorDispatcher) commitDispatchResult(ctx context.Context, req
 		ResultArtifact:   result.ResultArtifact,
 		Error:            result.Error,
 	})
-	return result, err
+	return d.withCommittedResultArtifact(req, result), err
+}
+
+func (d *BoardValidatorDispatcher) withCommittedResultArtifact(req ValidationDispatchRequest, result ValidationDispatchResult) ValidationDispatchResult {
+	if d == nil || d.board == nil || req.Validation == nil {
+		return result
+	}
+	validation, _, ok := d.board.CloneValidation(req.Validation.ID)
+	if !ok || validation == nil {
+		return result
+	}
+	result.ResultArtifactID = firstNonEmpty(validation.ResultArtifactID, result.ResultArtifactID)
+	if result.ResultArtifactID == "" {
+		return result
+	}
+	if artifact, ok := d.board.CloneArtifact(result.ResultArtifactID); ok {
+		result.ResultArtifact = artifact
+	}
+	return result
 }
 
 func deterministicValidationCommitStatus(validation *Validation, status ValidationStatus) ValidationStatus {
