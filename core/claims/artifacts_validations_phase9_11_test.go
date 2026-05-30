@@ -3,6 +3,7 @@ package claims_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/claims"
@@ -133,6 +134,93 @@ func TestPhase9MissingArtifactOutcomePostsBoundedCorrectiveClaimWhenEnabled(t *t
 	}
 }
 
+func TestPhase9DisabledRemediationRecordsSkippedReason(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "phase9-missing-corrective-disabled",
+		SessionID: "phase9",
+		TaskID:    "task",
+	})
+	claimID := phase9PostedClaimWithTargets(t, board, []string{"plan"})
+	testamentID := phase9EmptyTestament(t, board, claimID)
+
+	if err := board.BeginTestamentValidation(context.Background(), testamentID, "architect"); err != nil {
+		t.Fatalf("BeginTestamentValidation: %v", err)
+	}
+	if err := board.CompleteTestamentValidation(context.Background(), testamentID, "architect", claims.TestamentLifecycleValidationIncomplete, "required artifact missing"); err != nil {
+		t.Fatalf("CompleteTestamentValidation: %v", err)
+	}
+
+	if got := phase9CorrectiveClaims(board, claimID); len(got) != 0 {
+		t.Fatalf("corrective claims = %d, want none when remediation is disabled", len(got))
+	}
+	if !phase9NotificationContains(board, "corrective claim skipped", "remediation policy disabled") {
+		t.Fatalf("missing corrective skipped notification: %+v", board.Projection().NotificationErrors)
+	}
+}
+
+func TestPhase9OptionalValidationFailureDoesNotBlockRequiredArtifactAggregation(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "phase9-optional-nonblocking", SessionID: "phase9", TaskID: "task"})
+	claimID := phase9PostedClaimWithCustomValidations(t, board, []*claims.Validation{
+		{
+			ID:                 "phase9-required-plan",
+			Type:               claims.ValidationTypeInspection,
+			Description:        "required plan validates",
+			Required:           true,
+			ValidatorID:        "phase9.plan",
+			TargetArtifactName: "plan",
+			ArtifactDataType:   claims.ArtifactDataTypePlanMarkdown,
+		},
+		{
+			ID:                 "phase9-optional-notes",
+			Type:               claims.ValidationTypeInspection,
+			Description:        "optional notes validate",
+			Required:           false,
+			ValidatorID:        "phase9.notes",
+			TargetArtifactName: "notes",
+			ArtifactDataType:   claims.ArtifactDataTypePlanMarkdown,
+		},
+	})
+	artifactID := phase678AttachedPlanArtifact(t, board, claimID, "engineer")
+	testament := phase678OnlyTestament(t, board, claimID)
+
+	if err := board.BeginTestamentValidation(context.Background(), testament.ID, "architect"); err != nil {
+		t.Fatalf("BeginTestamentValidation: %v", err)
+	}
+	if err := board.BeginArtifactValidation(context.Background(), artifactID, "architect"); err != nil {
+		t.Fatalf("BeginArtifactValidation: %v", err)
+	}
+	if err := board.BeginValidation(context.Background(), claimID, "phase9-optional-notes", "architect", artifactID); err != nil {
+		t.Fatalf("BeginValidation optional: %v", err)
+	}
+	if err := board.CompleteValidationLifecycle(context.Background(), claimID, "phase9-optional-notes", "architect", claims.ValidationStatusValidationFailed, claims.ValidationLifecycleOptions{
+		Reason:           "optional notes absent",
+		TargetArtifactID: artifactID,
+	}); err != nil {
+		t.Fatalf("CompleteValidationLifecycle optional: %v", err)
+	}
+	if err := board.BeginValidation(context.Background(), claimID, "phase9-required-plan", "architect", artifactID); err != nil {
+		t.Fatalf("BeginValidation required: %v", err)
+	}
+	if err := board.CompleteValidationLifecycle(context.Background(), claimID, "phase9-required-plan", "architect", claims.ValidationStatusValidated, claims.ValidationLifecycleOptions{
+		Reason:           "required plan passed",
+		TargetArtifactID: artifactID,
+	}); err != nil {
+		t.Fatalf("CompleteValidationLifecycle required: %v", err)
+	}
+	if err := board.CompleteArtifactValidation(context.Background(), artifactID, "architect", true, nil); err != nil {
+		t.Fatalf("CompleteArtifactValidation: %v", err)
+	}
+
+	gotTestament, _ := board.CloneTestament(testament.ID)
+	if gotTestament.LifecycleStatus != claims.TestamentLifecycleValidated {
+		t.Fatalf("testament lifecycle = %s, want validated despite optional failure", gotTestament.LifecycleStatus)
+	}
+	gotClaim, _ := board.CloneClaim(claimID)
+	if gotClaim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
+		t.Fatalf("claim lifecycle = %s, want satisfied despite optional failure", gotClaim.LifecycleStatus)
+	}
+}
+
 func TestPhase9ValidationFailureCorrectiveIncludesArtifactSupersessionWhenPolicyEnabled(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 		BoardID:   "phase9-failure-corrective",
@@ -235,6 +323,27 @@ func TestPhase9CurrentArtifactInfrastructureErrorAggregatesToErroredCorrective(t
 	}
 }
 
+func phase9PostedClaimWithCustomValidations(t *testing.T, board *claims.ClaimsBoard, validations []*claims.Validation) string {
+	t.Helper()
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}, []claims.Claim{{
+		Title:       "Produce required evidence",
+		Description: "Produce all requested target artifacts.",
+		ActionType:  claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "engineer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: validations,
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "phase9-custom-validations:" + board.BoardID()})
+	if err != nil {
+		t.Fatalf("GenerateClaimAction: %v", err)
+	}
+	if err := board.PostGeneratedClaim(context.Background(), generated.Claims[0].ID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim: %v", err)
+	}
+	return generated.Claims[0].ID
+}
+
 func phase9PostedClaimWithTargets(t *testing.T, board *claims.ClaimsBoard, targets []string) string {
 	t.Helper()
 	validations := make([]*claims.Validation, 0, len(targets))
@@ -293,4 +402,20 @@ func phase9CorrectiveClaims(board *claims.ClaimsBoard, originalClaimID string) [
 		}
 	}
 	return out
+}
+
+func phase9NotificationContains(board *claims.ClaimsBoard, want ...string) bool {
+	for _, notification := range board.Projection().NotificationErrors {
+		matched := true
+		for _, part := range want {
+			if !strings.Contains(notification, part) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }

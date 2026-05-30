@@ -1505,6 +1505,77 @@ func debugSnapshot(t *testing.T, prog *integrationProgram, label string) {
 	}
 }
 
+func postBridgeLifecycleClaim(t *testing.T, board *claims.ClaimsBoard, key string) (string, string) {
+	t.Helper()
+	validationID := "bridge-lifecycle-validation-" + key
+	generated, err := board.GenerateClaimAction(context.Background(),
+		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title:       "lifecycle claim",
+			Description: "exercise canonical lifecycle UI",
+			ActionType:  claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+			Validations: []*claims.Validation{{
+				ID:                 validationID,
+				Type:               claims.ValidationTypeInspection,
+				Description:        "plan validates",
+				Required:           true,
+				ValidatorID:        "bridge.plan",
+				TargetArtifactName: "plan",
+				ArtifactDataType:   claims.ArtifactDataTypePlanMarkdown,
+			}},
+		}},
+		claims.GenerateClaimActionOptions{IdempotencyKey: "bridge-lifecycle:" + key},
+	)
+	if err != nil {
+		t.Fatalf("GenerateClaimAction: %v", err)
+	}
+	claimID := generated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), claimID, "architect", claims.ClaimPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedClaim: %v", err)
+	}
+	return claimID, validationID
+}
+
+func bridgeLifecyclePlanArtifact(t *testing.T, claimID, agentID string) claims.Artifact {
+	t.Helper()
+	artifact := claims.Artifact{
+		ClaimID:      claimID,
+		ArtifactName: "plan",
+		Kind:         claims.ArtifactKindPlanMarkdown,
+		AgentID:      agentID,
+		Reference:    "# Plan",
+	}
+	if err := claims.SetArtifactData(&artifact, claims.PlanMarkdownArtifactData{Markdown: "# Plan", Title: "Plan"}); err != nil {
+		t.Fatalf("SetArtifactData: %v", err)
+	}
+	return artifact
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	value, _ := metadata[strings.TrimSpace(key)].(string)
+	return strings.TrimSpace(value)
+}
+
+func containsAllStrings(values []string, wants ...string) bool {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		seen[strings.TrimSpace(value)] = struct{}{}
+	}
+	for _, want := range wants {
+		if _, ok := seen[strings.TrimSpace(want)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func postArchitectConsultClaim(t *testing.T, board *claims.ClaimsBoard) (parentClaimID, consultClaimID string) {
 	t.Helper()
 	parentAction := claims.Action{AgentID: "architect", Type: claims.ActionTypeTask}
@@ -1803,6 +1874,105 @@ func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing
 	}
 }
 
+func TestBridgeIntegration_CanonicalArtifactLifecycleDeltasUpdateStableRow(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-artifact-lifecycle")
+	defer cleanup()
+
+	claimID, validationID := postBridgeLifecycleClaim(t, board, "ses-canonical-artifact-lifecycle")
+	drainBridge(t, prog, "claim setup")
+	artifact := bridgeLifecyclePlanArtifact(t, claimID, "architect")
+	generated, err := board.GenerateArtifact(context.Background(), artifact, "architect", claims.ArtifactLifecycleOptions{Reason: "artifact generated"})
+	if err != nil {
+		t.Fatalf("GenerateArtifact: %v", err)
+	}
+	for _, status := range []claims.ArtifactStatus{
+		claims.ArtifactStatusReceived,
+		claims.ArtifactStatusAttached,
+		claims.ArtifactStatusValidating,
+		claims.ArtifactStatusValidated,
+	} {
+		if err := board.TransitionArtifactLifecycle(context.Background(), generated.ID, status, "architect", claims.ArtifactLifecycleOptions{Reason: "artifact " + string(status), ValidationID: validationID}); err != nil {
+			t.Fatalf("TransitionArtifactLifecycle(%s): %v", status, err)
+		}
+	}
+	drainBridge(t, prog, "artifact lifecycle deltas")
+
+	var statuses []string
+	completions := 0
+	for _, m := range prog.Snapshot() {
+		switch typed := m.(type) {
+		case msg.ClaimArtifactAddedMsg:
+			if typed.ArtifactID == generated.ID && typed.Kind == claimsBridgeArtifactLifecycleKind {
+				statuses = append(statuses, metadataString(typed.Metadata, "lifecycle_status"))
+			}
+		case msg.ClaimArtifactCompletedMsg:
+			if typed.StartArtifactID == generated.ID {
+				completions++
+			}
+		}
+	}
+	if !containsAllStrings(statuses, "generated", "received", "attached", "validating", "validated") {
+		debugSnapshot(t, prog, "artifact lifecycle deltas")
+		t.Fatalf("artifact lifecycle statuses = %v, want generated/received/attached/validating/validated", statuses)
+	}
+	if completions != 1 {
+		t.Fatalf("artifact lifecycle completions = %d, want 1", completions)
+	}
+}
+
+func TestBridgeIntegration_CanonicalValidationLifecycleRendersUnderArtifact(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-validation-lifecycle")
+	defer cleanup()
+
+	claimID, validationID := postBridgeLifecycleClaim(t, board, "ses-canonical-validation-lifecycle")
+	drainBridge(t, prog, "claim setup")
+	artifact := bridgeLifecyclePlanArtifact(t, claimID, "architect")
+	generated, err := board.GenerateArtifact(context.Background(), artifact, "architect", claims.ArtifactLifecycleOptions{Reason: "artifact generated"})
+	if err != nil {
+		t.Fatalf("GenerateArtifact: %v", err)
+	}
+	if err := board.BeginValidation(context.Background(), claimID, validationID, "architect", generated.ID); err != nil {
+		t.Fatalf("BeginValidation: %v", err)
+	}
+	if err := board.CompleteValidationLifecycle(context.Background(), claimID, validationID, "architect", claims.ValidationStatusValidated, claims.ValidationLifecycleOptions{
+		Reason:           "validation passed",
+		TargetArtifactID: generated.ID,
+	}); err != nil {
+		t.Fatalf("CompleteValidationLifecycle: %v", err)
+	}
+	drainBridge(t, prog, "validation lifecycle deltas")
+
+	var validationRows []msg.ClaimArtifactAddedMsg
+	completions := 0
+	for _, m := range prog.Snapshot() {
+		switch typed := m.(type) {
+		case msg.ClaimArtifactAddedMsg:
+			if typed.ArtifactID == validationID && typed.Kind == claimsBridgeValidationLifecycleKind {
+				validationRows = append(validationRows, typed)
+			}
+		case msg.ClaimArtifactCompletedMsg:
+			if typed.StartArtifactID == validationID {
+				completions++
+			}
+		}
+	}
+	if len(validationRows) == 0 {
+		debugSnapshot(t, prog, "validation lifecycle deltas")
+		t.Fatal("expected validation lifecycle artifact rows")
+	}
+	for _, row := range validationRows {
+		if row.ParentRowID != generated.ID {
+			t.Fatalf("validation ParentRowID = %q, want artifact %q", row.ParentRowID, generated.ID)
+		}
+		if row.ClaimID != claimID {
+			t.Fatalf("validation ClaimID = %q, want %q", row.ClaimID, claimID)
+		}
+	}
+	if completions != 1 {
+		t.Fatalf("validation lifecycle completions = %d, want 1", completions)
+	}
+}
+
 func TestBridgeIntegration_OutOfSessionArtifactDropped(t *testing.T) {
 	br, _, prog, cleanup := setupBridgeOnSession(t, "ses-active")
 	defer cleanup()
@@ -1817,6 +1987,9 @@ func TestBridgeIntegration_OutOfSessionArtifactDropped(t *testing.T) {
 		if _, ok := m.(msg.ClaimArtifactAddedMsg); ok {
 			t.Fatal("expected out-of-session artifact to be dropped, but got an emission")
 		}
+	}
+	if got := presentationMetricCount(br.PresentationMetricsSnapshot(), claimsVisibilityStaleSessionDropped, "artifact_sink_session_mismatch"); got != 1 {
+		t.Fatalf("stale-session metric = %d, want 1", got)
 	}
 }
 

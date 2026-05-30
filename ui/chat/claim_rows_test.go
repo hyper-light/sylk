@@ -135,6 +135,38 @@ func TestClaimsNative_ToolArtifactUsesArgsMetadataForInputSummary(t *testing.T) 
 	}
 }
 
+func TestClaimsNative_LifecycleArtifactReplayUpdatesSingleRow(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	base := msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "art-lifecycle",
+		CycleID:        "cycle-lifecycle",
+		ClaimID:        "claim-lifecycle",
+		OwnerAgentID:   "architect",
+		OwnerAgentType: "architect",
+		AgentID:        "architect",
+		Kind:           "artifact_lifecycle",
+		Reference:      "plan",
+		Metadata:       map[string]any{"lifecycle_status": "generated", "args_summary": "artifact generated"},
+		CreatedAt:      time.Now(),
+	}
+	m.Update(base)
+	base.Metadata = map[string]any{"lifecycle_status": "validating", "args_summary": "artifact validating"}
+	m.Update(base)
+
+	row := m.ArtifactRowByID("art-lifecycle")
+	if row == nil {
+		t.Fatal("lifecycle artifact row missing")
+	}
+	if got := row.Metadata["lifecycle_status"]; got != "validating" {
+		t.Fatalf("lifecycle_status = %#v, want validating", got)
+	}
+	cycle := m.ClaimRowByCycleID("cycle-lifecycle")
+	if cycle == nil || len(cycle.Artifacts) != 1 {
+		t.Fatalf("cycle artifacts = %+v, want one stable artifact row", cycle)
+	}
+}
+
 func TestClaimsNative_ToolArtifactCompletionUsesOutputMetadata(t *testing.T) {
 	m := newChatForClaimsTest(t)
 

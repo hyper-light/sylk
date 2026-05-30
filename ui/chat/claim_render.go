@@ -52,6 +52,9 @@ func (m *Model) projectClaimArtifactToHistory(art *ArtifactRow) {
 			e.AgentType = art.AgentType
 		}
 		if entryHasClaimArtifact(e, art.ArtifactID) {
+			if updateClaimArtifactInToolCalls(e.ToolCalls, art) {
+				invalidateChatEntryRender(e)
+			}
 			return
 		}
 		if attachClaimArtifactNested(e, art) {
@@ -916,6 +919,28 @@ func interAgentContainsArtifact(row *InterAgentTool, artID string) bool {
 	return false
 }
 
+func updateClaimArtifactInToolCalls(calls []ToolCallRecord, art *ArtifactRow) bool {
+	for i := range calls {
+		if strings.TrimSpace(calls[i].ToolCallKey) == art.ArtifactID {
+			applyClaimArtifactUpdate(&calls[i], art)
+			return true
+		}
+		if calls[i].InterAgent != nil && updateWithinInterAgent(calls[i].InterAgent, art) {
+			return true
+		}
+	}
+	return false
+}
+
+func updateWithinInterAgent(row *InterAgentTool, art *ArtifactRow) bool {
+	for c := range row.Children {
+		if updateClaimArtifactInToolCalls(row.Children[c].ToolCalls, art) {
+			return true
+		}
+	}
+	return false
+}
+
 // completeClaimArtifactInToolCalls finds the artifact anywhere in
 // the slice (top-level or nested via InterAgent.Children) and flips
 // it to its terminal state. Returns true if the artifact was
@@ -949,6 +974,7 @@ func completeWithinInterAgent(row *InterAgentTool, art *ArtifactRow) bool {
 // Status flips alongside Completed so the renderer drops the
 // pending-spinner visual.
 func applyClaimArtifactCompletion(tc *ToolCallRecord, art *ArtifactRow) {
+	applyClaimArtifactUpdate(tc, art)
 	tc.Duration = art.Duration
 	tc.Success = art.Status == ArtifactRowStatusSuccess
 	tc.Completed = true
@@ -962,6 +988,21 @@ func applyClaimArtifactCompletion(tc *ToolCallRecord, art *ArtifactRow) {
 	}
 	if tc.InterAgent != nil {
 		tc.InterAgent.Status = interAgentStatusFromArtifact(art.Status)
+	}
+}
+
+func applyClaimArtifactUpdate(tc *ToolCallRecord, art *ArtifactRow) {
+	if tc == nil || art == nil {
+		return
+	}
+	if name := claimArtifactDisplayName(art); name != "" {
+		tc.ToolName = name
+	}
+	if summary := strings.TrimSpace(art.ArgsSummary); summary != "" {
+		tc.ArgsSummary = summary
+	}
+	if fullArgs := claimArtifactFullArgs(art.Metadata); fullArgs != "" {
+		tc.FullArgs = fullArgs
 	}
 }
 

@@ -1120,6 +1120,12 @@ func (i *ClaimsInbox) matchesCanonicalStandingSubscription(delta CanonicalDelta)
 	if role == 0 {
 		role = RoleSubject
 	}
+	if _, ok := DeltaActionArtifactLifecycleStatus(delta.Action); ok {
+		return role.Has(RoleObserver)
+	}
+	if _, ok := DeltaActionValidationLifecycleStatus(delta.Action); ok {
+		return role.Has(RoleObserver)
+	}
 	switch delta.Action {
 	case DeltaActionClaimPosted:
 		if IsSystemInternalAction(delta.ClaimActionType()) {

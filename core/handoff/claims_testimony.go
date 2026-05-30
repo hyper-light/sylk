@@ -113,7 +113,11 @@ func handoffValidation(vtype claims.ValidationType, required bool, description, 
 
 // handoffFailedValidation builds an already-failed validation.
 func handoffFailedValidation(vtype claims.ValidationType, required bool, description, qualityBar string) *claims.Validation {
-	v := handoffValidation(vtype, required, description, qualityBar)
-	v.Status = claims.ValidationStatusFailed
-	return v
+	return &claims.Validation{
+		Type:        vtype,
+		Required:    required,
+		Description: description,
+		QualityBar:  qualityBar,
+		Status:      claims.ValidationStatusFailed,
+	}
 }

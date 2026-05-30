@@ -276,9 +276,7 @@ func (idx *claimRowIndex) addArtifactRow(row *ArtifactRow) *ArtifactRow {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	if existing, ok := idx.artifactRows[row.ArtifactID]; ok {
-		// Idempotent: a duplicate started artifact (e.g. replay) is a
-		// no-op. We keep the original row so children that already
-		// linked don't get orphaned.
+		mergeArtifactRow(existing, row)
 		return existing
 	}
 	idx.artifactRows[row.ArtifactID] = row
@@ -302,6 +300,42 @@ func (idx *claimRowIndex) addArtifactRow(row *ArtifactRow) *ArtifactRow {
 		cr.Artifacts = append(cr.Artifacts, row.ArtifactID)
 	}
 	return row
+}
+
+func mergeArtifactRow(existing, next *ArtifactRow) {
+	if existing == nil || next == nil {
+		return
+	}
+	existing.ParentRowID = firstNonEmptyClaimRowValue(existing.ParentRowID, next.ParentRowID)
+	existing.CycleID = firstNonEmptyClaimRowValue(existing.CycleID, next.CycleID)
+	existing.ClaimID = firstNonEmptyClaimRowValue(existing.ClaimID, next.ClaimID)
+	existing.Kind = firstNonEmptyClaimRowValue(next.Kind, existing.Kind)
+	existing.Reference = firstNonEmptyClaimRowValue(next.Reference, existing.Reference)
+	existing.ArgsSummary = firstNonEmptyClaimRowValue(next.ArgsSummary, existing.ArgsSummary)
+	existing.AgentID = firstNonEmptyClaimRowValue(existing.AgentID, next.AgentID)
+	existing.AgentType = firstNonEmptyClaimRowValue(existing.AgentType, next.AgentType)
+	existing.TargetAgent = firstNonEmptyClaimRowValue(existing.TargetAgent, next.TargetAgent)
+	if !next.StartedAt.IsZero() {
+		existing.StartedAt = next.StartedAt
+	}
+	if next.Metadata != nil {
+		if existing.Metadata == nil {
+			existing.Metadata = next.Metadata
+			return
+		}
+		for key, value := range next.Metadata {
+			existing.Metadata[key] = value
+		}
+	}
+}
+
+func firstNonEmptyClaimRowValue(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // completeArtifactRow flips a started row to its terminal state.

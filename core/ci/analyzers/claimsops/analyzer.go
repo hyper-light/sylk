@@ -44,6 +44,21 @@ var allowedRawGoFiles = []string{
 	"core/claims/validator_registry.go",
 }
 
+var allowedDirectClaimsLifecycleMutationFiles = []string{
+	"core/claims/artifact_validation_board.go",
+	"core/claims/artifact_validation_lifecycle.go",
+	"core/claims/board.go",
+	"core/claims/board_durable.go",
+	"core/claims/board_lifecycle.go",
+}
+
+var claimsLifecycleMutationFields = map[string]struct{}{
+	"LifecycleHistory": {},
+	"LifecycleStatus":  {},
+	"Status":           {},
+	"StatusHistory":    {},
+}
+
 func run(pass *analysis.Pass) (interface{}, error) {
 	for _, file := range pass.Files {
 		filename := filepathSlash(pass.Fset.Position(file.Pos()).Filename)
@@ -66,6 +81,8 @@ func checkNode(pass *analysis.Pass, filename string, n ast.Node) {
 		checkCall(pass, filename, node)
 	case *ast.CompositeLit:
 		checkComposite(pass, node)
+	case *ast.AssignStmt:
+		checkAssign(pass, filename, node)
 	}
 }
 
@@ -96,6 +113,17 @@ func checkComposite(pass *analysis.Pass, lit *ast.CompositeLit) {
 		return
 	}
 	pass.Reportf(lit.Pos(), "claims Artifact with Data must set DataType; use SetArtifactData or a typed artifact constructor")
+}
+
+func checkAssign(pass *analysis.Pass, filename string, stmt *ast.AssignStmt) {
+	if directClaimsLifecycleMutationAllowed(filename) {
+		return
+	}
+	for _, lhs := range stmt.Lhs {
+		if directClaimsLifecycleMutation(pass, lhs) {
+			pass.Reportf(lhs.Pos(), "direct claims lifecycle/status mutation is forbidden; use board lifecycle transition APIs or explicit replay helpers")
+		}
+	}
 }
 
 func literalUnboundedChannel(call *ast.CallExpr) bool {
@@ -225,6 +253,51 @@ func directVFSBypassAllowedAt(pkgPath, filename string) bool {
 		}
 	}
 	return false
+}
+
+func directClaimsLifecycleMutationAllowed(filename string) bool {
+	for _, allowed := range allowedDirectClaimsLifecycleMutationFiles {
+		if strings.HasSuffix(filename, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func directClaimsLifecycleMutation(pass *analysis.Pass, expr ast.Expr) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if _, ok := claimsLifecycleMutationFields[sel.Sel.Name]; !ok {
+		return false
+	}
+	return claimsLifecycleReceiverType(pass, sel.X)
+}
+
+func claimsLifecycleReceiverType(pass *analysis.Pass, expr ast.Expr) bool {
+	typ := pass.TypesInfo.TypeOf(expr)
+	if ptr, ok := typ.(*types.Pointer); ok {
+		typ = ptr.Elem()
+	}
+	named, ok := typ.(*types.Named)
+	if !ok || !claimsLifecycleTypeName(named.Obj().Name()) {
+		return false
+	}
+	pkg := named.Obj().Pkg()
+	if pkg != nil && pkg.Path() == "github.com/adalundhe/sylk/core/claims" {
+		return true
+	}
+	return !strings.HasPrefix(pass.Pkg.Path(), "github.com/adalundhe/sylk/")
+}
+
+func claimsLifecycleTypeName(name string) bool {
+	switch name {
+	case "Artifact", "Claim", "Testament", "Validation":
+		return true
+	default:
+		return false
+	}
 }
 
 func checksClaimsConcurrency(pkgPath string) bool {

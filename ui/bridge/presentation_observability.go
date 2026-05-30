@@ -21,6 +21,11 @@ const (
 	claimsPresentationReplacements        = "claims_presentation_replacements"
 	claimsPresentationInvalid             = "claims_presentation_invalid"
 	claimsPresentationDereferenceFailures = "claims_presentation_dereference_failures"
+	claimsVisibilityDeltasDropped         = "claims_visibility_delta_dropped"
+	claimsVisibilityMalformedDeltas       = "claims_visibility_delta_malformed"
+	claimsVisibilityMissingArtifacts      = "claims_visibility_artifact_missing"
+	claimsVisibilityStaleSessionDropped   = "claims_visibility_stale_session_suppressed"
+	claimsVisibilityRowsEmitted           = "claims_visibility_rows_emitted"
 
 	presentationMetricUnknown = "unknown"
 	presentationMaxContent    = 64 * 1024

@@ -12,6 +12,11 @@ type Artifact struct {
 	DataType string
 }
 
+type Validation struct {
+	Status        string
+	StatusHistory []string
+}
+
 type HandlerDeterminism string
 
 type Bus interface {
@@ -32,4 +37,7 @@ func Violations(ctx context.Context, bus Bus, session *versioning.SessionVFS, ma
 	_, _ = session.MergePipelineIntoGreen(ctx, "pipe", versioning.PipelineInspectorCertificate{})                            // want "direct VFS mutation bypasses claims evidence"
 	_, _ = session.RollbackPipelineIfTracked("pipe")                                                                         // want "direct VFS mutation bypasses claims evidence"
 	_, _ = manager.CreatePipelineVFS(versioning.VFSConfig{})                                                                 // want "direct VFS mutation bypasses claims evidence"
+	validation := &Validation{}
+	validation.Status = "failed"                                          // want "direct claims lifecycle/status mutation is forbidden"
+	validation.StatusHistory = append(validation.StatusHistory, "failed") // want "direct claims lifecycle/status mutation is forbidden"
 }

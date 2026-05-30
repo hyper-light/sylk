@@ -20,10 +20,14 @@ import (
 )
 
 const (
-	claimsBridgeName    = "bridge.claims"
-	claimsBridgeBuffer  = 256
-	claimsBridgeTimeout = 0
-	claimsBridgeAgentID = "tui"
+	claimsBridgeName                    = "bridge.claims"
+	claimsBridgeBuffer                  = 256
+	claimsBridgeTimeout                 = 0
+	claimsBridgeAgentID                 = "tui"
+	claimsBridgeArtifactLifecycleKind   = "artifact_lifecycle"
+	claimsBridgeValidationLifecycleKind = "validation_lifecycle"
+	claimsVisibilityMetricSurface       = "bridge"
+	claimsVisibilityMetricFormat        = "canonical_delta"
 )
 
 type claimMeta struct {
@@ -427,6 +431,9 @@ func (b *ClaimsBridge) processClaimsEntry(_ context.Context, entry *claims.Graph
 		if board != nil {
 			boardID = board.BoardID()
 		}
+		b.mu.Lock()
+		b.observePresentationMetricLocked(claimsVisibilityStaleSessionDropped, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, "entry_session_mismatch")
+		b.mu.Unlock()
 		b.debug("entry_drop_session",
 			"delta_kind", entry.Delta.DeltaKind(),
 			"delta_key", entry.Delta.DeltaKey(),
@@ -571,6 +578,26 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 			}
 			b.handleClaimClosed(claimID, "success")
 		}
+	case claims.DeltaActionArtifactGenerated,
+		claims.DeltaActionArtifactGenerationFailed,
+		claims.DeltaActionArtifactReceived,
+		claims.DeltaActionArtifactReceiptFailed,
+		claims.DeltaActionArtifactAttached,
+		claims.DeltaActionArtifactValidating,
+		claims.DeltaActionArtifactValidationFailed,
+		claims.DeltaActionArtifactValidated:
+		b.handleCanonicalArtifactLifecycle(sessionID, board, delta)
+	case claims.DeltaActionValidationReady,
+		claims.DeltaActionValidationValidating,
+		claims.DeltaActionValidationValidationFailed,
+		claims.DeltaActionValidationValidationFailedNotRequired,
+		claims.DeltaActionValidationErrored,
+		claims.DeltaActionValidationErroredNotRequired,
+		claims.DeltaActionValidationValidatingQualityBar,
+		claims.DeltaActionValidationQualityBarValidationFailed,
+		claims.DeltaActionValidationQualityBarValidationFailedNotRequired,
+		claims.DeltaActionValidationValidated:
+		b.handleCanonicalValidationLifecycle(sessionID, board, delta)
 	case claims.DeltaActionClaimSatisfied,
 		claims.DeltaActionClaimValidationIncomplete,
 		claims.DeltaActionClaimValidationFailed,
@@ -604,6 +631,271 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 			ContextTransition: canonicalProgressTransition(delta),
 		})
 	}
+}
+
+func (b *ClaimsBridge) handleCanonicalArtifactLifecycle(sessionID string, board *claims.ClaimsBoard, delta claims.CanonicalDelta) {
+	status, ok := claims.DeltaActionArtifactLifecycleStatus(delta.Action)
+	if !ok {
+		b.recordVisibilityMetric(claimsVisibilityMalformedDeltas, "unknown_artifact_action")
+		return
+	}
+	artifactID := strings.TrimSpace(delta.RefID("artifact", claims.RelatedTypeArtifact))
+	if artifactID == "" {
+		b.recordVisibilityMetric(claimsVisibilityMalformedDeltas, "missing_artifact_ref")
+		return
+	}
+	artifact, ok := board.CloneArtifact(artifactID)
+	if !ok || artifact == nil {
+		b.recordVisibilityMetric(claimsVisibilityMissingArtifacts, "artifact_ref_not_found")
+		return
+	}
+	claimID := firstNonBlank(delta.ClaimID(), artifact.ClaimID, claims.ClaimIDFromRelations(artifact.Relations))
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
+	rowArtifact := canonicalArtifactLifecycleRowArtifact(artifact, status, delta)
+	b.emitCanonicalLifecycleArtifactRow(sessionID, claimID, "", rowArtifact, artifactLifecycleOutcome(status), status.IsTerminal(), delta)
+	if claims.IsPresentableToUserChat(artifact.Presentation) && !isPresentationLifecycleArtifactKind(artifact.Kind) {
+		b.OnArtifactAdded(claimID, artifact.AgentID, sessionID, artifact)
+	}
+}
+
+func (b *ClaimsBridge) handleCanonicalValidationLifecycle(sessionID string, board *claims.ClaimsBoard, delta claims.CanonicalDelta) {
+	status, ok := claims.DeltaActionValidationLifecycleStatus(delta.Action)
+	if !ok {
+		b.recordVisibilityMetric(claimsVisibilityMalformedDeltas, "unknown_validation_action")
+		return
+	}
+	validationID := strings.TrimSpace(delta.ValidationID())
+	if validationID == "" {
+		b.recordVisibilityMetric(claimsVisibilityMalformedDeltas, "missing_validation_ref")
+		return
+	}
+	validation, claim, ok := board.CloneValidation(validationID)
+	if !ok || validation == nil {
+		b.recordVisibilityMetric(claimsVisibilityMalformedDeltas, "validation_ref_not_found")
+		return
+	}
+	claimID := canonicalValidationClaimID(delta, validation, claim)
+	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
+	artifactID := canonicalValidationArtifactID(board, delta, claimID, validation)
+	rowArtifact := canonicalValidationLifecycleRowArtifact(validation, status, artifactID, delta)
+	b.emitCanonicalLifecycleArtifactRow(sessionID, claimID, artifactID, rowArtifact, validationLifecycleOutcome(status), status.IsTerminal(), delta)
+}
+
+func (b *ClaimsBridge) recordVisibilityMetric(name, reason string) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.observePresentationMetricLocked(name, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, reason)
+	b.mu.Unlock()
+}
+
+func canonicalValidationClaimID(delta claims.CanonicalDelta, validation *claims.Validation, claim *claims.Claim) string {
+	if claim != nil {
+		return firstNonBlank(delta.ClaimID(), claim.ID, validation.ClaimID)
+	}
+	return firstNonBlank(delta.ClaimID(), validation.ClaimID)
+}
+
+func canonicalValidationArtifactID(board *claims.ClaimsBoard, delta claims.CanonicalDelta, claimID string, validation *claims.Validation) string {
+	if artifactID := strings.TrimSpace(delta.RefID("artifact", claims.RelatedTypeArtifact)); artifactID != "" {
+		return artifactID
+	}
+	if board == nil || validation == nil {
+		return ""
+	}
+	target := strings.TrimSpace(validation.TargetArtifactName)
+	if target == "" {
+		return ""
+	}
+	for _, testament := range board.Projection().Testaments {
+		if strings.TrimSpace(claims.ClaimIDFromRelations(testament.Relations)) != strings.TrimSpace(claimID) {
+			continue
+		}
+		if artifact := artifactByNameForBridge(&testament, target); artifact != nil {
+			return strings.TrimSpace(artifact.ID)
+		}
+	}
+	return ""
+}
+
+func artifactByNameForBridge(testament *claims.Testament, target string) *claims.Artifact {
+	if testament == nil {
+		return nil
+	}
+	for _, artifact := range testament.Artifacts {
+		if artifact != nil && strings.TrimSpace(artifact.ArtifactName) == target {
+			return artifact
+		}
+	}
+	return nil
+}
+
+func canonicalArtifactLifecycleRowArtifact(artifact *claims.Artifact, status claims.ArtifactStatus, delta claims.CanonicalDelta) *claims.Artifact {
+	row := cloneArtifact(artifact)
+	row.Kind = claimsBridgeArtifactLifecycleKind
+	row.Reference = firstNonBlank(strings.TrimSpace(artifact.ArtifactName), strings.TrimSpace(artifact.Kind), "artifact")
+	row.Metadata = lifecycleRowMetadata(row.Metadata, map[string]any{
+		"lifecycle_entity":        "artifact",
+		"lifecycle_status":        string(status),
+		"lifecycle_action":        string(delta.Action),
+		"lifecycle_delta_key":     delta.Key,
+		"lifecycle_original_kind": strings.TrimSpace(artifact.Kind),
+		"args_summary":            artifactLifecycleSummary(status),
+		"summary":                 artifactLifecycleSummary(status),
+	})
+	row.Created = nonZeroTime(firstNonZeroBridgeTime(delta.OccurredAt, artifact.Created))
+	return row
+}
+
+func canonicalValidationLifecycleRowArtifact(validation *claims.Validation, status claims.ValidationStatus, artifactID string, delta claims.CanonicalDelta) *claims.Artifact {
+	reference := firstNonBlank(strings.TrimSpace(validation.Description), strings.TrimSpace(validation.ValidatorID), "validation")
+	return &claims.Artifact{
+		ID:        strings.TrimSpace(validation.ID),
+		ClaimID:   strings.TrimSpace(validation.ClaimID),
+		Kind:      claimsBridgeValidationLifecycleKind,
+		Reference: reference,
+		AgentID:   firstNonBlank(strings.TrimSpace(validation.AgentID), strings.TrimSpace(validation.ValidatorID), delta.Actor.RouteKey()),
+		Created:   nonZeroTime(firstNonZeroBridgeTime(delta.OccurredAt, validation.Created)),
+		Metadata: lifecycleRowMetadata(nil, map[string]any{
+			"lifecycle_entity":     "validation",
+			"lifecycle_status":     string(status),
+			"lifecycle_action":     string(delta.Action),
+			"lifecycle_delta_key":  delta.Key,
+			"target_artifact_id":   strings.TrimSpace(artifactID),
+			"target_artifact_name": strings.TrimSpace(validation.TargetArtifactName),
+			"validator_id":         strings.TrimSpace(validation.ValidatorID),
+			"args_summary":         validationLifecycleSummary(status),
+			"summary":              validationLifecycleSummary(status),
+		}),
+	}
+}
+
+func lifecycleRowMetadata(base map[string]any, fields map[string]any) map[string]any {
+	out := cloneMetadata(base)
+	if out == nil {
+		out = make(map[string]any, len(fields))
+	}
+	for key, value := range fields {
+		if strings.TrimSpace(key) != "" && value != nil {
+			out[key] = value
+		}
+	}
+	return out
+}
+
+func (b *ClaimsBridge) emitCanonicalLifecycleArtifactRow(sessionID, claimID, parentRowID string, art *claims.Artifact, outcome string, terminal bool, delta claims.CanonicalDelta) {
+	if b == nil || art == nil {
+		return
+	}
+	b.mu.Lock()
+	if sessionID == "" || sessionID != b.activeSession {
+		b.observePresentationMetricLocked(claimsVisibilityStaleSessionDropped, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, "lifecycle_session_mismatch")
+		b.mu.Unlock()
+		return
+	}
+	out := b.claimArtifactLifecycleMsgLocked(sessionID, claimID, parentRowID, art)
+	var complete *msg.ClaimArtifactCompletedMsg
+	if terminal && out != nil {
+		complete = b.claimArtifactLifecycleCompletedMsgLocked(art, outcome, delta)
+	}
+	if out != nil || complete != nil {
+		b.observePresentationMetricLocked(claimsVisibilityRowsEmitted, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, strings.TrimSpace(art.Kind))
+	}
+	b.mu.Unlock()
+	if out != nil {
+		b.enqueue(*out)
+	}
+	if complete != nil {
+		b.enqueue(*complete)
+	}
+}
+
+func (b *ClaimsBridge) claimArtifactLifecycleMsgLocked(sessionID, claimID, parentRowID string, art *claims.Artifact) *msg.ClaimArtifactAddedMsg {
+	artifactID := strings.TrimSpace(art.ID)
+	if artifactID == "" {
+		return nil
+	}
+	meta := b.metaForClaimLocked(claimID)
+	if meta.CycleID == "" {
+		b.observePresentationMetricLocked(claimsVisibilityDeltasDropped, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, "missing_cycle")
+		return nil
+	}
+	rowArtifact := cloneArtifact(art)
+	rowArtifact.Metadata = cloneMetadata(art.Metadata)
+	rowArtifact.Created = nonZeroTime(rowArtifact.Created)
+	b.artifactByID[artifactID] = rowArtifact
+	b.artifactClaim[artifactID] = claimID
+	b.emittedStartedArtifacts[artifactID] = struct{}{}
+	artifactRef := participantDisplayFromArtifactWithMeta(meta, rowArtifact)
+	return &msg.ClaimArtifactAddedMsg{
+		ArtifactID:                  artifactID,
+		CycleID:                     meta.CycleID,
+		ParentRowID:                 strings.TrimSpace(parentRowID),
+		ClaimID:                     claimID,
+		OwnerAgentID:                meta.OwnerAgentID,
+		OwnerAgentType:              meta.OwnerAgentType,
+		TargetAgentID:               meta.TargetAgentID,
+		AgentID:                     firstNonBlank(strings.TrimSpace(rowArtifact.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
+		OwnerParticipantUID:         meta.OwnerParticipantUID,
+		OwnerParticipantCategory:    meta.OwnerParticipantCategory,
+		OwnerParticipantRoute:       meta.OwnerParticipantRoute,
+		TargetParticipantUID:        meta.TargetParticipantUID,
+		TargetParticipantCategory:   meta.TargetParticipantCategory,
+		TargetParticipantRoute:      meta.TargetParticipantRoute,
+		ArtifactParticipantUID:      artifactRef.UID,
+		ArtifactParticipantCategory: artifactRef.Category,
+		ArtifactParticipantRoute:    artifactRef.Route,
+		Kind:                        strings.TrimSpace(rowArtifact.Kind),
+		Reference:                   strings.TrimSpace(rowArtifact.Reference),
+		Metadata:                    cloneMetadata(rowArtifact.Metadata),
+		CreatedAt:                   rowArtifact.Created,
+		SuppressChat:                meta.SuppressChat,
+	}
+}
+
+func (b *ClaimsBridge) claimArtifactLifecycleCompletedMsgLocked(art *claims.Artifact, outcome string, delta claims.CanonicalDelta) *msg.ClaimArtifactCompletedMsg {
+	artifactID := strings.TrimSpace(art.ID)
+	if artifactID == "" {
+		return nil
+	}
+	if _, completed := b.completedStartedArtifacts[artifactID]; completed {
+		return nil
+	}
+	b.completedStartedArtifacts[artifactID] = struct{}{}
+	claimID := b.artifactClaim[artifactID]
+	meta := b.metaForClaimLocked(claimID)
+	return &msg.ClaimArtifactCompletedMsg{
+		StartArtifactID: artifactID,
+		CycleID:         meta.CycleID,
+		Outcome:         firstNonBlank(strings.TrimSpace(outcome), "success"),
+		Summary:         claimMetadataString(art.Metadata, "summary", "args_summary"),
+		Metadata:        cloneMetadata(art.Metadata),
+		CompletedAt:     nonZeroTime(firstNonZeroBridgeTime(delta.OccurredAt, art.Created)),
+		SuppressChat:    meta.SuppressChat,
+	}
+}
+
+func artifactLifecycleOutcome(status claims.ArtifactStatus) string {
+	if status.IsFailure() {
+		return "failure"
+	}
+	return "success"
+}
+
+func validationLifecycleOutcome(status claims.ValidationStatus) string {
+	if status.IsNegativeTerminal() {
+		return "failure"
+	}
+	return "success"
+}
+
+func artifactLifecycleSummary(status claims.ArtifactStatus) string {
+	return "artifact " + strings.ReplaceAll(string(status), "_", " ")
+}
+
+func validationLifecycleSummary(status claims.ValidationStatus) string {
+	return "validation " + strings.ReplaceAll(string(status), "_", " ")
 }
 
 func (b *ClaimsBridge) updateClaimMetaFromCanonicalDelta(claimID string, delta claims.CanonicalDelta) {
@@ -1440,6 +1732,7 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 
 	b.mu.Lock()
 	if sessionID == "" || sessionID != b.activeSession {
+		b.observePresentationMetricLocked(claimsVisibilityStaleSessionDropped, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, "artifact_sink_session_mismatch")
 		b.mu.Unlock()
 		return
 	}
@@ -2555,7 +2848,7 @@ func claimHasTag(c *claims.Claim, want string) bool {
 
 func isVisibleStartedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "tool_started":
+	case "tool_started", claimsBridgeArtifactLifecycleKind, claimsBridgeValidationLifecycleKind:
 		return true
 	default:
 		return false
@@ -2564,7 +2857,7 @@ func isVisibleStartedArtifactKind(kind string) bool {
 
 func isVisibleCompletedArtifactKind(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "tool_completed":
+	case "tool_completed", claimsBridgeArtifactLifecycleKind, claimsBridgeValidationLifecycleKind:
 		return true
 	default:
 		return false
@@ -2763,6 +3056,15 @@ func nonZeroTime(t time.Time) time.Time {
 		return time.Now().UTC()
 	}
 	return t
+}
+
+func firstNonZeroBridgeTime(values ...time.Time) time.Time {
+	for _, value := range values {
+		if !value.IsZero() {
+			return value
+		}
+	}
+	return time.Time{}
 }
 
 func firstNonBlank(values ...string) string {
