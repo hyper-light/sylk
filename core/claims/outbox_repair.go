@@ -25,16 +25,16 @@ type OutboxRepairOptions struct {
 }
 
 type OutboxRepairReport struct {
-	DryRun              bool                       `json:"dry_run"`
-	Scanned             int                        `json:"scanned"`
-	Matched             int                        `json:"matched"`
-	WouldProject        int                        `json:"would_project"`
-	Projected           int                        `json:"projected"`
-	RetryableFailures   []OutboxRepairFailure      `json:"retryable_failures,omitempty"`
-	TerminalFailures    []ProjectionFailureSummary `json:"terminal_failures,omitempty"`
-	Skipped             []string                   `json:"skipped,omitempty"`
-	Bounded             bool                       `json:"bounded"`
-	ReportTestamentID   string                     `json:"report_testament_id,omitempty"`
+	DryRun            bool                       `json:"dry_run"`
+	Scanned           int                        `json:"scanned"`
+	Matched           int                        `json:"matched"`
+	WouldProject      int                        `json:"would_project"`
+	Projected         int                        `json:"projected"`
+	RetryableFailures []OutboxRepairFailure      `json:"retryable_failures,omitempty"`
+	TerminalFailures  []ProjectionFailureSummary `json:"terminal_failures,omitempty"`
+	Skipped           []string                   `json:"skipped,omitempty"`
+	Bounded           bool                       `json:"bounded"`
+	ReportTestamentID string                     `json:"report_testament_id,omitempty"`
 }
 
 type OutboxRepairFailure struct {
@@ -89,7 +89,11 @@ func (db *DurableBoard) RepairOutbox(ctx context.Context, opts OutboxRepairOptio
 				continue
 			}
 			if failure.LastError != "" {
-				report.RetryableFailures = append(report.RetryableFailures, failure)
+				if opts.TerminalOnError {
+					report = appendOutboxRepairTerminalFailure(report, failure, record, db.operations.Budgets.AuditFindingLimit)
+				} else {
+					report.RetryableFailures = append(report.RetryableFailures, failure)
+				}
 			}
 		}
 	}
@@ -179,6 +183,26 @@ func repairFailure(record ClaimsOutboxRecord, projector string, attempts int, er
 	}
 }
 
+func appendOutboxRepairTerminalFailure(report OutboxRepairReport, failure OutboxRepairFailure, record ClaimsOutboxRecord, limit int) OutboxRepairReport {
+	if limit <= 0 {
+		limit = DefaultClaimsOperationsConfig().Budgets.AuditFindingLimit
+	}
+	if len(report.TerminalFailures) >= limit {
+		report.Bounded = true
+		return report
+	}
+	report.TerminalFailures = append(report.TerminalFailures, ProjectionFailureSummary{
+		RecordID:     failure.RecordID,
+		Projector:    failure.Projector,
+		Sequence:     failure.Sequence,
+		EntityType:   firstNonEmpty(failure.EntityType, record.EntityType),
+		EntityID:     firstNonEmpty(failure.EntityID, record.EntityID),
+		MutationKind: record.MutationKind,
+		LastError:    failure.LastError,
+	})
+	return report
+}
+
 func (db *DurableBoard) appendTerminalRepairFailures(report OutboxRepairReport, records []ClaimsOutboxRecord, projectors []ClaimsProjector) OutboxRepairReport {
 	projectorNames := make(map[string]struct{}, len(projectors))
 	for _, projector := range projectors {
@@ -196,8 +220,12 @@ func (db *DurableBoard) appendTerminalRepairFailures(report OutboxRepairReport, 
 			if slot.Status != OutboxStatusFailedTerminal {
 				continue
 			}
+			if outboxRepairHasTerminalFailure(report.TerminalFailures, record.ID, name) {
+				continue
+			}
 			report.TerminalFailures = append(report.TerminalFailures, ProjectionFailureSummary{
 				RecordID:     record.ID,
+				Projector:    name,
 				Sequence:     record.Sequence,
 				EntityType:   record.EntityType,
 				EntityID:     record.EntityID,
@@ -210,6 +238,15 @@ func (db *DurableBoard) appendTerminalRepairFailures(report OutboxRepairReport, 
 		}
 	}
 	return report
+}
+
+func outboxRepairHasTerminalFailure(failures []ProjectionFailureSummary, recordID, projector string) bool {
+	for _, failure := range failures {
+		if failure.RecordID == recordID && failure.Projector == projector {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *DurableBoard) finishOutboxRepairReport(ctx context.Context, opts OutboxRepairOptions, report OutboxRepairReport) (OutboxRepairReport, error) {
@@ -228,6 +265,9 @@ func (db *DurableBoard) finishOutboxRepairReport(ctx context.Context, opts Outbo
 			"terminal_failures":  len(report.TerminalFailures),
 			"bounded":            report.Bounded,
 		},
+	}
+	if err := SetArtifactData(artifact, report); err != nil {
+		return report, err
 	}
 	result, err := RecordInfrastructureEvidence(ctx, InfrastructureEvidenceOptions{
 		Board:     db.board,

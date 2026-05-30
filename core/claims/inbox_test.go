@@ -978,13 +978,17 @@ func TestDedupLRU_TouchKeepsRecentEntries(t *testing.T) {
 }
 
 func TestInbox_OrphansAreGloballyBounded(t *testing.T) {
+	orphanLimit := orphanInboxClaimLimitDivisor * (orphanInboxClaimLimitMinimum + 2)
 	inbox, _ := NewClaimsInbox(InboxConfig{
-		AgentID:                 "architect",
-		SessionID:               "sess",
-		BusSubscriptionQueueCap: orphanInboxClaimLimitMin,
+		AgentID:   "architect",
+		SessionID: "sess",
+		Operations: ClaimsOperationsConfig{Budgets: ClaimsOperationsBudgets{
+			InboxSubscriptionQueueCap: orphanLimit,
+			ContinuationOrphanLimit:   orphanLimit,
+		}},
 	})
 	limit := inbox.orphanClaimLimitLocked()
-	for idx := 0; idx < limit+orphanInboxClaimLimitMin; idx++ {
+	for idx := 0; idx < limit+orphanInboxClaimLimitMinimum+1; idx++ {
 		claimID := fmt.Sprintf("claim-%d", idx)
 		testamentID := fmt.Sprintf("testament-%d", idx)
 		inbox.Ingest(canonicalTestamentPostedForInboxTest(claimID, testamentID, "architect", uint64(idx+1)))

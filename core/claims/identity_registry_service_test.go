@@ -9,7 +9,7 @@ import (
 
 func TestIdentityRegistryServiceAllocateLookupLineageAndGeneration(t *testing.T) {
 	service := NewIdentityRegistryService(IdentityRegistryServiceConfig{})
-	root, err := service.Allocate(context.Background(), IdentityAllocationArtifactData{
+	root, err := service.allocate(context.Background(), IdentityAllocationArtifactData{
 		Category:   ParticipantCategoryService,
 		RouteKey:   "identity_registry",
 		Scope:      map[string]string{"session": "sess"},
@@ -18,7 +18,7 @@ func TestIdentityRegistryServiceAllocateLookupLineageAndGeneration(t *testing.T)
 	if err != nil {
 		t.Fatalf("Allocate root: %v", err)
 	}
-	again, err := service.Allocate(context.Background(), IdentityAllocationArtifactData{
+	again, err := service.allocate(context.Background(), IdentityAllocationArtifactData{
 		Category:   ParticipantCategoryService,
 		RouteKey:   "identity_registry",
 		Scope:      map[string]string{"session": "sess"},
@@ -30,7 +30,7 @@ func TestIdentityRegistryServiceAllocateLookupLineageAndGeneration(t *testing.T)
 	if again.UID != root.UID {
 		t.Fatalf("duplicate uid = %s, want %s", again.UID, root.UID)
 	}
-	child, err := service.Allocate(context.Background(), IdentityAllocationArtifactData{
+	child, err := service.allocate(context.Background(), IdentityAllocationArtifactData{
 		Category:   ParticipantCategoryService,
 		RouteKey:   "activation_controller",
 		Scope:      map[string]string{"session": "sess"},
@@ -40,7 +40,7 @@ func TestIdentityRegistryServiceAllocateLookupLineageAndGeneration(t *testing.T)
 	if err != nil {
 		t.Fatalf("Allocate child: %v", err)
 	}
-	if _, err := service.Allocate(context.Background(), IdentityAllocationArtifactData{
+	if _, err := service.allocate(context.Background(), IdentityAllocationArtifactData{
 		Category:   ParticipantCategoryService,
 		RouteKey:   "activation_controller",
 		Scope:      map[string]string{"session": "sess"},
@@ -52,7 +52,7 @@ func TestIdentityRegistryServiceAllocateLookupLineageAndGeneration(t *testing.T)
 	if got, ok := service.Lookup(context.Background(), root.UID); !ok || got.UID != root.UID {
 		t.Fatalf("Lookup = %+v ok=%v, want root", got, ok)
 	}
-	lineage, err := service.Lineage(context.Background(), child.UID)
+	lineage, err := service.lineage(context.Background(), child.UID)
 	if err != nil {
 		t.Fatalf("Lineage: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestIdentityRegistryServiceHandlerProducesTypedAllocationArtifact(t *testin
 
 func TestIdentityValidatorsPassAndFailDeterministically(t *testing.T) {
 	service := NewIdentityRegistryService(IdentityRegistryServiceConfig{})
-	allocation, err := service.Allocate(context.Background(), IdentityAllocationArtifactData{Category: ParticipantCategoryService, RouteKey: "guardian", Scope: map[string]string{"session": "sess"}, Generation: 1})
+	allocation, err := service.allocate(context.Background(), IdentityAllocationArtifactData{Category: ParticipantCategoryService, RouteKey: "guardian", Scope: map[string]string{"session": "sess"}, Generation: 1})
 	if err != nil {
 		t.Fatalf("Allocate: %v", err)
 	}

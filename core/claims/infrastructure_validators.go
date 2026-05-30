@@ -78,6 +78,23 @@ type SubscriptionAttachedValidator struct{}
 type TopicNameValidator struct{}
 type CapacityWithinBudgetValidator struct{}
 
+var infrastructureValidatorTargetArtifactNames = map[string]string{
+	ArtifactDataTypeIdentityAllocation:     "identity_allocation",
+	ArtifactDataTypeActivationRecord:       "activation_record",
+	ArtifactDataTypeDAGOperation:           "dag_operation",
+	ArtifactDataTypeVFSOperation:           "vfs_operation",
+	ArtifactDataTypeToolRuntimeExecution:   "tool_runtime_execution",
+	ArtifactDataTypeKnowledgeOperation:     "knowledge_operation",
+	ArtifactDataTypeMemoryContinuity:       "memory_continuity",
+	ArtifactDataTypeDocumentOperation:      "document_operation",
+	ArtifactDataTypeGuardianDecision:       "guardian_decision",
+	ArtifactDataTypeProviderGatewayCall:    "provider_gateway_call",
+	ArtifactDataTypeExternalAdapterEvent:   "external_adapter_event",
+	ArtifactDataTypeSessionLifecycle:       "session_lifecycle",
+	ArtifactDataTypeFabricSubscription:     "fabric_subscription",
+	ArtifactDataTypeBusTransport:           "bus_transport",
+}
+
 func RegisterDefaultInfrastructureValidators(registry *ValidatorRegistry) error {
 	if registry == nil {
 		return fmt.Errorf("%w: registry is nil", ErrValidatorRegistrationInvalid)
@@ -172,7 +189,11 @@ func (v VFSBaseVersionValidator) ValidateArtifact(_ context.Context, req Validat
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if strings.TrimSpace(v.ExpectedBaseVersion) == "" || data.BaseVersion == strings.TrimSpace(v.ExpectedBaseVersion) {
+	expected := strings.TrimSpace(v.ExpectedBaseVersion)
+	if expected == "" && strings.TrimSpace(data.BaseVersion) != "" {
+		return infrastructureValidatorPass("vfs base version valid")
+	}
+	if expected != "" && data.BaseVersion == expected {
 		return infrastructureValidatorPass("vfs base version valid")
 	}
 	return infrastructureValidatorFailure(req, "VFS base version mismatch", map[string]any{"got": data.BaseVersion, "want": v.ExpectedBaseVersion})
@@ -285,7 +306,11 @@ func (v ToolExpectedOutputValidator) ValidateArtifact(_ context.Context, req Val
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if strings.TrimSpace(v.Contains) == "" || strings.Contains(data.OutputSummary, v.Contains) {
+	contains := strings.TrimSpace(v.Contains)
+	if contains == "" && strings.TrimSpace(data.OutputSummary) != "" {
+		return infrastructureValidatorPass("tool expected output present")
+	}
+	if contains != "" && strings.Contains(data.OutputSummary, contains) {
 		return infrastructureValidatorPass("tool expected output present")
 	}
 	return infrastructureValidatorFailure(req, "tool expected output missing", map[string]any{"contains": v.Contains})
@@ -351,7 +376,7 @@ func (KnowledgeScoreRangeValidator) ValidateArtifact(_ context.Context, req Vali
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.ScoreMin <= data.ScoreMax {
+	if validKnowledgeScoreRange(data.ScoreMin, data.ScoreMax) {
 		return infrastructureValidatorPass("knowledge score range valid")
 	}
 	return infrastructureValidatorFailure(req, "knowledge score range invalid", map[string]any{"min": data.ScoreMin, "max": data.ScoreMax})
@@ -472,7 +497,11 @@ func (v GuardianPolicyMatchValidator) ValidateArtifact(_ context.Context, req Va
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if strings.TrimSpace(v.ExpectedRule) == "" || data.PolicyRule == strings.TrimSpace(v.ExpectedRule) {
+	expected := strings.TrimSpace(v.ExpectedRule)
+	if expected == "" && strings.TrimSpace(data.PolicyRule) != "" {
+		return infrastructureValidatorPass("guardian policy matched")
+	}
+	if expected != "" && data.PolicyRule == expected {
 		return infrastructureValidatorPass("guardian policy matched")
 	}
 	return infrastructureValidatorFailure(req, "guardian policy mismatch", map[string]any{"got": data.PolicyRule, "want": v.ExpectedRule})
@@ -560,7 +589,10 @@ func (v ProviderModelAllowedValidator) ValidateArtifact(_ context.Context, req V
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if len(v.AllowedModels) == 0 || stringInList(data.Model, v.AllowedModels) {
+	if len(v.AllowedModels) == 0 && strings.TrimSpace(data.Model) != "" {
+		return infrastructureValidatorPass("provider model allowed")
+	}
+	if len(v.AllowedModels) != 0 && stringInList(data.Model, v.AllowedModels) {
 		return infrastructureValidatorPass("provider model allowed")
 	}
 	return infrastructureValidatorFailure(req, "provider model not allowed", map[string]any{"model": data.Model, "allowed": v.AllowedModels})
@@ -593,7 +625,11 @@ func (v ExternalSchemaValidator) ValidateArtifact(_ context.Context, req Validat
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if strings.TrimSpace(v.ExpectedSchema) == "" || data.Schema == strings.TrimSpace(v.ExpectedSchema) {
+	expected := strings.TrimSpace(v.ExpectedSchema)
+	if expected == "" && strings.TrimSpace(data.Schema) != "" {
+		return infrastructureValidatorPass("external schema valid")
+	}
+	if expected != "" && data.Schema == expected {
 		return infrastructureValidatorPass("external schema valid")
 	}
 	return infrastructureValidatorFailure(req, "external schema mismatch", map[string]any{"got": data.Schema, "want": v.ExpectedSchema})
@@ -705,8 +741,11 @@ func infrastructureValidatorFailure(req ValidatorHandlerRequest, description str
 }
 
 func stringMapSubset(subset, superset map[string]string) bool {
-	if len(subset) == 0 || len(superset) == 0 {
+	if len(subset) == 0 {
 		return true
+	}
+	if len(superset) == 0 {
+		return false
 	}
 	for key, value := range subset {
 		if superset[strings.TrimSpace(key)] != strings.TrimSpace(value) {
@@ -717,10 +756,17 @@ func stringMapSubset(subset, superset map[string]string) bool {
 }
 
 func boundedInt(value, min, max int) bool {
+	if value < 0 {
+		return false
+	}
 	if min > 0 && value < min {
 		return false
 	}
 	return max <= 0 || value <= max
+}
+
+func validKnowledgeScoreRange(min, max float64) bool {
+	return min >= 0 && max <= 1 && min <= max
 }
 
 func validBusTopicName(topic string) bool {
@@ -763,9 +809,10 @@ func stringInList(value string, allowed []string) bool {
 }
 
 func referencedClaimExists(board *ClaimsBoard, claimID string) bool {
-	if board == nil {
-		return true
-	}
+	return board != nil && strings.TrimSpace(claimID) != "" && cloneClaimExists(board, claimID)
+}
+
+func cloneClaimExists(board *ClaimsBoard, claimID string) bool {
 	_, ok := board.CloneClaim(claimID)
 	return ok
 }
@@ -785,6 +832,12 @@ func infrastructureValidationErrorf(req ValidatorHandlerRequest, format string, 
 
 func defaultInfrastructureValidatorRegistrations() []ValidatorRegistration {
 	return []ValidatorRegistration{
+		infrastructureValidatorRegistration("identity.deterministic", ArtifactDataTypeIdentityAllocation, IdentityDeterministicValidator{}),
+		infrastructureValidatorRegistration("identity.generation_monotonic", ArtifactDataTypeIdentityAllocation, GenerationMonotonicValidator{}),
+		infrastructureValidatorRegistration("activation.readiness", ArtifactDataTypeActivationRecord, ActivationReadinessValidator{}),
+		infrastructureValidatorRegistration("activation.tier", ArtifactDataTypeActivationRecord, TierAchievedValidator{}),
+		infrastructureValidatorRegistration("activation.replica_count", ArtifactDataTypeActivationRecord, ReplicaCountValidator{}),
+		infrastructureValidatorRegistration("activation.duration", ArtifactDataTypeActivationRecord, ActivationDurationValidator{}),
 		infrastructureValidatorRegistration("dag.acyclic", ArtifactDataTypeDAGOperation, DAGAcyclicityValidator{}),
 		infrastructureValidatorRegistration("dag.required_nodes", ArtifactDataTypeDAGOperation, DAGRequiredNodeCoverageValidator{}),
 		infrastructureValidatorRegistration("dag.scope_subset", ArtifactDataTypeDAGOperation, DAGScopeSubsetValidator{}),
@@ -849,9 +902,13 @@ func infrastructureValidatorRegistration(id, dataType string, handler ValidatorH
 		Determinism:        HandlerDeterminismPure,
 		Timeout:            time.Second,
 		ConcurrencyBudget:  1,
-		TargetArtifactName: "infrastructure",
+		TargetArtifactName: infrastructureValidatorTargetArtifactName(dataType),
 		ArtifactDataType:   dataType,
 		ResultDataType:     ArtifactDataTypePresentationEvidence,
 		Handler:            handler,
 	}
+}
+
+func infrastructureValidatorTargetArtifactName(dataType string) string {
+	return firstNonEmpty(infrastructureValidatorTargetArtifactNames[strings.TrimSpace(dataType)], "infrastructure")
 }

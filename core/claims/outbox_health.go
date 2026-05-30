@@ -12,20 +12,20 @@ const (
 )
 
 type ProjectionHealthSnapshot struct {
-	BoardID           string                      `json:"board_id,omitempty"`
-	SessionID         string                      `json:"session_id,omitempty"`
-	GeneratedAt       time.Time                   `json:"generated_at"`
-	HighWaterSequence uint64                      `json:"high_water_sequence"`
-	QueueDepth        int                         `json:"queue_depth"`
-	MaxLag            uint64                      `json:"max_lag"`
-	RetryCount        int                         `json:"retry_count"`
-	TerminalFailures  int                         `json:"terminal_failures"`
-	LeaseExpirations  int                         `json:"lease_expirations"`
-	AverageLatency    time.Duration               `json:"average_projection_latency,omitempty"`
-	Projectors        []ProjectionProjectorHealth `json:"projectors,omitempty"`
-	Warnings          []string                    `json:"warnings,omitempty"`
-	FeatureFlags      map[string]string           `json:"feature_flags,omitempty"`
-	ShadowDiffs       []string                    `json:"shadow_diffs,omitempty"`
+	BoardID           string                         `json:"board_id,omitempty"`
+	SessionID         string                         `json:"session_id,omitempty"`
+	GeneratedAt       time.Time                      `json:"generated_at"`
+	HighWaterSequence uint64                         `json:"high_water_sequence"`
+	QueueDepth        int                            `json:"queue_depth"`
+	MaxLag            uint64                         `json:"max_lag"`
+	RetryCount        int                            `json:"retry_count"`
+	TerminalFailures  int                            `json:"terminal_failures"`
+	LeaseExpirations  int                            `json:"lease_expirations"`
+	AverageLatency    time.Duration                  `json:"average_projection_latency,omitempty"`
+	Projectors        []ProjectionProjectorHealth    `json:"projectors,omitempty"`
+	Warnings          []string                       `json:"warnings,omitempty"`
+	FeatureFlags      map[string]string              `json:"feature_flags,omitempty"`
+	ShadowDiffs       []string                       `json:"shadow_diffs,omitempty"`
 	Budgets           ClaimsOperationsBudgetSnapshot `json:"budgets,omitempty"`
 }
 
@@ -52,6 +52,7 @@ type ProjectionProjectorHealth struct {
 
 type ProjectionFailureSummary struct {
 	RecordID     string `json:"record_id"`
+	Projector    string `json:"projector,omitempty"`
 	Sequence     uint64 `json:"sequence"`
 	EntityType   string `json:"entity_type"`
 	EntityID     string `json:"entity_id"`
@@ -233,6 +234,7 @@ func updateProjectorHealth(ph *ProjectionProjectorHealth, rec ClaimsOutboxRecord
 		if len(ph.TerminalFailureIDs) < projectionHealthFailureLimit {
 			ph.TerminalFailureIDs = append(ph.TerminalFailureIDs, ProjectionFailureSummary{
 				RecordID:     rec.ID,
+				Projector:    ph.Projector,
 				Sequence:     rec.Sequence,
 				EntityType:   rec.EntityType,
 				EntityID:     rec.EntityID,

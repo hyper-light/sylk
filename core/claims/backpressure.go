@@ -33,17 +33,17 @@ type BackpressureEvent struct {
 }
 
 type BackpressureSnapshot struct {
-	Events     []BackpressureEvent `json:"events,omitempty"`
-	OverflowByClass map[string]uint64 `json:"overflow_by_class,omitempty"`
-	TotalOverflow uint64 `json:"total_overflow,omitempty"`
-	Truncated   uint64              `json:"truncated,omitempty"`
+	Events          []BackpressureEvent `json:"events,omitempty"`
+	OverflowByClass map[string]uint64   `json:"overflow_by_class,omitempty"`
+	TotalOverflow   uint64              `json:"total_overflow,omitempty"`
+	Truncated       uint64              `json:"truncated,omitempty"`
 }
 
 type BackpressureReporter struct {
-	mu        sync.Mutex
-	limit     int
-	events    []BackpressureEvent
-	truncated uint64
+	mu              sync.Mutex
+	limit           int
+	events          []BackpressureEvent
+	truncated       uint64
 	overflowByClass [numInboxClasses]uint64
 }
 

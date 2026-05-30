@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -263,72 +262,10 @@ func InboxPatternsFor(role ClaimsRole, sessionID, agentID string) []string {
 	return out
 }
 
-// busSubscriptionQueueCapDefault is the upper bound on unique
-// in-flight deltas the bus can deliver to one inbox subscription
-// before the bus's drop-oldest-by-priority eviction kicks in. It
-// anchors the dedup LRU, which must be at least this size to avoid
-// dedup-eviction racing the bus drop window. The value is derived
-// from the host's GOMAXPROCS so it scales with hardware:
-//
-//	cap = max(perCoreFloor × GOMAXPROCS, expectedFanIn ×
-//	          messagesPerTurn × replicasPerAgent × safetyFactor)
-//
-// where the right-hand term is the worst-case observed fan-in (every
-// peer agent emitting a full turn's worth of deltas at maximum replica
-// concurrency). With default coefficients on an 8-core machine this
-// resolves to 2048 — the same magnitude as the previous hand-picked
-// 4096 but expressed as a function of host capacity, peer count, and
-// observed turn volume rather than a literal.
-var busSubscriptionQueueCapDefault = computeBusSubscriptionQueueCap()
-
-const (
-	// inboxQueuePerCoreFloor is the floor scaling factor: each core
-	// gets at least this many slots so a high-core host can absorb
-	// proportionally more pending deltas. The product (procs ×
-	// floor) is the lower bound returned when the fan-in formula
-	// produces a smaller result.
-	inboxQueuePerCoreFloor = 256
-
-	// inboxQueueExpectedFanIn anchors the upper-bound formula in the
-	// observed maximum number of distinct agents that can publish
-	// deltas to one inbox simultaneously. Sized off the agent
-	// taxonomy (architect, librarian, orchestrator, engineer,
-	// guardian, inspector, tester, archivalist, academic, designer,
-	// guide ≈ 11 + headroom).
-	inboxQueueExpectedFanIn = 12
-
-	// inboxQueueMessagesPerTurn anchors how many deltas each peer
-	// loop emits on a single LLM iteration (claims/testimony
-	// architecture: ~1 claim + 5–10 tool artifacts + 1 testament
-	// flush ≈ 12–15).
-	inboxQueueMessagesPerTurn = 15
-
-	// inboxQueueReplicasPerAgent anchors the maximum concurrent
-	// replicas of one peer agent that can run in parallel
-	// (RequestReplicaPool default ceilings).
-	inboxQueueReplicasPerAgent = 8
-
-	// inboxQueueSafetyFactor reserves headroom for short bursts
-	// above the steady-state arrival rate. Two means we can absorb a
-	// 2× momentary spike without bus drops.
-	inboxQueueSafetyFactor = 2
-)
-
-func computeBusSubscriptionQueueCap() int {
-	procs := runtime.GOMAXPROCS(0)
-	if procs < 1 {
-		procs = 1
-	}
-	floor := procs * inboxQueuePerCoreFloor
-	upper := inboxQueueExpectedFanIn *
-		inboxQueueMessagesPerTurn *
-		inboxQueueReplicasPerAgent *
-		inboxQueueSafetyFactor
-	if floor > upper {
-		return floor
-	}
-	return upper
-}
+// busSubscriptionQueueCapDefault is the central claims-operations
+// inbox budget. It anchors the dedup LRU to the same bounded queue cap
+// used by bus subscriptions.
+var busSubscriptionQueueCapDefault = DefaultClaimsOperationsConfig().Budgets.InboxSubscriptionQueueCap
 
 // InboxConfig bundles construction parameters for a ClaimsInbox.
 type InboxConfig struct {
@@ -372,6 +309,11 @@ type InboxConfig struct {
 	// busSubscriptionQueueCapDefault. The dedup LRU is sized at
 	// BusSubscriptionQueueCap × len(patterns).
 	BusSubscriptionQueueCap int
+
+	// Operations supplies normalized claims-plane budgets. Explicit
+	// BusSubscriptionQueueCap wins for existing tests and small local
+	// harnesses; otherwise this config provides the queue cap.
+	Operations ClaimsOperationsConfig
 }
 
 // ClaimsInbox is the per-replica event-driven intake surface.
@@ -424,6 +366,9 @@ type ClaimsInbox struct {
 	// LRU once the actual pattern count is known at Start.
 	queueCap int
 
+	orphanLimit      int
+	orphanClaimLimit int
+
 	// matchCount tracks how many deltas have matched (for tests).
 	matchCount atomic.Uint64
 
@@ -435,6 +380,23 @@ type ClaimsInbox struct {
 	deliveredByClass [numInboxClasses]atomic.Uint64
 
 	closed atomic.Bool
+}
+
+type ClaimsInboxSnapshot struct {
+	AgentID           string            `json:"agent_id"`
+	SessionID         string            `json:"session_id"`
+	Role              ClaimsRole        `json:"role"`
+	QueueCap          int               `json:"queue_cap"`
+	OrphanLimit       int               `json:"orphan_limit"`
+	OrphanClaimLimit  int               `json:"orphan_claim_limit"`
+	Matched           uint64            `json:"matched"`
+	Overflow          uint64            `json:"overflow"`
+	DeliveredByClass  map[string]uint64 `json:"delivered_by_class,omitempty"`
+	SubscriptionCount int               `json:"subscription_count"`
+	ExpectationCount  int               `json:"expectation_count"`
+	OrphanClaimCount  int               `json:"orphan_claim_count"`
+	OrphanDeltaCount  int               `json:"orphan_delta_count"`
+	Closed            bool              `json:"closed"`
 }
 
 // NewClaimsInbox constructs an inbox. Subscriptions are NOT attached
@@ -450,24 +412,28 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 	if role == 0 {
 		role = RoleSubject
 	}
+	ops := NormalizeClaimsOperationsConfig(cfg.Operations)
 	queueCap := cfg.BusSubscriptionQueueCap
 	if queueCap <= 0 {
-		queueCap = busSubscriptionQueueCapDefault
+		queueCap = ops.Budgets.InboxSubscriptionQueueCap
 	}
+	orphanLimit := ops.Budgets.ContinuationOrphanLimit
 	// Pre-size dedup at queueCap (one pattern's worth). Start grows
 	// it to queueCap × pattern count once patterns resolve.
 	return &ClaimsInbox{
-		agentID:         cfg.AgentID,
-		sessionID:       cfg.SessionID,
-		role:            role,
-		subscriber:      subscribeOrNoop(cfg.Subscriber),
-		board:           cfg.Board,
-		onResolved:      cfg.OnResolved,
-		seen:            newDedupLRU(queueCap),
-		expectations:    make(map[string]*Expectation),
-		orphans:         make(map[string][]orphanedInboxDelta),
-		expectationSubs: make(map[string][]DeltaSubscription),
-		queueCap:        queueCap,
+		agentID:          cfg.AgentID,
+		sessionID:        cfg.SessionID,
+		role:             role,
+		subscriber:       subscribeOrNoop(cfg.Subscriber),
+		board:            cfg.Board,
+		onResolved:       cfg.OnResolved,
+		seen:             newDedupLRU(queueCap),
+		expectations:     make(map[string]*Expectation),
+		orphans:          make(map[string][]orphanedInboxDelta),
+		expectationSubs:  make(map[string][]DeltaSubscription),
+		queueCap:         queueCap,
+		orphanLimit:      orphanLimit,
+		orphanClaimLimit: inboxOrphanClaimLimit(orphanLimit),
 	}, nil
 }
 
@@ -875,9 +841,8 @@ func claimLifecycleStatusResolvesExpectation(status ClaimLifecycleStatus) bool {
 
 const (
 	orphanInboxDeltaMaxAge       = 10 * time.Minute
-	orphanInboxClaimLimitMin     = 16
-	orphanInboxClaimLimitMax     = 1024
 	orphanInboxClaimLimitDivisor = 4
+	orphanInboxClaimLimitMinimum = 1
 )
 
 type orphanedInboxDelta struct {
@@ -945,26 +910,24 @@ func (i *ClaimsInbox) stashOrphanIfResponseLocked(d Delta) {
 }
 
 func (i *ClaimsInbox) orphanLimitLocked() int {
-	limit := i.queueCap
+	limit := i.orphanLimit
 	if limit <= 0 {
-		limit = busSubscriptionQueueCapDefault
-	}
-	if limit < 16 {
-		limit = 16
-	}
-	if limit > 1024 {
-		limit = 1024
+		limit = DefaultClaimsOperationsConfig().Budgets.ContinuationOrphanLimit
 	}
 	return limit
 }
 
 func (i *ClaimsInbox) orphanClaimLimitLocked() int {
-	limit := i.queueCap / orphanInboxClaimLimitDivisor
-	if limit < orphanInboxClaimLimitMin {
-		return orphanInboxClaimLimitMin
+	if i.orphanClaimLimit > 0 {
+		return i.orphanClaimLimit
 	}
-	if limit > orphanInboxClaimLimitMax {
-		return orphanInboxClaimLimitMax
+	return inboxOrphanClaimLimit(i.orphanLimit)
+}
+
+func inboxOrphanClaimLimit(orphanLimit int) int {
+	limit := orphanLimit / orphanInboxClaimLimitDivisor
+	if limit < orphanInboxClaimLimitMinimum {
+		return orphanInboxClaimLimitMinimum
 	}
 	return limit
 }
@@ -1205,6 +1168,33 @@ func (i *ClaimsInbox) Len() int {
 	return int(i.matchCount.Load())
 }
 
+func (i *ClaimsInbox) Snapshot() ClaimsInboxSnapshot {
+	if i == nil {
+		return ClaimsInboxSnapshot{}
+	}
+	i.mu.Lock()
+	snap := ClaimsInboxSnapshot{
+		AgentID:           i.agentID,
+		SessionID:         i.sessionID,
+		Role:              i.role,
+		QueueCap:          i.queueCap,
+		OrphanLimit:       i.orphanLimit,
+		OrphanClaimLimit:  i.orphanClaimLimit,
+		Matched:           i.matchCount.Load(),
+		SubscriptionCount: len(i.subscriptions),
+		ExpectationCount:  len(i.expectations),
+		OrphanClaimCount:  len(i.orphans),
+		Closed:            i.closed.Load(),
+	}
+	for _, list := range i.orphans {
+		snap.OrphanDeltaCount += len(list)
+	}
+	i.mu.Unlock()
+	snap.Overflow = i.OverflowCount()
+	snap.DeliveredByClass = i.deliveredByClassSnapshot()
+	return snap
+}
+
 // OverflowCount returns the total number of deltas the bus has dropped
 // across this inbox's subscriptions due to per-subscription queue
 // overflow. Subscriptions whose handle does not implement
@@ -1239,6 +1229,17 @@ func (i *ClaimsInbox) DeliveredByClass(class InboxClass) uint64 {
 		return 0
 	}
 	return i.deliveredByClass[class].Load()
+}
+
+func (i *ClaimsInbox) deliveredByClassSnapshot() map[string]uint64 {
+	out := make(map[string]uint64, numInboxClasses)
+	for idx := range numInboxClasses {
+		class := InboxClass(idx)
+		if count := i.DeliveredByClass(class); count > 0 {
+			out[class.String()] = count
+		}
+	}
+	return out
 }
 
 // ConsultBudgetSnapshot is the publisher-side view of an inbox's

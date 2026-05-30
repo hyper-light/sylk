@@ -3,6 +3,7 @@ package claims
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -25,6 +26,10 @@ type SessionInboxRegistryEntry struct {
 	SessionID string
 	AgentID   string
 	Inbox     *ClaimsInbox
+}
+
+type SessionInboxRegistrySnapshot struct {
+	Entries []ClaimsInboxSnapshot `json:"entries,omitempty"`
 }
 
 var defaultInboxRegistry = &SessionInboxRegistry{
@@ -100,6 +105,32 @@ func (r *SessionInboxRegistry) Snapshot() []SessionInboxRegistryEntry {
 	for key, inbox := range r.inboxes {
 		sessionID, agentID, _ := strings.Cut(key, "|")
 		out = append(out, SessionInboxRegistryEntry{SessionID: sessionID, AgentID: agentID, Inbox: inbox})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SessionID != out[j].SessionID {
+			return out[i].SessionID < out[j].SessionID
+		}
+		return out[i].AgentID < out[j].AgentID
+	})
+	return out
+}
+
+func (r *SessionInboxRegistry) SnapshotStats() SessionInboxRegistrySnapshot {
+	entries := r.Snapshot()
+	out := SessionInboxRegistrySnapshot{Entries: make([]ClaimsInboxSnapshot, 0, len(entries))}
+	for _, entry := range entries {
+		if entry.Inbox == nil {
+			out.Entries = append(out.Entries, ClaimsInboxSnapshot{
+				SessionID: entry.SessionID,
+				AgentID:   entry.AgentID,
+				Closed:    true,
+			})
+			continue
+		}
+		snap := entry.Inbox.Snapshot()
+		snap.SessionID = firstNonEmpty(snap.SessionID, entry.SessionID)
+		snap.AgentID = firstNonEmpty(snap.AgentID, entry.AgentID)
+		out.Entries = append(out.Entries, snap)
 	}
 	return out
 }

@@ -43,11 +43,11 @@ const (
 )
 
 type ClaimsOperationsConfig struct {
-	Durability  ClaimsDurabilityConfig
-	Budgets     ClaimsOperationsBudgets
+	Durability   ClaimsDurabilityConfig
+	Budgets      ClaimsOperationsBudgets
 	Backpressure ClaimsBackpressureConfig
-	Audit       ClaimsOperationsAuditConfig
-	Warnings    []string
+	Audit        ClaimsOperationsAuditConfig
+	Warnings     []string
 }
 
 type ClaimsDurabilityConfig struct {
@@ -56,20 +56,20 @@ type ClaimsDurabilityConfig struct {
 }
 
 type ClaimsOperationsBudgets struct {
-	InboxSubscriptionQueueCap int
-	ServiceQueueCapacity      int
-	ServiceConcurrency        int
-	ValidatorConcurrency      int
-	ContinuationOrphanLimit   int
+	InboxSubscriptionQueueCap  int
+	ServiceQueueCapacity       int
+	ServiceConcurrency         int
+	ValidatorConcurrency       int
+	ContinuationOrphanLimit    int
 	OutboxProjectionBatchLimit int
-	OutboxRepairLimit         int
-	ReplayErrorPreviewBytes   int
-	OutboxLease               time.Duration
-	ShutdownGracePeriod       time.Duration
-	ShutdownHardDeadline      time.Duration
-	AuditFindingLimit         int
-	AuditInterval             time.Duration
-	AuditDeadline             time.Duration
+	OutboxRepairLimit          int
+	ReplayErrorPreviewBytes    int
+	OutboxLease                time.Duration
+	ShutdownGracePeriod        time.Duration
+	ShutdownHardDeadline       time.Duration
+	AuditFindingLimit          int
+	AuditInterval              time.Duration
+	AuditDeadline              time.Duration
 }
 
 type ClaimsBackpressureConfig struct {
@@ -78,25 +78,26 @@ type ClaimsBackpressureConfig struct {
 }
 
 type ClaimsOperationsAuditConfig struct {
-	Enabled bool
+	Enabled  bool
+	Disabled bool
 }
 
 type ClaimsOperationsBudgetSnapshot struct {
-	InboxSubscriptionQueueCap int           `json:"inbox_subscription_queue_cap"`
-	ServiceQueueCapacity      int           `json:"service_queue_capacity"`
-	ServiceConcurrency        int           `json:"service_concurrency"`
-	ValidatorConcurrency      int           `json:"validator_concurrency"`
-	ContinuationOrphanLimit   int           `json:"continuation_orphan_limit"`
-	OutboxProjectionBatchLimit int          `json:"outbox_projection_batch_limit"`
-	OutboxRepairLimit         int           `json:"outbox_repair_limit"`
-	ReplayErrorPreviewBytes   int           `json:"replay_error_preview_bytes"`
-	OutboxLease               time.Duration `json:"outbox_lease"`
-	ShutdownGracePeriod       time.Duration `json:"shutdown_grace_period"`
-	ShutdownHardDeadline      time.Duration `json:"shutdown_hard_deadline"`
-	AuditFindingLimit         int           `json:"audit_finding_limit"`
-	AuditInterval             time.Duration `json:"audit_interval"`
-	AuditDeadline             time.Duration `json:"audit_deadline"`
-	Warnings                  []string      `json:"warnings,omitempty"`
+	InboxSubscriptionQueueCap  int           `json:"inbox_subscription_queue_cap"`
+	ServiceQueueCapacity       int           `json:"service_queue_capacity"`
+	ServiceConcurrency         int           `json:"service_concurrency"`
+	ValidatorConcurrency       int           `json:"validator_concurrency"`
+	ContinuationOrphanLimit    int           `json:"continuation_orphan_limit"`
+	OutboxProjectionBatchLimit int           `json:"outbox_projection_batch_limit"`
+	OutboxRepairLimit          int           `json:"outbox_repair_limit"`
+	ReplayErrorPreviewBytes    int           `json:"replay_error_preview_bytes"`
+	OutboxLease                time.Duration `json:"outbox_lease"`
+	ShutdownGracePeriod        time.Duration `json:"shutdown_grace_period"`
+	ShutdownHardDeadline       time.Duration `json:"shutdown_hard_deadline"`
+	AuditFindingLimit          int           `json:"audit_finding_limit"`
+	AuditInterval              time.Duration `json:"audit_interval"`
+	AuditDeadline              time.Duration `json:"audit_deadline"`
+	Warnings                   []string      `json:"warnings,omitempty"`
 }
 
 func DefaultClaimsOperationsConfig() ClaimsOperationsConfig {
@@ -109,27 +110,28 @@ func NormalizeClaimsOperationsConfig(cfg ClaimsOperationsConfig) ClaimsOperation
 	out.Durability = normalizeClaimsDurabilityConfig(out.Durability)
 	out.Budgets = normalizeClaimsOperationsBudgets(out.Budgets, &out.Warnings)
 	out.Backpressure = normalizeClaimsBackpressureConfig(out.Backpressure, &out.Warnings)
+	out.Audit = normalizeClaimsOperationsAuditConfig(out.Audit)
 	return out
 }
 
 func ClaimsOperationsBudgetSnapshotFromConfig(cfg ClaimsOperationsConfig) ClaimsOperationsBudgetSnapshot {
 	cfg = NormalizeClaimsOperationsConfig(cfg)
 	return ClaimsOperationsBudgetSnapshot{
-		InboxSubscriptionQueueCap: cfg.Budgets.InboxSubscriptionQueueCap,
-		ServiceQueueCapacity:      cfg.Budgets.ServiceQueueCapacity,
-		ServiceConcurrency:        cfg.Budgets.ServiceConcurrency,
-		ValidatorConcurrency:      cfg.Budgets.ValidatorConcurrency,
-		ContinuationOrphanLimit:   cfg.Budgets.ContinuationOrphanLimit,
+		InboxSubscriptionQueueCap:  cfg.Budgets.InboxSubscriptionQueueCap,
+		ServiceQueueCapacity:       cfg.Budgets.ServiceQueueCapacity,
+		ServiceConcurrency:         cfg.Budgets.ServiceConcurrency,
+		ValidatorConcurrency:       cfg.Budgets.ValidatorConcurrency,
+		ContinuationOrphanLimit:    cfg.Budgets.ContinuationOrphanLimit,
 		OutboxProjectionBatchLimit: cfg.Budgets.OutboxProjectionBatchLimit,
-		OutboxRepairLimit:         cfg.Budgets.OutboxRepairLimit,
-		ReplayErrorPreviewBytes:   cfg.Budgets.ReplayErrorPreviewBytes,
-		OutboxLease:               cfg.Budgets.OutboxLease,
-		ShutdownGracePeriod:       cfg.Budgets.ShutdownGracePeriod,
-		ShutdownHardDeadline:      cfg.Budgets.ShutdownHardDeadline,
-		AuditFindingLimit:         cfg.Budgets.AuditFindingLimit,
-		AuditInterval:             cfg.Budgets.AuditInterval,
-		AuditDeadline:             cfg.Budgets.AuditDeadline,
-		Warnings:                  append([]string(nil), cfg.Warnings...),
+		OutboxRepairLimit:          cfg.Budgets.OutboxRepairLimit,
+		ReplayErrorPreviewBytes:    cfg.Budgets.ReplayErrorPreviewBytes,
+		OutboxLease:                cfg.Budgets.OutboxLease,
+		ShutdownGracePeriod:        cfg.Budgets.ShutdownGracePeriod,
+		ShutdownHardDeadline:       cfg.Budgets.ShutdownHardDeadline,
+		AuditFindingLimit:          cfg.Budgets.AuditFindingLimit,
+		AuditInterval:              cfg.Budgets.AuditInterval,
+		AuditDeadline:              cfg.Budgets.AuditDeadline,
+		Warnings:                   append([]string(nil), cfg.Warnings...),
 	}
 }
 
@@ -190,6 +192,15 @@ func normalizeClaimsBackpressureConfig(cfg ClaimsBackpressureConfig, warnings *[
 		appendOperationWarning(warnings, "near_capacity_ratio normalized to bounded default")
 		cfg.NearCapacityRatio = derivedNearCapacityRatio()
 	}
+	return cfg
+}
+
+func normalizeClaimsOperationsAuditConfig(cfg ClaimsOperationsAuditConfig) ClaimsOperationsAuditConfig {
+	if cfg.Disabled {
+		cfg.Enabled = false
+		return cfg
+	}
+	cfg.Enabled = true
 	return cfg
 }
 

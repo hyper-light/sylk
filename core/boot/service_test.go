@@ -174,7 +174,7 @@ func TestBootSequencerServiceConcurrentRecordsDoNotRace(t *testing.T) {
 		wg.Add(1)
 		go func(phase string) {
 			defer wg.Done()
-			_, err := service.RecordPhase(context.Background(), claims.BootPhaseArtifactData{
+			_, err := service.recordPhase(context.Background(), claims.BootPhaseArtifactData{
 				Phase:       phase,
 				PhaseOrder:  bootPhaseOrder(phase),
 				ProcessUID:  "proc-1",

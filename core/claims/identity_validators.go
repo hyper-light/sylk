@@ -52,8 +52,11 @@ func (v GenerationMonotonicValidator) ValidateArtifact(ctx context.Context, req 
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.ParentUID == "" || v.Registry == nil {
+	if data.ParentUID == "" {
 		return identityValidatorPass("identity generation monotonic")
+	}
+	if v.Registry == nil {
+		return identityValidatorFailure(req, "identity parent registry unavailable", map[string]any{"parent_uid": data.ParentUID})
 	}
 	parent, ok := v.Registry.Lookup(ctx, data.ParentUID)
 	if ok && data.Generation <= parent.Generation {
@@ -85,7 +88,10 @@ func (v TierAchievedValidator) ValidateArtifact(_ context.Context, req Validator
 		return ValidatorHandlerResult{}, err
 	}
 	expected := strings.TrimSpace(v.ExpectedTier)
-	if expected == "" || strings.TrimSpace(data.Tier) == expected {
+	if expected == "" && strings.TrimSpace(data.Tier) != "" {
+		return identityValidatorPass("activation tier achieved")
+	}
+	if expected != "" && strings.TrimSpace(data.Tier) == expected {
 		return identityValidatorPass("activation tier achieved")
 	}
 	return identityValidatorFailure(req, "activation tier not achieved", map[string]any{"got": data.Tier, "want": expected})
@@ -100,7 +106,10 @@ func (v ReplicaCountValidator) ValidateArtifact(_ context.Context, req Validator
 	if err != nil {
 		return ValidatorHandlerResult{}, err
 	}
-	if data.ReplicaCount == v.ExpectedReplicaCount {
+	if v.ExpectedReplicaCount <= 0 && data.ReplicaCount >= 0 {
+		return identityValidatorPass("activation replica count achieved")
+	}
+	if v.ExpectedReplicaCount > 0 && data.ReplicaCount == v.ExpectedReplicaCount {
 		return identityValidatorPass("activation replica count achieved")
 	}
 	return identityValidatorFailure(req, "activation replica count mismatch", map[string]any{"got": data.ReplicaCount, "want": v.ExpectedReplicaCount})

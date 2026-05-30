@@ -59,7 +59,7 @@ func (s *IdentityRegistryService) HandleServiceClaim(ctx context.Context, req Se
 	return s.handleIdentityRegistryCall(ctx, call)
 }
 
-func (s *IdentityRegistryService) Allocate(ctx context.Context, input IdentityAllocationArtifactData) (IdentityAllocationArtifactData, error) {
+func (s *IdentityRegistryService) allocate(ctx context.Context, input IdentityAllocationArtifactData) (IdentityAllocationArtifactData, error) {
 	if err := validateIdentityRegistryService(s); err != nil {
 		return IdentityAllocationArtifactData{}, err
 	}
@@ -101,7 +101,7 @@ func (s *IdentityRegistryService) Lookup(ctx context.Context, uid string) (Ident
 	return cloneIdentityAllocation(record), ok
 }
 
-func (s *IdentityRegistryService) Lineage(ctx context.Context, uid string) (IdentityLineageArtifactData, error) {
+func (s *IdentityRegistryService) lineage(ctx context.Context, uid string) (IdentityLineageArtifactData, error) {
 	if err := validateIdentityRegistryService(s); err != nil {
 		return IdentityLineageArtifactData{}, err
 	}
@@ -131,7 +131,7 @@ func (s *IdentityRegistryService) handleAllocate(ctx context.Context, call Expec
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
-	record, err := s.Allocate(ctx, input)
+	record, err := s.allocate(ctx, input)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
@@ -156,7 +156,7 @@ func (s *IdentityRegistryService) handleLookup(ctx context.Context, call Expecte
 }
 
 func (s *IdentityRegistryService) handleLineage(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
-	lineage, err := s.Lineage(ctx, stringArg(call.Arguments, "uid"))
+	lineage, err := s.lineage(ctx, stringArg(call.Arguments, "uid"))
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}

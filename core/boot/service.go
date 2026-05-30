@@ -60,10 +60,10 @@ func (s *BootSequencerService) HandleServiceClaim(ctx context.Context, req claim
 	if err != nil {
 		data = bootPhaseFailureData(call, s.processUID, err)
 	}
-	return s.RecordPhase(ctx, data, nil)
+	return s.recordPhase(ctx, data, nil)
 }
 
-func (s *BootSequencerService) RecordPhase(ctx context.Context, data claims.BootPhaseArtifactData, extra []*claims.Artifact) (claims.ServiceClaimResult, error) {
+func (s *BootSequencerService) recordPhase(ctx context.Context, data claims.BootPhaseArtifactData, extra []*claims.Artifact) (claims.ServiceClaimResult, error) {
 	if s == nil {
 		return claims.ServiceClaimResult{}, ErrBootSequencerServiceInvalid
 	}

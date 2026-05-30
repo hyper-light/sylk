@@ -1412,7 +1412,7 @@ func bootServiceDeterminism(participantID string) claims.HandlerDeterminism {
 	switch participantID {
 	case SystemProviderGatewayID:
 		return claims.HandlerDeterminismNondeterministic
-	case SystemVFSPipelineProvisionerID, SystemVFSToolProvisionerID, SystemVFSGlobalProvisionerID, SystemDAGProcessorID, SystemToolRuntimeID, SystemGuardianServiceID:
+	case SystemVFSPipelineProvisionerID, SystemVFSToolProvisionerID, SystemDAGProcessorID, SystemToolRuntimeID, SystemGuardianServiceID:
 		return claims.HandlerDeterminismSideEffect
 	default:
 		return claims.HandlerDeterminismContent

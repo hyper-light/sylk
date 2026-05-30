@@ -40,7 +40,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -320,11 +319,12 @@ type goroutineScopeProxy = GoroutineScopeProxy
 // ContinuationStoreConfig wires the per-agent store at construction.
 // All fields except ResumeFn are required.
 type ContinuationStoreConfig struct {
-	AgentID   string
-	SessionID string
-	Board     *claims.ClaimsBoard
-	ResumeFn  ResumeFn
-	Scope     GoroutineScopeProxy // optional; recommended in production
+	AgentID    string
+	SessionID  string
+	Board      *claims.ClaimsBoard
+	ResumeFn   ResumeFn
+	Scope      GoroutineScopeProxy // optional; recommended in production
+	Operations claims.ClaimsOperationsConfig
 }
 
 // NewContinuationStore constructs a per-agent continuation store.
@@ -336,6 +336,7 @@ func NewContinuationStore(cfg ContinuationStoreConfig) *ContinuationStore {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	operations := claims.NormalizeClaimsOperationsConfig(cfg.Operations)
 	return &ContinuationStore{
 		agentID:     cfg.AgentID,
 		sessionID:   cfg.SessionID,
@@ -344,7 +345,7 @@ func NewContinuationStore(cfg ContinuationStoreConfig) *ContinuationStore {
 		claimIndex:  make(map[string]string),
 		resumeFn:    cfg.ResumeFn,
 		scope:       cfg.Scope,
-		orphanLimit: computeContinuationOrphanLimit(),
+		orphanLimit: operations.Budgets.ContinuationOrphanLimit,
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -1430,6 +1431,33 @@ func (s *ContinuationStore) Stop(reason string) {
 	s.wg.Wait()
 }
 
+func (s *ContinuationStore) PendingContinuationCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending)
+}
+
+func (s *ContinuationStore) OrphanContinuationCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.orphans)
+}
+
+func (s *ContinuationStore) ContinuationOrphanLimit() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.orphanLimit
+}
+
 // CancelContinuation cancels one specific continuation by ID. Used
 // by tests and by future caller-driven cancellation surfaces (e.g.
 // a user pressing Esc to abort an in-flight consult round). The
@@ -1842,18 +1870,7 @@ func testamentRelatesToClaim(t claims.Testament, claimID string) bool {
 const orphanResolutionsMaxAge = 10 * time.Minute
 
 func computeContinuationOrphanLimit() int {
-	procs := runtime.GOMAXPROCS(0)
-	if procs < 1 {
-		procs = 1
-	}
-	limit := procs * continuationOrphanPerCoreFloor
-	if limit < continuationOrphanLimitMin {
-		return continuationOrphanLimitMin
-	}
-	if limit > continuationOrphanLimitMax {
-		return continuationOrphanLimitMax
-	}
-	return limit
+	return claims.DefaultClaimsOperationsConfig().Budgets.ContinuationOrphanLimit
 }
 
 func (s *ContinuationStore) stashOrphanResolutionLocked(delta *AwaitedClaimResult) {

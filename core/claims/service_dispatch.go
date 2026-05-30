@@ -52,12 +52,12 @@ type serviceShutdownHandler interface {
 }
 
 type ServiceDispatcherConfig struct {
-	Board       *ClaimsBoard
-	Subscriber  DeltaSubscriber
-	Scope       ScopeProvider
-	Participant ParticipantRegistration
-	Handler     ServiceHandler
-	SessionID   string
+	Board          *ClaimsBoard
+	Subscriber     DeltaSubscriber
+	Scope          ScopeProvider
+	Participant    ParticipantRegistration
+	Handler        ServiceHandler
+	SessionID      string
 	CancelRegistry *ClaimCancelRegistry
 }
 
@@ -69,15 +69,15 @@ type ServiceDispatcher struct {
 	handler     ServiceHandler
 	sessionID   string
 
-	mu            sync.Mutex
-	seen          map[string]struct{}
-	seenOrder     []string
-	inflight      chan struct{}
-	active        map[string]context.CancelFunc
-	subscriptions []DeltaSubscription
+	mu             sync.Mutex
+	seen           map[string]struct{}
+	seenOrder      []string
+	inflight       chan struct{}
+	active         map[string]context.CancelFunc
+	subscriptions  []DeltaSubscription
 	cancelRegistry *ClaimCancelRegistry
-	started       bool
-	closed        bool
+	started        bool
+	closed         bool
 }
 
 type ServiceDispatcherStats struct {
@@ -101,15 +101,15 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 		return nil, err
 	}
 	return &ServiceDispatcher{
-		board:       cfg.Board,
-		subscriber:  subscribeOrNoop(cfg.Subscriber),
-		scope:       cfg.Scope,
-		participant: participant,
-		handler:     cfg.Handler,
-		sessionID:   firstNonEmpty(strings.TrimSpace(cfg.SessionID), cfg.Board.SessionID()),
-		seen:        make(map[string]struct{}, participant.QueueCapacity*serviceSeenKeysPerDelta),
-		inflight:    make(chan struct{}, participant.ConcurrencyBudget),
-		active:      make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
+		board:          cfg.Board,
+		subscriber:     subscribeOrNoop(cfg.Subscriber),
+		scope:          cfg.Scope,
+		participant:    participant,
+		handler:        cfg.Handler,
+		sessionID:      firstNonEmpty(strings.TrimSpace(cfg.SessionID), cfg.Board.SessionID()),
+		seen:           make(map[string]struct{}, participant.QueueCapacity*serviceSeenKeysPerDelta),
+		inflight:       make(chan struct{}, participant.ConcurrencyBudget),
+		active:         make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
 		cancelRegistry: firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
 	}, nil
 }

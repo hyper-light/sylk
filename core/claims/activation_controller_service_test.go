@@ -10,7 +10,7 @@ import (
 
 func TestActivationControllerServiceActivateDeactivateAndQuery(t *testing.T) {
 	service := NewActivationControllerService(ActivationControllerServiceConfig{})
-	record, err := service.Activate(context.Background(), ActivationRecordArtifactData{
+	record, err := service.activate(context.Background(), ActivationRecordArtifactData{
 		ParticipantID:   "guide",
 		ParticipantType: "agent",
 		Tier:            "always_hot",
@@ -23,11 +23,11 @@ func TestActivationControllerServiceActivateDeactivateAndQuery(t *testing.T) {
 	if !record.Ready || record.ReplicaCount != 2 || record.Tier != "always_hot" {
 		t.Fatalf("activation record = %+v, want ready always_hot replicas", record)
 	}
-	got, ok := service.QueryTier(context.Background(), "guide")
+	got, ok := service.queryTier(context.Background(), "guide")
 	if !ok || got.ParticipantID != record.ParticipantID || !got.Ready {
 		t.Fatalf("QueryTier = %+v ok=%v, want ready guide", got, ok)
 	}
-	deactivated, err := service.Deactivate(context.Background(), "guide", "shutdown")
+	deactivated, err := service.deactivate(context.Background(), "guide", "shutdown")
 	if err != nil {
 		t.Fatalf("Deactivate: %v", err)
 	}
@@ -38,16 +38,16 @@ func TestActivationControllerServiceActivateDeactivateAndQuery(t *testing.T) {
 
 func TestActivationControllerServiceRejectsInvalidRecordsAndCapacity(t *testing.T) {
 	service := NewActivationControllerService(ActivationControllerServiceConfig{MaxRecords: 1})
-	if _, err := service.Activate(context.Background(), ActivationRecordArtifactData{ReplicaCount: 1}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
+	if _, err := service.activate(context.Background(), ActivationRecordArtifactData{ReplicaCount: 1}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
 		t.Fatalf("missing participant error = %v, want invalid", err)
 	}
-	if _, err := service.Activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide"}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
+	if _, err := service.activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide"}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
 		t.Fatalf("missing replicas error = %v, want invalid", err)
 	}
-	if _, err := service.Activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide", ReplicaCount: 1}); err != nil {
+	if _, err := service.activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide", ReplicaCount: 1}); err != nil {
 		t.Fatalf("Activate first: %v", err)
 	}
-	if _, err := service.Activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "engineer", ReplicaCount: 1}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
+	if _, err := service.activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "engineer", ReplicaCount: 1}); !errors.Is(err, ErrActivationControllerServiceInvalid) {
 		t.Fatalf("capacity error = %v, want invalid", err)
 	}
 }
@@ -200,7 +200,7 @@ func TestActivationControllerServiceConcurrentActivationConverges(t *testing.T) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := service.Activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide", Tier: "always_hot", ReplicaCount: 1})
+			_, err := service.activate(context.Background(), ActivationRecordArtifactData{ParticipantID: "guide", Tier: "always_hot", ReplicaCount: 1})
 			errs <- err
 		}()
 	}
@@ -211,7 +211,7 @@ func TestActivationControllerServiceConcurrentActivationConverges(t *testing.T) 
 			t.Fatalf("Activate concurrent: %v", err)
 		}
 	}
-	got, ok := service.QueryTier(context.Background(), "guide")
+	got, ok := service.queryTier(context.Background(), "guide")
 	if !ok || !got.Ready || got.ReplicaCount != 1 {
 		t.Fatalf("converged activation = %+v ok=%v, want one ready state", got, ok)
 	}

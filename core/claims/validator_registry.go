@@ -664,6 +664,12 @@ type BoardValidatorDispatcher struct {
 	active               map[string]context.CancelFunc
 }
 
+type BoardValidatorDispatcherStats struct {
+	InFlight            int      `json:"in_flight"`
+	Active              int      `json:"active"`
+	ActiveValidationIDs []string `json:"active_validation_ids,omitempty"`
+}
+
 func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardValidatorDispatcher, error) {
 	if cfg.Board == nil || cfg.Registry == nil {
 		return nil, fmt.Errorf("%w: board and registry are required", ErrValidatorDispatchInvalid)
@@ -759,6 +765,24 @@ func (d *BoardValidatorDispatcher) CancelClaimValidations(claim *Claim) int {
 	}
 	cancelled += d.cancelRegistry.CancelClaim(claim.ID)
 	return cancelled
+}
+
+func (d *BoardValidatorDispatcher) Stats() BoardValidatorDispatcherStats {
+	if d == nil {
+		return BoardValidatorDispatcherStats{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	active := make([]string, 0, len(d.active))
+	for validationID := range d.active {
+		active = append(active, validationID)
+	}
+	sort.Strings(active)
+	return BoardValidatorDispatcherStats{
+		InFlight:            len(d.inFlight),
+		Active:              len(d.active),
+		ActiveValidationIDs: active,
+	}
 }
 
 func (d *BoardValidatorDispatcher) dispatchAcquiredValidation(ctx context.Context, req ValidationDispatchRequest) (ValidationDispatchResult, error) {

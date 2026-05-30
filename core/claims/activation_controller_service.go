@@ -53,7 +53,7 @@ func (s *ActivationControllerService) HandleServiceClaim(ctx context.Context, re
 	return s.handleActivationControllerCall(ctx, call)
 }
 
-func (s *ActivationControllerService) Activate(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
+func (s *ActivationControllerService) activate(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
 	if err := validateActivationControllerService(s); err != nil {
 		return ActivationRecordArtifactData{}, err
 	}
@@ -74,11 +74,11 @@ func (s *ActivationControllerService) Activate(ctx context.Context, input Activa
 	return record, nil
 }
 
-func (s *ActivationControllerService) Deactivate(ctx context.Context, participantID, reason string) (ActivationRecordArtifactData, error) {
-	return s.DeactivateRecord(ctx, ActivationRecordArtifactData{ParticipantID: participantID, Operation: "deactivate", FailureReason: reason})
+func (s *ActivationControllerService) deactivate(ctx context.Context, participantID, reason string) (ActivationRecordArtifactData, error) {
+	return s.deactivateRecord(ctx, ActivationRecordArtifactData{ParticipantID: participantID, Operation: "deactivate", FailureReason: reason})
 }
 
-func (s *ActivationControllerService) DeactivateRecord(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
+func (s *ActivationControllerService) deactivateRecord(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
 	if err := validateActivationControllerService(s); err != nil {
 		return ActivationRecordArtifactData{}, err
 	}
@@ -112,7 +112,7 @@ func (s *ActivationControllerService) DeactivateRecord(ctx context.Context, inpu
 	return record, nil
 }
 
-func (s *ActivationControllerService) QueryTier(ctx context.Context, participantID string) (ActivationRecordArtifactData, bool) {
+func (s *ActivationControllerService) queryTier(ctx context.Context, participantID string) (ActivationRecordArtifactData, bool) {
 	if s == nil || ctxOrBackground(ctx).Err() != nil {
 		return ActivationRecordArtifactData{}, false
 	}
@@ -140,7 +140,7 @@ func (s *ActivationControllerService) handleActivate(ctx context.Context, call E
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
-	record, err := s.Activate(ctx, input)
+	record, err := s.activate(ctx, input)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
@@ -154,7 +154,7 @@ func (s *ActivationControllerService) handleDeactivate(ctx context.Context, call
 	}
 	record.ParticipantID = firstNonEmpty(record.ParticipantID, stringArg(call.Arguments, "participant_id"))
 	record.FailureReason = firstNonEmpty(record.FailureReason, stringArg(call.Arguments, "failure_reason"), stringArg(call.Arguments, "reason"))
-	record, err = s.DeactivateRecord(ctx, record)
+	record, err = s.deactivateRecord(ctx, record)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
@@ -162,7 +162,7 @@ func (s *ActivationControllerService) handleDeactivate(ctx context.Context, call
 }
 
 func (s *ActivationControllerService) handleQueryTier(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
-	record, ok := s.QueryTier(ctx, stringArg(call.Arguments, "participant_id"))
+	record, ok := s.queryTier(ctx, stringArg(call.Arguments, "participant_id"))
 	if ok {
 		record.Operation = "query_tier"
 		return activationRecordResult(record, "activation queried ")

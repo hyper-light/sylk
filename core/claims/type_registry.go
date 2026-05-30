@@ -27,6 +27,8 @@ const (
 	ArtifactDataTypeIdentityLineage            = "sylk.identity_lineage.v1"
 	ArtifactDataTypeActivationRecord           = "sylk.activation_record.v1"
 	ArtifactDataTypeProductionReadiness        = "sylk.production_readiness.v1"
+	ArtifactDataTypeOutboxRepairReport         = "sylk.outbox_repair_report.v1"
+	ArtifactDataTypeClaimsOperationsAudit      = "sylk.claims_operations_audit.v1"
 )
 
 const (
@@ -346,6 +348,8 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeIdentityLineage, IdentityLineageArtifactData{}},
 		{ArtifactDataTypeActivationRecord, ActivationRecordArtifactData{}},
 		{ArtifactDataTypeProductionReadiness, ProductionReadinessArtifactData{}},
+		{ArtifactDataTypeOutboxRepairReport, OutboxRepairReport{}},
+		{ArtifactDataTypeClaimsOperationsAudit, OperationsAuditResult{}},
 		{ArtifactDataTypeDAGOperation, DAGOperationArtifactData{}},
 		{ArtifactDataTypeVFSOperation, VFSOperationArtifactData{}},
 		{ArtifactDataTypeBootPhase, BootPhaseArtifactData{}},
