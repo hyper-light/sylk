@@ -22,6 +22,13 @@ type InfrastructureShadowComparison struct {
 	ComparedAt  time.Time `json:"compared_at"`
 }
 
+type InfrastructurePromotionDecision struct {
+	Subsystem string                           `json:"subsystem"`
+	Allowed   bool                             `json:"allowed"`
+	Mode      InfrastructureRolloutMode        `json:"mode"`
+	Blockers  []InfrastructureShadowComparison `json:"blockers,omitempty"`
+}
+
 func CompareInfrastructureShadow(subsystem string, serviceArtifacts, directArtifacts []*Artifact) InfrastructureShadowComparison {
 	comparison := InfrastructureShadowComparison{
 		Subsystem:   strings.TrimSpace(subsystem),
@@ -57,6 +64,21 @@ func RecordInfrastructureShadowComparison(ctx context.Context, board *ClaimsBoar
 			"comparison": comparison,
 		},
 	})
+}
+
+func EvaluateInfrastructurePromotion(cfg RolloutConfig, subsystem string, comparisons []InfrastructureShadowComparison) InfrastructurePromotionDecision {
+	subsystem = strings.TrimSpace(subsystem)
+	decision := InfrastructurePromotionDecision{Subsystem: subsystem, Mode: cfg.InfrastructureMode(subsystem), Allowed: true}
+	for _, comparison := range comparisons {
+		if strings.TrimSpace(comparison.Subsystem) != subsystem || !comparison.Critical {
+			continue
+		}
+		decision.Blockers = append(decision.Blockers, comparison)
+	}
+	if len(decision.Blockers) != 0 {
+		decision.Allowed = false
+	}
+	return decision
 }
 
 func rolloutArtifactSetHash(artifacts []*Artifact) string {

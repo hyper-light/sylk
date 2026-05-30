@@ -390,9 +390,9 @@ func TestGenerateClaimActionValidatesStructure(t *testing.T) {
 			c.Validations = []*Validation{{Description: "validation", QualityBar: "must pass", Type: ValidationTypeInspection, Required: true}}
 			return c
 		}()},
-		{name: "missing validation quality bar", action: Action{AgentID: "architect", Type: ActionTypeTask}, claim: func() Claim {
+		{name: "invalid validation expected tool", action: Action{AgentID: "architect", Type: ActionTypeTask}, claim: func() Claim {
 			c := base
-			c.Validations = []*Validation{{ID: "validation-id", Description: "validation", Type: ValidationTypeInspection, Required: true}}
+			c.Validations = []*Validation{{ID: "validation-id", Description: "validation", QualityBar: "must pass", Type: ValidationTypeInspection, Required: true, ExpectedToolCalls: []ExpectedToolCall{{Required: true}}}}
 			return c
 		}()},
 		{name: "invalid expected tool", action: Action{AgentID: "architect", Type: ActionTypeTask}, claim: func() Claim {

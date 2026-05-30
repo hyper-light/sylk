@@ -370,9 +370,6 @@ func normalizeLegacyClaimValidations(claim *Claim) error {
 		if strings.TrimSpace(validation.Description) == "" {
 			validation.Description = "validation for " + firstNonEmpty(claim.Title, claim.ID)
 		}
-		if strings.TrimSpace(validation.QualityBar) == "" {
-			validation.QualityBar = "must satisfy validation"
-		}
 	}
 	return nil
 }
@@ -1808,6 +1805,7 @@ func (b *ClaimsBoard) projectionLocked() *ClaimsBoardProjection {
 	b.populateClaimsProjectionLocked(p)
 	b.populateActionsProjectionLocked(p)
 	b.populateTestamentsProjectionLocked(p)
+	b.populateArtifactsProjectionLocked(p)
 
 	if errors := b.notificationErrorsSnapshotLocked(); len(errors) > 0 {
 		p.NotificationErrors = errors
@@ -1937,6 +1935,34 @@ func (b *ClaimsBoard) populateTestamentsProjectionLocked(p *ClaimsBoardProjectio
 		p.TotalTestaments++
 		p.TotalArtifacts += len(t.Artifacts)
 	}
+}
+
+func (b *ClaimsBoard) populateArtifactsProjectionLocked(p *ClaimsBoardProjection) {
+	artifacts := make([]*Artifact, 0, len(b.artifacts))
+	seen := make(map[string]struct{}, len(b.artifacts))
+	for _, artifact := range b.artifacts {
+		if artifact == nil || strings.TrimSpace(artifact.ID) == "" {
+			continue
+		}
+		if _, ok := seen[artifact.ID]; ok {
+			continue
+		}
+		seen[artifact.ID] = struct{}{}
+		artifacts = append(artifacts, artifact)
+	}
+	sort.SliceStable(artifacts, func(i, j int) bool {
+		if artifacts[i].Sequence != artifacts[j].Sequence {
+			return artifacts[i].Sequence < artifacts[j].Sequence
+		}
+		return artifacts[i].ID < artifacts[j].ID
+	})
+	p.Artifacts = make([]Artifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if clone := CloneArtifact(artifact); clone != nil {
+			p.Artifacts = append(p.Artifacts, *clone)
+		}
+	}
+	p.TotalArtifacts = len(p.Artifacts)
 }
 
 func (b *ClaimsBoard) ReadyForValidation() bool {
@@ -2365,7 +2391,10 @@ func (b *ClaimsBoard) existingArtifactForAttachmentLocked(candidate *Artifact, t
 	if strings.TrimSpace(candidate.ID) != "" {
 		return b.artifacts[candidate.ID]
 	}
-	claimID := firstNonEmpty(candidate.ClaimID, ClaimIDFromRelations(testament.Relations))
+	claimID := strings.TrimSpace(candidate.ClaimID)
+	if testament != nil {
+		claimID = firstNonEmpty(claimID, ClaimIDFromRelations(testament.Relations))
+	}
 	for _, artifact := range b.artifacts {
 		if artifact == nil || artifact.TestamentID != "" || artifact.ClaimID != claimID {
 			continue

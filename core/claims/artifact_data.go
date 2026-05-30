@@ -94,6 +94,42 @@ func ArtifactDataWithRegistry[T any](registry *TypeRegistry, artifact *Artifact)
 	return zero, nil
 }
 
+func ValidateArtifactDataPayload(artifact *Artifact) error {
+	return ValidateArtifactDataPayloadWithRegistry(DefaultTypeRegistry(), artifact)
+}
+
+func ValidateArtifactDataPayloadWithRegistry(registry *TypeRegistry, artifact *Artifact) error {
+	if artifact == nil {
+		return artifactDataError("", "", "validate", ErrArtifactDataNil)
+	}
+	entry, err := lookupArtifactPayloadType(registry, artifact)
+	if err != nil {
+		return artifactDataError(artifact.ID, artifact.DataType, "validate", err)
+	}
+	if len(artifact.Data) == 0 {
+		return artifactDataError(artifact.ID, artifact.DataType, "validate", ErrArtifactDataEmpty)
+	}
+	if err := validateArtifactContentHash(artifact); err != nil {
+		return artifactDataError(artifact.ID, artifact.DataType, "validate", err)
+	}
+	target := reflect.New(entry.GoType).Interface()
+	if err := safeCodecUnmarshal(entry.Codec, append([]byte(nil), artifact.Data...), target); err != nil {
+		return artifactDataError(artifact.ID, artifact.DataType, "unmarshal", err)
+	}
+	return nil
+}
+
+func lookupArtifactPayloadType(registry *TypeRegistry, artifact *Artifact) (RegisteredArtifactType, error) {
+	if registry == nil {
+		return RegisteredArtifactType{}, ErrArtifactTypeUnknown
+	}
+	dataType := strings.TrimSpace(artifact.DataType)
+	if dataType == "" {
+		return RegisteredArtifactType{}, ErrArtifactDataMismatch
+	}
+	return registry.LookupArtifactType(dataType)
+}
+
 func ArtifactContentHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])

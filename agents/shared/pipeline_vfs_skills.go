@@ -127,6 +127,62 @@ func vfsFirstNonEmpty(values ...string) string {
 	return ""
 }
 
+func recordPipelineVFSEvidence(ctx context.Context, cfg PipelineVFSSkillConfig, pipelineID, operation, reference, failureReason string, result versioning.MergePipelineResult, metadata map[string]any) {
+	if cfg.Board == nil {
+		return
+	}
+	board := cfg.Board()
+	if board == nil {
+		return
+	}
+	data := claims.VFSOperationArtifactData{
+		Operation:        operation,
+		Scope:            "global",
+		MountRef:         "global:" + strings.TrimSpace(pipelineID),
+		BaseVersion:      result.BaseVersion.String(),
+		ResultingVersion: result.MergedVersion.String(),
+		Attached:         false,
+		Status:           claims.InfrastructureStatusOK,
+		FailureReason:    strings.TrimSpace(failureReason),
+		Metadata:         mergeVFSMetadata(metadata, map[string]any{"pipeline_id": strings.TrimSpace(pipelineID)}),
+	}
+	if data.FailureReason != "" {
+		data.Status = claims.InfrastructureStatusFailed
+	}
+	if operation == claims.VFSProvisionerToolRollback {
+		data.ResultingVersion = ""
+	}
+	artifact, err := claims.NewVFSOperationArtifact(data)
+	if err != nil {
+		board.RecordNotificationError(operation + " evidence artifact: " + err.Error())
+		return
+	}
+	artifact.Reference = vfsFirstNonEmpty(strings.TrimSpace(reference), artifact.Reference)
+	_, err = claims.RecordInfrastructureEvidence(ctx, claims.InfrastructureEvidenceOptions{
+		Board:         board,
+		ActorID:       vfsAgentID(ctx, cfg),
+		SubjectID:     "sys:vfs_global_provisioner",
+		Operation:     operation,
+		ParentClaimID: claims.ParentClaimIDFromContext(ctx),
+		Artifact:      artifact,
+	})
+	if err != nil {
+		slog.Error("pipeline_vfs_evidence_failed", "operation", operation, "error", err.Error())
+		board.RecordNotificationError(operation + " evidence: " + err.Error())
+	}
+}
+
+func mergeVFSMetadata(primary, fallback map[string]any) map[string]any {
+	out := make(map[string]any, len(primary)+len(fallback))
+	for key, value := range fallback {
+		out[key] = value
+	}
+	for key, value := range primary {
+		out[key] = value
+	}
+	return out
+}
+
 // ────────────────────────────────────────────────────────────────────
 // 1. PipelineHandoffOTVFSSkill  (handoff_to_ot)
 // ────────────────────────────────────────────────────────────────────
@@ -196,50 +252,20 @@ func PipelineHandoffOTVFSSkill(cfg PipelineVFSSkillConfig) *skills.Skill {
 				}
 				result, mergeErr := committer.MergePipelineIntoGreen(ctx, pipelineID, cert)
 				if mergeErr != nil {
-					// Submit failure testament before returning error.
-					if cfg.Board != nil {
-						if board := cfg.Board(); board != nil {
-							if tErr := board.SubmitTestaments(ctx,
-								claims.Action{Type: claims.ActionTypeTestament, AgentID: vfsAgentID(ctx, cfg)},
-								[]claims.Testament{{
-									AgentID: vfsAgentID(ctx, cfg),
-									Summary: "pipeline merge failed: " + mergeErr.Error(),
-									Artifacts: []*claims.Artifact{{
-										AgentID: vfsAgentID(ctx, cfg), Kind: "error", Reference: mergeErr.Error(),
-									}},
-								}},
-							); tErr != nil {
-								slog.Error("handoff_ot_failure_testament_failed", "error", tErr.Error())
-								board.RecordNotificationError("handoff_to_ot failure testament: " + tErr.Error())
-							}
-						}
-					}
+					recordPipelineVFSEvidence(ctx, cfg, pipelineID, claims.VFSProvisionerToolMerge, "pipeline merge failed: "+mergeErr.Error(), mergeErr.Error(), versioning.MergePipelineResult{PipelineID: pipelineID}, map[string]any{"summary": summary})
 					return nil, fmt.Errorf("merge pipeline %s into green: %w", pipelineID, mergeErr)
 				}
 				hadDraft = result.HadDraft
 				baseVersion = result.BaseVersion
 				mergedVersion = result.MergedVersion
 				pathCount = result.PathCount
-			}
-
-			// Claims board testament: "pipeline accepted" — submitted
-			// AFTER successful merge so the board reflects reality.
-			if cfg.Board != nil {
-				if board := cfg.Board(); board != nil {
-					if err := board.SubmitTestaments(ctx,
-						claims.Action{Type: claims.ActionTypeTestament, AgentID: vfsAgentID(ctx, cfg)},
-						[]claims.Testament{{
-							AgentID: vfsAgentID(ctx, cfg),
-							Summary: "pipeline accepted: " + summary,
-							Artifacts: []*claims.Artifact{
-								{AgentID: vfsAgentID(ctx, cfg), Kind: "merge_result", Reference: mergedVersion.String()},
-							},
-						}},
-					); err != nil {
-						slog.Error("handoff_ot_testament_failed", "error", err.Error())
-						board.RecordNotificationError("handoff_to_ot testament: " + err.Error())
-					}
-				}
+				recordPipelineVFSEvidence(ctx, cfg, pipelineID, claims.VFSProvisionerToolMerge, mergedVersion.String(), "", result, map[string]any{
+					"summary":        summary,
+					"declared_scope": declaredScope,
+					"open_concerns":  openConcerns,
+					"paths_merged":   pathCount,
+					"had_draft":      hadDraft,
+				})
 			}
 
 			// ── Pipeline success update ────────────────────────────
@@ -367,28 +393,10 @@ func PipelineDiscardPipelineVFSSkill(cfg PipelineVFSSkillConfig) *skills.Skill {
 
 			// ── VFS rollback ───────────────────────────────────────
 			if err := committer.Rollback(ctx, pipelineID); err != nil {
+				recordPipelineVFSEvidence(ctx, cfg, pipelineID, claims.VFSProvisionerToolRollback, "pipeline rollback failed: "+err.Error(), err.Error(), versioning.MergePipelineResult{PipelineID: pipelineID}, map[string]any{"reason": reason})
 				return nil, fmt.Errorf("rollback pipeline %s: %w", pipelineID, err)
 			}
-
-			// ── Claims board testament ─────────────────────────────
-			if cfg.Board != nil {
-				if board := cfg.Board(); board != nil {
-					if err := board.SubmitTestaments(ctx,
-						claims.Action{Type: claims.ActionTypeTestament, AgentID: vfsAgentID(ctx, cfg)},
-						[]claims.Testament{{
-							AgentID: vfsAgentID(ctx, cfg),
-							Summary: "pipeline discarded: " + reason,
-							Artifacts: []*claims.Artifact{
-								{AgentID: vfsAgentID(ctx, cfg), Kind: "discard_reason", Reference: reason},
-								{AgentID: vfsAgentID(ctx, cfg), Kind: "pipeline_id", Reference: pipelineID},
-							},
-						}},
-					); err != nil {
-						slog.Error("discard_pipeline_testament_failed", "error", err.Error())
-						board.RecordNotificationError("discard_pipeline testament: " + err.Error())
-					}
-				}
-			}
+			recordPipelineVFSEvidence(ctx, cfg, pipelineID, claims.VFSProvisionerToolRollback, "pipeline discarded: "+reason, "", versioning.MergePipelineResult{PipelineID: pipelineID}, map[string]any{"reason": reason})
 
 			// ── Failure update ─────────────────────────────────────
 			if task != nil {

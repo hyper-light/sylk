@@ -20,14 +20,17 @@ func TestDirectVFSBypassAllowlistIsNarrow(t *testing.T) {
 	allowed := []string{
 		"github.com/adalundhe/sylk/core/versioning",
 		"github.com/adalundhe/sylk/core/claims",
-		"github.com/adalundhe/sylk/agents/shared",
 	}
 	for _, pkg := range allowed {
 		if !directVFSBypassAllowed(pkg) {
 			t.Fatalf("expected %s to be explicitly allowlisted", pkg)
 		}
 	}
+	if !directVFSBypassAllowedAt("github.com/adalundhe/sylk/agents/shared", "/repo/agents/shared/pipeline_committer.go") {
+		t.Fatal("expected pipeline_committer.go to be the only agents/shared direct VFS migration wrapper")
+	}
 	blocked := []string{
+		"github.com/adalundhe/sylk/agents/shared",
 		"github.com/adalundhe/sylk/agents/orchestrator",
 		"github.com/adalundhe/sylk/agents/engineer",
 		"github.com/adalundhe/sylk/ui/bridge",

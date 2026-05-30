@@ -178,6 +178,7 @@ func RebuildClaimsProjectionsSkillWithRegistry(bp BoardProvider, registry *Sessi
 		BoolParam("dry_run", "When true, report what would be replayed without calling projectors or changing outbox state.", false).
 		BoolParam("resume_from_last_success", "When true, skip records already marked succeeded for each selected projector.", false).
 		BoolParam("emit_report", "When true, submit a projection_rebuild_report testament to the board.", false).
+		BoolParam("authorized", "Required for non-dry-run repair. Dry-run remains the default safe mode.", false).
 		Usage("Use for operational repair when projection health shows lag, retryable failures, or missing deterministic knowledge/fabric projection. Prefer dry_run=true before replaying.").
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := requireBoard(bp)
@@ -192,19 +193,27 @@ func RebuildClaimsProjectionsSkillWithRegistry(bp BoardProvider, registry *Sessi
 				FromSequence          int    `json:"from_sequence"`
 				ToSequence            int    `json:"to_sequence"`
 				Limit                 int    `json:"limit"`
-				DryRun                bool   `json:"dry_run"`
+				DryRun                *bool  `json:"dry_run"`
 				ResumeFromLastSuccess bool   `json:"resume_from_last_success"`
 				EmitReport            bool   `json:"emit_report"`
+				Authorized            bool   `json:"authorized"`
 			}
 			if err := json.Unmarshal(input, &params); err != nil {
 				return nil, fmt.Errorf("invalid parameters: %w", err)
+			}
+			dryRun := true
+			if params.DryRun != nil {
+				dryRun = *params.DryRun
+			}
+			if !dryRun && !params.Authorized {
+				return nil, fmt.Errorf("projection repair apply requires authorized=true; run dry_run=true first")
 			}
 			rebuild := ProjectionRebuildOptions{
 				Projectors:            splitProjectorParam(params.Projectors),
 				FromSequence:          positiveIntToUint64(params.FromSequence),
 				ToSequence:            positiveIntToUint64(params.ToSequence),
 				Limit:                 params.Limit,
-				DryRun:                params.DryRun,
+				DryRun:                dryRun,
 				ResumeFromLastSuccess: params.ResumeFromLastSuccess,
 				EmitReport:            params.EmitReport,
 			}

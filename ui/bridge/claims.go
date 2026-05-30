@@ -824,10 +824,11 @@ type participantDisplayRef struct {
 }
 
 func participantDisplayFromAgentRef(ref claims.AgentRef) participantDisplayRef {
+	explicitCategory := strings.TrimSpace(ref.Category)
 	ref = ref.Normalized()
 	route := firstNonBlank(ref.Name, ref.Type, ref.RouteKey())
 	agentID := firstNonBlank(ref.RouteKey(), route)
-	category := normalizeParticipantDisplayCategory(ref.Category, agentID)
+	category := explicitParticipantDisplayCategory(firstNonBlank(explicitCategory, ref.Category))
 	return participantDisplayRef{
 		AgentID:  agentID,
 		UID:      firstNonBlank(ref.UID, agentID),
@@ -853,6 +854,19 @@ func participantDisplayFromArtifact(art *claims.Artifact) participantDisplayRef 
 	return ref
 }
 
+func participantDisplayFromArtifactWithMeta(meta claimMeta, art *claims.Artifact) participantDisplayRef {
+	if art == nil {
+		return participantDisplayRef{}
+	}
+	actor := firstNonBlank(strings.TrimSpace(art.ParticipantID), strings.TrimSpace(art.AgentID))
+	if actor != "" {
+		if ref := participantRefForActor(meta, actor); ref.UID != "" || ref.Category != "" || ref.Route != "" {
+			return ref
+		}
+	}
+	return participantDisplayFromArtifact(art)
+}
+
 func participantDisplayFromRelationID(agentID string) participantDisplayRef {
 	agentID = strings.TrimSpace(agentID)
 	if agentID == "" {
@@ -861,7 +875,7 @@ func participantDisplayFromRelationID(agentID string) participantDisplayRef {
 	return participantDisplayRef{
 		AgentID:  agentID,
 		UID:      agentID,
-		Category: normalizeParticipantDisplayCategory("", agentID),
+		Category: "",
 		Route:    participantRouteFromRelationID(agentID),
 	}
 }
@@ -874,48 +888,12 @@ func participantRouteFromRelationID(agentID string) string {
 	return agentID
 }
 
-func normalizeParticipantDisplayCategory(category, agentID string) string {
+func explicitParticipantDisplayCategory(category string) string {
 	category = strings.TrimSpace(category)
 	if claims.ParticipantCategory(category).Valid() {
 		return category
 	}
-	return inferredParticipantCategory(agentID)
-}
-
-func inferredParticipantCategory(agentID string) string {
-	agentID = strings.TrimSpace(agentID)
-	switch {
-	case strings.HasPrefix(agentID, "participant:service:"):
-		return string(claims.ParticipantCategoryService)
-	case strings.HasPrefix(agentID, "participant:system:"):
-		return string(claims.ParticipantCategorySystem)
-	case strings.HasPrefix(agentID, "participant:external:"):
-		return string(claims.ParticipantCategoryExternal)
-	case strings.HasPrefix(agentID, "external:"):
-		return string(claims.ParticipantCategoryExternal)
-	case knownServiceRoute(agentID):
-		return string(claims.ParticipantCategoryService)
-	default:
-		return string(claims.ParticipantCategoryAgent)
-	}
-}
-
-func knownServiceRoute(agentID string) bool {
-	switch strings.TrimSpace(agentID) {
-	case "sys:dag_processor",
-		"sys:vfs_tool_provisioner",
-		"sys:tool_runtime",
-		"sys:knowledge_graph",
-		"sys:memory_forest",
-		"sys:document_db",
-		"sys:guardian_gate",
-		"sys:provider_gateway",
-		"sys:external_adapter",
-		"activation_controller":
-		return true
-	default:
-		return false
-	}
+	return ""
 }
 
 func (b *ClaimsBridge) currentBoard() (*claims.ClaimsBoard, string) {
@@ -1605,7 +1583,7 @@ func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, ar
 		meta = withOwnerParticipant(meta, participantDisplayFromRelationID(cycle.OwnerAgentID))
 	}
 	parentRowID := b.parentRowIDForClaimLocked(claimID)
-	artifactRef := participantDisplayFromArtifact(art)
+	artifactRef := participantDisplayFromArtifactWithMeta(meta, art)
 	b.emittedStartedArtifacts[artifactID] = struct{}{}
 	return &msg.ClaimArtifactAddedMsg{
 		ArtifactID:                  artifactID,
@@ -1723,15 +1701,16 @@ func (b *ClaimsBridge) claimResponseTextMsgLocked(sessionID, claimID string, art
 	if content == "" {
 		return nil
 	}
+	participantRef := participantDisplayFromArtifactWithMeta(meta, art)
 	return &msg.ClaimResponseTextMsg{
 		SessionID:           sessionID,
 		CycleID:             meta.CycleID,
 		ClaimID:             claimID,
 		ParentRowID:         b.parentRowIDForClaimLocked(claimID),
 		AgentID:             firstNonBlank(strings.TrimSpace(art.AgentID), claimContextActor(meta, ""), meta.OwnerAgentID),
-		ParticipantUID:      participantDisplayFromArtifact(art).UID,
-		ParticipantCategory: participantDisplayFromArtifact(art).Category,
-		ParticipantRoute:    participantDisplayFromArtifact(art).Route,
+		ParticipantUID:      participantRef.UID,
+		ParticipantCategory: participantRef.Category,
+		ParticipantRoute:    participantRef.Route,
 		Content:             content,
 		CreatedAt:           nonZeroTime(art.Created),
 		SuppressChat:        meta.SuppressChat,
@@ -1875,7 +1854,7 @@ func (b *ClaimsBridge) claimPresentationMsgLocked(sessionID, claimID string, art
 	}
 	content = safeClaimPresentationContent(sourceID, content, format)
 	b.observePresentationMetricLocked(claimsPresentationMessagesEmitted, string(claims.PresentationSurfaceChat), format, "")
-	participantRef := participantDisplayFromArtifact(art)
+	participantRef := participantDisplayFromArtifactWithMeta(meta, art)
 	return &msg.ClaimPresentationMsg{
 		SessionID:           sessionID,
 		CycleID:             cycleID,

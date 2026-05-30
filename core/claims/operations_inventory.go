@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 type OperationsSurfaceStatus string
@@ -20,6 +21,12 @@ type OperationsInventoryEntry struct {
 	Status      OperationsSurfaceStatus
 	Package     string
 	Boundary    string
+}
+
+type OperationsInventoryOwner struct {
+	Requirement  string
+	OwnerClaimID string
+	Deadline     string
 }
 
 var (
@@ -73,10 +80,10 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.invariant.no_untracked_goroutines", OperationsSurfacePartial, "core/claims", "ScopeProvider"},
 		{"ops.invariant.no_unbounded_queues", OperationsSurfacePartial, "core/claims", "ParticipantRegistration"},
 		{"ops.invariant.no_silent_drops", OperationsSurfaceImplemented, "core/claims", "ServiceDispatcher"},
-		{"ops.invariant.cancellation_propagates", OperationsSurfacePlanned, "core/claims", "cancellation graph traversal"},
+		{"ops.invariant.cancellation_propagates", OperationsSurfaceImplemented, "core/claims", "CancelClaimTree"},
 		{"ops.invariant.replay_reconstructs_state", OperationsSurfaceImplemented, "core/claims", "OpenDurableBoard"},
 		{"ops.invariant.bootstrap_idempotent", OperationsSurfaceImplemented, "core/boot", "OperationsSequencer"},
-		{"ops.invariant.shutdown_drains", OperationsSurfacePlanned, "core/claims", "shutdown drain ordering"},
+		{"ops.invariant.shutdown_drains", OperationsSurfaceImplemented, "core/claims", "SessionShutdownCoordinator"},
 		{"ops.invariant.performance_bounds_declared", OperationsSurfacePartial, "core/claims", "ParticipantRegistration"},
 		{"ops.boot.phase_0", OperationsSurfaceImplemented, "core/boot", "InitializePhase0"},
 		{"ops.boot.phase_1", OperationsSurfaceImplemented, "core/boot", "CommitPhase1"},
@@ -88,7 +95,7 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.boot.phase_7", OperationsSurfaceImplemented, "core/boot", "CommitPhase7"},
 		{"ops.dispatch.service_handlers", OperationsSurfaceImplemented, "core/claims", "ServiceDispatcher"},
 		{"ops.dispatch.validator_registry", OperationsSurfaceImplemented, "core/claims", "ProgrammaticValidatorDispatcher"},
-		{"ops.recovery.orphan_validations", OperationsSurfacePlanned, "core/claims", "recovery audit worker"},
+		{"ops.recovery.orphan_validations", OperationsSurfaceImplemented, "core/claims", "RecoverServiceWork"},
 		{"ops.telemetry.exporters", OperationsSurfacePlanned, "core/claims", "telemetry exporter"},
 		{"ops.ui.observer_intake", OperationsSurfacePartial, "ui/bridge", "ClaimsBridge.startClaimsIntake"},
 		{"ops.delta.legacy_compatibility", OperationsSurfacePartial, "core/claims", "deltas.go"},
@@ -110,6 +117,32 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.service.fabric_subscriber", OperationsSurfaceImplemented, "core/claims", "SessionInboxRegistry"},
 		{"ops.service.bus_administrator", OperationsSurfaceImplemented, "core/claims", "DeltaBus"},
 	}
+}
+
+func OperationsInventoryOwners() map[string]OperationsInventoryOwner {
+	return map[string]OperationsInventoryOwner{
+		"ops.telemetry.exporters": {
+			Requirement:  "ops.telemetry.exporters",
+			OwnerClaimID: "claims-infra-telemetry-exporters",
+			Deadline:     "2026-06-30",
+		},
+	}
+}
+
+func ValidateOperationsInventoryPlanning(entries []OperationsInventoryEntry, owners map[string]OperationsInventoryOwner) error {
+	for _, entry := range entries {
+		if entry.Status != OperationsSurfacePlanned {
+			continue
+		}
+		owner := owners[strings.TrimSpace(entry.Requirement)]
+		if strings.TrimSpace(owner.OwnerClaimID) == "" || strings.TrimSpace(owner.Deadline) == "" || strings.TrimSpace(owner.Requirement) != strings.TrimSpace(entry.Requirement) {
+			return fmt.Errorf("%w: planned entry %s requires owner claim and deadline", ErrOperationsInventoryInvalid, entry.Requirement)
+		}
+		if _, err := time.Parse(time.DateOnly, strings.TrimSpace(owner.Deadline)); err != nil {
+			return fmt.Errorf("%w: planned entry %s has invalid deadline %q", ErrOperationsInventoryInvalid, entry.Requirement, owner.Deadline)
+		}
+	}
+	return nil
 }
 
 func deltaActionInventory() []OperationsInventoryEntry {

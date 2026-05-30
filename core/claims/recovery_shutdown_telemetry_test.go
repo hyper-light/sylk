@@ -124,6 +124,48 @@ func TestRecoverServiceWorkDoesNotReplayUnsafeNondeterministicClaim(t *testing.T
 	}
 }
 
+func TestRecoverServiceWorkRedispatchesSideEffectClaimWithRecoveryIdempotencyArtifact(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "recovery-board", SessionID: "recovery-session", TaskID: "task"})
+	participant := recoveryParticipant(t, claims.HandlerDeterminismSideEffect)
+	claimID := postMockeryInfrastructureClaim(t, board, participant.RouteKey, claims.ProviderGatewayToolComplete, map[string]any{"model": "mock"})
+	recordGeneratedRecoveryIdempotencyArtifact(t, board, claimID, participant, "service-recovery-key")
+
+	artifact := typedReadinessArtifact(t, "side-effect-recovered", "safe side effect recovered")
+	handler := &claimsmocks.ServiceHandler{}
+	handler.On("HandleServiceClaim", mock.Anything, mock.MatchedBy(func(req claims.ServiceClaimRequest) bool {
+		return req.Claim != nil && req.Claim.ID == claimID
+	})).Return(claims.ServiceClaimResult{Summary: "recovered", Artifacts: []*claims.Artifact{artifact}}, nil).Once()
+	scope := &claimsmocks.ScopeProvider{}
+	scope.On("Go", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		fn := args.Get(2).(func(context.Context) error)
+		if err := fn(context.Background()); err != nil {
+			t.Errorf("recovery dispatch: %v", err)
+		}
+	}).Return(nil).Once()
+	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{Board: board, Scope: scope, Participant: participant, Handler: handler})
+	if err != nil {
+		t.Fatalf("NewServiceDispatcher: %v", err)
+	}
+	registry := claims.NewServiceDispatcherRegistry()
+	if err := registry.Register(board.SessionID(), dispatcher); err != nil {
+		t.Fatalf("Register dispatcher: %v", err)
+	}
+
+	result, err := claims.RecoverServiceWork(context.Background(), claims.ServiceRecoveryOptions{
+		Board:        board,
+		Dispatchers:  registry,
+		Participants: []claims.ParticipantRegistration{participant},
+	})
+	if err != nil {
+		t.Fatalf("RecoverServiceWork: %v", err)
+	}
+	if result.Redispatched != 1 || result.Failed != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	handler.AssertExpectations(t)
+	scope.AssertExpectations(t)
+}
+
 func TestRecoverServiceWorkDoesNotReplayNondeterministicValidator(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "validator-recovery-board", SessionID: "validator-recovery-session", TaskID: "task"})
 	_, validationID := postTypedValidationClaim(t, board, claims.ValidationStatusValidating)
@@ -146,6 +188,56 @@ func TestRecoverServiceWorkDoesNotReplayNondeterministicValidator(t *testing.T) 
 	handler.AssertNotCalled(t, "ValidateArtifact", mock.Anything, mock.Anything)
 }
 
+func TestRecoverServiceWorkRedispatchesSideEffectValidatorWithRecoveryIdempotencyArtifact(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "validator-recovery-board", SessionID: "validator-recovery-session", TaskID: "task"})
+	claimID, validationID := postRecoveryIdempotencyValidationClaim(t, board, claims.ValidationStatusValidating)
+	handler := &claimsmocks.ValidatorHandler{}
+	handler.On("ValidateArtifact", mock.Anything, mock.MatchedBy(func(req claims.ValidatorHandlerRequest) bool {
+		return req.Validation.ID == validationID && req.Artifact.ArtifactName == claims.ArtifactKindRecoveryIdempotency
+	})).Return(claims.ValidatorHandlerResult{ResultArtifact: typedReadinessArtifact(t, "validator-result", "safe validator replay")}, nil).Once()
+	registry := claims.NewValidatorRegistry()
+	_, err := registry.Register(claims.ValidatorRegistration{
+		ValidatorID:        "mock.validator",
+		ValidationType:     claims.ValidationTypeContract,
+		Determinism:        claims.HandlerDeterminismSideEffect,
+		Timeout:            time.Second,
+		ConcurrencyBudget:  1,
+		TargetArtifactName: claims.ArtifactKindRecoveryIdempotency,
+		ArtifactDataType:   claims.ArtifactDataTypeRecoveryIdempotency,
+		ResultDataType:     claims.ArtifactDataTypePresentationEvidence,
+		Handler:            handler,
+	})
+	if err != nil {
+		t.Fatalf("Register validator: %v", err)
+	}
+	dispatcher, err := claims.NewBoardValidatorDispatcher(claims.BoardValidatorDispatcherConfig{
+		Board:                board,
+		Registry:             registry,
+		MaxInputBytes:        validatorTestByteLimit,
+		MaxOutputBytes:       validatorTestByteLimit,
+		ApprovedValidatorIDs: map[string]bool{"mock.validator": true},
+	})
+	if err != nil {
+		t.Fatalf("NewBoardValidatorDispatcher: %v", err)
+	}
+
+	result, err := claims.RecoverServiceWork(context.Background(), claims.ServiceRecoveryOptions{
+		Board:               board,
+		ValidatorDispatcher: dispatcher,
+	})
+	if err != nil {
+		t.Fatalf("RecoverServiceWork: %v", err)
+	}
+	if result.ValidationRedispatched != 1 || result.ValidationFailed != 0 {
+		t.Fatalf("validator recovery result = %+v", result)
+	}
+	validation, claim, ok := board.CloneValidation(validationID)
+	if !ok || claim.ID != claimID || validation.Status != claims.ValidationStatusValidated {
+		t.Fatalf("validation after recovery = claim:%+v validation:%+v ok:%v", claim, validation, ok)
+	}
+	handler.AssertExpectations(t)
+}
+
 func TestRecoverServiceWorkRecoversPendingContinuations(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "continuation-recovery-board", SessionID: "continuation-recovery-session", TaskID: "task"})
 	result, err := claims.RecoverServiceWork(context.Background(), claims.ServiceRecoveryOptions{
@@ -158,6 +250,23 @@ func TestRecoverServiceWorkRecoversPendingContinuations(t *testing.T) {
 	if result.ContinuationsRecovered != 3 || result.ContinuationRecovererOK != 1 {
 		t.Fatalf("continuation recovery result = %+v", result)
 	}
+}
+
+func TestRecoverServiceWorkUsesMockeryContinuationRecoverer(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "continuation-recovery-board", SessionID: "continuation-recovery-session", TaskID: "task"})
+	recoverer := &claimsmocks.PendingContinuationRecoverer{}
+	recoverer.On("RecoverPendingContinuations", mock.Anything).Return(2).Once()
+	result, err := claims.RecoverServiceWork(context.Background(), claims.ServiceRecoveryOptions{
+		Board:         board,
+		Continuations: []claims.PendingContinuationRecoverer{recoverer},
+	})
+	if err != nil {
+		t.Fatalf("RecoverServiceWork: %v", err)
+	}
+	if result.ContinuationsRecovered != 2 || result.ContinuationRecovererOK != 1 {
+		t.Fatalf("continuation recovery result = %+v", result)
+	}
+	recoverer.AssertExpectations(t)
 }
 
 func TestCancelClaimTreeCancelsLeavesBeforeParents(t *testing.T) {
@@ -180,6 +289,45 @@ func TestCancelClaimTreeCancelsLeavesBeforeParents(t *testing.T) {
 		if !claim.LifecycleStatus.IsTerminal() {
 			t.Fatalf("claim %s not terminal: %s", claimID, claim.LifecycleStatus)
 		}
+	}
+}
+
+func TestCancelClaimTreeCallsMockeryWorkCanceller(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "cancel-board", SessionID: "cancel-session", TaskID: "task"})
+	postCancellationClaim(t, board, "root", "")
+	canceller := &claimsmocks.ClaimWorkCanceller{}
+	canceller.On("CancelClaimWork", mock.Anything, "root", "user interrupt").Return(true, nil).Once()
+	result, err := claims.CancelClaimTree(context.Background(), claims.ClaimCancellationOptions{
+		Board:          board,
+		RootClaimIDs:   []string{"root"},
+		Reason:         "user interrupt",
+		WorkCancellers: []claims.ClaimWorkCanceller{canceller},
+	})
+	if err != nil {
+		t.Fatalf("CancelClaimTree: %v", err)
+	}
+	if len(result.CancelledClaimIDs) != 1 || result.CancelledClaimIDs[0] != "root" {
+		t.Fatalf("cancellation result = %+v", result)
+	}
+	canceller.AssertExpectations(t)
+}
+
+func TestCancelClaimTreeRecordsMissingRootEvidence(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "cancel-board", SessionID: "cancel-session", TaskID: "task"})
+	result, err := claims.CancelClaimTree(context.Background(), claims.ClaimCancellationOptions{
+		Board:         board,
+		RootClaimIDs:  []string{"missing-root"},
+		OriginClaimID: "origin",
+		Reason:        "user interrupt",
+	})
+	if err != nil {
+		t.Fatalf("CancelClaimTree: %v", err)
+	}
+	if len(result.MissingClaimIDs) != 1 || result.MissingClaimIDs[0] != "missing-root" {
+		t.Fatalf("missing roots = %+v", result.MissingClaimIDs)
+	}
+	if !projectionHasMissingCancellationRoot(board.Projection(), "missing-root") {
+		t.Fatalf("missing-root evidence not recorded: %+v", board.Projection().Testaments)
 	}
 }
 
@@ -300,6 +448,33 @@ func TestSessionShutdownCoordinatorOrdersResourcesAndIsIdempotent(t *testing.T) 
 	}
 }
 
+func TestSessionShutdownCoordinatorUsesMockeryResources(t *testing.T) {
+	recorder := &shutdownRecorder{}
+	inbox := &claimsmocks.ShutdownInbox{}
+	inbox.On("Close").Run(func(mock.Arguments) { recorder.add("inbox") }).Return(nil).Once()
+	scope := &claimsmocks.ShutdownScope{}
+	scope.On("SignalShutdown").Run(func(mock.Arguments) { recorder.add("signal") }).Return().Once()
+	scope.On("Shutdown", mock.Anything, mock.Anything).Run(func(mock.Arguments) { recorder.add("scope") }).Return(nil).Once()
+	store := &claimsmocks.ShutdownContinuationStore{}
+	store.On("Stop", "session shutdown").Run(func(mock.Arguments) { recorder.add("continuation") }).Return().Once()
+	coordinator := claims.NewSessionShutdownCoordinator()
+	result, err := coordinator.Shutdown(context.Background(), claims.SessionShutdownOptions{
+		SessionID:     "shutdown-session",
+		Inboxes:       []claims.ShutdownInbox{inbox},
+		Scopes:        []claims.ShutdownScope{scope},
+		Continuations: []claims.ShutdownContinuationStore{store},
+	})
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if got := recorder.String(); got != "inbox,signal,continuation,scope" {
+		t.Fatalf("resource order = %s result=%+v", got, result)
+	}
+	inbox.AssertExpectations(t)
+	scope.AssertExpectations(t)
+	store.AssertExpectations(t)
+}
+
 func recoveryParticipant(t *testing.T, determinism claims.HandlerDeterminism) claims.ParticipantRegistration {
 	t.Helper()
 	participant, err := claims.NewParticipantRegistration(claims.ParticipantCategoryService, "sys:provider_gateway", map[string]string{"session": "recovery"}, 8, 1, time.Second, determinism, []claims.ActionType{claims.ActionTypeTask})
@@ -375,7 +550,6 @@ func postTypedValidationClaim(t *testing.T, board *claims.ClaimsBoard, status cl
 			ResultDataType:     claims.ArtifactDataTypePresentationEvidence,
 			Required:           true,
 			Description:        "typed artifact contract",
-			QualityBar:         "artifact validates",
 			Timeout:            time.Second,
 		}},
 	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "typed-validation-" + string(status)})
@@ -398,6 +572,55 @@ func postTypedValidationClaim(t *testing.T, board *claims.ClaimsBoard, status cl
 	}
 	targetArtifactID := generatedTestament.Testaments[0].Artifacts[0].ID
 	if err := board.PostGeneratedTestament(context.Background(), generatedTestament.Testaments[0].ID, "sys:validator", claims.TestamentPostOptions{}); err != nil {
+		t.Fatalf("PostGeneratedTestament: %v", err)
+	}
+	advanceValidationStatus(t, board, claimID, validationID, targetArtifactID, status)
+	return claimID, validationID
+}
+
+func postRecoveryIdempotencyValidationClaim(t *testing.T, board *claims.ClaimsBoard, status claims.ValidationStatus) (string, string) {
+	t.Helper()
+	validationID := "mock-validator-recovery-idempotency-" + string(status)
+	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: "issuer", Type: claims.ActionTypeTask}, []claims.Claim{{
+		Title:       "Validate recovery idempotency artifact",
+		Description: "Validator recovery may replay only when the target artifact proves idempotency.",
+		ActionType:  claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: "issuer", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+			{Related: "sys:validator", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+		},
+		Validations: []*claims.Validation{{
+			ID:                 validationID,
+			Type:               claims.ValidationTypeContract,
+			ValidatorID:        "mock.validator",
+			TargetArtifactName: claims.ArtifactKindRecoveryIdempotency,
+			ArtifactDataType:   claims.ArtifactDataTypeRecoveryIdempotency,
+			ResultDataType:     claims.ArtifactDataTypePresentationEvidence,
+			Required:           true,
+			Description:        "recovery idempotency contract",
+			Timeout:            time.Second,
+		}},
+	}}, claims.GenerateClaimActionOptions{IdempotencyKey: "recovery-idempotency-validation-" + string(status)})
+	if err != nil {
+		t.Fatalf("GenerateClaimAction: %v", err)
+	}
+	claimID := generated.Claims[0].ID
+	if err := board.PostGeneratedClaim(context.Background(), claimID, "issuer", claims.ClaimPostOptions{Reason: "validator recovery idempotency test"}); err != nil {
+		t.Fatalf("PostGeneratedClaim: %v", err)
+	}
+	participant := claims.ParticipantRegistration{UID: "mock.validator", RouteKey: "mock.validator"}
+	artifact := recoveryIdempotencyArtifact(t, claimID, participant, "validator-recovery-key")
+	generatedTestament, err := board.GenerateTestamentAction(context.Background(), claims.Action{AgentID: "mock.validator", Type: claims.ActionTypeTestament}, []claims.Testament{{
+		AgentID:   "mock.validator",
+		Summary:   "recovery idempotency target artifact",
+		Relations: []claims.Relation{{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipClaim}},
+		Artifacts: []*claims.Artifact{artifact},
+	}}, claims.GenerateTestamentActionOptions{IdempotencyKey: "recovery-idempotency-validation-testament-" + string(status)})
+	if err != nil {
+		t.Fatalf("GenerateTestamentAction: %v", err)
+	}
+	targetArtifactID := generatedTestament.Testaments[0].Artifacts[0].ID
+	if err := board.PostGeneratedTestament(context.Background(), generatedTestament.Testaments[0].ID, "mock.validator", claims.TestamentPostOptions{}); err != nil {
 		t.Fatalf("PostGeneratedTestament: %v", err)
 	}
 	advanceValidationStatus(t, board, claimID, validationID, targetArtifactID, status)
@@ -464,6 +687,39 @@ func typedReadinessArtifact(t *testing.T, name, reference string) *claims.Artifa
 	return artifact
 }
 
+func recordGeneratedRecoveryIdempotencyArtifact(t *testing.T, board *claims.ClaimsBoard, claimID string, participant claims.ParticipantRegistration, key string) {
+	t.Helper()
+	artifact := recoveryIdempotencyArtifact(t, claimID, participant, key)
+	if _, err := board.GenerateArtifact(context.Background(), *artifact, "sys:claims_recovery", claims.ArtifactLifecycleOptions{Reason: "recovery idempotency evidence generated"}); err != nil {
+		t.Fatalf("GenerateArtifact: %v", err)
+	}
+}
+
+func recoveryIdempotencyArtifact(t *testing.T, claimID string, participant claims.ParticipantRegistration, key string) *claims.Artifact {
+	t.Helper()
+	artifact := &claims.Artifact{
+		ArtifactName:  claims.ArtifactKindRecoveryIdempotency,
+		Kind:          claims.ArtifactKindRecoveryIdempotency,
+		AgentID:       "sys:claims_recovery",
+		ParticipantID: participant.RouteKey,
+		ClaimID:       claimID,
+		Reference:     key,
+		Relations:     []claims.Relation{{Related: claimID, RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipDerivedFrom}},
+	}
+	if err := claims.SetArtifactData(artifact, claims.RecoveryIdempotencyArtifactData{
+		Key:            key,
+		ParticipantID:  participant.UID,
+		Scope:          claimID,
+		Operation:      "recovery_redispatch",
+		IssuedBy:       "sys:claims_recovery",
+		IssuedAt:       time.Now().UTC(),
+		SafetyEvidence: "idempotent operation key is durable",
+	}); err != nil {
+		t.Fatalf("SetArtifactData: %v", err)
+	}
+	return artifact
+}
+
 func validationTargetArtifact(t *testing.T, board *claims.ClaimsBoard, claimID, validationID string) *claims.Artifact {
 	t.Helper()
 	validation, _, ok := board.CloneValidation(validationID)
@@ -479,6 +735,23 @@ func validationTargetArtifact(t *testing.T, board *claims.ClaimsBoard, claimID, 
 	}
 	t.Fatalf("target artifact for %s not found", validationID)
 	return nil
+}
+
+func projectionHasMissingCancellationRoot(proj *claims.ClaimsBoardProjection, claimID string) bool {
+	if proj == nil {
+		return false
+	}
+	for _, testament := range proj.Testaments {
+		for _, artifact := range testament.Artifacts {
+			if artifact == nil || artifact.Kind != claims.ArtifactKindErrorDiagnostic {
+				continue
+			}
+			if value, _ := artifact.Metadata["missing_claim_id"].(string); value == claimID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type continuationRecoverer struct {

@@ -12,7 +12,8 @@ import "sync"
 // For example, for a Claim that has Relations containing
 // { Related: "action_1", RelatedType: "action", Relationship: "claim_action" },
 // the index maintains:
-//   relations[indexKey("action", "claim_action", "action_1")] = [...claims that point at action_1 via claim_action...]
+//
+//	relations[indexKey("action", "claim_action", "action_1")] = [...claims that point at action_1 via claim_action...]
 //
 // Additionally maintains a scope index keyed by (ScopeKind, ScopeKey)
 // → []ClaimID to serve find_overlapping_claims.

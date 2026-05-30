@@ -25,6 +25,7 @@ type ClaimPostOptions struct {
 type ClaimPostPolicyRequest struct {
 	Claim      *Claim
 	ActorID    string
+	Issuer     AgentRef
 	Subject    AgentRef
 	Evaluators []AgentRef
 }
@@ -772,9 +773,6 @@ func validateClaimValidationExpectedTools(claim *Claim) error {
 		if strings.TrimSpace(validation.Description) == "" {
 			return fmt.Errorf("claim %q validation description is required", firstNonEmpty(claim.ID, claim.Title))
 		}
-		if strings.TrimSpace(validation.QualityBar) == "" {
-			return fmt.Errorf("claim %q validation %q quality bar is required", firstNonEmpty(claim.ID, claim.Title), firstNonEmpty(validation.ID, validation.Description))
-		}
 		if err := ValidateExpectedToolCalls(validation.ExpectedToolCalls, nil); err != nil {
 			return fmt.Errorf("claim %q validation %q expected tool calls: %w", firstNonEmpty(claim.ID, claim.Title), firstNonEmpty(validation.ID, validation.Description), err)
 		}
@@ -828,6 +826,9 @@ func (b *ClaimsBoard) validateClaimPostableLocked(ctx context.Context, claim *Cl
 	if !opts.AllowSelfTarget && isPeerDirectedActionType(claim.ActionType) && identity.selfTargeted() {
 		return lifecyclePostError{reason: fmt.Sprintf("claim %q invalid self-target for peer-directed action %q", claim.ID, claim.ActionType), artifactKind: ArtifactKindPolicyDenied}
 	}
+	if err := validateClaimQualityBarEligibility(claim, identity); err != nil {
+		return err
+	}
 	if claim.ActionType == ActionTypeHandoff {
 		if err := b.handoffEligibleForPostLocked(strings.TrimSpace(actorID), claim.ID); err != nil {
 			return lifecyclePostError{reason: err.Error(), artifactKind: ArtifactKindPolicyDenied, cause: err}
@@ -864,6 +865,28 @@ func (b *ClaimsBoard) resolveClaimPostIdentity(ctx context.Context, claim *Claim
 		return claimPostIdentity{}, err
 	}
 	return claimPostIdentity{issuer: issuer, subject: subject, evaluators: evaluators}, nil
+}
+
+func validateClaimQualityBarEligibility(claim *Claim, identity claimPostIdentity) error {
+	if !claimDeclaresQualityBar(claim) {
+		return nil
+	}
+	if ParticipantCategory(identity.issuer.Category) == ParticipantCategoryAgent {
+		return nil
+	}
+	return lifecyclePostError{
+		reason:       fmt.Sprintf("claim %q non-empty quality bars require an agentic claimant", claim.ID),
+		artifactKind: ArtifactKindPolicyDenied,
+	}
+}
+
+func claimDeclaresQualityBar(claim *Claim) bool {
+	for _, validation := range claim.Validations {
+		if validation != nil && strings.TrimSpace(validation.QualityBar) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *ClaimsBoard) resolveSubjectPostAgentRef(ctx context.Context, agentID, claimID string, opts ClaimPostOptions) (AgentRef, error) {
@@ -910,6 +933,7 @@ func (b *ClaimsBoard) applyClaimPostPolicy(ctx context.Context, claim *Claim, ac
 	decision := b.claimPostPolicy.DecideClaimPost(ctx, ClaimPostPolicyRequest{
 		Claim:      CloneClaimEntity(claim),
 		ActorID:    actorID,
+		Issuer:     identity.issuer,
 		Subject:    identity.subject,
 		Evaluators: identity.evaluators,
 	})
@@ -1079,19 +1103,31 @@ func (b *ClaimsBoard) validateGenerateTestamentActionLocked(action Action, testa
 }
 
 func (b *ClaimsBoard) validateGeneratedTestamentArtifactsLocked(testament *Testament, opts GenerateTestamentActionOptions) error {
+	seen := make(map[string]string, len(testament.Artifacts))
 	for _, artifact := range testament.Artifacts {
 		if artifact == nil {
 			return fmt.Errorf("generated testament %q has nil artifact", firstNonEmpty(testament.ID, testament.Summary))
 		}
 		candidate := artifact
+		strictParentage := false
 		if existing := b.existingArtifactForAttachmentLocked(artifact, testament); existing != nil {
-			if strings.TrimSpace(existing.TestamentID) != "" {
-				return fmt.Errorf("generated testament %q artifact %q is already attached", firstNonEmpty(testament.ID, testament.Summary), existing.ID)
+			if err := validateExistingAttachmentCandidate(testament, existing); err != nil {
+				return err
 			}
 			candidate = existing
+			strictParentage = true
+		}
+		if err := validateTestamentArtifactDuplicate(testament, candidate, seen); err != nil {
+			return err
+		}
+		if err := validateTestamentArtifactParentage(testament, candidate, strictParentage); err != nil {
+			return err
 		}
 		if strings.TrimSpace(candidate.Kind) == "" {
 			return fmt.Errorf("generated testament %q artifact kind is required", firstNonEmpty(testament.ID, testament.Summary))
+		}
+		if err := validateTestamentArtifactPayload(candidate); err != nil {
+			return err
 		}
 		if !opts.AllowEmptyArtifactReference && strings.TrimSpace(candidate.Reference) == "" && strings.TrimSpace(candidate.ContentHash) == "" {
 			return fmt.Errorf("generated testament %q artifact %q requires reference or content hash", firstNonEmpty(testament.ID, testament.Summary), firstNonEmpty(candidate.ID, candidate.Kind))
@@ -1101,6 +1137,62 @@ func (b *ClaimsBoard) validateGeneratedTestamentArtifactsLocked(testament *Testa
 		}
 	}
 	return nil
+}
+
+func validateExistingAttachmentCandidate(testament *Testament, artifact *Artifact) error {
+	if strings.TrimSpace(artifact.TestamentID) != "" {
+		return fmt.Errorf("generated testament %q artifact %q is already attached", firstNonEmpty(testament.ID, testament.Summary), artifact.ID)
+	}
+	switch artifact.Status {
+	case ArtifactStatusGenerated, ArtifactStatusReceived:
+		return nil
+	default:
+		return fmt.Errorf("generated testament %q artifact %q status %q cannot be attached", firstNonEmpty(testament.ID, testament.Summary), artifact.ID, artifact.Status)
+	}
+}
+
+func validateTestamentArtifactDuplicate(testament *Testament, artifact *Artifact, seen map[string]string) error {
+	for _, key := range testamentArtifactDuplicateKeys(artifact) {
+		if prev := seen[key]; prev != "" {
+			return fmt.Errorf("generated testament %q duplicate artifact reference %q", firstNonEmpty(testament.ID, testament.Summary), prev)
+		}
+		seen[key] = firstNonEmpty(artifact.ID, artifact.ArtifactName)
+	}
+	return nil
+}
+
+func testamentArtifactDuplicateKeys(artifact *Artifact) []string {
+	keys := make([]string, 0, 2)
+	if id := strings.TrimSpace(artifact.ID); id != "" {
+		keys = append(keys, "id:"+id)
+	}
+	if name := strings.TrimSpace(artifact.ArtifactName); name != "" {
+		keys = append(keys, "name:"+name)
+	}
+	return keys
+}
+
+func validateTestamentArtifactParentage(testament *Testament, artifact *Artifact, strict bool) error {
+	claimID := strings.TrimSpace(ClaimIDFromRelations(testament.Relations))
+	if claimID != "" && strings.TrimSpace(artifact.ClaimID) != "" && artifact.ClaimID != claimID {
+		return fmt.Errorf("generated testament %q artifact %q belongs to claim %q, want %q", firstNonEmpty(testament.ID, testament.Summary), artifact.ID, artifact.ClaimID, claimID)
+	}
+	if !strict {
+		return nil
+	}
+	testifier := strings.TrimSpace(testament.AgentID)
+	participant := firstNonEmpty(artifact.ParticipantID, artifact.AgentID)
+	if testifier != "" && participant != "" && participant != testifier {
+		return fmt.Errorf("generated testament %q artifact %q belongs to participant %q, want %q", firstNonEmpty(testament.ID, testament.Summary), artifact.ID, participant, testifier)
+	}
+	return nil
+}
+
+func validateTestamentArtifactPayload(artifact *Artifact) error {
+	if strings.TrimSpace(artifact.DataType) == "" && len(artifact.Data) == 0 {
+		return nil
+	}
+	return ValidateArtifactDataPayload(artifact)
 }
 
 func (b *ClaimsBoard) stampGeneratedClaimActionLocked(action *Action, now time.Time, opts GenerateClaimActionOptions) {

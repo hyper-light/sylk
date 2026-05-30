@@ -54,6 +54,16 @@ func TestBuildProductionReadinessArtifactRejectsInvalidWaiver(t *testing.T) {
 	}
 }
 
+func TestBuildProductionReadinessReportRequiresMockeryEvidence(t *testing.T) {
+	report := BuildProductionReadinessReport(ProductionReadinessRequest{Evidence: evidenceExcept(ReadinessEvidenceMockery)})
+	if report.Data.Ready {
+		t.Fatal("report should not be ready without mockery drift evidence")
+	}
+	if !containsString(report.Data.Missing, ReadinessEvidenceMockery) {
+		t.Fatalf("missing evidence = %v, want mockery", report.Data.Missing)
+	}
+}
+
 func TestProductionReadinessWaiverCanCoverScopedEvidence(t *testing.T) {
 	req := ProductionReadinessRequest{
 		Evidence: evidenceExcept(ReadinessEvidenceRollback),
@@ -109,4 +119,13 @@ func evidenceExcept(skip string) []ProductionReadinessEvidence {
 		evidence = append(evidence, ProductionReadinessEvidence{Category: category, Reference: category + "-artifact", Status: "passed"})
 	}
 	return evidence
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

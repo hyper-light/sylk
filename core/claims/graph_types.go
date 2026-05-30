@@ -106,6 +106,6 @@ func (n GraphNode) NodeID() string {
 // graph. The agent follows edges by calling traverse(TargetID).
 type GraphEdge struct {
 	TargetID     string `json:"target_id"`
-	TargetType   string `json:"target_type"`   // RelatedType constants
-	Relationship string `json:"relationship"`  // Relationship constants
+	TargetType   string `json:"target_type"`  // RelatedType constants
+	Relationship string `json:"relationship"` // Relationship constants
 }

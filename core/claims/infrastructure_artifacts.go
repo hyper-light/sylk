@@ -12,6 +12,7 @@ const (
 	ArtifactDataTypeGuardianDecision     = "sylk.infrastructure.guardian_decision.v1"
 	ArtifactDataTypeProviderGatewayCall  = "sylk.infrastructure.provider_gateway_call.v1"
 	ArtifactDataTypeExternalAdapterEvent = "sylk.infrastructure.external_adapter_event.v1"
+	ArtifactDataTypeRecoveryIdempotency  = "sylk.infrastructure.recovery_idempotency.v1"
 )
 
 const (
@@ -24,6 +25,7 @@ const (
 	ArtifactKindGuardianDecision     = "guardian_decision"
 	ArtifactKindProviderGatewayCall  = "provider_gateway_call"
 	ArtifactKindExternalAdapterEvent = "external_adapter_event"
+	ArtifactKindRecoveryIdempotency  = "recovery_idempotency"
 )
 
 type DAGEdgeArtifactData struct {
@@ -222,4 +224,15 @@ type ExternalAdapterEventArtifactData struct {
 	Status            string         `json:"status,omitempty"`
 	FailureReason     string         `json:"failure_reason,omitempty"`
 	Metadata          map[string]any `json:"metadata,omitempty"`
+}
+
+type RecoveryIdempotencyArtifactData struct {
+	Key            string    `json:"key"`
+	ParticipantID  string    `json:"participant_id,omitempty"`
+	Scope          string    `json:"scope,omitempty"`
+	Operation      string    `json:"operation,omitempty"`
+	IssuedBy       string    `json:"issued_by,omitempty"`
+	IssuedAt       time.Time `json:"issued_at,omitempty"`
+	ExpiresAt      time.Time `json:"expires_at,omitempty"`
+	SafetyEvidence string    `json:"safety_evidence,omitempty"`
 }

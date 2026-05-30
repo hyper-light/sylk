@@ -56,6 +56,16 @@ type QualityBarEvaluationRequest struct {
 	Artifact       *Artifact
 	Validation     *Validation
 	ResultArtifact *Artifact
+	Context        QualityBarEvaluationContext
+}
+
+type QualityBarEvaluationContext struct {
+	QualityBar              string
+	ArtifactInline          string
+	ArtifactReference       string
+	ResultArtifactInline    string
+	ResultArtifactReference string
+	RetrievalRequired       bool
 }
 
 type QualityBarEvaluationResult struct {

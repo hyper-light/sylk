@@ -116,3 +116,16 @@ func TestRolloutConfigFromEnv(t *testing.T) {
 		t.Fatalf("provider infrastructure mode not parsed: %+v", cfg)
 	}
 }
+
+func TestInfrastructurePromotionBlocksCriticalShadowDiffs(t *testing.T) {
+	cfg := DefaultRolloutConfig()
+	cfg.ClaimsInfraDAG = InfrastructureRolloutShadow
+	ok := EvaluateInfrastructurePromotion(cfg, "dag", []InfrastructureShadowComparison{{Subsystem: "dag", Critical: false}})
+	if !ok.Allowed || ok.Mode != InfrastructureRolloutShadow {
+		t.Fatalf("promotion decision = %+v, want allowed shadow decision", ok)
+	}
+	blocked := EvaluateInfrastructurePromotion(cfg, "dag", []InfrastructureShadowComparison{{Subsystem: "dag", Critical: true, DiffReasons: []string{"hash mismatch"}}})
+	if blocked.Allowed || len(blocked.Blockers) != 1 {
+		t.Fatalf("blocked decision = %+v, want one blocker", blocked)
+	}
+}

@@ -47,6 +47,10 @@ func (b *ClaimsBoard) generateArtifactLifecycle(ctx context.Context, artifact Ar
 		b.mu.Unlock()
 		return CloneArtifact(existing), nil
 	}
+	if err := b.validateArtifactGenerationLocked(stamped, to); err != nil {
+		b.mu.Unlock()
+		return nil, err
+	}
 	payload := artifactLifecyclePayload(stamped.ID, to, actorID, opts, now)
 	payload["artifact"] = stamped
 	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, payload, []ClaimsOutboxRecord{b.outboxRecordLocked(stamped.Sequence, RelatedTypeArtifact, stamped.ID, string(mustArtifactLifecycleDeltaAction(to)), now)}); err != nil {
@@ -120,6 +124,29 @@ func (b *ClaimsBoard) RecordArtifactReceiptFailure(ctx context.Context, artifact
 	return b.TransitionArtifactLifecycle(ctx, artifactID, ArtifactStatusReceiptFailed, receiverID, ArtifactLifecycleOptions{Reason: "artifact receipt failed", Error: artifactErr})
 }
 
+func (b *ClaimsBoard) ReceiveArtifact(ctx context.Context, artifactID, receiverID string) (*Artifact, error) {
+	artifact, _, _, ok := b.cloneArtifactWithParents(artifactID)
+	if !ok {
+		return nil, fmt.Errorf("artifact %q not found", artifactID)
+	}
+	if artifactReceiptAlreadySettled(artifact.Status) {
+		return artifact, nil
+	}
+	if artifact.Status != ArtifactStatusGenerated {
+		return artifact, fmt.Errorf("artifact %q status %q cannot be received", artifact.ID, artifact.Status)
+	}
+	if err := b.validateArtifactReceipt(artifact); err != nil {
+		receiptErr := artifactReceiptError(artifact, receiverID, err)
+		_ = b.RecordArtifactReceiptFailure(ctx, artifact.ID, receiverID, receiptErr)
+		return b.cloneArtifactAfterReceiptFailure(artifact.ID, err)
+	}
+	if err := b.AcknowledgeArtifactReceipt(ctx, artifact.ID, receiverID); err != nil {
+		return artifact, err
+	}
+	received, _, _, _ := b.cloneArtifactWithParents(artifact.ID)
+	return received, nil
+}
+
 func (b *ClaimsBoard) BeginArtifactValidation(ctx context.Context, artifactID, actorID string) error {
 	return b.TransitionArtifactLifecycle(ctx, artifactID, ArtifactStatusValidating, actorID, ArtifactLifecycleOptions{Reason: "artifact validation started"})
 }
@@ -129,6 +156,128 @@ func (b *ClaimsBoard) CompleteArtifactValidation(ctx context.Context, artifactID
 		return b.TransitionArtifactLifecycle(ctx, artifactID, ArtifactStatusValidated, actorID, ArtifactLifecycleOptions{Reason: "artifact validated"})
 	}
 	return b.TransitionArtifactLifecycle(ctx, artifactID, ArtifactStatusValidationFailed, actorID, ArtifactLifecycleOptions{Reason: "artifact validation failed", Error: artifactErr})
+}
+
+func (b *ClaimsBoard) validateArtifactGenerationLocked(artifact *Artifact, to ArtifactStatus) error {
+	if artifact == nil {
+		return fmt.Errorf("artifact is required")
+	}
+	if to == ArtifactStatusGenerationFailed {
+		return b.validateArtifactGenerationFailureLocked(artifact)
+	}
+	if to != ArtifactStatusGenerated {
+		return nil
+	}
+	if err := validateGeneratedArtifactShape(artifact); err != nil {
+		return err
+	}
+	if err := ValidateArtifactDataPayload(artifact); err != nil {
+		return err
+	}
+	if duplicate := b.duplicateGeneratedArtifactNameLocked(artifact); duplicate != nil {
+		return fmt.Errorf("generated artifact %q duplicates artifact name %q on claim %q", artifact.ID, artifact.ArtifactName, artifact.ClaimID)
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) validateArtifactGenerationFailureLocked(artifact *Artifact) error {
+	if strings.TrimSpace(artifact.ClaimID) == "" {
+		return fmt.Errorf("failed artifact claim_id is required")
+	}
+	if strings.TrimSpace(artifact.ArtifactName) == "" {
+		return fmt.Errorf("failed artifact artifact_name is required")
+	}
+	return nil
+}
+
+func validateGeneratedArtifactShape(artifact *Artifact) error {
+	if strings.TrimSpace(artifact.ClaimID) == "" {
+		return fmt.Errorf("generated artifact claim_id is required")
+	}
+	if strings.TrimSpace(artifact.ArtifactName) == "" {
+		return fmt.Errorf("generated artifact artifact_name is required")
+	}
+	if strings.TrimSpace(artifact.Kind) == "" {
+		return fmt.Errorf("generated artifact kind is required")
+	}
+	if strings.TrimSpace(artifact.DataType) == "" {
+		return fmt.Errorf("generated artifact data_type is required")
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) duplicateGeneratedArtifactNameLocked(artifact *Artifact) *Artifact {
+	for _, existing := range b.artifacts {
+		if existing == nil || existing.ID == artifact.ID {
+			continue
+		}
+		if existing.TestamentID != "" || existing.Status.IsTerminal() {
+			continue
+		}
+		if existing.ClaimID == artifact.ClaimID && existing.ArtifactName == artifact.ArtifactName {
+			return existing
+		}
+	}
+	return nil
+}
+
+func artifactReceiptAlreadySettled(status ArtifactStatus) bool {
+	return status == ArtifactStatusReceived ||
+		status == ArtifactStatusAttached ||
+		status == ArtifactStatusValidating ||
+		status == ArtifactStatusValidated ||
+		status == ArtifactStatusValidationFailed ||
+		status == ArtifactStatusReceiptFailed
+}
+
+func (b *ClaimsBoard) validateArtifactReceipt(artifact *Artifact) error {
+	if err := validateGeneratedArtifactShape(artifact); err != nil {
+		return err
+	}
+	if err := ValidateArtifactDataPayload(artifact); err != nil {
+		return err
+	}
+	if duplicate := b.duplicateReceiptArtifactName(artifact); duplicate != nil {
+		return fmt.Errorf("artifact %q duplicates received name %q on claim %q", artifact.ID, artifact.ArtifactName, artifact.ClaimID)
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) duplicateReceiptArtifactName(artifact *Artifact) *Artifact {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, existing := range b.artifacts {
+		if existing == nil || existing.ID == artifact.ID {
+			continue
+		}
+		if existing.ClaimID == artifact.ClaimID && existing.ArtifactName == artifact.ArtifactName {
+			return CloneArtifact(existing)
+		}
+	}
+	return nil
+}
+
+func artifactReceiptError(artifact *Artifact, receiverID string, cause error) *ArtifactError {
+	return &ArtifactError{
+		Category:    ArtifactErrorCategoryReceiptStructural,
+		Description: cause.Error(),
+		Source:      DegradedAgentRef(receiverID, "artifact receipt failed"),
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"artifact_id":   strings.TrimSpace(artifact.ID),
+			"artifact_name": strings.TrimSpace(artifact.ArtifactName),
+			"claim_id":      strings.TrimSpace(artifact.ClaimID),
+			"data_type":     strings.TrimSpace(artifact.DataType),
+		},
+	}
+}
+
+func (b *ClaimsBoard) cloneArtifactAfterReceiptFailure(artifactID string, cause error) (*Artifact, error) {
+	failed, _, _, ok := b.cloneArtifactWithParents(artifactID)
+	if !ok {
+		return nil, cause
+	}
+	return failed, cause
 }
 
 func (b *ClaimsBoard) TransitionValidationLifecycle(ctx context.Context, claimID, validationID string, to ValidationStatus, actorID string, opts ValidationLifecycleOptions) error {
@@ -382,7 +531,7 @@ func (b *ClaimsBoard) prepareValidationLifecycleOptionsLocked(claim *Claim, vali
 		return opts
 	}
 	result := CloneArtifact(opts.ResultArtifact)
-	if b.stampValidationResultArtifactLocked(result, claim, validation, b.testamentForValidationResultLocked(claim, validation), actorID, now) {
+	if b.stampValidationResultArtifactLocked(result, claim, validation, actorID, now) {
 		opts.ResultArtifact = result
 		opts.ResultArtifactID = result.ID
 	}
@@ -392,7 +541,7 @@ func (b *ClaimsBoard) prepareValidationLifecycleOptionsLocked(claim *Claim, vali
 func (b *ClaimsBoard) recordValidationLifecycleMutationLocked(claim *Claim, validation *Validation, to ValidationStatus, actorID string, opts ValidationLifecycleOptions, now time.Time) string {
 	resultArtifactID := firstNonEmpty(opts.ResultArtifactID, validation.ResultArtifactID)
 	if opts.ResultArtifact != nil {
-		resultArtifactID = b.appendValidationResultArtifactLocked(claim, validation, opts.ResultArtifact, actorID, now)
+		resultArtifactID = b.indexValidationResultArtifactLocked(opts.ResultArtifact)
 	}
 	_, _ = TransitionValidationStatus(validation, to, actorID, opts.Reason, now)
 	validation.ResultArtifactID = firstNonEmpty(resultArtifactID, validation.ResultArtifactID)
@@ -402,47 +551,23 @@ func (b *ClaimsBoard) recordValidationLifecycleMutationLocked(claim *Claim, vali
 	return validation.ResultArtifactID
 }
 
-func (b *ClaimsBoard) appendValidationResultArtifactLocked(claim *Claim, validation *Validation, result *Artifact, actorID string, now time.Time) string {
-	testament := b.testamentForValidationResultLocked(claim, validation)
-	if testament == nil {
+func (b *ClaimsBoard) indexValidationResultArtifactLocked(result *Artifact) string {
+	if result == nil || strings.TrimSpace(result.ID) == "" {
 		return ""
 	}
-	result = CloneArtifact(result)
-	b.stampValidationResultArtifactLocked(result, claim, validation, testament, actorID, now)
-	testament.Artifacts = append(testament.Artifacts, result)
+	b.indexArtifactLocked(result)
 	b.indexRelations(result.ID, result.Relations)
 	return result.ID
 }
 
-func (b *ClaimsBoard) testamentForValidationResultLocked(claim *Claim, validation *Validation) *Testament {
-	if claim == nil || validation == nil {
-		return nil
-	}
-	for _, testament := range b.testaments {
-		if ClaimIDFromRelations(testament.Relations) == claim.ID && validationTargetsTestament(validation, testament) {
-			return testament
-		}
-	}
-	return nil
-}
-
-func validationTargetsTestament(validation *Validation, testament *Testament) bool {
-	for _, artifact := range testament.Artifacts {
-		if artifact != nil && artifact.ArtifactName == validation.TargetArtifactName {
-			return true
-		}
-	}
-	return false
-}
-
-func (b *ClaimsBoard) stampValidationResultArtifactLocked(artifact *Artifact, claim *Claim, validation *Validation, testament *Testament, actorID string, now time.Time) bool {
-	if artifact == nil || claim == nil || validation == nil || testament == nil {
+func (b *ClaimsBoard) stampValidationResultArtifactLocked(artifact *Artifact, claim *Claim, validation *Validation, actorID string, now time.Time) bool {
+	if artifact == nil || claim == nil || validation == nil {
 		return false
 	}
 	if artifact.ID == "" {
 		artifact.ID = uuid.NewString()
 	}
-	artifact.TestamentID = testament.ID
+	artifact.TestamentID = ""
 	artifact.ClaimID = claim.ID
 	artifact.AgentID = firstNonEmpty(artifact.AgentID, actorID)
 	artifact.ParticipantID = firstNonEmpty(artifact.ParticipantID, artifact.AgentID)
@@ -456,6 +581,12 @@ func (b *ClaimsBoard) stampValidationResultArtifactLocked(artifact *Artifact, cl
 	artifact.Accessed = now
 	if artifact.ArtifactName == "" {
 		artifact.ArtifactName = validation.ID + ".result"
+	}
+	if !HasRelation(artifact.Relations, RelationshipClaim, claim.ID) {
+		artifact.Relations = append(artifact.Relations, Relation{Related: claim.ID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim})
+	}
+	if !HasRelation(artifact.Relations, RelationshipDerivedFrom, validation.ID) {
+		artifact.Relations = append(artifact.Relations, Relation{Related: validation.ID, RelatedType: RelatedTypeValidation, Relationship: RelationshipDerivedFrom})
 	}
 	if artifact.DataType == "" && artifact.Kind != ArtifactKindErrorDiagnostic {
 		artifact.DataType = validation.ResultDataType

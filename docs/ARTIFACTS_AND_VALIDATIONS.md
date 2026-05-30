@@ -1412,6 +1412,7 @@ strings:
 | Guardian decision evidence | `sylk.infrastructure.guardian_decision.v1` |
 | Provider gateway call evidence | `sylk.infrastructure.provider_gateway_call.v1` |
 | External adapter event evidence | `sylk.infrastructure.external_adapter_event.v1` |
+| Recovery idempotency evidence | `sylk.infrastructure.recovery_idempotency.v1` |
 
 Registration of a typed validator via `RegisterValidator[T, R]`
 implicitly registers `T` and `R` with the type registry if not

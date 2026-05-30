@@ -31,6 +31,10 @@ func TestServiceDispatcherSuccessPostsTestamentAndSatisfiesReceiptClaim(t *testi
 	if testaments[0].LifecycleStatus != TestamentLifecycleValidated {
 		t.Fatalf("testament lifecycle = %s, want validated", testaments[0].LifecycleStatus)
 	}
+	key := ServiceHandlerIdempotencyKey(claim, participant)
+	if !testamentHasIdempotencyKey(testaments[0], key) {
+		t.Fatalf("testament missing service idempotency key %s: %+v", key, testaments[0])
+	}
 }
 
 func TestServiceDispatcherHandlerErrorRecordsLifecycleFailure(t *testing.T) {
@@ -156,6 +160,49 @@ func TestServiceDispatcherEmptyArtifactsBecomeReadinessEvidence(t *testing.T) {
 	artifact := testaments[0].Artifacts[0]
 	if artifact.Kind != ArtifactKindReadiness || artifact.ArtifactName != "service_readiness" {
 		t.Fatalf("fallback artifact = %+v, want deterministic readiness artifact", artifact)
+	}
+}
+
+func TestServiceDispatcherDisabledRolloutRecordsFailureWithoutHandler(t *testing.T) {
+	cfg := DefaultRolloutConfig()
+	cfg.ClaimsInfraToolRuntime = InfrastructureRolloutDisabled
+	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "service-board", SessionID: "service-session", TaskID: "service-task", Rollout: cfg})
+	claimID := postServiceDispatchClaim(t, board, "service-disabled-rollout")
+	participant := serviceDispatchParticipant(t)
+	count := 0
+	handler := serviceHandlerFunc(func(context.Context, ServiceClaimRequest) (ServiceClaimResult, error) {
+		count++
+		return ServiceClaimResult{Summary: "should not run"}, nil
+	})
+	dispatcher := newTestServiceDispatcher(t, board, participant, handler)
+	if err := dispatcher.DispatchDelta(context.Background(), serviceClaimPostedDelta(board, claimID, participant)); err != nil {
+		t.Fatalf("DispatchDelta: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("handler calls = %d, want 0 while rollout disabled", count)
+	}
+	assertServiceClaimLifecycle(t, board, claimID, ClaimLifecycleValidationErrored)
+}
+
+func TestServiceDispatcherShadowModeRecordsCriticalDiffEvidence(t *testing.T) {
+	cfg := DefaultRolloutConfig()
+	cfg.ClaimsInfraToolRuntime = InfrastructureRolloutShadow
+	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "service-board", SessionID: "service-session", TaskID: "service-task", Rollout: cfg})
+	claimID := postServiceDispatchClaim(t, board, "service-shadow-rollout")
+	participant := serviceDispatchParticipant(t)
+	handler := serviceHandlerFunc(func(context.Context, ServiceClaimRequest) (ServiceClaimResult, error) {
+		return ServiceClaimResult{
+			Summary:         "shadow compared",
+			Artifacts:       []*Artifact{serviceDispatchArtifact(t, "service", "service-result")},
+			ShadowArtifacts: []*Artifact{serviceDispatchArtifact(t, "legacy", "legacy-result")},
+		}, nil
+	})
+	dispatcher := newTestServiceDispatcher(t, board, participant, handler)
+	if err := dispatcher.DispatchDelta(context.Background(), serviceClaimPostedDelta(board, claimID, participant)); err != nil {
+		t.Fatalf("DispatchDelta: %v", err)
+	}
+	if !projectionHasArtifactKind(board.Projection(), ArtifactKindInfrastructureShadowDiff) {
+		t.Fatalf("projection missing %s evidence", ArtifactKindInfrastructureShadowDiff)
 	}
 }
 
@@ -310,6 +357,29 @@ func serviceDispatchParticipant(t *testing.T) ParticipantRegistration {
 		t.Fatalf("NewServiceParticipantRegistration: %v", err)
 	}
 	return participant
+}
+
+func serviceDispatchArtifact(t *testing.T, name, reference string) *Artifact {
+	t.Helper()
+	artifact := &Artifact{ArtifactName: name, Kind: ArtifactKindReadiness, Reference: reference}
+	if err := SetArtifactData(artifact, PresentationEvidenceArtifactData{Kind: ArtifactKindReadiness, Reference: reference}); err != nil {
+		t.Fatalf("SetArtifactData: %v", err)
+	}
+	return artifact
+}
+
+func projectionHasArtifactKind(proj *ClaimsBoardProjection, kind string) bool {
+	if proj == nil {
+		return false
+	}
+	for _, testament := range proj.Testaments {
+		for _, artifact := range testament.Artifacts {
+			if artifact != nil && artifact.Kind == kind {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func newTestServiceDispatcher(t *testing.T, board *ClaimsBoard, participant ParticipantRegistration, handler ServiceHandler) *ServiceDispatcher {

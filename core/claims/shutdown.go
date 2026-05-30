@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/concurrency"
 )
 
 const (
@@ -17,15 +19,18 @@ const (
 	shutdownActorID                 = "sys:claims_shutdown"
 )
 
+//go:generate mockery --name=ShutdownScope --output=./mocks --outpkg=mocks
 type ShutdownScope interface {
 	SignalShutdown()
 	Shutdown(gracePeriod, hardDeadline time.Duration) error
 }
 
+//go:generate mockery --name=ShutdownInbox --output=./mocks --outpkg=mocks
 type ShutdownInbox interface {
 	Close() error
 }
 
+//go:generate mockery --name=ShutdownContinuationStore --output=./mocks --outpkg=mocks
 type ShutdownContinuationStore interface {
 	Stop(reason string)
 }
@@ -35,9 +40,10 @@ type SessionShutdownOptions struct {
 	Board        *ClaimsBoard
 	DurableBoard *DurableBoard
 
-	ServiceDispatchers *ServiceDispatcherRegistry
-	SessionBoards      *SessionBoardRegistry
-	SessionInboxes     *SessionInboxRegistry
+	ServiceDispatchers  *ServiceDispatcherRegistry
+	ValidatorDispatcher *BoardValidatorDispatcher
+	SessionBoards       *SessionBoardRegistry
+	SessionInboxes      *SessionInboxRegistry
 
 	Scopes             []ShutdownScope
 	Inboxes            []ShutdownInbox
@@ -52,15 +58,23 @@ type SessionShutdownOptions struct {
 }
 
 type SessionShutdownResult struct {
-	SessionID      string   `json:"session_id,omitempty"`
-	Steps          []string `json:"steps,omitempty"`
-	Cancelled      []string `json:"cancelled,omitempty"`
-	Terminal       []string `json:"terminal,omitempty"`
-	Errors         []string `json:"errors,omitempty"`
-	OutboxDrained  int      `json:"outbox_drained"`
-	SnapshotSaved  bool     `json:"snapshot_saved"`
-	BoardClosed    bool     `json:"board_closed"`
-	AlreadyStopped bool     `json:"already_stopped"`
+	SessionID      string               `json:"session_id,omitempty"`
+	Steps          []string             `json:"steps,omitempty"`
+	Cancelled      []string             `json:"cancelled,omitempty"`
+	Terminal       []string             `json:"terminal,omitempty"`
+	Errors         []string             `json:"errors,omitempty"`
+	OutboxDrained  int                  `json:"outbox_drained"`
+	SnapshotSaved  bool                 `json:"snapshot_saved"`
+	BoardClosed    bool                 `json:"board_closed"`
+	AlreadyStopped bool                 `json:"already_stopped"`
+	LeakReports    []ShutdownLeakReport `json:"leak_reports,omitempty"`
+}
+
+type ShutdownLeakReport struct {
+	AgentID     string   `json:"agent_id,omitempty"`
+	LeakedCount int      `json:"leaked_count"`
+	Workers     []string `json:"workers,omitempty"`
+	StackDump   string   `json:"stack_dump,omitempty"`
 }
 
 type SessionShutdownCoordinator struct {
@@ -128,7 +142,6 @@ func runSessionShutdown(ctx context.Context, opts SessionShutdownOptions) (Sessi
 	for _, inbox := range opts.Inboxes {
 		record("close_inbox", closeShutdownInbox(inbox))
 	}
-	record("close_service_dispatchers", closeServiceDispatchers(opts))
 	for _, scope := range opts.Scopes {
 		if scope != nil {
 			scope.SignalShutdown()
@@ -139,6 +152,7 @@ func runSessionShutdown(ctx context.Context, opts SessionShutdownOptions) (Sessi
 	result.Cancelled = cancelResult.CancelledClaimIDs
 	result.Terminal = cancelResult.TerminalClaimIDs
 	record("cancel_claims", cancelErr)
+	record("close_service_dispatchers", closeServiceDispatchers(opts))
 	for _, store := range opts.Continuations {
 		if store != nil {
 			store.Stop(firstNonEmpty(opts.Reason, "session shutdown"))
@@ -146,7 +160,11 @@ func runSessionShutdown(ctx context.Context, opts SessionShutdownOptions) (Sessi
 	}
 	result.Steps = append(result.Steps, "stop_continuations")
 	for _, scope := range opts.Scopes {
-		record("shutdown_scope", shutdownScope(scope, opts))
+		err := shutdownScope(scope, opts)
+		if report, ok := shutdownLeakReport(err); ok {
+			result.LeakReports = append(result.LeakReports, report)
+		}
+		record("shutdown_scope", err)
 	}
 	if opts.DurableBoard != nil {
 		result.OutboxDrained = opts.DurableBoard.DrainOutbox(ctx, opts.OutboxDrainLimit)
@@ -209,12 +227,13 @@ func cancelShutdownClaims(ctx context.Context, opts SessionShutdownOptions) (Cla
 		return ClaimCancellationResult{}, nil
 	}
 	return CancelClaimTree(ctx, ClaimCancellationOptions{
-		Board:         opts.Board,
-		Dispatchers:   opts.ServiceDispatchers,
-		RootClaimIDs:  opts.ActiveRootClaimIDs,
-		OriginClaimID: strings.Join(normalizeStringList(opts.ActiveRootClaimIDs), ","),
-		ActorID:       opts.ActorID,
-		Reason:        firstNonEmpty(opts.Reason, "session shutdown"),
+		Board:               opts.Board,
+		Dispatchers:         opts.ServiceDispatchers,
+		ValidatorDispatcher: opts.ValidatorDispatcher,
+		RootClaimIDs:        opts.ActiveRootClaimIDs,
+		OriginClaimID:       strings.Join(normalizeStringList(opts.ActiveRootClaimIDs), ","),
+		ActorID:             opts.ActorID,
+		Reason:              firstNonEmpty(opts.Reason, "session shutdown"),
 	})
 }
 
@@ -237,6 +256,19 @@ func removeRegistries(opts SessionShutdownOptions) {
 			opts.SessionInboxes.Remove(opts.SessionID, agentID)
 		}
 	}
+}
+
+func shutdownLeakReport(err error) (ShutdownLeakReport, bool) {
+	var leak *concurrency.GoroutineLeakError
+	if !errors.As(err, &leak) || leak == nil {
+		return ShutdownLeakReport{}, false
+	}
+	return ShutdownLeakReport{
+		AgentID:     leak.AgentID,
+		LeakedCount: leak.LeakedCount,
+		Workers:     append([]string(nil), leak.Workers...),
+		StackDump:   leak.StackDump,
+	}, true
 }
 
 func shutdownInboxAgentIDs(board *ClaimsBoard) []string {

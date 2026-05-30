@@ -73,12 +73,13 @@ const (
 
 // RelatedTypeXxx constants for Relation.RelatedType.
 const (
-	RelatedTypeAction     = "action"
-	RelatedTypeClaim      = "claim"
-	RelatedTypeTestament  = "testament"
-	RelatedTypeValidation = "validation"
-	RelatedTypeArtifact   = "artifact"
-	RelatedTypeAgent      = "agent"
+	RelatedTypeAction         = "action"
+	RelatedTypeClaim          = "claim"
+	RelatedTypeTestament      = "testament"
+	RelatedTypeValidation     = "validation"
+	RelatedTypeArtifact       = "artifact"
+	RelatedTypeAgent          = "agent"
+	RelatedTypeIdempotencyKey = "idempotency_key"
 )
 
 // StatusChange records a single status transition on a stateful object
@@ -887,8 +888,9 @@ type ClaimsBoardProjection struct {
 	TotalTestamentActions int `json:"total_testament_actions"`
 
 	// Testament/artifact counts.
-	TotalTestaments int `json:"total_testaments"`
-	TotalArtifacts  int `json:"total_artifacts"`
+	TotalTestaments int        `json:"total_testaments"`
+	TotalArtifacts  int        `json:"total_artifacts"`
+	Artifacts       []Artifact `json:"artifacts,omitempty"`
 
 	// NotificationErrors contains subscriber notification failures
 	// accumulated since the last projection read. Non-empty signals
@@ -932,6 +934,14 @@ func CloneClaimsBoardProjection(p *ClaimsBoardProjection) *ClaimsBoardProjection
 		for i := range p.Testaments {
 			if clone := CloneTestamentEntity(&p.Testaments[i]); clone != nil {
 				cp.Testaments[i] = *clone
+			}
+		}
+	}
+	if len(p.Artifacts) > 0 {
+		cp.Artifacts = make([]Artifact, len(p.Artifacts))
+		for i := range p.Artifacts {
+			if clone := CloneArtifact(&p.Artifacts[i]); clone != nil {
+				cp.Artifacts[i] = *clone
 			}
 		}
 	}

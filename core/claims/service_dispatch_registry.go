@@ -139,7 +139,7 @@ func (r *ServiceDispatcherRegistry) Snapshot(sessionID string) ServiceDispatcher
 		stats := dispatcher.Stats()
 		out.Dispatchers = append(out.Dispatchers, stats)
 		out.Inflight += stats.Inflight
-		out.QueueDepth += stats.SeenCount
+		out.QueueDepth += stats.QueueDepth
 		out.Capacity += stats.Capacity
 	}
 	sort.Slice(out.Dispatchers, func(i, j int) bool {

@@ -78,17 +78,22 @@ func (stubScopeProvider) Go(_ string, _ time.Duration, fn func(context.Context) 
 }
 
 func setupBridgeOnSession(t *testing.T, sessionID string) (*ClaimsBridge, *claims.ClaimsBoard, *integrationProgram, func()) {
+	return setupBridgeOnSessionWithResolver(t, sessionID, nil)
+}
+
+func setupBridgeOnSessionWithResolver(t *testing.T, sessionID string, resolver claims.AgentRefResolver) (*ClaimsBridge, *claims.ClaimsBoard, *integrationProgram, func()) {
 	t.Helper()
 	registry := claims.DefaultSessionBoardRegistry()
 	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
 	deltaBus := guide.NewClaimsBusAdapter(bus)
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
-		BoardID:    "integration-board-" + sessionID,
-		PipelineID: "p",
-		TaskID:     "t",
-		SessionID:  sessionID,
-		DeltaBus:   deltaBus,
-		Scope:      stubScopeProvider{},
+		BoardID:          "integration-board-" + sessionID,
+		PipelineID:       "p",
+		TaskID:           "t",
+		SessionID:        sessionID,
+		DeltaBus:         deltaBus,
+		Scope:            stubScopeProvider{},
+		AgentRefResolver: resolver,
 	})
 	if err := registry.Register(sessionID, board); err != nil {
 		t.Fatalf("Register: %v", err)
@@ -2134,9 +2139,19 @@ func TestBridgeIntegration_ClaimContextRoutesToUI(t *testing.T) {
 }
 
 func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.T) {
-	br, board, prog, cleanup := setupBridgeOnSession(t, "ses-service-participant")
-	defer cleanup()
 	serviceRoute := "sys:provider_gateway"
+	resolver := claims.AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
+		switch strings.TrimSpace(agentID) {
+		case "architect":
+			return claims.AgentRef{UID: "participant:agent:architect:test", Type: "architect", Name: "architect", Category: string(claims.ParticipantCategoryAgent), Generation: 1}, true
+		case serviceRoute:
+			return claims.AgentRef{UID: "participant:service:provider_gateway:test", Type: serviceRoute, Name: serviceRoute, Category: string(claims.ParticipantCategoryService), Generation: 1, Labels: map[string]string{"session": sessionID}}, true
+		default:
+			return claims.AgentRef{}, false
+		}
+	})
+	br, board, prog, cleanup := setupBridgeOnSessionWithResolver(t, "ses-service-participant", resolver)
+	defer cleanup()
 	if err := board.PostAction(context.Background(),
 		claims.Action{AgentID: "architect", Type: claims.ActionTypeTask},
 		[]claims.Claim{{

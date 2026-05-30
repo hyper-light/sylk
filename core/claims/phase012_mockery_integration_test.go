@@ -242,7 +242,6 @@ func TestPhase345IntegrationMockerySideEffectValidatorUsesPolicyAndRedactor(t *t
 			ID:                 "side-effect-validation",
 			Type:               claims.ValidationTypeInspection,
 			Description:        "plan side-effect validator",
-			QualityBar:         "plan is validated",
 			Required:           true,
 			ValidatorID:        "plan.side_effect.validator",
 			TargetArtifactName: "plan",

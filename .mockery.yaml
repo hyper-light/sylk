@@ -251,6 +251,26 @@ packages:
         config:
           mockname: "ServiceHandler"
 
+      PendingContinuationRecoverer:
+        config:
+          mockname: "PendingContinuationRecoverer"
+
+      ClaimWorkCanceller:
+        config:
+          mockname: "ClaimWorkCanceller"
+
+      ShutdownScope:
+        config:
+          mockname: "ShutdownScope"
+
+      ShutdownInbox:
+        config:
+          mockname: "ShutdownInbox"
+
+      ShutdownContinuationStore:
+        config:
+          mockname: "ShutdownContinuationStore"
+
       ExpectedToolExecutor:
         config:
           mockname: "ExpectedToolExecutor"

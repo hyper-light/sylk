@@ -23,8 +23,24 @@ type InfrastructureTelemetryOptions struct {
 	TypeRegistry        *TypeRegistry
 	Recovery            *ServiceRecoveryResult
 	Cancellation        *ClaimCancellationResult
+	BootHealth          []InfrastructureBootHealth
+	RepairSkills        []InfrastructureRepairSkillStatus
 	ParticipantLimit    int
 	ArtifactTypeLimit   int
+}
+
+type InfrastructureBootHealth struct {
+	Phase       string `json:"phase"`
+	Status      string `json:"status"`
+	ClaimID     string `json:"claim_id,omitempty"`
+	TestamentID string `json:"testament_id,omitempty"`
+}
+
+type InfrastructureRepairSkillStatus struct {
+	Name                   string `json:"name"`
+	DryRunDefault          bool   `json:"dry_run_default"`
+	ApplyRequiresAuth      bool   `json:"apply_requires_auth"`
+	ReportTestamentOnApply bool   `json:"report_testament_on_apply"`
 }
 
 type InfrastructureTelemetrySnapshot struct {
@@ -38,6 +54,8 @@ type InfrastructureTelemetrySnapshot struct {
 	FeatureFlags      map[string]string                 `json:"feature_flags,omitempty"`
 	Recovery          *ServiceRecoveryResult            `json:"recovery,omitempty"`
 	Cancellation      *ClaimCancellationResult          `json:"cancellation,omitempty"`
+	BootHealth        []InfrastructureBootHealth        `json:"boot_health,omitempty"`
+	RepairSkills      []InfrastructureRepairSkillStatus `json:"repair_skills,omitempty"`
 	Warnings          []string                          `json:"warnings,omitempty"`
 }
 
@@ -78,6 +96,8 @@ func InfrastructureTelemetry(ctx context.Context, opts InfrastructureTelemetryOp
 		cancellation := *opts.Cancellation
 		snap.Cancellation = &cancellation
 	}
+	snap.BootHealth = boundedBootHealth(opts.BootHealth, defaultTelemetryWarningLimit)
+	snap.RepairSkills = boundedRepairSkills(firstNonEmptyRepairSkills(opts.RepairSkills), defaultTelemetryWarningLimit)
 	snap.Warnings = boundedStrings(append(snap.Warnings, snap.Projection.Warnings...), defaultTelemetryWarningLimit)
 	return snap
 }
@@ -172,6 +192,32 @@ func boundedStrings(values []string, limit int) []string {
 		}
 	}
 	return out
+}
+
+func boundedBootHealth(values []InfrastructureBootHealth, limit int) []InfrastructureBootHealth {
+	if len(values) > limit {
+		values = values[:limit]
+	}
+	return append([]InfrastructureBootHealth(nil), values...)
+}
+
+func boundedRepairSkills(values []InfrastructureRepairSkillStatus, limit int) []InfrastructureRepairSkillStatus {
+	if len(values) > limit {
+		values = values[:limit]
+	}
+	return append([]InfrastructureRepairSkillStatus(nil), values...)
+}
+
+func firstNonEmptyRepairSkills(values []InfrastructureRepairSkillStatus) []InfrastructureRepairSkillStatus {
+	if len(values) != 0 {
+		return values
+	}
+	return []InfrastructureRepairSkillStatus{{
+		Name:                   "rebuild_claims_projections",
+		DryRunDefault:          true,
+		ApplyRequiresAuth:      true,
+		ReportTestamentOnApply: true,
+	}}
 }
 
 func firstNonNilTypeRegistry(values ...*TypeRegistry) *TypeRegistry {

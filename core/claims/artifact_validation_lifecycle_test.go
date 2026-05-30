@@ -155,6 +155,8 @@ func TestArtifactAndValidationTransitionTables(t *testing.T) {
 		{ValidationStatusValidatingQualityBar, ValidationStatusValidated},
 		{ValidationStatusValidatingQualityBar, ValidationStatusQualityBarValidationFailed},
 		{ValidationStatusValidatingQualityBar, ValidationStatusQualityBarValidationFailedNotRequired},
+		{ValidationStatusValidatingQualityBar, ValidationStatusErrored},
+		{ValidationStatusValidatingQualityBar, ValidationStatusErroredNotRequired},
 	}
 	for _, step := range validationValid {
 		if !CanTransitionValidationStatus(step.from, step.to) {

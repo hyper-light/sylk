@@ -345,6 +345,7 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeGuardianDecision, GuardianDecisionArtifactData{}},
 		{ArtifactDataTypeProviderGatewayCall, ProviderGatewayCallArtifactData{}},
 		{ArtifactDataTypeExternalAdapterEvent, ExternalAdapterEventArtifactData{}},
+		{ArtifactDataTypeRecoveryIdempotency, RecoveryIdempotencyArtifactData{}},
 	}
 	for _, entry := range entries {
 		if err := registry.Register(entry.dataType, entry.sample, codec); err != nil {

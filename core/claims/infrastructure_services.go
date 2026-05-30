@@ -298,6 +298,31 @@ func NewDefaultInfrastructureServiceHandler(participantID string) ServiceHandler
 	}
 }
 
+func InfrastructureSubsystemForParticipantID(participantID string) string {
+	switch strings.TrimSpace(participantID) {
+	case "sys:dag_processor", "dag_processor":
+		return "dag"
+	case "sys:vfs_pipeline_provisioner", "sys:vfs_tool_provisioner", "sys:vfs_global_provisioner", "vfs_pipeline_provisioner", "vfs_tool_provisioner", "vfs_global_provisioner":
+		return "vfs"
+	case "sys:tool_runtime", "tool_runtime":
+		return "tool_runtime"
+	case "sys:knowledge_graph_reader", "sys:knowledge_graph_writer", "knowledge_graph_reader", "knowledge_graph_writer":
+		return "knowledge"
+	case "sys:memory_forest", "memory_forest":
+		return "memory"
+	case "sys:document_db_reader", "sys:document_db_writer", "document_db_reader", "document_db_writer":
+		return "document"
+	case "sys:guardian_service", "guardian_service":
+		return "guardian"
+	case "sys:provider_gateway", "provider_gateway":
+		return "provider"
+	case "sys:external_adapter", "external_adapter":
+		return "external"
+	default:
+		return ""
+	}
+}
+
 func (s *InfrastructureService) HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if err := validateInfrastructureService(s); err != nil {
 		return ServiceClaimResult{}, err
@@ -1174,6 +1199,10 @@ func dagOperationArtifact(data DAGOperationArtifactData) (*Artifact, error) {
 
 func vfsOperationArtifact(data VFSOperationArtifactData) (*Artifact, error) {
 	return infrastructureArtifact("vfs_operation", ArtifactKindVFSOperation, data.MountRef, data.FailureReason, data)
+}
+
+func NewVFSOperationArtifact(data VFSOperationArtifactData) (*Artifact, error) {
+	return vfsOperationArtifact(data)
 }
 
 func toolRuntimeExecutionArtifact(data ToolRuntimeExecutionArtifactData) (*Artifact, error) {

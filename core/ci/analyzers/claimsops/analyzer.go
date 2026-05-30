@@ -34,7 +34,10 @@ var allowedDirectVFSPackages = []string{
 	"github.com/adalundhe/sylk/core/versioning",
 	"github.com/adalundhe/sylk/core/container",
 	"github.com/adalundhe/sylk/core/claims",
-	"github.com/adalundhe/sylk/agents/shared",
+}
+
+var allowedDirectVFSFiles = []string{
+	"agents/shared/pipeline_committer.go",
 }
 
 var allowedRawGoFiles = []string{
@@ -83,10 +86,9 @@ func checkCall(pass *analysis.Pass, filename string, call *ast.CallExpr) {
 	if missingRegistrationDeterminism(pass.TypesInfo, call) {
 		pass.Reportf(call.Pos(), "participant registration must declare HandlerDeterminism; use HandlerDeterminismPure, Content, SideEffect, or Nondeterministic")
 	}
-	if directVFSBypass(pass, call) && !directVFSBypassAllowed(pass.Pkg.Path()) {
+	if directVFSBypass(pass, call) && !directVFSBypassAllowedAt(pass.Pkg.Path(), filename) {
 		pass.Reportf(call.Pos(), "direct VFS mutation bypasses claims evidence; route through the infrastructure service dispatcher or a documented claim-synthesizing wrapper")
 	}
-	_ = filename
 }
 
 func checkComposite(pass *analysis.Pass, lit *ast.CompositeLit) {
@@ -207,6 +209,18 @@ func methodFromVersioning(info *types.Info, fun ast.Expr) bool {
 func directVFSBypassAllowed(pkgPath string) bool {
 	for _, prefix := range allowedDirectVFSPackages {
 		if pkgPath == prefix || strings.HasPrefix(pkgPath, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func directVFSBypassAllowedAt(pkgPath, filename string) bool {
+	if directVFSBypassAllowed(pkgPath) {
+		return true
+	}
+	for _, allowed := range allowedDirectVFSFiles {
+		if strings.HasSuffix(filename, allowed) {
 			return true
 		}
 	}

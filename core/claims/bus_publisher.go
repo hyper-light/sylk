@@ -80,8 +80,8 @@ func (NoopDeltaBus) SubscribeDelta(pattern string, _ DeltaHandler) (DeltaSubscri
 
 type noopSubscription struct{ topic string }
 
-func (s noopSubscription) Topic() string       { return s.topic }
-func (s noopSubscription) Unsubscribe() error  { return nil }
+func (s noopSubscription) Topic() string      { return s.topic }
+func (s noopSubscription) Unsubscribe() error { return nil }
 
 // publishOrNoop returns a non-nil DeltaPublisher. Zero nil-checks in
 // callers.

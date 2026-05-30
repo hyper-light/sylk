@@ -17,7 +17,10 @@ var (
 	ErrServiceDispatchOverflow  = errors.New("service dispatcher concurrency budget exhausted")
 )
 
-const serviceFailureStackLimitBytes = 64 * 1024
+const (
+	serviceFailureStackLimitBytes = 64 * 1024
+	serviceSeenKeysPerDelta       = 2
+)
 
 type ServiceClaimRequest struct {
 	Board       *ClaimsBoard
@@ -27,9 +30,10 @@ type ServiceClaimRequest struct {
 }
 
 type ServiceClaimResult struct {
-	Summary   string
-	Artifacts []*Artifact
-	Metadata  map[string]any
+	Summary         string
+	Artifacts       []*Artifact
+	ShadowArtifacts []*Artifact
+	Metadata        map[string]any
 }
 
 type ServiceShutdownRequest struct {
@@ -80,6 +84,7 @@ type ServiceDispatcherStats struct {
 	Started        bool                    `json:"started"`
 	Closed         bool                    `json:"closed"`
 	SeenCount      int                     `json:"seen_count"`
+	QueueDepth     int                     `json:"queue_depth"`
 	Inflight       int                     `json:"inflight"`
 	Capacity       int                     `json:"capacity"`
 	ActiveClaimIDs []string                `json:"active_claim_ids,omitempty"`
@@ -100,7 +105,7 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 		participant: participant,
 		handler:     cfg.Handler,
 		sessionID:   firstNonEmpty(strings.TrimSpace(cfg.SessionID), cfg.Board.SessionID()),
-		seen:        make(map[string]struct{}, participant.QueueCapacity),
+		seen:        make(map[string]struct{}, participant.QueueCapacity*serviceSeenKeysPerDelta),
 		inflight:    make(chan struct{}, participant.ConcurrencyBudget),
 		active:      make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
 	}, nil
@@ -165,6 +170,7 @@ func (d *ServiceDispatcher) Stats() ServiceDispatcherStats {
 		Started:        d.started,
 		Closed:         d.closed,
 		SeenCount:      len(d.seen),
+		QueueDepth:     len(d.active),
 		Inflight:       len(d.inflight),
 		Capacity:       cap(d.inflight),
 		ActiveClaimIDs: active,
@@ -200,10 +206,13 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 	if err := d.acceptDelta(delta); err != nil {
 		return err
 	}
+	if !d.dispatchEnabled() {
+		return d.recordFailure(ctx, delta, ValidationErrorCategoryDispatcher, "infrastructure dispatch disabled by rollout gate", nil)
+	}
 	if d.isClosed() {
 		return fmt.Errorf("%w: dispatcher is closed", ErrServiceDispatcherInvalid)
 	}
-	if !d.remember(delta.Key) {
+	if !d.remember(delta) {
 		return nil
 	}
 	if !d.acquire(delta) {
@@ -240,6 +249,9 @@ func (d *ServiceDispatcher) invoke(ctx context.Context, delta CanonicalDelta) (e
 	if err != nil {
 		return err
 	}
+	if d.testamentAlreadyRecorded(claim) {
+		return nil
+	}
 	result, err := d.handler.HandleServiceClaim(ctx, ServiceClaimRequest{Board: d.board, Claim: claim, Delta: delta, Participant: d.participant})
 	if err != nil {
 		return d.recordFailure(ctx, delta, ValidationErrorCategoryHandler, err.Error(), nil)
@@ -266,16 +278,24 @@ func (d *ServiceDispatcher) prepareClaim(ctx context.Context, delta CanonicalDel
 }
 
 func (d *ServiceDispatcher) postSuccess(ctx context.Context, claim *Claim, result ServiceClaimResult) error {
+	idempotencyKey := ServiceHandlerIdempotencyKey(claim, d.participant)
 	artifacts := normalizeServiceArtifacts(result.Artifacts, d.participant.RouteKey)
+	if err := d.recordShadowComparison(ctx, artifacts, result.ShadowArtifacts); err != nil {
+		return err
+	}
 	testament := Testament{
-		AgentID:    d.participant.RouteKey,
-		Summary:    firstNonEmpty(strings.TrimSpace(result.Summary), "service claim completed"),
-		Confidence: "deterministic",
-		Relations:  []Relation{{Related: claim.ID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim}},
-		Artifacts:  artifacts,
+		AgentID:        d.participant.RouteKey,
+		Summary:        firstNonEmpty(strings.TrimSpace(result.Summary), "service claim completed"),
+		Confidence:     "deterministic",
+		IdempotencyKey: idempotencyKey,
+		Relations: []Relation{
+			{Related: claim.ID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim},
+			{Related: idempotencyKey, RelatedType: RelatedTypeIdempotencyKey, Relationship: RelationshipDerivedFrom},
+		},
+		Artifacts: artifacts,
 	}
 	generated, err := d.board.GenerateTestamentAction(ctx, Action{AgentID: d.participant.RouteKey, Type: ActionTypeTestament, Status: ActionStatusComplete}, []Testament{testament}, GenerateTestamentActionOptions{
-		IdempotencyKey: "service_dispatch:" + claim.ID + ":" + d.participant.UID,
+		IdempotencyKey: "service_dispatch:" + idempotencyKey,
 		Reason:         "service handler testament generated",
 	})
 	if err != nil {
@@ -377,6 +397,14 @@ func (d *ServiceDispatcher) acceptDelta(delta CanonicalDelta) error {
 	return nil
 }
 
+func (d *ServiceDispatcher) dispatchEnabled() bool {
+	subsystem := InfrastructureSubsystemForParticipantID(d.participant.RouteKey)
+	if subsystem == "" {
+		return true
+	}
+	return d.board.RolloutConfig().InfrastructureDispatchEnabled(subsystem)
+}
+
 func (d *ServiceDispatcher) markStarting() (bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -476,23 +504,33 @@ func (d *ServiceDispatcher) untrackActive(claimID string) {
 	d.mu.Unlock()
 }
 
-func (d *ServiceDispatcher) remember(deltaKey string) bool {
+func (d *ServiceDispatcher) remember(delta CanonicalDelta) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	deltaKey := strings.TrimSpace(delta.Key)
 	if _, ok := d.seen[deltaKey]; ok {
 		return false
 	}
+	claimKey := "claim:" + strings.TrimSpace(delta.ClaimID())
+	if _, ok := d.seen[claimKey]; ok {
+		return false
+	}
 	d.seen[deltaKey] = struct{}{}
-	d.seenOrder = append(d.seenOrder, deltaKey)
+	d.seen[claimKey] = struct{}{}
+	d.seenOrder = append(d.seenOrder, deltaKey, claimKey)
 	d.pruneSeenLocked()
 	return true
 }
 
 func (d *ServiceDispatcher) pruneSeenLocked() {
-	for len(d.seenOrder) > d.participant.QueueCapacity {
+	for len(d.seenOrder) > d.seenCapacity() {
 		delete(d.seen, d.seenOrder[0])
 		d.seenOrder = d.seenOrder[1:]
 	}
+}
+
+func (d *ServiceDispatcher) seenCapacity() int {
+	return d.participant.QueueCapacity * serviceSeenKeysPerDelta
 }
 
 func (d *ServiceDispatcher) subscriptionTopics() []string {
@@ -575,6 +613,69 @@ func deltaTargetsParticipant(delta CanonicalDelta, ref AgentRef) bool {
 		}
 	}
 	return false
+}
+
+func (d *ServiceDispatcher) testamentAlreadyRecorded(claim *Claim) bool {
+	if d == nil || d.board == nil || claim == nil {
+		return false
+	}
+	key := ServiceHandlerIdempotencyKey(claim, d.participant)
+	for _, testament := range d.board.TestamentsByClaim(claim.ID) {
+		if testamentHasIdempotencyKey(testament, key) && testament.LifecycleStatus.IsTerminal() {
+			return true
+		}
+	}
+	return false
+}
+
+func testamentHasIdempotencyKey(testament *Testament, key string) bool {
+	if testament == nil || strings.TrimSpace(key) == "" {
+		return false
+	}
+	if strings.TrimSpace(testament.IdempotencyKey) == strings.TrimSpace(key) {
+		return true
+	}
+	for _, relation := range testament.Relations {
+		if relation.RelatedType == RelatedTypeIdempotencyKey && relation.Relationship == RelationshipDerivedFrom && strings.TrimSpace(relation.Related) == strings.TrimSpace(key) {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *ServiceDispatcher) recordShadowComparison(ctx context.Context, serviceArtifacts, shadowArtifacts []*Artifact) error {
+	subsystem := InfrastructureSubsystemForParticipantID(d.participant.RouteKey)
+	if subsystem == "" || len(shadowArtifacts) == 0 || d.board.RolloutConfig().InfrastructureMode(subsystem) != InfrastructureRolloutShadow {
+		return nil
+	}
+	comparison := CompareInfrastructureShadow(subsystem, serviceArtifacts, shadowArtifacts)
+	_, err := RecordInfrastructureShadowComparison(ctx, d.board, comparison)
+	return err
+}
+
+func ServiceHandlerIdempotencyKey(claim *Claim, participant ParticipantRegistration) string {
+	if claim == nil {
+		return stableInfrastructureHash(participant.UID)
+	}
+	return stableInfrastructureHash(map[string]any{
+		"type":                string(claim.ActionType),
+		"subject_uid":         firstNonEmpty(participant.UID, SubjectAgentID(claim.Relations)),
+		"scope":               claim.Scope,
+		"expected_tool_calls": claim.ExpectedToolCalls,
+		"title":               strings.TrimSpace(claim.Title),
+		"description":         strings.TrimSpace(claim.Description),
+		"nonce":               expectedToolIdempotencyNonce(claim.ExpectedToolCalls),
+		"participant_version": participant.Generation,
+	})
+}
+
+func expectedToolIdempotencyNonce(calls []ExpectedToolCall) string {
+	for _, call := range calls {
+		if nonce := firstNonEmpty(stringArg(call.Arguments, "idempotency_nonce"), stringArg(call.Arguments, "nonce")); nonce != "" {
+			return nonce
+		}
+	}
+	return ""
 }
 
 func boundedServiceFailureStack(stack []byte) string {

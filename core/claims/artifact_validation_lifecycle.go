@@ -110,6 +110,8 @@ var validationStatusTransitions = map[ValidationStatus]map[ValidationStatus]bool
 		ValidationStatusValidated:                             true,
 		ValidationStatusQualityBarValidationFailed:            true,
 		ValidationStatusQualityBarValidationFailedNotRequired: true,
+		ValidationStatusErrored:                               true,
+		ValidationStatusErroredNotRequired:                    true,
 	},
 }
 

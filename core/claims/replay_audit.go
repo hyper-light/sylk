@@ -138,6 +138,11 @@ func auditServiceClaim(ctx context.Context, opts ReplayAuditOptions, claim Claim
 
 func auditValidator(ctx context.Context, opts ReplayAuditOptions, item validationRecoveryItem) ReplayAuditFinding {
 	finding := ReplayAuditFinding{ClaimID: item.Claim.ID, ValidationID: item.Validation.ID, Kind: "validator"}
+	if opts.ValidatorRegistry == nil {
+		finding.Status = "skipped"
+		finding.Reason = "validator registry not configured for replay audit"
+		return finding
+	}
 	reg, ok := opts.ValidatorRegistry.Lookup(&item.Claim, &item.Validation)
 	if !ok {
 		finding.Status = "skipped"

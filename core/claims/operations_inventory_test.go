@@ -127,6 +127,22 @@ func TestOperationsInventoryDuplicateRequirementValidationNamesKey(t *testing.T)
 	}
 }
 
+func TestOperationsInventoryPlannedEntriesRequireOwnerClaimAndDeadline(t *testing.T) {
+	if err := ValidateOperationsInventoryPlanning(OperationsInventory(), OperationsInventoryOwners()); err != nil {
+		t.Fatalf("ValidateOperationsInventoryPlanning: %v", err)
+	}
+	entry := OperationsInventoryEntry{Requirement: "ops.planned.synthetic", Status: OperationsSurfacePlanned, Package: "core/claims", Boundary: "planned"}
+	if err := ValidateOperationsInventoryPlanning([]OperationsInventoryEntry{entry}, nil); !errors.Is(err, ErrOperationsInventoryInvalid) {
+		t.Fatalf("missing owner error = %v, want ErrOperationsInventoryInvalid", err)
+	}
+	owners := map[string]OperationsInventoryOwner{
+		entry.Requirement: {Requirement: entry.Requirement, OwnerClaimID: "owner", Deadline: "not-a-date"},
+	}
+	if err := ValidateOperationsInventoryPlanning([]OperationsInventoryEntry{entry}, owners); !errors.Is(err, ErrOperationsInventoryInvalid) || !strings.Contains(err.Error(), "invalid deadline") {
+		t.Fatalf("invalid deadline error = %v, want named invalid deadline", err)
+	}
+}
+
 func assertInventoryRequirement(t *testing.T, inventory []OperationsInventoryEntry, requirement string) OperationsInventoryEntry {
 	t.Helper()
 	entry, ok := findInventoryRequirement(inventory, requirement)

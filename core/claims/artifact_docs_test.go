@@ -58,6 +58,7 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeGuardianDecision,
 		ArtifactDataTypeProviderGatewayCall,
 		ArtifactDataTypeExternalAdapterEvent,
+		ArtifactDataTypeRecoveryIdempotency,
 	} {
 		if !strings.Contains(body, dataType) {
 			t.Fatalf("ARTIFACTS_AND_VALIDATIONS.md missing data type %s", dataType)

@@ -435,6 +435,10 @@ func (db *DurableBoard) AcknowledgeArtifactReceipt(ctx context.Context, artifact
 	return db.board.AcknowledgeArtifactReceipt(ctx, artifactID, receiverID)
 }
 
+func (db *DurableBoard) ReceiveArtifact(ctx context.Context, artifactID, receiverID string) (*Artifact, error) {
+	return db.board.ReceiveArtifact(ctx, artifactID, receiverID)
+}
+
 func (db *DurableBoard) RecordArtifactReceiptFailure(ctx context.Context, artifactID, receiverID string, artifactErr *ArtifactError) error {
 	return db.board.RecordArtifactReceiptFailure(ctx, artifactID, receiverID, artifactErr)
 }
@@ -465,6 +469,10 @@ func (db *DurableBoard) BeginValidationQualityBar(ctx context.Context, claimID, 
 
 func (db *DurableBoard) CompleteValidationLifecycle(ctx context.Context, claimID, validationID, actorID string, status ValidationStatus, opts ValidationLifecycleOptions) error {
 	return db.board.CompleteValidationLifecycle(ctx, claimID, validationID, actorID, status, opts)
+}
+
+func (db *DurableBoard) BuildValidationResultTestament(ctx context.Context, req ResultTestamentRequest) (ResultTestamentResult, error) {
+	return db.board.BuildValidationResultTestament(ctx, req)
 }
 
 func (db *DurableBoard) RejectClaim(ctx context.Context, claimID string, change StatusChange, replacements *Action, replacementClaims []Claim) error {

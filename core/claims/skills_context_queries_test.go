@@ -129,13 +129,13 @@ func TestFindOverlappingClaims_UsesScopeIndex(t *testing.T) {
 		Action{Type: ActionTypeTask, AgentID: "inspector"},
 		[]Claim{
 			{
-				Title: "Auth fn",
-				Scope: []ClaimScopeEntry{{Kind: "file", Key: "services/auth.go"}},
+				Title:     "Auth fn",
+				Scope:     []ClaimScopeEntry{{Kind: "file", Key: "services/auth.go"}},
 				Relations: []Relation{{Related: "eng", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject}},
 			},
 			{
-				Title: "Auth test",
-				Scope: []ClaimScopeEntry{{Kind: "file", Key: "services/auth.go"}, {Kind: "file", Key: "services/auth_test.go"}},
+				Title:     "Auth test",
+				Scope:     []ClaimScopeEntry{{Kind: "file", Key: "services/auth.go"}, {Kind: "file", Key: "services/auth_test.go"}},
 				Relations: []Relation{{Related: "tester", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject}},
 			},
 		},

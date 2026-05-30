@@ -790,8 +790,8 @@ func (d *BoardValidatorDispatcher) recoverAcquiredValidation(ctx context.Context
 	if !ok {
 		return d.commitRecoveryDispatchError(ctx, req, ValidatorRegistration{ValidatorID: validationAgentID(req.Validation)}, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error())
 	}
-	if !validationRecoveryMayRedispatch(reg) {
-		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryDispatcher, "validator recovery requires pure/content determinism")
+	if !validationRecoveryMayRedispatch(reg, req) {
+		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryDispatcher, "validator recovery requires pure/content determinism or idempotency evidence")
 	}
 	if err := validateDispatchInput(d.registry.typeRegistry(), reg, req); err != nil {
 		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryArtifactType, err.Error())
@@ -893,10 +893,14 @@ func (d *BoardValidatorDispatcher) validateBoardParentage(req ValidationDispatch
 	if !ok || storedArtifact.ID != req.Artifact.ID {
 		return fmt.Errorf("%w: artifact %q is not the board target for validation %q", ErrValidatorDispatchInvalid, req.Artifact.ID, req.Validation.ID)
 	}
-	if storedArtifact.TestamentID == "" || storedArtifact.Status != ArtifactStatusAttached {
+	if storedArtifact.TestamentID == "" || !artifactReadyForValidationDispatch(storedArtifact.Status) {
 		return fmt.Errorf("%w: artifact %q is not attached and ready for validation", ErrValidatorDispatchInvalid, storedArtifact.ID)
 	}
 	return nil
+}
+
+func artifactReadyForValidationDispatch(status ArtifactStatus) bool {
+	return status == ArtifactStatusAttached || status == ArtifactStatusValidating
 }
 
 func (d *BoardValidatorDispatcher) validateBoundedInput(artifact *Artifact) error {
@@ -996,6 +1000,7 @@ func (d *BoardValidatorDispatcher) commitDispatchResult(ctx context.Context, req
 	if result.Error != nil && result.ResultArtifact == nil {
 		result.ResultArtifact = validatorErrorArtifact(reg, req, result.Error, nil)
 	}
+	result.Status = deterministicValidationCommitStatus(req.Validation, result.Status)
 	err := d.board.CompleteValidationLifecycle(ctx, req.Claim.ID, req.Validation.ID, firstNonEmpty(reg.ValidatorID, validationAgentID(req.Validation)), result.Status, ValidationLifecycleOptions{
 		Reason:           validationResultReason(result),
 		TargetArtifactID: dispatchArtifactID(req.Artifact),
@@ -1003,6 +1008,17 @@ func (d *BoardValidatorDispatcher) commitDispatchResult(ctx context.Context, req
 		Error:            result.Error,
 	})
 	return result, err
+}
+
+func deterministicValidationCommitStatus(validation *Validation, status ValidationStatus) ValidationStatus {
+	if status == ValidationStatusValidated && validationHasQualityBar(validation) {
+		return ValidationStatusValidatingQualityBar
+	}
+	return status
+}
+
+func validationHasQualityBar(validation *Validation) bool {
+	return validation != nil && strings.TrimSpace(validation.QualityBar) != ""
 }
 
 func (d *BoardValidatorDispatcher) handlerContext(ctx context.Context, validation *Validation) (context.Context, context.CancelFunc) {
@@ -1112,6 +1128,12 @@ func firstNonNilClock(clock ClaimsClock) ClaimsClock {
 	return clock
 }
 
-func validationRecoveryMayRedispatch(reg ValidatorRegistration) bool {
-	return reg.Determinism == HandlerDeterminismPure || reg.Determinism == HandlerDeterminismContent
+func validationRecoveryMayRedispatch(reg ValidatorRegistration, req ValidationDispatchRequest) bool {
+	if reg.Determinism == HandlerDeterminismPure || reg.Determinism == HandlerDeterminismContent {
+		return true
+	}
+	if reg.Determinism != HandlerDeterminismSideEffect && reg.Determinism != HandlerDeterminismNondeterministic {
+		return false
+	}
+	return artifactProvesRecoveryIdempotency(req.Artifact, ParticipantRegistration{UID: reg.ValidatorID, RouteKey: reg.ValidatorID})
 }

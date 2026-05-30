@@ -17,6 +17,7 @@ const (
 	ReadinessEvidenceE2E         = "e2e"
 	ReadinessEvidenceRace        = "race"
 	ReadinessEvidenceAnalyzer    = "analyzer"
+	ReadinessEvidenceMockery     = "mockery"
 	ReadinessEvidenceDocs        = "docs"
 	ReadinessEvidencePerformance = "performance"
 	ReadinessEvidenceRunbook     = "runbook"
@@ -50,6 +51,7 @@ func RequiredProductionReadinessEvidence() []string {
 		ReadinessEvidenceE2E,
 		ReadinessEvidenceRace,
 		ReadinessEvidenceAnalyzer,
+		ReadinessEvidenceMockery,
 		ReadinessEvidenceDocs,
 		ReadinessEvidencePerformance,
 		ReadinessEvidenceRunbook,
@@ -61,6 +63,7 @@ func RequiredProductionReadinessEvidence() []string {
 func BuildProductionReadinessReport(req ProductionReadinessRequest) ProductionReadinessReport {
 	evidence := normalizeReadinessEvidence(req.Evidence)
 	waivers, invalid := normalizeReadinessWaivers(req.Waivers)
+	invalid = append(invalid, plannedInventoryReadinessFindings(OperationsInventory())...)
 	missing := missingReadinessEvidence(evidence, waivers)
 	data := ProductionReadinessArtifactData{
 		Ready:     len(missing) == 0 && len(invalid) == 0,
@@ -195,6 +198,13 @@ func readinessEvidencePassing(ev ProductionReadinessEvidence) bool {
 	default:
 		return false
 	}
+}
+
+func plannedInventoryReadinessFindings(entries []OperationsInventoryEntry) []string {
+	if err := ValidateOperationsInventoryPlanning(entries, OperationsInventoryOwners()); err != nil {
+		return []string{err.Error()}
+	}
+	return nil
 }
 
 func readinessReference(data ProductionReadinessArtifactData) string {

@@ -3,6 +3,7 @@
 LLAMA_DIR := third_party/go-llama.cpp
 LIBRARY_PATH := $(shell pwd)/$(LLAMA_DIR)
 C_INCLUDE_PATH := $(shell pwd)/$(LLAMA_DIR)
+MOCKERY ?= go run github.com/vektra/mockery/v2@v2.53.6
 
 all: build
 
@@ -30,11 +31,10 @@ claims-infra-race:
 	go test -race ./core/claims ./ui/bridge ./core/ci/analyzers/claimsops
 
 mockery-check:
-	mockery --config .mockery.yaml --dry-run
+	$(MOCKERY) --config .mockery.yaml --dry-run
 
 docs-traceability:
-	test -s docs/CLAIMS_AND_INFRASTRUCTURE.md
-	test -s docs/CLAIMS_OPERATIONS.md
+	scripts/ci/docs-traceability.sh
 
 test-gguf: libbinding
 	LIBRARY_PATH=$(LIBRARY_PATH) C_INCLUDE_PATH=$(C_INCLUDE_PATH) go test -tags gguf ./...

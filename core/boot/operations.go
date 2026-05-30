@@ -596,6 +596,9 @@ func (s *OperationsSequencer) ensureServiceDispatcher(ctx context.Context, spec 
 	if err != nil {
 		return nil, err
 	}
+	if artifact := s.disabledServiceDispatcherArtifact(spec, participant, participants); artifact != nil {
+		return artifact, nil
+	}
 	if dispatcher, ok := s.serviceDispatcherRegistry.Lookup(s.board.SessionID(), participant.UID); ok {
 		return dispatcherReadinessArtifact(s.identity.BootSequencerUID, spec.Phase, dispatcher, "existing", spec, participants), nil
 	}
@@ -989,6 +992,17 @@ func dispatcherReadinessArtifact(agentID string, phase BootOperationPhase, dispa
 	}
 	metadata := dispatcherMetadata(phase, participant, outcome, spec, participants)
 	return readinessArtifact(agentID, "service_dispatcher."+sanitizeKeyPart(dispatcherParticipantID(spec, participant)), true, metadata)
+}
+
+func (s *OperationsSequencer) disabledServiceDispatcherArtifact(spec ServiceDispatcherBootRegistration, participant claims.ParticipantRegistration, participants map[string]SystemParticipantActivation) *claims.Artifact {
+	subsystem := claims.InfrastructureSubsystemForParticipantID(participant.RouteKey)
+	if subsystem == "" || s.board.RolloutConfig().InfrastructureDispatchEnabled(subsystem) {
+		return nil
+	}
+	metadata := dispatcherMetadata(spec.Phase, participant, "disabled_by_rollout", spec, participants)
+	metadata["rollout_subsystem"] = subsystem
+	metadata["rollout_mode"] = string(s.board.RolloutConfig().InfrastructureMode(subsystem))
+	return readinessArtifact(s.identity.BootSequencerUID, "service_dispatcher."+sanitizeKeyPart(dispatcherParticipantID(spec, participant)), true, metadata)
 }
 
 func dispatcherFailureArtifact(agentID string, phase BootOperationPhase, spec ServiceDispatcherBootRegistration, cause error) *claims.Artifact {

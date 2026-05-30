@@ -673,7 +673,6 @@ func postPhase345Claim(t *testing.T, board *ClaimsBoard, validatorID string, req
 			ID:                 "phase345-validation",
 			Type:               ValidationTypeInspection,
 			Description:        "plan validates",
-			QualityBar:         "plan is inspectable",
 			Required:           required,
 			ValidatorID:        validatorID,
 			TargetArtifactName: "plan",
