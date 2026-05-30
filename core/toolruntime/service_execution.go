@@ -160,6 +160,9 @@ func runtimeServiceCallArgs(r *Runtime, inv Invocation) map[string]any {
 	}
 	return map[string]any{
 		"tool_name":         firstRuntimeServiceString(toolName, inv.ToolCall.Name),
+		"agent_id":          strings.TrimSpace(inv.AgentID),
+		"capability_scope":  strings.TrimSpace(inv.CapabilityScope),
+		"correlation_id":    strings.TrimSpace(inv.CorrelationID),
 		"args":              rawInvocationArgs(inv.ToolCall.Arguments),
 		"redacted_args":     redactedInvocationArgs(inv.ToolCall.Arguments),
 		"policy_decision":   decision,

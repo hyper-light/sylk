@@ -928,19 +928,21 @@ func (db *DurableBoard) applyTestamentSubmitted(event *walEvent) error {
 
 func (db *DurableBoard) applyArtifactLifecycleTransition(event *walEvent) error {
 	var payload struct {
-		ArtifactID   string         `json:"artifact_id"`
-		Artifact     *Artifact      `json:"artifact,omitempty"`
-		To           ArtifactStatus `json:"to"`
-		AgentID      string         `json:"agent_id"`
-		Reason       string         `json:"reason"`
-		Changed      time.Time      `json:"changed"`
-		Error        *ArtifactError `json:"error,omitempty"`
-		ValidationID string         `json:"validation_id,omitempty"`
+		ArtifactID   string                   `json:"artifact_id"`
+		Artifact     *Artifact                `json:"artifact,omitempty"`
+		To           ArtifactStatus           `json:"to"`
+		AgentID      string                   `json:"agent_id"`
+		Reason       string                   `json:"reason"`
+		Changed      time.Time                `json:"changed"`
+		Error        *ArtifactError           `json:"error,omitempty"`
+		ValidationID string                   `json:"validation_id,omitempty"`
+		TestamentTo  TestamentLifecycleStatus `json:"testament_to,omitempty"`
+		ClaimTo      ClaimLifecycleStatus     `json:"claim_to,omitempty"`
 	}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return err
 	}
-	artifact, _, _, ok := db.board.findArtifactForMutationLocked(payload.ArtifactID)
+	artifact, testament, claim, ok := db.board.findArtifactForMutationLocked(payload.ArtifactID)
 	createdFromPayload := false
 	if !ok {
 		if payload.Artifact == nil || !artifactGenerationReplayStatus(payload.To) {
@@ -960,10 +962,22 @@ func (db *DurableBoard) applyArtifactLifecycleTransition(event *walEvent) error 
 		artifact.Errors = append(artifact.Errors, cloneArtifactError(payload.Error))
 	}
 	artifact.Accessed = changed
+	propagation := artifactTerminalPropagation{TestamentTo: payload.TestamentTo, ClaimTo: payload.ClaimTo}
+	if propagation.TestamentTo == "" {
+		propagation = db.board.artifactTerminalPropagationLocked(artifact, testament, claim, payload.To, payload.Error)
+	}
+	claimSynced := db.board.applyArtifactTerminalPropagationLocked(testament, propagation, payload.AgentID, payload.Reason, changed)
 	action := mustArtifactLifecycleDeltaAction(payload.To)
-	db.insertReplayOutbox([]ClaimsOutboxRecord{
+	records := []ClaimsOutboxRecord{
 		db.board.outboxRecordLocked(event.Sequence, RelatedTypeArtifact, artifact.ID, string(action), event.CreatedAt),
-	})
+	}
+	if propagation.TestamentTo != "" {
+		records = append(records, db.board.outboxRecordsForTestamentLifecyclePtrLocked([]*Testament{testament}, propagation.TestamentTo, event.CreatedAt)...)
+	}
+	if claimSynced && claim != nil {
+		records = append(records, db.board.outboxRecordsForClaimLifecyclePtrLocked([]*Claim{claim}, propagation.ClaimTo, event.CreatedAt)...)
+	}
+	db.insertReplayOutbox(records)
 	return nil
 }
 

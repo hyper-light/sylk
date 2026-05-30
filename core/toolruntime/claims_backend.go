@@ -119,7 +119,15 @@ func invocationFromClaims(req claims.ToolRuntimeExecutionRequest, data claims.To
 	if err != nil {
 		return Invocation{}, err
 	}
-	agentID := firstClaimsToolString(claims.IssuerAgentID(req.Claim.Relations), req.Claim.AgentID, req.Participant.RouteKey)
+	claimID := ""
+	claimAgentID := ""
+	var claimRelations []claims.Relation
+	if req.Claim != nil {
+		claimID = req.Claim.ID
+		claimAgentID = req.Claim.AgentID
+		claimRelations = req.Claim.Relations
+	}
+	agentID := firstClaimsToolString(claimsToolStringArg(req.Call.Arguments, "agent_id"), claims.IssuerAgentID(claimRelations), claimAgentID, req.Participant.RouteKey)
 	return Invocation{
 		ToolCall: providers.ToolCall{
 			ID:        firstClaimsToolString(req.Call.ID, data.ToolName),
@@ -127,8 +135,8 @@ func invocationFromClaims(req claims.ToolRuntimeExecutionRequest, data claims.To
 			Arguments: arguments,
 		},
 		AgentID:         agentID,
-		CorrelationID:   firstClaimsToolString(req.Call.ID, req.Claim.ID),
-		CapabilityScope: firstClaimsToolString(req.Participant.RouteKey, agentID),
+		CorrelationID:   firstClaimsToolString(claimsToolStringArg(req.Call.Arguments, "correlation_id"), req.Call.ID, claimID),
+		CapabilityScope: firstClaimsToolString(claimsToolStringArg(req.Call.Arguments, "capability_scope"), claimsToolNestedStringArg(req.Call.Arguments, "sandbox_scope", "capability_scope"), req.Participant.RouteKey, agentID),
 	}, nil
 }
 
@@ -145,15 +153,23 @@ func toolArgumentsJSON(args map[string]any) (string, error) {
 }
 
 func claimsToolContext(ctx context.Context, req claims.ToolRuntimeExecutionRequest, agentID string) (context.Context, *claims.TestamentAccumulator) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	acc := claims.AccumulatorFromContext(ctx)
 	if acc != nil {
 		return ctx, acc
 	}
-	sessionID := req.Claim.SessionID
+	sessionID := ""
+	claimID := ""
+	if req.Claim != nil {
+		sessionID = req.Claim.SessionID
+		claimID = req.Claim.ID
+	}
 	if req.Board != nil {
 		sessionID = firstClaimsToolString(sessionID, req.Board.SessionID())
 	}
-	acc = claims.NewTestamentAccumulator(agentID, sessionID).WithBoard(req.Board).WithClaimID(req.Claim.ID)
+	acc = claims.NewTestamentAccumulator(agentID, sessionID).WithBoard(req.Board).WithClaimID(claimID)
 	return claims.WithTestamentAccumulator(ctx, acc), acc
 }
 
@@ -203,6 +219,34 @@ func boundedClaimsToolText(text string, limit int) string {
 
 func claimsToolFailureExitStatus() int {
 	return 1
+}
+
+func claimsToolStringArg(args map[string]any, key string) string {
+	if args == nil {
+		return ""
+	}
+	value, ok := args[key]
+	if !ok {
+		return ""
+	}
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func claimsToolNestedStringArg(args map[string]any, parent, key string) string {
+	if args == nil {
+		return ""
+	}
+	parentValue, ok := args[parent].(map[string]string)
+	if ok {
+		return strings.TrimSpace(parentValue[key])
+	}
+	anyMap, ok := args[parent].(map[string]any)
+	if !ok {
+		return ""
+	}
+	text, _ := anyMap[key].(string)
+	return strings.TrimSpace(text)
 }
 
 func claimsToolDeniedDecision(current string) string {

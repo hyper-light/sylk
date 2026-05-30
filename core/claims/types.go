@@ -56,6 +56,7 @@ const (
 	RelationshipSupersedes      = "supersedes"       // replaces the related object
 	RelationshipDependsOn       = "depends_on"       // cannot proceed until related is satisfied
 	RelationshipCausedBy        = "caused_by"        // created in response to the related object
+	RelationshipCorrects        = "corrects"         // corrective work intended to repair the related object
 	RelationshipRefines         = "refines"          // narrows or clarifies the related object
 	RelationshipConflictsWith   = "conflicts_with"   // contradicts the related object
 	RelationshipDerivedFrom     = "derived_from"     // content derived from the related object
@@ -1019,6 +1020,10 @@ type ClaimsBoardConfig struct {
 	// into the artifact and claim validation orchestrators. Nil keeps
 	// the board storage-only and preserves legacy explicit validation.
 	ValidationRuntime *ClaimsValidationRuntimeConfig
+
+	// RemediationPolicy optionally enables bounded corrective claims
+	// generated from terminal testament validation outcomes.
+	RemediationPolicy *RemediationPolicy
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

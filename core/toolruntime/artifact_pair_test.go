@@ -155,6 +155,47 @@ func TestExecuteRaw_ToolOutcomeYieldedSkipsCompletedArtifact(t *testing.T) {
 	}
 }
 
+func TestExecuteRaw_WithBoardRoutesThroughToolRuntimeServiceClaim(t *testing.T) {
+	registry := skills.NewRegistry()
+	mustRegisterSkill(t, registry, newRuntimeTestSkill("echo", "Echo tool"))
+	rt := mustNewRuntime(t, registry, NewManifest("tester-agent", "test",
+		NewToolPolicy("echo", EffectReadOnly, DomainFilesystem, ExecutionModeLocal, WithVisibleByDefault()),
+	))
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "tool-runtime-service", SessionID: "test-session", TaskID: "task"})
+	acc := claims.NewTestamentAccumulator("tester-agent", "test-session").WithBoard(board)
+	ctx := claims.WithTestamentAccumulator(context.Background(), acc)
+
+	result, err := rt.ExecuteRaw(ctx, toolInvocation("echo"))
+	if err != nil {
+		t.Fatalf("ExecuteRaw: %v", err)
+	}
+	if result.ToolName != "echo" || result.Status != skills.ToolStatusCompleted {
+		t.Fatalf("result = %+v, want completed echo execution", result)
+	}
+	proj := board.Projection()
+	if proj.TotalClaims != 1 || proj.TotalTestaments != 1 {
+		t.Fatalf("projection claims/testaments = %d/%d, want service claim and testament", proj.TotalClaims, proj.TotalTestaments)
+	}
+	claim := proj.Claims[0]
+	if claims.SubjectAgentID(claim.Relations) != toolRuntimeParticipantID || claim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
+		t.Fatalf("service claim = %+v, want satisfied tool runtime claim", claim)
+	}
+	testament := proj.Testaments[0]
+	if testament.AgentID != toolRuntimeParticipantID || testament.LifecycleStatus != claims.TestamentLifecycleValidated {
+		t.Fatalf("service testament = %+v, want validated tool runtime testament", testament)
+	}
+	if len(testament.Artifacts) != 1 {
+		t.Fatalf("service testament artifacts = %d, want 1", len(testament.Artifacts))
+	}
+	data, err := claims.ArtifactData[claims.ToolRuntimeExecutionArtifactData](testament.Artifacts[0])
+	if err != nil {
+		t.Fatalf("tool runtime artifact data: %v", err)
+	}
+	if data.ToolName != "echo" || data.PolicyDecision != "allowed" || data.ExecutionMode != string(ExecutionModeLocal) || data.Status != claims.InfrastructureStatusOK {
+		t.Fatalf("tool runtime service data = %+v, want allowed local success", data)
+	}
+}
+
 func TestRecordToolCallEnd_MapsErrorToOutcomeFailure(t *testing.T) {
 	ctx, acc := newAccumulatorOnContext(t)
 	trace := recordToolCallStart(ctx, toolInvocation("write_file"), "tester-agent")

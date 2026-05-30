@@ -51,7 +51,7 @@ func (b *ClaimsBoard) generateArtifactLifecycle(ctx context.Context, artifact Ar
 		b.mu.Unlock()
 		return nil, err
 	}
-	payload := artifactLifecyclePayload(stamped.ID, to, actorID, opts, now)
+	payload := artifactLifecyclePayload(stamped.ID, to, actorID, opts, artifactTerminalPropagation{}, now)
 	payload["artifact"] = stamped
 	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, payload, []ClaimsOutboxRecord{b.outboxRecordLocked(stamped.Sequence, RelatedTypeArtifact, stamped.ID, string(mustArtifactLifecycleDeltaAction(to)), now)}); err != nil {
 		b.mu.Unlock()
@@ -153,12 +153,15 @@ func (b *ClaimsBoard) ReceiveArtifact(ctx context.Context, artifactID, receiverI
 }
 
 type artifactLifecycleMutation struct {
-	Artifact  *Artifact
-	Testament *Testament
-	Claim     *Claim
-	Status    ArtifactStatus
-	ActorID   string
-	At        time.Time
+	Artifact             *Artifact
+	Testament            *Testament
+	Claim                *Claim
+	Status               ArtifactStatus
+	ActorID              string
+	At                   time.Time
+	TestamentTransition  TestamentLifecycleStatus
+	ClaimTransition      ClaimLifecycleStatus
+	ClaimLifecycleSynced bool
 }
 
 func (b *ClaimsBoard) transitionArtifactLifecycleMutationLocked(artifact *Artifact, testament *Testament, claim *Claim, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions) (artifactLifecycleMutation, error) {
@@ -169,7 +172,14 @@ func (b *ClaimsBoard) transitionArtifactLifecycleMutationLocked(artifact *Artifa
 	now := time.Now().UTC()
 	action := mustArtifactLifecycleDeltaAction(to)
 	records := []ClaimsOutboxRecord{b.outboxRecordLocked(artifact.Sequence, RelatedTypeArtifact, artifact.ID, string(action), now)}
-	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, artifactLifecyclePayload(artifact.ID, to, actorID, opts, now), records); err != nil {
+	propagation := b.artifactTerminalPropagationLocked(artifact, testament, claim, to, opts.Error)
+	if propagation.TestamentTo != "" {
+		records = append(records, b.outboxRecordsForTestamentLifecyclePtrLocked([]*Testament{testament}, propagation.TestamentTo, now)...)
+	}
+	if propagation.ClaimTo != "" && claim != nil {
+		records = append(records, b.outboxRecordsForClaimLifecyclePtrLocked([]*Claim{claim}, propagation.ClaimTo, now)...)
+	}
+	if err := b.appendDurableEventLocked(walEventArtifactLifecycleTransition, actorID, artifactLifecyclePayload(artifact.ID, to, actorID, opts, propagation, now), records); err != nil {
 		return artifactLifecycleMutation{}, err
 	}
 	if _, err := TransitionArtifactStatus(artifact, to, actorID, opts.Reason, now); err != nil {
@@ -179,20 +189,189 @@ func (b *ClaimsBoard) transitionArtifactLifecycleMutationLocked(artifact *Artifa
 		artifact.Errors = append(artifact.Errors, cloneArtifactError(opts.Error))
 	}
 	artifact.Accessed = now
+	claimSynced := b.applyArtifactTerminalPropagationLocked(testament, propagation, actorID, opts.Reason, now)
 	return artifactLifecycleMutation{
-		Artifact:  CloneArtifact(artifact),
-		Testament: CloneTestamentEntity(testament),
-		Claim:     CloneClaimEntity(claim),
-		Status:    to,
-		ActorID:   actorID,
-		At:        now,
+		Artifact:             CloneArtifact(artifact),
+		Testament:            CloneTestamentEntity(testament),
+		Claim:                CloneClaimEntity(claim),
+		Status:               to,
+		ActorID:              actorID,
+		At:                   now,
+		TestamentTransition:  propagation.TestamentTo,
+		ClaimTransition:      propagation.ClaimTo,
+		ClaimLifecycleSynced: claimSynced,
 	}, nil
 }
 
 func (b *ClaimsBoard) publishArtifactLifecycleMutation(ctx context.Context, result artifactLifecycleMutation) {
 	b.projectDurableOutbox(ctx)
 	b.amplifier.PublishCanonicalArtifactLifecycle(ctx, result.Artifact, result.Testament, result.Claim, result.Status, result.ActorID, result.At)
+	if result.TestamentTransition != "" && b.shouldEmitCanonicalDirect() {
+		b.amplifier.dispatchCanonical(ctx, b.amplifier.buildTestamentLifecycleDeltas(ctx, result.Testament, result.Claim, result.TestamentTransition, result.ActorID, result.At))
+		if result.ClaimLifecycleSynced {
+			b.amplifier.dispatchCanonical(ctx, b.amplifier.buildClaimLifecycleDeltas(ctx, actionForClaimRecord(b, result.Claim), result.Claim, result.ClaimTransition, result.ActorID, result.At))
+		}
+	}
+	if result.TestamentTransition != "" {
+		b.notifyTestamentLifecycleDelta(result.Testament, result.TestamentTransition, result.ActorID)
+		if result.ClaimLifecycleSynced {
+			b.notifyClaimLifecycleDelta(result.Claim, result.ClaimTransition, result.ActorID, result.Testament.ID)
+		}
+		b.postTerminalTestamentCorrectives(ctx, result.Testament, result.Claim, result.TestamentTransition, result.ActorID)
+	}
 	b.notifySubscribers()
+}
+
+func (b *ClaimsBoard) artifactTerminalPropagationLocked(artifact *Artifact, testament *Testament, claim *Claim, to ArtifactStatus, transitionErr *ArtifactError) artifactTerminalPropagation {
+	if artifact == nil || testament == nil || claim == nil || !to.IsTerminal() {
+		return artifactTerminalPropagation{}
+	}
+	outcome := b.testamentValidationOutcomeAfterArtifactLocked(testament, claim, artifact.ID, to, transitionErr)
+	if outcome == "" || !CanTransitionTestamentLifecycle(testament.LifecycleStatus, outcome) {
+		return artifactTerminalPropagation{}
+	}
+	return artifactTerminalPropagation{
+		TestamentTo: outcome,
+		ClaimTo:     claimLifecycleForTestamentValidation(outcome),
+	}
+}
+
+func (b *ClaimsBoard) testamentValidationOutcomeAfterArtifactLocked(testament *Testament, claim *Claim, artifactID string, to ArtifactStatus, transitionErr *ArtifactError) TestamentLifecycleStatus {
+	targets := requiredArtifactValidationTargets(claim)
+	if len(targets) == 0 {
+		return testamentArtifactOutcome(testament, artifactID, to, transitionErr)
+	}
+	return requiredArtifactValidationOutcome(testament, targets, artifactID, to, transitionErr)
+}
+
+func requiredArtifactValidationTargets(claim *Claim) []*Validation {
+	if claim == nil {
+		return nil
+	}
+	out := make([]*Validation, 0, len(claim.Validations))
+	for _, validation := range claim.Validations {
+		if validation != nil && validation.Required && strings.TrimSpace(validation.TargetArtifactName) != "" {
+			out = append(out, validation)
+		}
+	}
+	return out
+}
+
+func requiredArtifactValidationOutcome(testament *Testament, validations []*Validation, artifactID string, to ArtifactStatus, transitionErr *ArtifactError) TestamentLifecycleStatus {
+	var incomplete, failed, errored bool
+	for _, validation := range validations {
+		artifact := artifactByName(testament, validation.TargetArtifactName)
+		if artifact == nil {
+			incomplete = true
+			continue
+		}
+		status := artifactStatusAfter(artifact, artifactID, to)
+		switch {
+		case artifactValidationErrored(artifact, artifactID, status, transitionErr), validation.Status == ValidationStatusErrored:
+			errored = true
+		case artifactValidationFailed(status), validation.Status == ValidationStatusValidationFailed || validation.Status == ValidationStatusFailed || validation.Status == ValidationStatusQualityBarValidationFailed:
+			failed = true
+		case artifactValidationIncomplete(status), !validation.Status.IsTerminal():
+			incomplete = true
+		case status == ArtifactStatusValidated && ValidationStatusPassesRequired(validation.Status):
+		default:
+			return ""
+		}
+	}
+	return testamentOutcomeFromFlags(incomplete, failed, errored)
+}
+
+func testamentArtifactOutcome(testament *Testament, artifactID string, to ArtifactStatus, transitionErr *ArtifactError) TestamentLifecycleStatus {
+	if testament == nil || len(testament.Artifacts) == 0 {
+		return TestamentLifecycleValidationIncomplete
+	}
+	var incomplete, failed, errored bool
+	for _, artifact := range testament.Artifacts {
+		if artifact == nil {
+			incomplete = true
+			continue
+		}
+		status := artifactStatusAfter(artifact, artifactID, to)
+		switch {
+		case artifactValidationErrored(artifact, artifactID, status, transitionErr):
+			errored = true
+		case artifactValidationFailed(status):
+			failed = true
+		case artifactValidationIncomplete(status):
+			incomplete = true
+		case status == ArtifactStatusValidated:
+		default:
+			return ""
+		}
+	}
+	return testamentOutcomeFromFlags(incomplete, failed, errored)
+}
+
+func testamentOutcomeFromFlags(incomplete, failed, errored bool) TestamentLifecycleStatus {
+	switch {
+	case errored:
+		return TestamentLifecycleValidationErrored
+	case failed:
+		return TestamentLifecycleValidationFailed
+	case incomplete:
+		return TestamentLifecycleValidationIncomplete
+	default:
+		return TestamentLifecycleValidated
+	}
+}
+
+func artifactStatusAfter(artifact *Artifact, artifactID string, to ArtifactStatus) ArtifactStatus {
+	if artifact != nil && strings.TrimSpace(artifact.ID) == strings.TrimSpace(artifactID) {
+		return to
+	}
+	if artifact == nil {
+		return ""
+	}
+	return artifact.Status
+}
+
+func artifactValidationErrored(artifact *Artifact, artifactID string, status ArtifactStatus, transitionErr *ArtifactError) bool {
+	if status != ArtifactStatusValidationFailed {
+		return false
+	}
+	if artifact != nil && strings.TrimSpace(artifact.ID) == strings.TrimSpace(artifactID) && artifactFailureIsInfrastructureError(transitionErr) {
+		return true
+	}
+	for _, artifactErr := range artifact.Errors {
+		if artifactFailureIsInfrastructureError(artifactErr) {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactValidationFailed(status ArtifactStatus) bool {
+	return status == ArtifactStatusValidationFailed
+}
+
+func artifactValidationIncomplete(status ArtifactStatus) bool {
+	return status == ArtifactStatusGenerationFailed || status == ArtifactStatusReceiptFailed
+}
+
+func artifactByName(testament *Testament, name string) *Artifact {
+	name = strings.TrimSpace(name)
+	if testament == nil || name == "" {
+		return nil
+	}
+	for _, artifact := range testament.Artifacts {
+		if artifact != nil && artifact.ArtifactName == name {
+			return artifact
+		}
+	}
+	return nil
+}
+
+func (b *ClaimsBoard) applyArtifactTerminalPropagationLocked(testament *Testament, propagation artifactTerminalPropagation, actorID, reason string, now time.Time) bool {
+	if testament == nil || propagation.TestamentTo == "" {
+		return false
+	}
+	b.transitionTestamentLifecycleLocked(testament, propagation.TestamentTo, actorID, lifecycleReason(reason, string(propagation.TestamentTo)), now)
+	return b.syncClaimLifecycleForTestamentValidationLocked(testament, propagation.TestamentTo, actorID, lifecycleReason(reason, string(propagation.TestamentTo)), now)
 }
 
 func (b *ClaimsBoard) BeginArtifactValidation(ctx context.Context, artifactID, actorID string) error {
@@ -539,7 +718,12 @@ func (b *ClaimsBoard) stampGeneratedArtifactLocked(artifact *Artifact, to Artifa
 	artifact.Presentation = NormalizePresentation(artifact.Presentation)
 }
 
-func artifactLifecyclePayload(artifactID string, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions, changed time.Time) map[string]any {
+type artifactTerminalPropagation struct {
+	TestamentTo TestamentLifecycleStatus `json:"testament_to,omitempty"`
+	ClaimTo     ClaimLifecycleStatus     `json:"claim_to,omitempty"`
+}
+
+func artifactLifecyclePayload(artifactID string, to ArtifactStatus, actorID string, opts ArtifactLifecycleOptions, propagation artifactTerminalPropagation, changed time.Time) map[string]any {
 	return map[string]any{
 		"artifact_id":   strings.TrimSpace(artifactID),
 		"to":            to,
@@ -548,6 +732,8 @@ func artifactLifecyclePayload(artifactID string, to ArtifactStatus, actorID stri
 		"changed":       changed,
 		"error":         opts.Error,
 		"validation_id": strings.TrimSpace(opts.ValidationID),
+		"testament_to":  propagation.TestamentTo,
+		"claim_to":      propagation.ClaimTo,
 	}
 }
 

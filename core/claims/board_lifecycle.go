@@ -677,6 +677,7 @@ func (b *ClaimsBoard) transitionTestamentValidation(ctx context.Context, testame
 		b.notifyClaimLifecycleDelta(claimSnapshot, claimLifecycleForTestamentValidation(to), actorID, testamentSnapshot.ID)
 	}
 	b.notifySubscribers()
+	b.postTerminalTestamentCorrectives(ctx, testamentSnapshot, claimSnapshot, to, actorID)
 	return nil
 }
 

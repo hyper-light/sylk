@@ -66,6 +66,7 @@ type ClaimsBoard struct {
 	agentRefResolver  AgentRefResolver
 	claimPostPolicy   ClaimPostPolicy
 	validationRuntime *ClaimsValidationRuntimeConfig
+	remediationPolicy RemediationPolicy
 
 	// Cached projection: recomputed only when projectionDirty is set.
 	// Multiple readers share the same immutable pointer.
@@ -144,6 +145,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		agentRefResolver:          cfg.AgentRefResolver,
 		claimPostPolicy:           cfg.ClaimPostPolicy,
 		validationRuntime:         cloneClaimsValidationRuntimeConfig(cfg.ValidationRuntime),
+		remediationPolicy:         normalizeRemediationPolicy(cfg.RemediationPolicy),
 		legacySessionNoWAL:        cfg.LegacySessionNoWAL,
 		rollout:                   boardRolloutConfig(cfg.Rollout),
 	}

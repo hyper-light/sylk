@@ -92,16 +92,22 @@ func TestPipelineBootRecorderUsesGeneratedLifecycleAndTypedEvidence(t *testing.T
 		t.Fatal("postBootPhaseClaim returned empty claim id")
 	}
 	submitBootPhaseTestament(board, "setup", claimID, time.Millisecond, nil)
-	assertClaimLifecycle(t, board, claimID, claims.ClaimLifecycleSatisfied)
+	claim := assertClaimLifecycle(t, board, claimID, claims.ClaimLifecycleSatisfied)
+	if got, want := claims.SubjectAgentID(claim.Relations), bootClaimsAgentID(board); got != want {
+		t.Fatalf("claim subject = %q, want process-scoped boot sequencer %q", got, want)
+	}
 	testaments := board.TestamentsByClaim(claimID)
 	if len(testaments) != 1 {
 		t.Fatalf("testaments = %d, want 1", len(testaments))
+	}
+	if testaments[0].AgentID != bootClaimsAgentID(board) {
+		t.Fatalf("testament agent = %q, want %q", testaments[0].AgentID, bootClaimsAgentID(board))
 	}
 	if testaments[0].LifecycleStatus != claims.TestamentLifecycleValidated {
 		t.Fatalf("testament lifecycle = %s, want validated", testaments[0].LifecycleStatus)
 	}
 	data := bootPhaseArtifactData(t, testaments[0].Artifacts[0])
-	if data.Phase != "setup" || data.Status != claims.InfrastructureStatusOK {
+	if data.Phase != "setup" || data.Status != claims.InfrastructureStatusOK || data.ProcessUID != board.SessionID() {
 		t.Fatalf("boot data = %+v, want typed setup success", data)
 	}
 }
