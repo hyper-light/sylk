@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,9 +38,6 @@ const (
 	walEventClaimRejected                 = "claim_rejected"
 	walEventPhaseTransition               = "phase_transition"
 	walEventBoardComplete                 = "board_complete"
-
-	durableOutboxProjectBatchLimit = 128
-	walReplayErrorPreviewBytes     = 80
 )
 
 type walEvent struct {
@@ -68,6 +66,26 @@ type walCheckpoint struct {
 	UpdatedAt  time.Time             `json:"updated_at"`
 }
 
+type WALReplayIssueKind string
+
+const (
+	WALReplayIssueMalformedJSON     WALReplayIssueKind = "malformed_json"
+	WALReplayIssueUnknownEventKind  WALReplayIssueKind = "unknown_event_kind"
+	WALReplayIssueMissingReference  WALReplayIssueKind = "missing_reference"
+	WALReplayIssueDuplicateEvent    WALReplayIssueKind = "duplicate_event"
+	WALReplayIssueIllegalTransition WALReplayIssueKind = "illegal_transition"
+	WALReplayIssuePanic             WALReplayIssueKind = "panic"
+	WALReplayIssueSnapshotInvalid   WALReplayIssueKind = "snapshot_invalid"
+)
+
+type WALReplayIssue struct {
+	Sequence  uint64             `json:"sequence,omitempty"`
+	Kind      WALReplayIssueKind `json:"kind"`
+	EventKind string             `json:"event_kind,omitempty"`
+	Message   string             `json:"message"`
+	Preview   string             `json:"preview,omitempty"`
+}
+
 // DurableBoard wraps a ClaimsBoard with WAL persistence.
 // WAL is written FIRST, then in-memory state is mutated.
 // On crash between WAL write and mutation, recovery replays the WAL
@@ -75,13 +93,15 @@ type walCheckpoint struct {
 type DurableBoard struct {
 	board *ClaimsBoard
 
-	mu         sync.Mutex
-	walDir     string
-	walFile    *os.File
-	seq        uint64
-	seen       map[string]uint64
-	outbox     *ClaimsOutbox
-	projectors []ClaimsProjector
+	mu           sync.Mutex
+	walDir       string
+	walFile      *os.File
+	seq          uint64
+	seen         map[string]uint64
+	outbox       *ClaimsOutbox
+	projectors   []ClaimsProjector
+	operations   ClaimsOperationsConfig
+	replayIssues []WALReplayIssue
 
 	healthMu      sync.Mutex
 	healthHistory []ProjectionHealthSnapshot
@@ -90,6 +110,7 @@ type DurableBoard struct {
 }
 
 func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
+	cfg.Operations = NormalizeClaimsOperationsConfig(cfg.Operations)
 	sessionDir := strings.TrimSpace(cfg.SessionDir)
 	boardID := strings.TrimSpace(cfg.BoardID)
 	if boardID == "" {
@@ -98,12 +119,13 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 	}
 	if sessionDir == "" {
 		db := &DurableBoard{
-			board: NewClaimsBoard(cfg),
-			seen:  make(map[string]uint64),
+			board:      NewClaimsBoard(cfg),
+			seen:       make(map[string]uint64),
+			operations: cfg.Operations,
 		}
 		db.projectors = durableProjectors(cfg)
 		if !cfg.DisableOutbox {
-			outbox, err := OpenClaimsOutbox("", projectorNames(db.projectors))
+			outbox, err := OpenClaimsOutboxWithConfig("", projectorNames(db.projectors), cfg.Operations)
 			if err != nil {
 				return nil, err
 			}
@@ -122,7 +144,7 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 		return nil, fmt.Errorf("create claims WAL dir: %w", err)
 	}
 
-	db := &DurableBoard{walDir: walDir, seen: make(map[string]uint64)}
+	db := &DurableBoard{walDir: walDir, seen: make(map[string]uint64), operations: cfg.Operations}
 	db.projectors = durableProjectors(cfg)
 
 	walPath := filepath.Join(walDir, "events.wal.jsonl")
@@ -153,7 +175,7 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 
 	if !cfg.DisableOutbox {
 		outboxDir := filepath.Join(filepath.Dir(walDir), "outbox")
-		outbox, err := OpenClaimsOutbox(outboxDir, projectorNames(db.projectors))
+		outbox, err := OpenClaimsOutboxWithConfig(outboxDir, projectorNames(db.projectors), cfg.Operations)
 		if err != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("open claims outbox: %w", err)
@@ -167,7 +189,7 @@ func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
 	}
 	db.projectOutbox(context.Background())
 	if cfg.Scope == nil && cfg.DeltaBus != nil {
-		db.DrainOutbox(context.Background(), durableOutboxProjectBatchLimit)
+		db.DrainOutbox(context.Background(), db.operations.Budgets.OutboxProjectionBatchLimit)
 	}
 
 	return db, nil
@@ -178,6 +200,15 @@ func (db *DurableBoard) Board() *ClaimsBoard {
 		return nil
 	}
 	return db.board
+}
+
+func (db *DurableBoard) ReplayIssues() []WALReplayIssue {
+	if db == nil {
+		return nil
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return append([]WALReplayIssue(nil), db.replayIssues...)
 }
 
 func (db *DurableBoard) Close() error {
@@ -228,12 +259,46 @@ func (db *DurableBoard) SaveSnapshot() error {
 
 	snapshotPath := db.snapshotPath()
 	tmpPath := snapshotPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+	if err := writeSnapshotFile(tmpPath, data, db.operations.Durability.WALSyncMode); err != nil {
 		return fmt.Errorf("write claims snapshot: %w", err)
 	}
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return os.Rename(tmpPath, snapshotPath)
+	if err := os.Rename(tmpPath, snapshotPath); err != nil {
+		return err
+	}
+	if db.operations.Durability.WALSyncMode == WALSyncModeAppendSync {
+		return syncDir(filepath.Dir(snapshotPath))
+	}
+	return nil
+}
+
+func writeSnapshotFile(path string, data []byte, mode WALSyncMode) error {
+	if mode != WALSyncModeAppendSync {
+		return os.WriteFile(path, data, 0o644)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func (db *DurableBoard) appendEvent(kind, agentID string, payload any) (uint64, time.Time, error) {
@@ -285,6 +350,11 @@ func (db *DurableBoard) appendEvent(kind, agentID string, payload any) (uint64, 
 	if _, err := db.walFile.Write(line); err != nil {
 		return 0, time.Time{}, fmt.Errorf("write WAL event: %w", err)
 	}
+	if db.operations.Durability.WALSyncMode.syncsWALOnAppend() {
+		if err := db.walFile.Sync(); err != nil {
+			return 0, time.Time{}, fmt.Errorf("sync WAL event: %w", err)
+		}
+	}
 
 	db.seen[fingerprint] = db.seq
 	return db.seq, createdAt, nil
@@ -325,9 +395,9 @@ func (db *DurableBoard) projectOutbox(ctx context.Context) {
 	if !db.projectionScheduled.CompareAndSwap(false, true) {
 		return
 	}
-	if err := db.board.scope.Go("claims_outbox_project", 30*time.Second, func(runCtx context.Context) error {
+	if err := db.board.scope.Go("claims_outbox_project", db.operations.Budgets.AuditDeadline, func(runCtx context.Context) error {
 		defer db.projectionScheduled.Store(false)
-		db.DrainOutbox(runCtx, durableOutboxProjectBatchLimit)
+		db.DrainOutbox(runCtx, db.operations.Budgets.OutboxProjectionBatchLimit)
 		return nil
 	}); err != nil {
 		db.projectionScheduled.Store(false)
@@ -504,7 +574,18 @@ func (db *DurableBoard) loadSnapshot(cfg ClaimsBoardConfig) (*ClaimsBoard, uint6
 
 	var checkpoint walCheckpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return NewClaimsBoard(cfg), 0, nil // corrupt → start fresh
+		board := NewClaimsBoard(cfg)
+		msg := "claims snapshot invalid: " + err.Error()
+		board.RecordNotificationError(msg)
+		db.addReplayIssue(WALReplayIssue{Kind: WALReplayIssueSnapshotInvalid, Message: msg})
+		return board, 0, nil
+	}
+	if err := validateWALCheckpoint(cfg, checkpoint); err != nil {
+		board := NewClaimsBoard(cfg)
+		msg := "claims snapshot invalid: " + err.Error()
+		board.RecordNotificationError(msg)
+		db.addReplayIssue(WALReplayIssue{Kind: WALReplayIssueSnapshotInvalid, Message: msg})
+		return board, 0, nil
 	}
 
 	board := NewClaimsBoard(cfg)
@@ -528,8 +609,44 @@ func (db *DurableBoard) loadSnapshot(cfg ClaimsBoardConfig) (*ClaimsBoard, uint6
 		board.artifacts = checkpoint.Artifacts
 	}
 	board.ensureArtifactIndexLocked()
+	board.rebuildDerivedState()
 
 	return board, checkpoint.Seq, nil
+}
+
+func validateWALCheckpoint(cfg ClaimsBoardConfig, checkpoint walCheckpoint) error {
+	if strings.TrimSpace(cfg.BoardID) != "" && checkpoint.BoardID != cfg.BoardID {
+		return fmt.Errorf("board id %q does not match %q", checkpoint.BoardID, cfg.BoardID)
+	}
+	if strings.TrimSpace(cfg.SessionID) != "" && checkpoint.SessionID != cfg.SessionID {
+		return fmt.Errorf("session id %q does not match %q", checkpoint.SessionID, cfg.SessionID)
+	}
+	if len(checkpoint.Claims) != len(uniqueStringList(checkpoint.ClaimOrder)) {
+		return fmt.Errorf("claim order does not match claim index")
+	}
+	for _, claimID := range checkpoint.ClaimOrder {
+		if checkpoint.Claims[claimID] == nil {
+			return fmt.Errorf("claim order references missing claim %q", claimID)
+		}
+	}
+	return nil
+}
+
+func uniqueStringList(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (db *DurableBoard) replayWAL(afterSeq uint64) error {
@@ -544,8 +661,7 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	var seq uint64
-	var corruptEntries []string
-	var replayErrors []string
+	var issues []WALReplayIssue
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -555,9 +671,12 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 
 		var event walEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			corruptEntries = append(corruptEntries, fmt.Sprintf(
-				"WAL seq %d: %s (prefix: %s)", seq, err.Error(), truncateForLog(line, walReplayErrorPreviewBytes),
-			))
+			issues = append(issues, WALReplayIssue{
+				Sequence: seq,
+				Kind:     WALReplayIssueMalformedJSON,
+				Message:  err.Error(),
+				Preview:  truncateForLog(line, db.operations.Budgets.ReplayErrorPreviewBytes),
+			})
 			continue
 		}
 		event.Sequence = seq
@@ -568,14 +687,18 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 			continue
 		}
 		if _, ok := db.seen[fp]; ok {
+			issues = append(issues, WALReplayIssue{
+				Sequence:  seq,
+				Kind:      WALReplayIssueDuplicateEvent,
+				EventKind: event.Kind,
+				Message:   "duplicate logical WAL event collapsed",
+			})
 			continue
 		}
 		db.seen[fp] = seq
 
-		if err := db.applyEvent(&event); err != nil {
-			replayErrors = append(replayErrors, fmt.Sprintf(
-				"WAL seq %d kind %s: %s", seq, event.Kind, err.Error(),
-			))
+		if err := db.applyEventRecovering(&event); err != nil {
+			issues = append(issues, classifyWALReplayIssue(seq, event.Kind, err))
 			continue
 		}
 	}
@@ -584,20 +707,76 @@ func (db *DurableBoard) replayWAL(afterSeq uint64) error {
 	// Surface corruption as notification errors on the board so the
 	// first projection query exposes them to agents. Agents can then
 	// record them as testament error artifacts.
-	if (len(corruptEntries) > 0 || len(replayErrors) > 0) && db.board != nil {
+	if len(issues) > 0 && db.board != nil {
 		db.board.mu.Lock()
-		for _, entry := range corruptEntries {
-			db.board.appendNotificationErrorLocked(entry)
-		}
-		for _, entry := range replayErrors {
-			db.board.appendNotificationErrorLocked(entry)
+		for _, issue := range issues {
+			db.board.appendNotificationErrorLocked(issue.Notification())
 		}
 		db.board.mu.Unlock()
 	}
+	db.addReplayIssues(issues)
 	if db.board != nil {
 		db.board.rebuildDerivedState()
 	}
 	return nil
+}
+
+func (issue WALReplayIssue) Notification() string {
+	parts := []string{
+		"WAL replay",
+		"seq=" + fmt.Sprint(issue.Sequence),
+		"kind=" + string(issue.Kind),
+	}
+	if issue.EventKind != "" {
+		parts = append(parts, "event="+issue.EventKind)
+	}
+	if issue.Message != "" {
+		parts = append(parts, "message="+issue.Message)
+	}
+	if issue.Preview != "" {
+		parts = append(parts, "preview="+issue.Preview)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (db *DurableBoard) addReplayIssue(issue WALReplayIssue) {
+	db.addReplayIssues([]WALReplayIssue{issue})
+}
+
+func (db *DurableBoard) addReplayIssues(issues []WALReplayIssue) {
+	if db == nil || len(issues) == 0 {
+		return
+	}
+	db.mu.Lock()
+	db.replayIssues = append(db.replayIssues, issues...)
+	db.mu.Unlock()
+}
+
+func (db *DurableBoard) applyEventRecovering(event *walEvent) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic during WAL replay: %v", recovered)
+		}
+	}()
+	return db.applyEvent(event)
+}
+
+func classifyWALReplayIssue(seq uint64, eventKind string, err error) WALReplayIssue {
+	issue := WALReplayIssue{Sequence: seq, EventKind: eventKind, Message: err.Error()}
+	var lifecycleErr *LifecycleTransitionError
+	switch {
+	case errors.As(err, &lifecycleErr):
+		issue.Kind = WALReplayIssueIllegalTransition
+	case strings.Contains(err.Error(), "missing ") && strings.Contains(err.Error(), "replay event"):
+		issue.Kind = WALReplayIssueMissingReference
+	case strings.Contains(err.Error(), "unknown WAL event kind"):
+		issue.Kind = WALReplayIssueUnknownEventKind
+	case strings.Contains(err.Error(), "panic during WAL replay"):
+		issue.Kind = WALReplayIssuePanic
+	default:
+		issue.Kind = WALReplayIssueIllegalTransition
+	}
+	return issue
 }
 
 func (db *DurableBoard) applyEvent(event *walEvent) error {
@@ -653,7 +832,7 @@ func (db *DurableBoard) applyEvent(event *walEvent) error {
 		})
 		return nil
 	default:
-		return nil
+		return fmt.Errorf("unknown WAL event kind %q", event.Kind)
 	}
 }
 

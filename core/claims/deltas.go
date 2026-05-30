@@ -409,7 +409,10 @@ func isErrorArtifactKind(kind string) bool {
 		kind == ArtifactKindPolicyDenied ||
 		kind == ArtifactKindMissingDependency ||
 		kind == ArtifactKindInterrupted ||
-		kind == ArtifactKindInvalidExpectedToolCall
+		kind == ArtifactKindInvalidExpectedToolCall ||
+		kind == ArtifactKindProviderFailure ||
+		kind == ArtifactKindRateLimitEncounter ||
+		kind == ArtifactKindActivationFailure
 }
 
 // CollectArtifactKinds returns the unique artifact kinds in

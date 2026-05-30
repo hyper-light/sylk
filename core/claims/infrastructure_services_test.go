@@ -261,6 +261,44 @@ func TestInfrastructureServicePhase8GuardianProviderAndExternalArtifacts(t *test
 	}
 }
 
+func TestProviderGatewayServiceCatalogArtifactKinds(t *testing.T) {
+	provider := NewProviderGatewayService(InfrastructureServiceConfig{ProviderBackend: providerBackendFunc(func(_ context.Context, req ProviderGatewayCallRequest) (ProviderGatewayCallArtifactData, error) {
+		data := req.Requested
+		data.ResponseSummary = "ok"
+		data.TotalTokens = 9
+		data.InputTokens = 4
+		data.OutputTokens = 5
+		data.CacheReadTokens = 2
+		data.Metadata = mergeMetadata(data.Metadata, map[string]any{"retry_count": 1, "cache_hit": true})
+		return data, nil
+	})})
+	result, err := provider.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(ProviderGatewayToolComplete, map[string]any{
+		"model":         "catalog-model",
+		"identity":      "guide",
+		"budget_tokens": float64(100),
+	})})
+	if err != nil {
+		t.Fatalf("provider catalog HandleServiceClaim: %v", err)
+	}
+	assertArtifactKinds(t, result.Artifacts, []string{ArtifactKindLLMResponse, ArtifactKindUsage, ArtifactKindCacheHit, ArtifactKindRetryRecord})
+
+	rateLimited := NewProviderGatewayService(InfrastructureServiceConfig{ProviderBackend: providerBackendFunc(func(_ context.Context, req ProviderGatewayCallRequest) (ProviderGatewayCallArtifactData, error) {
+		data := req.Requested
+		data.Error = "429 rate limit exceeded"
+		return data, nil
+	})})
+	result, err = rateLimited.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(ProviderGatewayToolComplete, map[string]any{
+		"model":    "catalog-model",
+		"identity": "guide",
+	})})
+	if err != nil {
+		t.Fatalf("provider rate limit HandleServiceClaim: %v", err)
+	}
+	if result.Artifacts[0].Kind != ArtifactKindRateLimitEncounter {
+		t.Fatalf("rate-limit artifact kind = %s, want %s", result.Artifacts[0].Kind, ArtifactKindRateLimitEncounter)
+	}
+}
+
 func TestInfrastructureServicePhase12GuardianActionsAndAliasValidators(t *testing.T) {
 	guardian := NewGuardianService(InfrastructureServiceConfig{GuardianBackend: guardianBackendFunc(func(_ context.Context, req GuardianDecisionRequest) (GuardianDecisionArtifactData, error) {
 		return req.Requested, nil
@@ -400,7 +438,7 @@ func TestInfrastructureServicesMissingBackendEmitFailureArtifacts(t *testing.T) 
 			if err != nil {
 				t.Fatalf("HandleServiceClaim: %v", err)
 			}
-			if artifact.Kind != ArtifactKindErrorDiagnostic && artifact.Kind != ArtifactKindPolicyDenied {
+			if !isErrorArtifactKind(artifact.Kind) {
 				t.Fatalf("artifact kind = %s, want failure artifact", artifact.Kind)
 			}
 			if len(artifact.Errors) == 0 || artifact.Errors[0].Description != tt.want {
@@ -546,6 +584,49 @@ func TestSystemParticipantServicesProduceTypedArtifactsAndValidators(t *testing.
 	}
 }
 
+func TestSystemEvidenceParticipantCatalogScopesAndCategories(t *testing.T) {
+	session, err := systemEvidenceParticipant(SystemEvidenceOptions{
+		SubjectID:    "sys:session_manager",
+		SessionID:    "session-1",
+		ArtifactKind: SystemEvidenceKindSession,
+		Metadata:     map[string]any{"process_uid": "proc-1"},
+	})
+	if err != nil {
+		t.Fatalf("session participant: %v", err)
+	}
+	if session.Category != ParticipantCategoryService || session.ScopeKeys["process_uid"] != "proc-1" {
+		t.Fatalf("session participant = %+v, want service scoped by process_uid", session)
+	}
+	if _, ok := session.ScopeKeys["session_id"]; ok {
+		t.Fatalf("session participant scope = %+v, must not use session_id", session.ScopeKeys)
+	}
+
+	fabric, err := systemEvidenceParticipant(SystemEvidenceOptions{
+		SubjectID:    "sys:fabric_subscriber",
+		SessionID:    "session-1",
+		ArtifactKind: SystemEvidenceKindFabric,
+	})
+	if err != nil {
+		t.Fatalf("fabric participant: %v", err)
+	}
+	if fabric.Category != ParticipantCategoryService || fabric.ScopeKeys["session_id"] != "session-1" || fabric.Determinism != HandlerDeterminismContent {
+		t.Fatalf("fabric participant = %+v, want content service scoped by session_id", fabric)
+	}
+
+	bus, err := systemEvidenceParticipant(SystemEvidenceOptions{
+		SubjectID:    "sys:bus_administrator",
+		SessionID:    "session-1",
+		ArtifactKind: SystemEvidenceKindBus,
+		Metadata:     map[string]any{"process_uid": "proc-1"},
+	})
+	if err != nil {
+		t.Fatalf("bus participant: %v", err)
+	}
+	if bus.Category != ParticipantCategorySystem || bus.ScopeKeys["process_uid"] != "proc-1" {
+		t.Fatalf("bus participant = %+v, want system scoped by process_uid", bus)
+	}
+}
+
 func TestSystemParticipantValidatorsRejectNegativeAndEdgeCases(t *testing.T) {
 	badSession, err := sessionLifecycleArtifact(SessionLifecycleArtifactData{Operation: "persist", SessionID: "system-session", Persisted: false, Status: InfrastructureStatusFailed, FailureReason: "disk full"}, "session_persist", ArtifactKindPersistOutcome)
 	if err != nil {
@@ -597,6 +678,21 @@ func TestSystemParticipantServiceConcurrentRecordsDoNotDeadlock(t *testing.T) {
 	for err := range errs {
 		if err != nil {
 			t.Fatalf("concurrent system participant record: %v", err)
+		}
+	}
+}
+
+func assertArtifactKinds(t *testing.T, artifacts []*Artifact, want []string) {
+	t.Helper()
+	got := make(map[string]int, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact != nil {
+			got[artifact.Kind]++
+		}
+	}
+	for _, kind := range want {
+		if got[kind] == 0 {
+			t.Fatalf("artifact kinds = %v, missing %s", got, kind)
 		}
 	}
 }

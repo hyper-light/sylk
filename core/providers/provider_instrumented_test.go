@@ -17,11 +17,13 @@ type fakeProvider struct {
 	err       error
 	stream    []*StreamChunk
 	streamErr error
+	tokens    int
+	tokenErr  error
 }
 
 func (f *fakeProvider) Name() string                         { return f.name }
 func (f *fakeProvider) SupportedModels() []ModelInfo         { return nil }
-func (f *fakeProvider) CountTokens(_ []Message) (int, error) { return 0, nil }
+func (f *fakeProvider) CountTokens(_ []Message) (int, error) { return f.tokens, f.tokenErr }
 func (f *fakeProvider) MaxContextTokens(_ string) int        { return 0 }
 func (f *fakeProvider) HealthCheck(_ context.Context) error  { return nil }
 func (f *fakeProvider) Complete(_ context.Context, _ *Request) (*Response, error) {
@@ -191,8 +193,8 @@ func TestInstrument_StreamEmitsActivityWithChunkCount(t *testing.T) {
 	for range out {
 		got++
 	}
-	if got != len(chunks) {
-		t.Fatalf("expected %d chunks, got %d", len(chunks), got)
+	if got != 3 {
+		t.Fatalf("expected 3 service-synthesized chunks, got %d", got)
 	}
 
 	deadline := time.Now().Add(time.Second)
@@ -207,7 +209,7 @@ func TestInstrument_StreamEmitsActivityWithChunkCount(t *testing.T) {
 		t.Fatal("Stream must eventually emit ActionLLMResponseCompleted")
 	}
 	last := emitted[len(emitted)-1]
-	if !strings.Contains(string(last.Payload), `"chunk_count":4`) {
+	if !strings.Contains(string(last.Payload), `"chunk_count":3`) {
 		t.Errorf("payload should record chunk count; got %s", string(last.Payload))
 	}
 	if !strings.Contains(string(last.Payload), `"input_tokens":10`) {

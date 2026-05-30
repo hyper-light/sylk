@@ -26,6 +26,7 @@ type ProjectionHealthSnapshot struct {
 	Warnings          []string                    `json:"warnings,omitempty"`
 	FeatureFlags      map[string]string           `json:"feature_flags,omitempty"`
 	ShadowDiffs       []string                    `json:"shadow_diffs,omitempty"`
+	Budgets           ClaimsOperationsBudgetSnapshot `json:"budgets,omitempty"`
 }
 
 type ProjectionProjectorHealth struct {
@@ -102,6 +103,7 @@ func (db *DurableBoard) ProjectionHealth(now ...time.Time) ProjectionHealthSnaps
 	}
 	snap := db.outbox.Health(db.board.BoardID(), db.board.SessionID(), db.board.HighWaterSequence(), t)
 	snap.FeatureFlags = rollout.FeatureFlags()
+	snap.Budgets = ClaimsOperationsBudgetSnapshotFromConfig(db.operations)
 	if rollout.ClaimsKnowledgeMirror == ProjectionRolloutShadow {
 		snap.ShadowDiffs = projectionShadowDiffs(snap)
 	}
@@ -289,6 +291,8 @@ func cloneProjectionHealthSnapshot(in ProjectionHealthSnapshot) ProjectionHealth
 		}
 	}
 	out.ShadowDiffs = append([]string(nil), in.ShadowDiffs...)
+	out.Budgets = in.Budgets
+	out.Budgets.Warnings = append([]string(nil), in.Budgets.Warnings...)
 	return out
 }
 

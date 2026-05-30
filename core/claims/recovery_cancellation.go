@@ -526,6 +526,7 @@ type ClaimCancellationResult struct {
 	CancelledClaimIDs []string `json:"cancelled_claim_ids,omitempty"`
 	TerminalClaimIDs  []string `json:"terminal_claim_ids,omitempty"`
 	MissingClaimIDs   []string `json:"missing_claim_ids,omitempty"`
+	CyclicClaimIDs    []string `json:"cyclic_claim_ids,omitempty"`
 	StuckClaimIDs     []string `json:"stuck_claim_ids,omitempty"`
 	Bounded           bool     `json:"bounded"`
 }
@@ -540,8 +541,9 @@ func CancelClaimTree(ctx context.Context, opts ClaimCancellationOptions) (ClaimC
 	result := ClaimCancellationResult{OriginClaimID: strings.TrimSpace(opts.OriginClaimID)}
 	proj := opts.Board.Projection()
 	graph := cancellationGraph(proj)
-	order, missing, bounded := cancellationOrder(opts.RootClaimIDs, graph, positiveOrDefault(opts.ScanLimit, defaultServiceRecoveryScanLimit))
+	order, missing, cycles, bounded := cancellationOrder(opts.RootClaimIDs, graph, positiveOrDefault(opts.ScanLimit, defaultServiceRecoveryScanLimit))
 	result.MissingClaimIDs = missing
+	result.CyclicClaimIDs = cycles
 	result.Bounded = bounded
 	for _, claimID := range missing {
 		if err := recordMissingCancellationRoot(ctx, opts, claimID); err != nil {
@@ -562,6 +564,22 @@ func CancelClaimTree(ctx context.Context, opts ClaimCancellationOptions) (ClaimC
 		result.CancelledClaimIDs = append(result.CancelledClaimIDs, claimID)
 	}
 	return result, ctx.Err()
+}
+
+func CancelAllActiveRootClaims(ctx context.Context, opts ClaimCancellationOptions) (ClaimCancellationResult, error) {
+	if opts.Board == nil {
+		return ClaimCancellationResult{}, fmt.Errorf("claim cancellation requires board")
+	}
+	opts.RootClaimIDs = activeRootClaimIDs(opts.Board.Projection())
+	return CancelClaimTree(ctx, opts)
+}
+
+func CancelAllActiveClaims(ctx context.Context, opts ClaimCancellationOptions) (ClaimCancellationResult, error) {
+	if opts.Board == nil {
+		return ClaimCancellationResult{}, fmt.Errorf("claim cancellation requires board")
+	}
+	opts.RootClaimIDs = activeClaimIDs(opts.Board.Projection())
+	return CancelClaimTree(ctx, opts)
 }
 
 func cancelActiveClaimWork(ctx context.Context, opts ClaimCancellationOptions, claim *Claim) int {
@@ -611,17 +629,18 @@ func cancellationGraph(proj *ClaimsBoardProjection) cancellationGraphSnapshot {
 
 func cancellationRelationship(relationship string) bool {
 	switch strings.TrimSpace(relationship) {
-	case RelationshipCausedBy, RelationshipDependsOn:
+	case RelationshipCausedBy, RelationshipDependsOn, RelationshipClaim:
 		return true
 	default:
 		return false
 	}
 }
 
-func cancellationOrder(rootIDs []string, graph cancellationGraphSnapshot, limit int) ([]string, []string, bool) {
+func cancellationOrder(rootIDs []string, graph cancellationGraphSnapshot, limit int) ([]string, []string, []string, bool) {
 	visited := make(map[string]bool, len(graph.claims))
 	var order []string
 	var missing []string
+	var cycles []string
 	bounded := false
 	for _, rootID := range normalizeStringList(rootIDs) {
 		if _, ok := graph.claims[rootID]; !ok {
@@ -629,30 +648,82 @@ func cancellationOrder(rootIDs []string, graph cancellationGraphSnapshot, limit 
 			continue
 		}
 		before := len(order)
-		order, bounded = appendCancellationPostOrder(rootID, graph, visited, order, limit)
+		var foundCycles []string
+		order, foundCycles, bounded = appendCancellationPostOrder(rootID, graph, visited, nil, order, limit)
+		for _, claimID := range foundCycles {
+			cycles = appendUniqueString(cycles, claimID)
+		}
 		if bounded || len(order) == before && !visited[rootID] {
 			break
 		}
 	}
-	return order, missing, bounded
+	return order, missing, cycles, bounded
 }
 
-func appendCancellationPostOrder(rootID string, graph cancellationGraphSnapshot, visited map[string]bool, order []string, limit int) ([]string, bool) {
+func appendCancellationPostOrder(rootID string, graph cancellationGraphSnapshot, visited map[string]bool, stack []string, order []string, limit int) ([]string, []string, bool) {
+	if stringInList(rootID, stack) {
+		return order, []string{rootID}, false
+	}
 	if visited[rootID] {
-		return order, false
+		return order, nil, false
 	}
 	if len(order) >= limit {
-		return order, true
+		return order, nil, true
 	}
 	visited[rootID] = true
+	stack = append(stack, rootID)
+	var cycles []string
 	for _, childID := range graph.children[rootID] {
-		next, bounded := appendCancellationPostOrder(childID, graph, visited, order, limit)
+		next, foundCycles, bounded := appendCancellationPostOrder(childID, graph, visited, stack, order, limit)
 		order = next
+		for _, claimID := range foundCycles {
+			cycles = appendUniqueString(cycles, claimID)
+		}
 		if bounded {
-			return order, true
+			return order, cycles, true
 		}
 	}
-	return append(order, rootID), false
+	return append(order, rootID), cycles, false
+}
+
+func activeRootClaimIDs(proj *ClaimsBoardProjection) []string {
+	if proj == nil {
+		return nil
+	}
+	childClaims := make(map[string]struct{})
+	for _, claim := range proj.Claims {
+		for _, relation := range claim.Relations {
+			if relation.RelatedType == RelatedTypeClaim && cancellationRelationship(relation.Relationship) {
+				childClaims[claim.ID] = struct{}{}
+			}
+		}
+	}
+	var roots []string
+	for _, claim := range proj.Claims {
+		if claim.Status.IsTerminal() || claim.LifecycleStatus.IsTerminal() {
+			continue
+		}
+		if _, isChild := childClaims[claim.ID]; !isChild {
+			roots = append(roots, claim.ID)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func activeClaimIDs(proj *ClaimsBoardProjection) []string {
+	if proj == nil {
+		return nil
+	}
+	var ids []string
+	for _, claim := range proj.Claims {
+		if claim.Status.IsTerminal() || claim.LifecycleStatus.IsTerminal() {
+			continue
+		}
+		ids = append(ids, claim.ID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func recordCancellationFailure(ctx context.Context, opts ClaimCancellationOptions, claimID string, contextCancelled bool) error {

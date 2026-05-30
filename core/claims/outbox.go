@@ -20,8 +20,6 @@ const (
 	OutboxStatusSucceeded       OutboxProjectorStatus = "succeeded"
 	OutboxStatusFailedRetryable OutboxProjectorStatus = "failed_retryable"
 	OutboxStatusFailedTerminal  OutboxProjectorStatus = "failed_terminal"
-
-	defaultOutboxLease = 30 * time.Second
 )
 
 type OutboxProjectorStatus string
@@ -61,18 +59,27 @@ type claimsOutboxEvent struct {
 }
 
 type ClaimsOutbox struct {
-	mu         sync.Mutex
-	path       string
-	file       *os.File
-	projectors []string
-	records    map[string]*ClaimsOutboxRecord
-	order      []string
+	mu           sync.Mutex
+	path         string
+	file         *os.File
+	projectors   []string
+	records      map[string]*ClaimsOutboxRecord
+	order        []string
+	lease        time.Duration
+	pendingLimit int
 }
 
 func OpenClaimsOutbox(dir string, projectors []string) (*ClaimsOutbox, error) {
+	return OpenClaimsOutboxWithConfig(dir, projectors, ClaimsOperationsConfig{})
+}
+
+func OpenClaimsOutboxWithConfig(dir string, projectors []string, cfg ClaimsOperationsConfig) (*ClaimsOutbox, error) {
+	ops := NormalizeClaimsOperationsConfig(cfg)
 	o := &ClaimsOutbox{
-		projectors: normalizeProjectorNames(projectors),
-		records:    make(map[string]*ClaimsOutboxRecord),
+		projectors:   normalizeProjectorNames(projectors),
+		records:      make(map[string]*ClaimsOutboxRecord),
+		lease:        ops.Budgets.OutboxLease,
+		pendingLimit: ops.Budgets.OutboxProjectionBatchLimit,
 	}
 	if strings.TrimSpace(dir) == "" {
 		return o, nil
@@ -133,7 +140,10 @@ func (o *ClaimsOutbox) Pending(projector string, limit int, now time.Time) []Cla
 		return nil
 	}
 	if limit <= 0 {
-		limit = 64
+		limit = o.pendingLimit
+	}
+	if limit <= 0 {
+		limit = operationsDefaultOutboxBatch
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -189,7 +199,7 @@ func (o *ClaimsOutbox) Claim(recordID, projector, worker string, leaseUntil time
 		worker = "claims-projector"
 	}
 	if leaseUntil.IsZero() {
-		leaseUntil = time.Now().UTC().Add(defaultOutboxLease)
+		leaseUntil = time.Now().UTC().Add(o.leaseDuration())
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -263,7 +273,7 @@ func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, p
 			if err := ctx.Err(); err != nil {
 				return projected
 			}
-			ok, err := o.Claim(rec.ID, name, "claims-board", time.Now().UTC().Add(defaultOutboxLease))
+			ok, err := o.Claim(rec.ID, name, "claims-board", time.Now().UTC().Add(o.leaseDuration()))
 			if err != nil {
 				board.RecordProjectionError(rec, name, err)
 				continue
@@ -285,6 +295,13 @@ func (o *ClaimsOutbox) ProjectPending(ctx context.Context, board *ClaimsBoard, p
 		}
 	}
 	return projected
+}
+
+func (o *ClaimsOutbox) leaseDuration() time.Duration {
+	if o == nil || o.lease <= 0 {
+		return OperationsDefaultOutboxLease
+	}
+	return o.lease
 }
 
 func (o *ClaimsOutbox) insertLocked(record ClaimsOutboxRecord, appendEvent bool) error {

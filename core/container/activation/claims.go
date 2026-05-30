@@ -30,7 +30,7 @@ func (ac *ActivationController) postActivationSuccess(agentType string, c *conta
 	}
 	record := ac.activationRecord(agentType, c, nil, duration)
 	ac.runAsync("activation_claim_"+agentType, func(ctx context.Context) error {
-		return invokeActivationServiceClaim(ctx, board, record)
+		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolActivate, record)
 	})
 }
 
@@ -43,21 +43,67 @@ func (ac *ActivationController) postActivationError(agentType string, err error,
 	}
 	record := ac.activationRecord(agentType, nil, err, duration)
 	ac.runAsync("activation_error_"+agentType, func(ctx context.Context) error {
-		return invokeActivationServiceClaim(ctx, board, record)
+		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolActivate, record)
 	})
 }
 
-func (ac *ActivationController) activationRecord(agentType string, c *container.Container, activationErr error, duration time.Duration) claims.ActivationRecordArtifactData {
-	tier := TierCold
-	if ac != nil {
-		if current, err := ac.TierOf(agentType); err == nil {
-			tier = current
-		}
+func (ac *ActivationController) postActivationTransition(agentType string, previous, target, final ActivationTier, transitionErr error, duration time.Duration) {
+	board := ac.loadBoard()
+	if board == nil {
+		return
 	}
 	record := claims.ActivationRecordArtifactData{
 		ParticipantID:   strings.TrimSpace(agentType),
 		ParticipantType: "agent",
+		Operation:       "tier_transition",
+		PreviousTier:    pod.TierString(previous),
+		TargetTier:      pod.TierString(target),
+		Tier:            pod.TierString(final),
+		Ready:           final >= TierWarm,
+		Duration:        duration,
+	}
+	if record.Ready {
+		record.ReplicaCount = 1
+	}
+	if transitionErr != nil {
+		record.FailureReason = transitionErr.Error()
+		record.Ready = false
+		record.ReplicaCount = 0
+	}
+	ac.runAsync("activation_transition_"+agentType, func(ctx context.Context) error {
+		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolDeactivate, record)
+	})
+}
+
+func (ac *ActivationController) postActivationQuery(agentType string, tier ActivationTier) {
+	board := ac.loadBoard()
+	if board == nil {
+		return
+	}
+	record := claims.ActivationRecordArtifactData{
+		ParticipantID:   strings.TrimSpace(agentType),
+		ParticipantType: "agent",
+		Operation:       "query_tier",
 		Tier:            pod.TierString(tier),
+		TargetTier:      pod.TierString(tier),
+		Ready:           tier >= TierWarm,
+	}
+	if record.Ready {
+		record.ReplicaCount = 1
+	}
+	ac.runAsync("activation_query_"+agentType, func(ctx context.Context) error {
+		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolQueryTier, record)
+	})
+}
+
+func (ac *ActivationController) activationRecord(agentType string, c *container.Container, activationErr error, duration time.Duration) claims.ActivationRecordArtifactData {
+	tier := ac.currentTierForRecord(agentType)
+	record := claims.ActivationRecordArtifactData{
+		ParticipantID:   strings.TrimSpace(agentType),
+		ParticipantType: "agent",
+		Operation:       "activate",
+		Tier:            pod.TierString(tier),
+		TargetTier:      pod.TierString(TierHot),
 		Duration:        duration,
 	}
 	if c != nil {
@@ -75,7 +121,18 @@ func (ac *ActivationController) activationRecord(agentType string, c *container.
 	return record
 }
 
-func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard, record claims.ActivationRecordArtifactData) error {
+func (ac *ActivationController) currentTierForRecord(agentType string) ActivationTier {
+	if ac == nil {
+		return TierCold
+	}
+	entry, err := ac.getEntry(agentType)
+	if err != nil {
+		return TierCold
+	}
+	return entry.LoadTier()
+}
+
+func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard, tool string, record claims.ActivationRecordArtifactData) error {
 	participant, err := activationControllerParticipant(board)
 	if err != nil {
 		return err
@@ -86,10 +143,10 @@ func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard
 		Participant:  participant,
 		IssuerID:     activationClaimsAgent,
 		SubjectID:    activationControllerParticipantID,
-		Title:        fmt.Sprintf("Activate %s", record.ParticipantID),
-		Description:  fmt.Sprintf("Activate agent type %s for the current session.", record.ParticipantID),
-		ActionType:   claims.ActionTypeActivation,
-		ExpectedCall: claims.ExpectedToolCall{Tool: claims.ActivationControllerToolActivate, Arguments: activationServiceArguments(record)},
+		Title:        fmt.Sprintf("Activation controller %s %s", record.Operation, record.ParticipantID),
+		Description:  fmt.Sprintf("Run activation controller operation %s for agent type %s.", record.Operation, record.ParticipantID),
+		ActionType:   claims.ActionTypeTask,
+		ExpectedCall: claims.ExpectedToolCall{Tool: tool, Arguments: activationServiceArguments(record)},
 		Reason:       "activation controller service claim generated",
 	})
 	return err
@@ -104,7 +161,7 @@ func activationControllerParticipant(board *claims.ClaimsBoard) (claims.Particip
 		len(activationControllerTools()),
 		activationControllerTimeout(),
 		claims.HandlerDeterminismSideEffect,
-		[]claims.ActionType{claims.ActionTypeActivation},
+		[]claims.ActionType{claims.ActionTypeTask},
 	)
 }
 
@@ -112,7 +169,10 @@ func activationServiceArguments(record claims.ActivationRecordArtifactData) map[
 	return map[string]any{
 		"participant_id":   record.ParticipantID,
 		"participant_type": record.ParticipantType,
+		"operation":        record.Operation,
 		"tier":             record.Tier,
+		"previous_tier":    record.PreviousTier,
+		"target_tier":      record.TargetTier,
 		"replica_count":    record.ReplicaCount,
 		"ready":            record.Ready,
 		"failure_reason":   record.FailureReason,

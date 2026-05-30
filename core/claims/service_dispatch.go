@@ -58,6 +58,7 @@ type ServiceDispatcherConfig struct {
 	Participant ParticipantRegistration
 	Handler     ServiceHandler
 	SessionID   string
+	CancelRegistry *ClaimCancelRegistry
 }
 
 type ServiceDispatcher struct {
@@ -74,6 +75,7 @@ type ServiceDispatcher struct {
 	inflight      chan struct{}
 	active        map[string]context.CancelFunc
 	subscriptions []DeltaSubscription
+	cancelRegistry *ClaimCancelRegistry
 	started       bool
 	closed        bool
 }
@@ -108,6 +110,7 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 		seen:        make(map[string]struct{}, participant.QueueCapacity*serviceSeenKeysPerDelta),
 		inflight:    make(chan struct{}, participant.ConcurrencyBudget),
 		active:      make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
+		cancelRegistry: firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
 	}, nil
 }
 
@@ -189,9 +192,10 @@ func (d *ServiceDispatcher) CancelClaim(claimID string) bool {
 	cancel := d.active[claimID]
 	d.mu.Unlock()
 	if cancel == nil {
-		return false
+		return d.cancelRegistry.CancelClaim(claimID) > 0
 	}
 	cancel()
+	_ = d.cancelRegistry.CancelClaim(claimID)
 	return true
 }
 
@@ -219,9 +223,10 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 		return d.recordOverflow(ctx, delta)
 	}
 	if err := d.scope.Go("claims.service."+d.participant.RouteKey, d.participant.HandlerTimeout, func(runCtx context.Context) error {
-		runCtx, cancel := context.WithCancel(runCtx)
-		d.trackActive(delta.ClaimID(), cancel)
+		runCtx, reg := d.cancelRegistry.Context(runCtx, delta.ClaimID())
+		d.trackActive(delta.ClaimID(), reg.cancel)
 		defer d.untrackActive(delta.ClaimID())
+		defer reg.Done()
 		defer d.release()
 		return d.invoke(runCtx, delta)
 	}); err != nil {
@@ -543,6 +548,13 @@ func validateServiceDispatcherConfig(cfg ServiceDispatcherConfig) error {
 		return fmt.Errorf("%w: board, scope, and handler are required", ErrServiceDispatcherInvalid)
 	}
 	return cfg.Participant.Validate()
+}
+
+func firstNonNilClaimCancelRegistry(registry *ClaimCancelRegistry) *ClaimCancelRegistry {
+	if registry != nil {
+		return registry
+	}
+	return NewClaimCancelRegistry()
 }
 
 func normalizeServiceArtifacts(artifacts []*Artifact, agentID string) []*Artifact {

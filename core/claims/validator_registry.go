@@ -645,6 +645,7 @@ type BoardValidatorDispatcherConfig struct {
 	MaxInputBytes        int64
 	MaxOutputBytes       int64
 	ApprovedValidatorIDs map[string]bool
+	CancelRegistry       *ClaimCancelRegistry
 }
 
 type BoardValidatorDispatcher struct {
@@ -657,6 +658,7 @@ type BoardValidatorDispatcher struct {
 	maxInputBytes        int64
 	maxOutputBytes       int64
 	approvedValidatorIDs map[string]bool
+	cancelRegistry       *ClaimCancelRegistry
 	mu                   sync.Mutex
 	inFlight             map[string]struct{}
 	active               map[string]context.CancelFunc
@@ -684,6 +686,7 @@ func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardVali
 		maxInputBytes:        cfg.MaxInputBytes,
 		maxOutputBytes:       cfg.MaxOutputBytes,
 		approvedValidatorIDs: copyBoolMap(cfg.ApprovedValidatorIDs),
+		cancelRegistry:       firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
 		inFlight:             make(map[string]struct{}),
 		active:               make(map[string]context.CancelFunc),
 	}, nil
@@ -754,6 +757,7 @@ func (d *BoardValidatorDispatcher) CancelClaimValidations(claim *Claim) int {
 			cancelled++
 		}
 	}
+	cancelled += d.cancelRegistry.CancelClaim(claim.ID)
 	return cancelled
 }
 
@@ -774,7 +778,9 @@ func (d *BoardValidatorDispatcher) dispatchAcquiredValidation(ctx context.Contex
 	if result, denied := d.enforcePolicy(ctx, reg, req); denied {
 		return d.commitDispatchResult(ctx, req, reg, result)
 	}
-	handlerCtx, cancel := d.handlerContext(ctx, req.Validation)
+	handlerCtx, claimReg := d.cancelRegistry.Context(ctx, req.Claim.ID)
+	defer claimReg.Done()
+	handlerCtx, cancel := d.handlerContext(handlerCtx, req.Validation)
 	d.trackActive(req.Validation.ID, cancel)
 	defer d.untrackActive(req.Validation.ID)
 	result, err := d.programmatic.DispatchValidation(handlerCtx, req)
@@ -799,7 +805,9 @@ func (d *BoardValidatorDispatcher) recoverAcquiredValidation(ctx context.Context
 	if err := d.validateBoundedInput(req.Artifact); err != nil {
 		return d.commitRecoveryDispatchError(ctx, req, reg, ValidationErrorCategoryDispatcher, err.Error())
 	}
-	handlerCtx, cancel := d.handlerContext(ctx, req.Validation)
+	handlerCtx, claimReg := d.cancelRegistry.Context(ctx, req.Claim.ID)
+	defer claimReg.Done()
+	handlerCtx, cancel := d.handlerContext(handlerCtx, req.Validation)
 	d.trackActive(req.Validation.ID, cancel)
 	defer d.untrackActive(req.Validation.ID)
 	result, err := d.programmatic.DispatchValidation(handlerCtx, req)

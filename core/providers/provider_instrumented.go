@@ -65,7 +65,7 @@ func (p *instrumentedProvider) Complete(ctx context.Context, req *CompletionRequ
 
 	trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "complete")
 
-	resp, err := p.wrapped.Complete(span.Context(), req)
+	resp, err := p.completeViaProviderGateway(span.Context(), req, trace)
 	if err != nil {
 		span.EndWithError(err)
 		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "complete", trace, nil, err)
@@ -90,66 +90,88 @@ func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionReques
 	span := p.beginSpan(ctx, req, "stream")
 	trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "stream")
 
-	in, err := p.wrapped.Stream(span.Context(), req)
+	resp, err := p.streamViaProviderGateway(span.Context(), req, trace)
 	if err != nil {
-		// End immediately on the synchronous setup failure so the
-		// failed setup is captured as a finished activity.
 		span.EndWithError(err)
 		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, nil, err)
+		span.End()
 		return nil, err
 	}
-	out := make(chan *StreamChunk, 16)
-	go func() {
-		defer close(out)
-		defer span.End()
-		var (
-			chunkCount int
-			usage      Usage
-			stop       StopReason
-			content    strings.Builder
-			streamErr  error
-		)
-		for chunk := range in {
-			chunkCount++
-			if chunk != nil {
-				if chunk.Usage != nil {
-					usage = *chunk.Usage
-				}
-				if chunk.StopReason != "" {
-					stop = chunk.StopReason
-				}
-				if chunk.Type == ChunkTypeError {
-					streamErr = errFromChunk(chunk)
-				}
-				if chunk.Type == ChunkTypeText && chunk.Text != "" && content.Len() < llmDispatchContentSummaryCap {
-					content.WriteString(chunk.Text)
-				}
-			}
-			out <- chunk
-		}
-		span.SetAttribute("chunk_count", chunkCount)
-		span.SetAttribute("stop_reason", string(stop))
-		span.SetAttribute("input_tokens", usage.InputTokens)
-		span.SetAttribute("output_tokens", usage.OutputTokens)
-		span.SetAttribute("total_tokens", usage.TotalTokens)
-		span.SetAttribute("reasoning_tokens", usage.ReasoningTokens)
-		span.SetAttribute("cache_read_tokens", usage.CacheReadTokens)
-		span.SetAttribute("cache_write_tokens", usage.CacheWriteTokens)
-		// Synthesize a CompletionResponse-shaped summary for the
-		// dispatch end artifact so the chat panel renders the same
-		// shape as Complete.
-		streamResp := &CompletionResponse{
-			Content:    truncateForDispatchSummary(content.String()),
-			StopReason: stop,
-			Usage:      usage,
-		}
-		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, streamResp, streamErr)
-	}()
+	chunks := providerGatewayStreamChunks(resp)
+	out := make(chan *StreamChunk, len(chunks))
+	for _, chunk := range chunks {
+		out <- chunk
+	}
+	close(out)
+	span.SetAttribute("chunk_count", len(chunks))
+	span.SetAttribute("stop_reason", string(resp.StopReason))
+	span.SetAttribute("input_tokens", resp.Usage.InputTokens)
+	span.SetAttribute("output_tokens", resp.Usage.OutputTokens)
+	span.SetAttribute("total_tokens", resp.Usage.TotalTokens)
+	span.SetAttribute("reasoning_tokens", resp.Usage.ReasoningTokens)
+	span.SetAttribute("cache_read_tokens", resp.Usage.CacheReadTokens)
+	span.SetAttribute("cache_write_tokens", resp.Usage.CacheWriteTokens)
+	recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, resp, nil)
+	span.End()
 	return out, nil
 }
 
 func (p *instrumentedProvider) CountTokens(messages []Message) (int, error) {
 	return p.wrapped.CountTokens(messages)
+}
+
+func (p *instrumentedProvider) completeViaProviderGateway(ctx context.Context, req *CompletionRequest, trace llmDispatchTrace) (*CompletionResponse, error) {
+	data, resp, err := p.providerGatewayCallOrDirect(ctx, req, "complete", trace)
+	if err != nil {
+		return nil, err
+	}
+	if execErr := providerGatewayExecutionError(data); execErr != nil {
+		return nil, execErr
+	}
+	if resp != nil {
+		return resp, nil
+	}
+	return providerGatewayResponseFromData(data), nil
+}
+
+func (p *instrumentedProvider) streamViaProviderGateway(ctx context.Context, req *CompletionRequest, trace llmDispatchTrace) (*CompletionResponse, error) {
+	data, resp, err := p.providerGatewayCallOrDirect(ctx, req, "stream", trace)
+	if err != nil {
+		return nil, err
+	}
+	if execErr := providerGatewayExecutionError(data); execErr != nil {
+		return nil, execErr
+	}
+	if resp != nil {
+		return resp, nil
+	}
+	return providerGatewayResponseFromData(data), nil
+}
+
+func (p *instrumentedProvider) providerGatewayCallOrDirect(ctx context.Context, req *CompletionRequest, mode string, trace llmDispatchTrace) (claims.ProviderGatewayCallArtifactData, *Response, error) {
+	data, resp, err := invokeProviderGatewayServiceClaim(ctx, p.wrapped, req, mode, trace)
+	if !errors.Is(err, errProviderGatewayServiceUnavailable) {
+		return data, resp, err
+	}
+	return p.directProviderGatewayCall(ctx, req, mode, trace)
+}
+
+func (p *instrumentedProvider) directProviderGatewayCall(ctx context.Context, req *CompletionRequest, mode string, trace llmDispatchTrace) (claims.ProviderGatewayCallArtifactData, *Response, error) {
+	backend := NewClaimsGatewayBackend(ClaimsGatewayBackendConfig{
+		Provider:             p.wrapped,
+		Request:              req,
+		ResponseSummaryLimit: llmDispatchContentSummaryCap,
+		PartialSummaryLimit:  defaultProviderGatewayPartialLimit(),
+	})
+	data := providerGatewayArtifactData(p.wrapped.Name(), req, mode, trace, nil, nil)
+	out, resp, err := backend.ExecuteProviderGatewayCall(ctx, claims.ProviderGatewayCallRequest{
+		Call:      claims.ExpectedToolCall{ID: trace.dispatchID, Tool: data.Operation, Arguments: providerGatewayRequestArguments(req, data)},
+		Requested: data,
+	})
+	if err != nil {
+		return out, resp, err
+	}
+	return out, resp, nil
 }
 
 func (p *instrumentedProvider) MaxContextTokens(model string) int {
@@ -213,66 +235,8 @@ func (p *instrumentedProvider) Close() error {
 }
 
 func (p *instrumentedProvider) StreamWithHandler(ctx context.Context, req *StreamRequest, handler StreamHandler) error {
-	span := p.beginSpan(ctx, req, "stream_with_handler")
-	defer func() { span.End() }()
-
-	if h, ok := p.wrapped.(StreamHandlerProvider); ok {
-		trace := recordLLMDispatchStart(ctx, p.wrapped.Name(), req, "stream_with_handler")
-		// Wrap the handler so we can observe the final chunk's usage
-		// + stop reason + error and record the dispatch end with a
-		// faithful CompletionResponse shape.
-		var (
-			contentSummary strings.Builder
-			finalUsage     Usage
-			finalStop      StopReason
-			handlerErr     error
-		)
-		wrappedHandler := func(chunk *StreamChunk) error {
-			if chunk != nil {
-				if chunk.Usage != nil {
-					finalUsage = *chunk.Usage
-				}
-				if chunk.StopReason != "" {
-					finalStop = chunk.StopReason
-				}
-				if chunk.Type == ChunkTypeText && chunk.Text != "" && contentSummary.Len() < llmDispatchContentSummaryCap {
-					contentSummary.WriteString(chunk.Text)
-				}
-			}
-			if handler == nil {
-				return nil
-			}
-			if hErr := handler(chunk); hErr != nil {
-				handlerErr = hErr
-				return hErr
-			}
-			return nil
-		}
-		err := h.StreamWithHandler(span.Context(), req, wrappedHandler)
-		if err == nil && handlerErr != nil {
-			err = handlerErr
-		}
-		if err != nil {
-			span.EndWithError(err)
-		}
-		summaryResp := &CompletionResponse{
-			Content:    truncateForDispatchSummary(contentSummary.String()),
-			StopReason: finalStop,
-			Usage:      finalUsage,
-		}
-		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream_with_handler", trace, summaryResp, err)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	// Fall back to Stream-based delivery for providers that don't
-	// implement StreamWithHandler natively. Note: p.Stream is the
-	// instrumented Stream above, which already records dispatch
-	// start/end — no second recording needed here.
-	out, err := p.Stream(span.Context(), req)
+	out, err := p.Stream(ctx, req)
 	if err != nil {
-		span.EndWithError(err)
 		return err
 	}
 	for chunk := range out {
@@ -280,7 +244,6 @@ func (p *instrumentedProvider) StreamWithHandler(ctx context.Context, req *Strea
 			continue
 		}
 		if hErr := handler(chunk); hErr != nil {
-			span.EndWithError(hErr)
 			return hErr
 		}
 	}
@@ -415,7 +378,6 @@ func recordLLMDispatchEnd(ctx context.Context, providerName string, req *Request
 		}
 	}
 	acc.RecordArtifact(artifact)
-	recordProviderGatewayServiceClaim(ctx, providerName, req, mode, trace, resp, dispatchErr)
 }
 
 func truncateForDispatchSummary(s string) string {

@@ -99,6 +99,7 @@ type ClaimsBoard struct {
 
 	legacySessionNoWAL bool
 	rollout            RolloutConfig
+	operations         ClaimsOperationsConfig
 	canonicalViaOutbox bool
 	durable            *DurableBoard
 }
@@ -123,6 +124,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 	if maxIter <= 0 {
 		maxIter = defaultMaxIterations
 	}
+	operations := NormalizeClaimsOperationsConfig(cfg.Operations)
 	b := &ClaimsBoard{
 		boardID:                   boardID,
 		pipelineID:                cfg.PipelineID,
@@ -148,6 +150,7 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		remediationPolicy:         normalizeRemediationPolicy(cfg.RemediationPolicy),
 		legacySessionNoWAL:        cfg.LegacySessionNoWAL,
 		rollout:                   boardRolloutConfig(cfg.Rollout),
+		operations:                operations,
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
@@ -203,6 +206,16 @@ func (b *ClaimsBoard) RolloutConfig() RolloutConfig {
 	cfg := b.rollout
 	b.mu.RUnlock()
 	return cfg.Normalized()
+}
+
+func (b *ClaimsBoard) OperationsConfig() ClaimsOperationsConfig {
+	if b == nil {
+		return DefaultClaimsOperationsConfig()
+	}
+	b.mu.RLock()
+	cfg := b.operations
+	b.mu.RUnlock()
+	return NormalizeClaimsOperationsConfig(cfg)
 }
 
 // ParentBoardID returns the parent board's ID (empty for root boards).

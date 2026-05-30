@@ -1024,6 +1024,11 @@ type ClaimsBoardConfig struct {
 	// RemediationPolicy optionally enables bounded corrective claims
 	// generated from terminal testament validation outcomes.
 	RemediationPolicy *RemediationPolicy
+
+	// Operations centralizes durability, queue, shutdown, recovery, and
+	// audit budgets for the claims operations plane. Zero values normalize
+	// to bounded defaults; they never mean unbounded queues.
+	Operations ClaimsOperationsConfig
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

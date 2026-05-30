@@ -333,7 +333,10 @@ func (ac *ActivationController) DemoteTo(ctx context.Context, agentType string, 
 		return nil
 	}
 
-	return ac.demote(ctx, entry, effectiveTarget)
+	started := time.Now()
+	err = ac.demote(ctx, entry, effectiveTarget)
+	ac.postActivationTransition(agentType, current, effectiveTarget, entry.LoadTier(), err, time.Since(started))
+	return err
 }
 
 // EvictUnderPressure evaluates resource pressure and demotes agents
@@ -1179,5 +1182,7 @@ func (ac *ActivationController) TierOf(agentType string) (ActivationTier, error)
 	if err != nil {
 		return TierCold, err
 	}
-	return entry.LoadTier(), nil
+	tier := entry.LoadTier()
+	ac.postActivationQuery(agentType, tier)
+	return tier, nil
 }

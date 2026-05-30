@@ -270,8 +270,38 @@ func identityLineageArtifact(data IdentityLineageArtifactData) (*Artifact, error
 }
 
 func activationRecordArtifact(data ActivationRecordArtifactData) (*Artifact, error) {
-	artifact := &Artifact{ArtifactName: "activation_record", Kind: ArtifactKindReadiness, Reference: data.ParticipantID}
+	artifact := &Artifact{ArtifactName: "activation_record", Kind: activationRecordArtifactKind(data), Reference: data.ParticipantID}
 	return artifact, SetArtifactData(artifact, data)
+}
+
+func activationRecordArtifacts(data ActivationRecordArtifactData) ([]*Artifact, error) {
+	primary, err := activationRecordArtifact(data)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := []*Artifact{primary}
+	if data.Ready && data.ReplicaCount > 0 && primary.Kind != ArtifactKindReplicaSet {
+		replica := &Artifact{ArtifactName: "replica_set", Kind: ArtifactKindReplicaSet, Reference: data.ParticipantID}
+		if err := SetArtifactData(replica, data); err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, replica)
+	}
+	return artifacts, nil
+}
+
+func activationRecordArtifactKind(data ActivationRecordArtifactData) string {
+	if strings.TrimSpace(data.FailureReason) != "" {
+		return ArtifactKindActivationFailure
+	}
+	switch strings.TrimSpace(data.Operation) {
+	case "deactivate", "tier_transition":
+		return ArtifactKindTierTransition
+	case "replica_set":
+		return ArtifactKindReplicaSet
+	default:
+		return ArtifactKindActivationRecord
+	}
 }
 
 func cloneIdentityAllocation(in IdentityAllocationArtifactData) IdentityAllocationArtifactData {

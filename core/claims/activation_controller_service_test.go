@@ -67,8 +67,8 @@ func TestActivationControllerServiceHandlerProducesTypedArtifacts(t *testing.T) 
 	if err != nil {
 		t.Fatalf("HandleServiceClaim activate: %v", err)
 	}
-	if len(result.Artifacts) != 1 {
-		t.Fatalf("artifacts = %d, want 1", len(result.Artifacts))
+	if len(result.Artifacts) < 1 {
+		t.Fatalf("artifacts = %d, want at least 1", len(result.Artifacts))
 	}
 	data, err := ArtifactData[ActivationRecordArtifactData](result.Artifacts[0])
 	if err != nil {
@@ -76,6 +76,9 @@ func TestActivationControllerServiceHandlerProducesTypedArtifacts(t *testing.T) 
 	}
 	if data.ParticipantID != "guardian" || !data.Ready || data.ReplicaCount != 1 {
 		t.Fatalf("activation artifact = %+v, want ready guardian", data)
+	}
+	if result.Artifacts[0].Kind != ArtifactKindActivationRecord {
+		t.Fatalf("activation artifact kind = %s, want %s", result.Artifacts[0].Kind, ArtifactKindActivationRecord)
 	}
 
 	query := &Claim{ExpectedToolCalls: []ExpectedToolCall{{Tool: ActivationControllerToolQueryTier, Arguments: map[string]any{"participant_id": "guardian"}}}}
@@ -86,6 +89,56 @@ func TestActivationControllerServiceHandlerProducesTypedArtifacts(t *testing.T) 
 	data, err = ArtifactData[ActivationRecordArtifactData](result.Artifacts[0])
 	if err != nil || data.Tier != "always_hot" {
 		t.Fatalf("query artifact = %+v err=%v, want always_hot", data, err)
+	}
+}
+
+func TestActivationControllerServiceTransitionAndQueryArtifacts(t *testing.T) {
+	service := NewActivationControllerService(ActivationControllerServiceConfig{})
+	if _, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{
+		Tool: ActivationControllerToolActivate,
+		Arguments: map[string]any{
+			"participant_id": "engineer",
+			"tier":           "hot",
+			"target_tier":    "hot",
+			"replica_count":  float64(1),
+		},
+	}}}}); err != nil {
+		t.Fatalf("activate setup: %v", err)
+	}
+
+	result, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{
+		Tool: ActivationControllerToolDeactivate,
+		Arguments: map[string]any{
+			"participant_id": "engineer",
+			"operation":      "tier_transition",
+			"previous_tier":  "hot",
+			"target_tier":    "warm",
+			"tier":           "warm",
+			"replica_count":  float64(1),
+			"ready":          true,
+		},
+	}}}})
+	if err != nil {
+		t.Fatalf("transition HandleServiceClaim: %v", err)
+	}
+	data, err := ArtifactData[ActivationRecordArtifactData](result.Artifacts[0])
+	if err != nil {
+		t.Fatalf("transition artifact data: %v", err)
+	}
+	if result.Artifacts[0].Kind != ArtifactKindTierTransition || data.PreviousTier != "hot" || data.TargetTier != "warm" || !data.Ready {
+		t.Fatalf("transition artifact = %+v kind=%s, want hot->warm ready transition", data, result.Artifacts[0].Kind)
+	}
+
+	query, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{
+		Tool:      ActivationControllerToolQueryTier,
+		Arguments: map[string]any{"participant_id": "engineer"},
+	}}}})
+	if err != nil {
+		t.Fatalf("query HandleServiceClaim: %v", err)
+	}
+	data, err = ArtifactData[ActivationRecordArtifactData](query.Artifacts[0])
+	if err != nil || data.Operation != "query_tier" || data.Tier != "warm" {
+		t.Fatalf("query artifact = %+v err=%v, want query_tier warm", data, err)
 	}
 }
 

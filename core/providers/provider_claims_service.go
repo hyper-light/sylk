@@ -2,7 +2,9 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
@@ -10,43 +12,75 @@ import (
 
 const providerGatewayParticipantID = "sys:provider_gateway"
 
-type completedProviderGatewayBackend struct {
-	data claims.ProviderGatewayCallArtifactData
+var errProviderGatewayServiceUnavailable = errors.New("provider gateway service unavailable")
+
+type providerGatewayExecutionBackend struct {
+	inner *ClaimsGatewayBackend
+	mu    sync.Mutex
+	data  claims.ProviderGatewayCallArtifactData
+	resp  *Response
 }
 
-func (b completedProviderGatewayBackend) HandleProviderGatewayCall(_ context.Context, _ claims.ProviderGatewayCallRequest) (claims.ProviderGatewayCallArtifactData, error) {
-	return b.data, nil
+func newProviderGatewayExecutionBackend(provider ProviderAdapter, req *Request) *providerGatewayExecutionBackend {
+	return &providerGatewayExecutionBackend{
+		inner: NewClaimsGatewayBackend(ClaimsGatewayBackendConfig{
+			Provider:             provider,
+			Request:              req,
+			ResponseSummaryLimit: llmDispatchContentSummaryCap,
+			PartialSummaryLimit:  defaultProviderGatewayPartialLimit(),
+		}),
+	}
 }
 
-func recordProviderGatewayServiceClaim(ctx context.Context, providerName string, req *Request, mode string, trace llmDispatchTrace, resp *Response, dispatchErr error) {
+func (b *providerGatewayExecutionBackend) HandleProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (claims.ProviderGatewayCallArtifactData, error) {
+	data, resp, err := b.inner.ExecuteProviderGatewayCall(ctx, req)
+	b.mu.Lock()
+	b.data = data
+	b.resp = cloneProviderResponse(resp)
+	b.mu.Unlock()
+	return data, err
+}
+
+func (b *providerGatewayExecutionBackend) Result() (claims.ProviderGatewayCallArtifactData, *Response) {
+	if b == nil {
+		return claims.ProviderGatewayCallArtifactData{}, nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.data, cloneProviderResponse(b.resp)
+}
+
+func invokeProviderGatewayServiceClaim(ctx context.Context, provider ProviderAdapter, req *Request, mode string, trace llmDispatchTrace) (claims.ProviderGatewayCallArtifactData, *Response, error) {
 	acc := claims.AccumulatorFromContext(ctx)
-	if acc == nil || acc.Board() == nil || trace.dispatchID == "" {
-		return
+	if acc == nil || acc.Board() == nil || provider == nil || trace.dispatchID == "" {
+		return claims.ProviderGatewayCallArtifactData{}, nil, errProviderGatewayServiceUnavailable
 	}
-	data := providerGatewayArtifactData(providerName, req, mode, trace, resp, dispatchErr)
-	participant, err := providerGatewayParticipant(acc.Board(), providerName, acc.SessionID())
+	data := providerGatewayArtifactData(provider.Name(), req, mode, trace, nil, nil)
+	participant, err := providerGatewayParticipant(acc.Board(), provider.Name(), acc.SessionID())
 	if err != nil {
-		acc.Board().RecordNotificationError("provider gateway participant: " + err.Error())
-		return
+		return data, nil, err
 	}
-	invokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), providerGatewayServiceTimeout())
+	backend := newProviderGatewayExecutionBackend(provider, req)
+	invokeCtx, cancel := context.WithTimeout(ctx, providerGatewayServiceTimeout())
 	defer cancel()
-	_, err = claims.InvokeServiceClaim(invokeCtx, claims.ServiceInvocationOptions{
+	result, err := claims.InvokeServiceClaim(invokeCtx, claims.ServiceInvocationOptions{
 		Board:          acc.Board(),
-		Handler:        claims.NewProviderGatewayService(claims.InfrastructureServiceConfig{ProviderBackend: completedProviderGatewayBackend{data: data}, ProviderPartialLimit: len(data.PartialSummaries)}),
+		Handler:        claims.NewProviderGatewayService(claims.InfrastructureServiceConfig{ProviderBackend: backend, ProviderPartialLimit: defaultProviderGatewayPartialLimit()}),
 		Participant:    participant,
 		IssuerID:       firstClaimsGatewayString(acc.AgentID(), data.Identity),
 		SubjectID:      providerGatewayParticipantID,
 		Title:          "Provider gateway: " + data.Operation,
-		Description:    "Record provider gateway dispatch outcome as claims-plane service evidence.",
+		Description:    "Execute provider gateway dispatch through the claims-plane service participant.",
 		ActionType:     claims.ActionTypeTask,
-		ExpectedCall:   claims.ExpectedToolCall{ID: trace.dispatchID, Tool: data.Operation, Arguments: providerGatewayCallArguments(data)},
+		ExpectedCall:   claims.ExpectedToolCall{ID: trace.dispatchID, Tool: data.Operation, Arguments: providerGatewayRequestArguments(req, data)},
 		IdempotencyKey: "provider.gateway:" + trace.dispatchID,
-		Reason:         "provider gateway service claim generated",
+		Reason:         "provider gateway service claim executed",
 	})
 	if err != nil {
-		acc.Board().RecordNotificationError("provider gateway service claim: " + err.Error())
+		return data, nil, err
 	}
+	backendData, resp := backend.Result()
+	return providerGatewayResultData(result.Result, backendData), resp, nil
 }
 
 func providerGatewayParticipant(board *claims.ClaimsBoard, providerName, sessionID string) (claims.ParticipantRegistration, error) {
@@ -91,6 +125,9 @@ func providerGatewayArtifactData(providerName string, req *Request, mode string,
 		data.InputTokens = resp.Usage.InputTokens
 		data.OutputTokens = resp.Usage.OutputTokens
 		data.TotalTokens = firstClaimsGatewayInt(resp.Usage.TotalTokens, resp.Usage.InputTokens+resp.Usage.OutputTokens)
+		data.ReasoningTokens = resp.Usage.ReasoningTokens
+		data.CacheReadTokens = resp.Usage.CacheReadTokens
+		data.CacheWriteTokens = resp.Usage.CacheWriteTokens
 		data.ProviderRequestID = firstClaimsGatewayString(providerRequestID(resp), data.ProviderRequestID)
 		data.Metadata["tool_calls"] = len(resp.ToolCalls)
 	}
@@ -119,6 +156,9 @@ func providerGatewayCallArguments(data claims.ProviderGatewayCallArtifactData) m
 		"input_tokens":         data.InputTokens,
 		"output_tokens":        data.OutputTokens,
 		"total_tokens":         data.TotalTokens,
+		"reasoning_tokens":     data.ReasoningTokens,
+		"cache_read_tokens":    data.CacheReadTokens,
+		"cache_write_tokens":   data.CacheWriteTokens,
 		"latency":              data.Latency,
 		"rate_limit_remaining": data.RateLimitRemaining,
 		"rate_limited":         data.RateLimited,
@@ -128,6 +168,18 @@ func providerGatewayCallArguments(data claims.ProviderGatewayCallArtifactData) m
 		"partial_summaries":    append([]string(nil), data.PartialSummaries...),
 		"metadata":             cloneProviderMetadata(data.Metadata),
 	}
+}
+
+func providerGatewayRequestArguments(req *Request, data claims.ProviderGatewayCallArtifactData) map[string]any {
+	args := providerGatewayCallArguments(data)
+	if req == nil {
+		return args
+	}
+	args["messages"] = cloneProviderMessages(req.Messages)
+	args["system_prompt"] = req.SystemPrompt
+	args["max_tokens"] = req.MaxTokens
+	args["metadata"] = cloneProviderMetadata(req.Metadata)
+	return args
 }
 
 func providerGatewayOperation(mode string) string {
@@ -149,6 +201,79 @@ func providerGatewayRecordClasses() []string {
 
 func providerGatewayServiceTimeout() time.Duration {
 	return time.Duration(len(providerGatewayTools())*len(providerGatewayRecordClasses())) * time.Second
+}
+
+func defaultProviderGatewayPartialLimit() int {
+	return len(providerGatewayTools()) * len(providerGatewayRecordClasses())
+}
+
+func providerGatewayResultData(result claims.ServiceClaimResult, fallback claims.ProviderGatewayCallArtifactData) claims.ProviderGatewayCallArtifactData {
+	for _, artifact := range result.Artifacts {
+		data, err := claims.ArtifactData[claims.ProviderGatewayCallArtifactData](artifact)
+		if err == nil {
+			return data
+		}
+	}
+	return fallback
+}
+
+func providerGatewayExecutionError(data claims.ProviderGatewayCallArtifactData) error {
+	if data.Error != "" {
+		return errors.New(data.Error)
+	}
+	if data.RateLimited {
+		return errors.New(firstClaimsGatewayString(data.FailureReason, "provider rate limited"))
+	}
+	return nil
+}
+
+func providerGatewayResponseFromData(data claims.ProviderGatewayCallArtifactData) *Response {
+	return &Response{
+		Content:    data.ResponseSummary,
+		Model:      data.Model,
+		StopReason: StopReason(data.FinishReason),
+		Usage: Usage{
+			InputTokens:      data.InputTokens,
+			OutputTokens:     data.OutputTokens,
+			TotalTokens:      data.TotalTokens,
+			ReasoningTokens:  data.ReasoningTokens,
+			CacheReadTokens:  data.CacheReadTokens,
+			CacheWriteTokens: data.CacheWriteTokens,
+		},
+		ProviderMetadata: cloneProviderMetadata(data.Metadata),
+	}
+}
+
+func cloneProviderResponse(in *Response) *Response {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.ToolCalls = append([]ToolCall(nil), in.ToolCalls...)
+	out.ProviderMetadata = cloneProviderMetadata(in.ProviderMetadata)
+	return &out
+}
+
+func providerGatewayStreamChunks(resp *Response) []*StreamChunk {
+	now := time.Now().UTC()
+	if resp == nil {
+		return []*StreamChunk{{Type: ChunkTypeEnd, Timestamp: now}}
+	}
+	chunks := []*StreamChunk{{Type: ChunkTypeStart, Timestamp: now}}
+	if resp.Content != "" {
+		chunks = append(chunks, &StreamChunk{Type: ChunkTypeText, Text: resp.Content, Timestamp: now})
+	}
+	chunks = append(chunks, &StreamChunk{
+		Type:         ChunkTypeEnd,
+		Usage:        &Usage{InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens, TotalTokens: resp.Usage.TotalTokens, ReasoningTokens: resp.Usage.ReasoningTokens, CacheReadTokens: resp.Usage.CacheReadTokens, CacheWriteTokens: resp.Usage.CacheWriteTokens},
+		StopReason:   resp.StopReason,
+		Timestamp:    now,
+		ProviderData: cloneProviderMetadata(resp.ProviderMetadata),
+	})
+	for idx, chunk := range chunks {
+		chunk.Index = idx
+	}
+	return chunks
 }
 
 func requestMessages(req *Request) []Message {

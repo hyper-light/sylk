@@ -14,6 +14,7 @@ import (
 
 type ClaimsGatewayBackendConfig struct {
 	Provider             ProviderAdapter
+	Request              *Request
 	ResponseSummaryLimit int
 	PartialSummaryLimit  int
 	Clock                func() time.Time
@@ -21,9 +22,14 @@ type ClaimsGatewayBackendConfig struct {
 
 type ClaimsGatewayBackend struct {
 	provider             ProviderAdapter
+	request              *Request
 	responseSummaryLimit int
 	partialSummaryLimit  int
 	clock                func() time.Time
+}
+
+type ProviderEmbeddingAdapter interface {
+	Embed(ctx context.Context, input string) ([]float32, error)
 }
 
 type claimsGatewayArgs struct {
@@ -39,6 +45,7 @@ type claimsGatewayArgs struct {
 func NewClaimsGatewayBackend(cfg ClaimsGatewayBackendConfig) *ClaimsGatewayBackend {
 	return &ClaimsGatewayBackend{
 		provider:             cfg.Provider,
+		request:              cloneProviderRequest(cfg.Request),
 		responseSummaryLimit: cfg.ResponseSummaryLimit,
 		partialSummaryLimit:  cfg.PartialSummaryLimit,
 		clock:                firstClaimsGatewayClock(cfg.Clock),
@@ -46,51 +53,62 @@ func NewClaimsGatewayBackend(cfg ClaimsGatewayBackendConfig) *ClaimsGatewayBacke
 }
 
 func (b *ClaimsGatewayBackend) HandleProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (claims.ProviderGatewayCallArtifactData, error) {
+	data, _, err := b.ExecuteProviderGatewayCall(ctx, req)
+	return data, err
+}
+
+func (b *ClaimsGatewayBackend) ExecuteProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (claims.ProviderGatewayCallArtifactData, *Response, error) {
 	data := req.Requested
 	if b == nil || b.provider == nil {
 		data.Error = "provider adapter not configured"
-		return data, nil
+		return data, nil, nil
 	}
 	providerReq, err := providerRequestFromClaims(req.Call.Arguments, data)
 	if err != nil {
 		data.Error = err.Error()
-		return data, nil
+		return data, nil, nil
+	}
+	if b.request != nil {
+		providerReq = cloneProviderRequest(b.request)
 	}
 	started := b.clock()
+	var resp *Response
 	switch data.Operation {
 	case claims.ProviderGatewayToolCountTokens:
 		data = b.countTokens(data, providerReq)
 	case claims.ProviderGatewayToolCompleteStreaming:
-		data = b.stream(ctx, data, providerReq)
+		data, resp = b.stream(ctx, data, providerReq)
+	case claims.ProviderGatewayToolEmbedding:
+		data = b.embedding(ctx, data, providerReq)
 	default:
-		data = b.complete(ctx, data, providerReq)
+		data, resp = b.complete(ctx, data, providerReq)
 	}
 	data.Latency = b.clock().Sub(started)
-	return data, nil
+	return data, resp, nil
 }
 
-func (b *ClaimsGatewayBackend) complete(ctx context.Context, data claims.ProviderGatewayCallArtifactData, req *Request) claims.ProviderGatewayCallArtifactData {
+func (b *ClaimsGatewayBackend) complete(ctx context.Context, data claims.ProviderGatewayCallArtifactData, req *Request) (claims.ProviderGatewayCallArtifactData, *Response) {
 	resp, err := b.provider.Complete(ctx, req)
 	if err != nil {
 		data.Error = err.Error()
-		return data
+		return data, nil
 	}
-	return b.applyResponse(data, req, resp)
+	return b.applyResponse(data, req, resp), resp
 }
 
-func (b *ClaimsGatewayBackend) stream(ctx context.Context, data claims.ProviderGatewayCallArtifactData, req *Request) claims.ProviderGatewayCallArtifactData {
+func (b *ClaimsGatewayBackend) stream(ctx context.Context, data claims.ProviderGatewayCallArtifactData, req *Request) (claims.ProviderGatewayCallArtifactData, *Response) {
 	stream, err := b.provider.Stream(ctx, req)
 	if err != nil {
 		data.Error = err.Error()
-		return data
+		return data, nil
 	}
 	resp, partials, err := collectClaimsGatewayStream(ctx, stream, b.responseLimit(data, req), b.partialLimit(data))
 	data.PartialSummaries = partials
 	if err != nil {
 		data.Error = err.Error()
-		return data
+		return data, resp
 	}
-	return b.applyResponse(data, req, resp)
+	return b.applyResponse(data, req, resp), resp
 }
 
 func (b *ClaimsGatewayBackend) countTokens(data claims.ProviderGatewayCallArtifactData, req *Request) claims.ProviderGatewayCallArtifactData {
@@ -101,6 +119,22 @@ func (b *ClaimsGatewayBackend) countTokens(data claims.ProviderGatewayCallArtifa
 	}
 	data.InputTokens = total
 	data.TotalTokens = total
+	return data
+}
+
+func (b *ClaimsGatewayBackend) embedding(ctx context.Context, data claims.ProviderGatewayCallArtifactData, req *Request) claims.ProviderGatewayCallArtifactData {
+	embedder, ok := b.provider.(ProviderEmbeddingAdapter)
+	if !ok {
+		data.Error = "provider embedding backend not configured"
+		return data
+	}
+	vector, err := embedder.Embed(ctx, providerEmbeddingInput(req))
+	if err != nil {
+		data.Error = err.Error()
+		return data
+	}
+	data.ResponseSummary = "embedding generated"
+	data.Metadata = mergeClaimsGatewayMetadata(map[string]any{"embedding_dimension": len(vector)}, data.Metadata)
 	return data
 }
 
@@ -115,7 +149,11 @@ func (b *ClaimsGatewayBackend) applyResponse(data claims.ProviderGatewayCallArti
 	data.InputTokens = firstClaimsGatewayInt(resp.Usage.InputTokens, data.InputTokens)
 	data.OutputTokens = firstClaimsGatewayInt(resp.Usage.OutputTokens, data.OutputTokens)
 	data.TotalTokens = firstClaimsGatewayInt(resp.Usage.TotalTokens, data.TotalTokens, data.InputTokens+data.OutputTokens)
+	data.ReasoningTokens = firstClaimsGatewayInt(resp.Usage.ReasoningTokens, data.ReasoningTokens)
+	data.CacheReadTokens = firstClaimsGatewayInt(resp.Usage.CacheReadTokens, data.CacheReadTokens)
+	data.CacheWriteTokens = firstClaimsGatewayInt(resp.Usage.CacheWriteTokens, data.CacheWriteTokens)
 	data.ProviderRequestID = firstClaimsGatewayString(providerRequestID(resp), data.ProviderRequestID)
+	data.Metadata = mergeClaimsGatewayMetadata(resp.ProviderMetadata, data.Metadata)
 	return data
 }
 
@@ -159,6 +197,8 @@ type claimsGatewayStreamCollector struct {
 	summaryLimit int
 	partialLimit int
 	partials     []string
+	providerData map[string]any
+	retryCount   int
 	err          error
 }
 
@@ -170,6 +210,7 @@ func (c *claimsGatewayStreamCollector) add(chunk *StreamChunk) {
 	if chunk == nil {
 		return
 	}
+	c.addMetadata(chunk)
 	switch chunk.Type {
 	case ChunkTypeText:
 		c.addText(chunk.Text)
@@ -177,6 +218,15 @@ func (c *claimsGatewayStreamCollector) add(chunk *StreamChunk) {
 		c.addEnd(chunk)
 	case ChunkTypeError:
 		c.err = fmt.Errorf("stream error: %s", chunk.Text)
+	}
+}
+
+func (c *claimsGatewayStreamCollector) addMetadata(chunk *StreamChunk) {
+	if chunk.RetryReset {
+		c.retryCount++
+	}
+	if len(chunk.ProviderData) != 0 {
+		c.providerData = mergeClaimsGatewayMetadata(chunk.ProviderData, c.providerData)
 	}
 }
 
@@ -214,7 +264,14 @@ func (c *claimsGatewayStreamCollector) partialTextLimit() int {
 }
 
 func (c *claimsGatewayStreamCollector) response() *Response {
-	return &Response{Content: c.content.String(), StopReason: c.stopReason, Usage: c.usage}
+	metadata := cloneClaimsGatewayMetadata(c.providerData)
+	if c.retryCount > 0 {
+		if metadata == nil {
+			metadata = make(map[string]any, 1)
+		}
+		metadata["retry_count"] = c.retryCount
+	}
+	return &Response{Content: c.content.String(), StopReason: c.stopReason, Usage: c.usage, ProviderMetadata: metadata}
 }
 
 func decodeClaimsGatewayArgs(args map[string]any, out *claimsGatewayArgs) error {
@@ -231,6 +288,23 @@ func promptMessages(args claimsGatewayArgs) []Message {
 		return nil
 	}
 	return []Message{{Role: RoleUser, Content: prompt}}
+}
+
+func providerEmbeddingInput(req *Request) string {
+	if req == nil {
+		return ""
+	}
+	var builder strings.Builder
+	for _, msg := range req.Messages {
+		if strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		if builder.Len() > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(msg.Content)
+	}
+	return firstClaimsGatewayString(builder.String(), req.SystemPrompt)
 }
 
 func promptHash(messages []Message, systemPrompt string) string {
@@ -291,6 +365,54 @@ func mergeClaimsGatewayMetadata(primary, fallback map[string]any) map[string]any
 	}
 	for key, value := range primary {
 		out[key] = value
+	}
+	return out
+}
+
+func cloneClaimsGatewayMetadata(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func cloneProviderRequest(in *Request) *Request {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Messages = cloneProviderMessages(in.Messages)
+	out.StopSequences = append([]string(nil), in.StopSequences...)
+	out.Tools = cloneProviderTools(in.Tools)
+	out.Metadata = cloneClaimsGatewayMetadata(in.Metadata)
+	out.ResponseSchema = cloneClaimsGatewayMetadata(in.ResponseSchema)
+	return &out
+}
+
+func cloneProviderMessages(in []Message) []Message {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Message, len(in))
+	for idx, msg := range in {
+		out[idx] = msg
+		out[idx].ToolCalls = append([]ToolCall(nil), msg.ToolCalls...)
+		out[idx].Metadata = cloneClaimsGatewayMetadata(msg.Metadata)
+	}
+	return out
+}
+
+func cloneProviderTools(in []Tool) []Tool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Tool, len(in))
+	for idx, tool := range in {
+		out[idx] = tool.Clone()
 	}
 	return out
 }

@@ -71,6 +71,49 @@ func TestClaimsGatewayBackendStreamingBoundsPartialsWithMockeryProvider(t *testi
 	}
 }
 
+func TestClaimsGatewayBackendCountTokensWithMockeryProvider(t *testing.T) {
+	messages := []providers.Message{{Role: providers.RoleUser, Content: "count me"}}
+	provider := providermocks.NewMockStreamProvider(t)
+	provider.EXPECT().CountTokens(mock.MatchedBy(func(got []providers.Message) bool {
+		return len(got) == 1 && got[0].Content == messages[0].Content
+	})).Return(7, nil).Once()
+
+	backend := providers.NewClaimsGatewayBackend(providers.ClaimsGatewayBackendConfig{Provider: provider, Clock: fixedProviderClock})
+	data, err := backend.HandleProviderGatewayCall(context.Background(), claims.ProviderGatewayCallRequest{
+		Call: claims.ExpectedToolCall{Tool: claims.ProviderGatewayToolCountTokens, Arguments: map[string]any{
+			"model":    "token-model",
+			"identity": "guide",
+			"messages": messages,
+		}},
+		Requested: claims.ProviderGatewayCallArtifactData{Operation: claims.ProviderGatewayToolCountTokens, Model: "token-model", Identity: "guide"},
+	})
+	if err != nil {
+		t.Fatalf("HandleProviderGatewayCall count tokens: %v", err)
+	}
+	if data.InputTokens != 7 || data.TotalTokens != 7 || data.Error != "" {
+		t.Fatalf("count token data = %+v, want usage-only success", data)
+	}
+}
+
+func TestClaimsGatewayBackendEmbeddingDoesNotFallThroughToComplete(t *testing.T) {
+	provider := providermocks.NewMockStreamProvider(t)
+	backend := providers.NewClaimsGatewayBackend(providers.ClaimsGatewayBackendConfig{Provider: provider, Clock: fixedProviderClock})
+	data, err := backend.HandleProviderGatewayCall(context.Background(), claims.ProviderGatewayCallRequest{
+		Call: claims.ExpectedToolCall{Tool: claims.ProviderGatewayToolEmbedding, Arguments: map[string]any{
+			"model":    "embed-model",
+			"identity": "guide",
+			"input":    "embed me",
+		}},
+		Requested: claims.ProviderGatewayCallArtifactData{Operation: claims.ProviderGatewayToolEmbedding, Model: "embed-model", Identity: "guide"},
+	})
+	if err != nil {
+		t.Fatalf("HandleProviderGatewayCall embedding: %v", err)
+	}
+	if data.Error != "provider embedding backend not configured" || data.ResponseSummary != "" {
+		t.Fatalf("embedding data = %+v, want explicit embedding backend failure", data)
+	}
+}
+
 func fixedProviderClock() time.Time {
 	return time.Unix(1, 0).UTC()
 }

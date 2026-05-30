@@ -36,6 +36,12 @@ const (
 	ArtifactKindDocumentOperation    = "document_operation"
 	ArtifactKindGuardianDecision     = "guardian_decision"
 	ArtifactKindProviderGatewayCall  = "provider_gateway_call"
+	ArtifactKindLLMResponse          = "llm_response"
+	ArtifactKindUsage                = "usage"
+	ArtifactKindCacheHit             = "cache_hit"
+	ArtifactKindRetryRecord          = "retry_record"
+	ArtifactKindProviderFailure      = "provider_failure"
+	ArtifactKindRateLimitEncounter   = "rate_limit_encounter"
 	ArtifactKindExternalAdapterEvent = "external_adapter_event"
 	ArtifactKindSessionHandle        = "session_handle"
 	ArtifactKindSessionState         = "session_state"
@@ -237,6 +243,9 @@ type ProviderGatewayCallArtifactData struct {
 	InputTokens        int            `json:"input_tokens,omitempty"`
 	OutputTokens       int            `json:"output_tokens,omitempty"`
 	TotalTokens        int            `json:"total_tokens,omitempty"`
+	ReasoningTokens    int            `json:"reasoning_tokens,omitempty"`
+	CacheReadTokens    int            `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens   int            `json:"cache_write_tokens,omitempty"`
 	Latency            time.Duration  `json:"latency,omitempty"`
 	RateLimitRemaining int            `json:"rate_limit_remaining,omitempty"`
 	RateLimited        bool           `json:"rate_limited,omitempty"`

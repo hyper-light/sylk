@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	csecurity "github.com/adalundhe/sylk/core/container/security"
@@ -268,6 +269,32 @@ func TestController_DemoteHotToWarm(t *testing.T) {
 	if snap.DemotionsToWarm != 1 {
 		t.Fatalf("expected 1 warm demotion, got %d", snap.DemotionsToWarm)
 	}
+}
+
+func TestController_DemoteAndTierOfPostActivationServiceClaims(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "activation-controller-board", SessionID: "activation-controller-session", TaskID: "task"})
+	cfg := testControllerConfig(t)
+	cfg.BoardProvider = func() *claims.ClaimsBoard { return board }
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	if _, err := ac.EnsureActive(testCtx(t), "engineer"); err != nil {
+		t.Fatalf("EnsureActive: %v", err)
+	}
+	waitForActivationClaims(t, board, 1)
+	if err := ac.DemoteTo(testCtx(t), "engineer", TierWarm); err != nil {
+		t.Fatalf("DemoteTo: %v", err)
+	}
+	waitForActivationClaims(t, board, 2)
+	if _, err := ac.TierOf("engineer"); err != nil {
+		t.Fatalf("TierOf: %v", err)
+	}
+	waitForActivationClaims(t, board, 3)
+
+	assertActivationOperationClaim(t, board, "tier_transition")
+	assertActivationOperationClaim(t, board, "query_tier")
 }
 
 func TestController_PromoteFromWarm(t *testing.T) {
@@ -753,6 +780,33 @@ func assertTier(t *testing.T, ac *ActivationController, agentType string, expect
 	if tier != expected {
 		t.Fatalf("expected %v for %s, got %v", expected, agentType, tier)
 	}
+}
+
+func waitForActivationClaims(t *testing.T, board *claims.ClaimsBoard, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(board.Projection().Claims) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("claims = %d, want at least %d", len(board.Projection().Claims), want)
+}
+
+func assertActivationOperationClaim(t *testing.T, board *claims.ClaimsBoard, operation string) {
+	t.Helper()
+	for _, claim := range board.Projection().Claims {
+		for _, testament := range board.TestamentsByClaim(claim.ID) {
+			for _, artifact := range testament.Artifacts {
+				data, err := claims.ArtifactData[claims.ActivationRecordArtifactData](artifact)
+				if err == nil && data.Operation == operation {
+					return
+				}
+			}
+		}
+	}
+	t.Fatalf("activation operation %q not found", operation)
 }
 
 // --- Request Guard Tests ---

@@ -12,12 +12,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 )
 
-const (
-	defaultShutdownOutboxDrainLimit = 512
-	defaultShutdownGracePeriod      = 5 * time.Second
-	defaultShutdownHardDeadline     = 30 * time.Second
-	shutdownActorID                 = "sys:claims_shutdown"
-)
+const shutdownActorID = "sys:claims_shutdown"
 
 //go:generate mockery --name=ShutdownScope --output=./mocks --outpkg=mocks
 type ShutdownScope interface {
@@ -196,13 +191,13 @@ func normalizeSessionShutdownOptions(opts SessionShutdownOptions) SessionShutdow
 		opts.SessionID = opts.Board.SessionID()
 	}
 	if opts.GracePeriod <= 0 {
-		opts.GracePeriod = defaultShutdownGracePeriod
+		opts.GracePeriod = DefaultClaimsOperationsConfig().Budgets.ShutdownGracePeriod
 	}
 	if opts.HardDeadline <= 0 {
-		opts.HardDeadline = defaultShutdownHardDeadline
+		opts.HardDeadline = DefaultClaimsOperationsConfig().Budgets.ShutdownHardDeadline
 	}
 	if opts.OutboxDrainLimit <= 0 {
-		opts.OutboxDrainLimit = defaultShutdownOutboxDrainLimit
+		opts.OutboxDrainLimit = DefaultClaimsOperationsConfig().Budgets.OutboxProjectionBatchLimit
 	}
 	opts.ActorID = firstNonEmpty(strings.TrimSpace(opts.ActorID), shutdownActorID)
 	return opts

@@ -714,11 +714,11 @@ func (s *InfrastructureService) handleProvider(ctx context.Context, call Expecte
 		data = failProviderGatewayCall(data, "provider gateway record capacity reached")
 	}
 	s.mu.Unlock()
-	artifact, err := providerGatewayCallArtifact(data)
+	artifacts, err := providerGatewayCallArtifacts(data)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
-	return ServiceClaimResult{Summary: "provider " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return ServiceClaimResult{Summary: "provider " + data.Operation + " " + data.Status, Artifacts: artifacts}, nil
 }
 
 func (s *InfrastructureService) handleExternal(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -1197,6 +1197,7 @@ func finalizeProviderBackendData(ctx context.Context, call ExpectedToolCall, req
 	}
 	data.PartialSummaries = boundedStringList(data.PartialSummaries, partialLimit)
 	data.Metadata = mergeMetadata(requested.Metadata, data.Metadata)
+	data.RateLimited = data.RateLimited || providerGatewayRateLimited(data.Error) || providerGatewayRateLimited(data.FailureReason)
 	data.FailureReason = firstNonEmpty(data.FailureReason, providerFailureReason(data))
 	data.Status = statusFromFailure(data.FailureReason)
 	if err := ctx.Err(); err != nil {
@@ -1293,7 +1294,76 @@ func NewGuardianDecisionArtifact(data GuardianDecisionArtifactData) (*Artifact, 
 }
 
 func providerGatewayCallArtifact(data ProviderGatewayCallArtifactData) (*Artifact, error) {
-	return infrastructureArtifact("provider_gateway_call", ArtifactKindProviderGatewayCall, data.ProviderRequestID, data.FailureReason, data)
+	return infrastructureArtifact("provider_gateway_call", providerGatewayPrimaryArtifactKind(data), data.ProviderRequestID, data.FailureReason, data)
+}
+
+func providerGatewayCallArtifacts(data ProviderGatewayCallArtifactData) ([]*Artifact, error) {
+	primary, err := providerGatewayCallArtifact(data)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := []*Artifact{primary}
+	for _, secondary := range providerGatewaySecondaryArtifactSpecs(data) {
+		artifact, err := infrastructureArtifact(secondary.name, secondary.kind, data.ProviderRequestID, secondary.failure, data)
+		if err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts, nil
+}
+
+type providerGatewayArtifactSpec struct {
+	name    string
+	kind    string
+	failure string
+}
+
+func providerGatewayPrimaryArtifactKind(data ProviderGatewayCallArtifactData) string {
+	if data.RateLimited {
+		return ArtifactKindRateLimitEncounter
+	}
+	if data.Error != "" || data.FailureReason != "" {
+		return ArtifactKindProviderFailure
+	}
+	if data.Operation == ProviderGatewayToolCountTokens {
+		return ArtifactKindUsage
+	}
+	return ArtifactKindLLMResponse
+}
+
+func providerGatewaySecondaryArtifactSpecs(data ProviderGatewayCallArtifactData) []providerGatewayArtifactSpec {
+	specs := make([]providerGatewayArtifactSpec, 0, providerGatewaySecondaryArtifactCount(data))
+	if providerGatewayHasUsage(data) && providerGatewayPrimaryArtifactKind(data) != ArtifactKindUsage {
+		specs = append(specs, providerGatewayArtifactSpec{name: "usage", kind: ArtifactKindUsage})
+	}
+	if providerGatewayHasCacheHit(data) {
+		specs = append(specs, providerGatewayArtifactSpec{name: "cache_hit", kind: ArtifactKindCacheHit})
+	}
+	if providerGatewayHasRetryRecord(data) {
+		specs = append(specs, providerGatewayArtifactSpec{name: "retry_record", kind: ArtifactKindRetryRecord})
+	}
+	if data.RateLimited && providerGatewayPrimaryArtifactKind(data) != ArtifactKindRateLimitEncounter {
+		specs = append(specs, providerGatewayArtifactSpec{name: "rate_limit_encounter", kind: ArtifactKindRateLimitEncounter, failure: data.FailureReason})
+	}
+	return specs
+}
+
+func providerGatewaySecondaryArtifactCount(data ProviderGatewayCallArtifactData) int {
+	count := 0
+	if providerGatewayHasUsage(data) {
+		count++
+	}
+	if providerGatewayHasCacheHit(data) {
+		count++
+	}
+	if providerGatewayHasRetryRecord(data) {
+		count++
+	}
+	if data.RateLimited {
+		count++
+	}
+	return count
 }
 
 func externalAdapterEventArtifact(data ExternalAdapterEventArtifactData) (*Artifact, error) {
@@ -1586,6 +1656,8 @@ func failGuardianDecision(data GuardianDecisionArtifactData, reason string) Guar
 
 func failProviderGatewayCall(data ProviderGatewayCallArtifactData, reason string) ProviderGatewayCallArtifactData {
 	data.FailureReason = firstNonEmpty(data.FailureReason, reason)
+	data.Error = firstNonEmpty(data.Error, data.FailureReason)
+	data.RateLimited = data.RateLimited || providerGatewayRateLimited(data.FailureReason)
 	data.Status = InfrastructureStatusFailed
 	return data
 }
@@ -1815,6 +1887,49 @@ func providerFailureReason(data ProviderGatewayCallArtifactData) string {
 		return "provider budget exceeded"
 	}
 	return ""
+}
+
+func providerGatewayRateLimited(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return strings.Contains(reason, "rate limit") || strings.Contains(reason, "429")
+}
+
+func providerGatewayHasUsage(data ProviderGatewayCallArtifactData) bool {
+	return data.InputTokens > 0 ||
+		data.OutputTokens > 0 ||
+		data.TotalTokens > 0 ||
+		data.ReasoningTokens > 0 ||
+		data.CacheReadTokens > 0 ||
+		data.CacheWriteTokens > 0
+}
+
+func providerGatewayHasCacheHit(data ProviderGatewayCallArtifactData) bool {
+	if data.CacheReadTokens > 0 {
+		return true
+	}
+	value, _ := data.Metadata["cache_hit"].(bool)
+	return value
+}
+
+func providerGatewayHasRetryRecord(data ProviderGatewayCallArtifactData) bool {
+	if providerGatewayMetadataInt(data.Metadata, "retry_count") > 0 {
+		return true
+	}
+	value, _ := data.Metadata["retry_record"].(bool)
+	return value
+}
+
+func providerGatewayMetadataInt(metadata map[string]any, key string) int {
+	switch value := metadata[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
 }
 
 func boundedStringList(values []string, limit int) []string {

@@ -21,6 +21,12 @@ type SessionInboxRegistry struct {
 	inboxes map[string]*ClaimsInbox
 }
 
+type SessionInboxRegistryEntry struct {
+	SessionID string
+	AgentID   string
+	Inbox     *ClaimsInbox
+}
+
 var defaultInboxRegistry = &SessionInboxRegistry{
 	inboxes: make(map[string]*ClaimsInbox),
 }
@@ -82,6 +88,20 @@ func (r *SessionInboxRegistry) Lookup(sessionID, agentID string) *ClaimsInbox {
 	inbox := r.inboxes[inboxKey(sessionID, agentID)]
 	r.mu.RUnlock()
 	return inbox
+}
+
+func (r *SessionInboxRegistry) Snapshot() []SessionInboxRegistryEntry {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]SessionInboxRegistryEntry, 0, len(r.inboxes))
+	for key, inbox := range r.inboxes {
+		sessionID, agentID, _ := strings.Cut(key, "|")
+		out = append(out, SessionInboxRegistryEntry{SessionID: sessionID, AgentID: agentID, Inbox: inbox})
+	}
+	return out
 }
 
 // Remove unregisters the inbox for (sessionID, agentID). Safe to call

@@ -29,6 +29,13 @@ const (
 	ArtifactDataTypeProductionReadiness        = "sylk.production_readiness.v1"
 )
 
+const (
+	ArtifactKindActivationRecord  = "activation_record"
+	ArtifactKindTierTransition    = "tier_transition"
+	ArtifactKindReplicaSet        = "replica_set"
+	ArtifactKindActivationFailure = "activation_failure"
+)
+
 var (
 	ErrArtifactTypeDuplicate = errors.New("artifact data type duplicate")
 	ErrArtifactTypeUnknown   = errors.New("artifact data type unknown")
@@ -281,7 +288,10 @@ type IdentityLineageArtifactData struct {
 type ActivationRecordArtifactData struct {
 	ParticipantID   string        `json:"participant_id"`
 	ParticipantType string        `json:"participant_type,omitempty"`
+	Operation       string        `json:"operation,omitempty"`
 	Tier            string        `json:"tier,omitempty"`
+	PreviousTier    string        `json:"previous_tier,omitempty"`
+	TargetTier      string        `json:"target_tier,omitempty"`
 	ReplicaCount    int           `json:"replica_count,omitempty"`
 	Ready           bool          `json:"ready"`
 	FailureReason   string        `json:"failure_reason,omitempty"`

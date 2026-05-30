@@ -138,6 +138,9 @@ func systemEvidenceParticipant(opts SystemEvidenceOptions) (ParticipantRegistrat
 	if kind == systemParticipantFabric {
 		determinism = HandlerDeterminismContent
 	}
+	if kind == systemParticipantBus {
+		category = ParticipantCategorySystem
+	}
 	return NewParticipantRegistration(
 		category,
 		opts.SubjectID,
@@ -187,7 +190,7 @@ func systemEvidenceScope(opts SystemEvidenceOptions, kind string) map[string]str
 	case systemParticipantGeneric:
 		return map[string]string{"process_uid": firstNonEmpty(systemEvidenceMetadataString(opts.Metadata, "process_uid"), opts.SessionID, "process")}
 	default:
-		return map[string]string{"session_id": opts.SessionID}
+		return map[string]string{"process_uid": firstNonEmpty(systemEvidenceMetadataString(opts.Metadata, "process_uid"), "process")}
 	}
 }
 

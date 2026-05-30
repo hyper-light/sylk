@@ -60,6 +60,7 @@ func (s *ActivationControllerService) Activate(ctx context.Context, input Activa
 	if err := ctxOrBackground(ctx).Err(); err != nil {
 		return ActivationRecordArtifactData{}, err
 	}
+	input.Operation = firstNonEmpty(input.Operation, "activate")
 	record, err := normalizeActivationRecord(input, true)
 	if err != nil {
 		return ActivationRecordArtifactData{}, err
@@ -74,24 +75,40 @@ func (s *ActivationControllerService) Activate(ctx context.Context, input Activa
 }
 
 func (s *ActivationControllerService) Deactivate(ctx context.Context, participantID, reason string) (ActivationRecordArtifactData, error) {
+	return s.DeactivateRecord(ctx, ActivationRecordArtifactData{ParticipantID: participantID, Operation: "deactivate", FailureReason: reason})
+}
+
+func (s *ActivationControllerService) DeactivateRecord(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
 	if err := validateActivationControllerService(s); err != nil {
 		return ActivationRecordArtifactData{}, err
 	}
 	if err := ctxOrBackground(ctx).Err(); err != nil {
 		return ActivationRecordArtifactData{}, err
 	}
-	participantID = strings.TrimSpace(participantID)
-	if participantID == "" {
+	input.ParticipantID = strings.TrimSpace(input.ParticipantID)
+	if input.ParticipantID == "" {
 		return ActivationRecordArtifactData{}, fmt.Errorf("%w: participant id is required", ErrActivationControllerServiceInvalid)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	record := s.records[participantID]
-	record.ParticipantID = participantID
-	record.Ready = false
-	record.ReplicaCount = 0
-	record.FailureReason = firstNonEmpty(strings.TrimSpace(reason), "deactivated")
-	s.records[participantID] = record
+	prior := s.records[input.ParticipantID]
+	input.Operation = firstNonEmpty(input.Operation, "deactivate")
+	input.ParticipantType = firstNonEmpty(input.ParticipantType, prior.ParticipantType)
+	input.PreviousTier = firstNonEmpty(input.PreviousTier, prior.Tier)
+	input.Tier = firstNonEmpty(input.Tier, input.TargetTier, prior.Tier)
+	input.TargetTier = firstNonEmpty(input.TargetTier, input.Tier)
+	if input.Operation == "deactivate" {
+		input.Ready = false
+		input.ReplicaCount = 0
+	}
+	record, err := normalizeActivationRecord(input, false)
+	if err != nil {
+		return ActivationRecordArtifactData{}, err
+	}
+	if _, exists := s.records[record.ParticipantID]; !exists && len(s.records) >= s.maxRecords {
+		return ActivationRecordArtifactData{}, fmt.Errorf("%w: max records reached", ErrActivationControllerServiceInvalid)
+	}
+	s.records[input.ParticipantID] = record
 	return record, nil
 }
 
@@ -131,8 +148,13 @@ func (s *ActivationControllerService) handleActivate(ctx context.Context, call E
 }
 
 func (s *ActivationControllerService) handleDeactivate(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
-	reason := firstNonEmpty(stringArg(call.Arguments, "failure_reason"), stringArg(call.Arguments, "reason"))
-	record, err := s.Deactivate(ctx, stringArg(call.Arguments, "participant_id"), reason)
+	record, err := activationRecordFromArgs(call.Arguments)
+	if err != nil {
+		return ServiceClaimResult{}, err
+	}
+	record.ParticipantID = firstNonEmpty(record.ParticipantID, stringArg(call.Arguments, "participant_id"))
+	record.FailureReason = firstNonEmpty(record.FailureReason, stringArg(call.Arguments, "failure_reason"), stringArg(call.Arguments, "reason"))
+	record, err = s.DeactivateRecord(ctx, record)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
@@ -141,7 +163,17 @@ func (s *ActivationControllerService) handleDeactivate(ctx context.Context, call
 
 func (s *ActivationControllerService) handleQueryTier(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	record, ok := s.QueryTier(ctx, stringArg(call.Arguments, "participant_id"))
-	if !ok {
+	if ok {
+		record.Operation = "query_tier"
+		return activationRecordResult(record, "activation queried ")
+	}
+	record, err := activationRecordFromArgs(call.Arguments)
+	if err != nil {
+		return ServiceClaimResult{}, err
+	}
+	record.Operation = firstNonEmpty(record.Operation, "query_tier")
+	record, err = normalizeActivationRecord(record, false)
+	if err != nil {
 		return ServiceClaimResult{}, fmt.Errorf("%w: %s", ErrActivationControllerServiceInvalid, stringArg(call.Arguments, "participant_id"))
 	}
 	return activationRecordResult(record, "activation queried ")
@@ -168,7 +200,10 @@ func activationRecordFromArgs(args map[string]any) (ActivationRecordArtifactData
 func normalizeActivationRecord(in ActivationRecordArtifactData, activating bool) (ActivationRecordArtifactData, error) {
 	in.ParticipantID = strings.TrimSpace(in.ParticipantID)
 	in.ParticipantType = strings.TrimSpace(in.ParticipantType)
+	in.Operation = strings.TrimSpace(in.Operation)
 	in.Tier = strings.TrimSpace(in.Tier)
+	in.PreviousTier = strings.TrimSpace(in.PreviousTier)
+	in.TargetTier = strings.TrimSpace(in.TargetTier)
 	in.FailureReason = strings.TrimSpace(in.FailureReason)
 	if in.ParticipantID == "" {
 		return ActivationRecordArtifactData{}, fmt.Errorf("%w: participant id is required", ErrActivationControllerServiceInvalid)
@@ -179,16 +214,18 @@ func normalizeActivationRecord(in ActivationRecordArtifactData, activating bool)
 	if in.Duration < 0 {
 		return ActivationRecordArtifactData{}, fmt.Errorf("%w: activation duration must be non-negative", ErrActivationControllerServiceInvalid)
 	}
-	in.Ready = activating && in.FailureReason == ""
+	if activating {
+		in.Ready = in.FailureReason == ""
+	}
 	return in, nil
 }
 
 func activationRecordResult(record ActivationRecordArtifactData, prefix string) (ServiceClaimResult, error) {
-	artifact, err := activationRecordArtifact(record)
+	artifacts, err := activationRecordArtifacts(record)
 	if err != nil {
 		return ServiceClaimResult{}, err
 	}
-	return ServiceClaimResult{Summary: prefix + record.ParticipantID, Artifacts: []*Artifact{artifact}}, nil
+	return ServiceClaimResult{Summary: prefix + record.ParticipantID, Artifacts: artifacts}, nil
 }
 
 func validateActivationControllerService(s *ActivationControllerService) error {

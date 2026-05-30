@@ -19,7 +19,7 @@ func TestInvokeActivationServiceClaimPostsTypedActivationRecord(t *testing.T) {
 		Ready:           true,
 		Duration:        time.Millisecond,
 	}
-	if err := invokeActivationServiceClaim(context.Background(), board, record); err != nil {
+	if err := invokeActivationServiceClaim(context.Background(), board, claims.ActivationControllerToolActivate, record); err != nil {
 		t.Fatalf("invokeActivationServiceClaim: %v", err)
 	}
 	assertActivationServiceRecord(t, board, "guide", true, "")
@@ -36,10 +36,49 @@ func TestInvokeActivationServiceClaimRecordsFailedActivationWithoutReplica(t *te
 		FailureReason:   errors.New("runtime unavailable").Error(),
 		Duration:        time.Millisecond,
 	}
-	if err := invokeActivationServiceClaim(context.Background(), board, record); err != nil {
+	if err := invokeActivationServiceClaim(context.Background(), board, claims.ActivationControllerToolActivate, record); err != nil {
 		t.Fatalf("invokeActivationServiceClaim failure record: %v", err)
 	}
 	assertActivationServiceRecord(t, board, "engineer", false, "runtime unavailable")
+}
+
+func TestInvokeActivationServiceClaimPostsTransitionAndQueryRecords(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "activation-service-transition-board", SessionID: "activation-session", TaskID: "task"})
+	transition := claims.ActivationRecordArtifactData{
+		ParticipantID:   "engineer",
+		ParticipantType: "agent",
+		Operation:       "tier_transition",
+		PreviousTier:    "hot",
+		TargetTier:      "warm",
+		Tier:            "warm",
+		ReplicaCount:    1,
+		Ready:           true,
+		Duration:        time.Millisecond,
+	}
+	if err := invokeActivationServiceClaim(context.Background(), board, claims.ActivationControllerToolDeactivate, transition); err != nil {
+		t.Fatalf("transition invokeActivationServiceClaim: %v", err)
+	}
+	query := claims.ActivationRecordArtifactData{
+		ParticipantID:   "engineer",
+		ParticipantType: "agent",
+		Operation:       "query_tier",
+		Tier:            "warm",
+		TargetTier:      "warm",
+		ReplicaCount:    1,
+		Ready:           true,
+	}
+	if err := invokeActivationServiceClaim(context.Background(), board, claims.ActivationControllerToolQueryTier, query); err != nil {
+		t.Fatalf("query invokeActivationServiceClaim: %v", err)
+	}
+	projection := board.Projection()
+	if len(projection.Claims) != 2 {
+		t.Fatalf("claims = %d, want 2", len(projection.Claims))
+	}
+	for _, claim := range projection.Claims {
+		if claim.ActionType != claims.ActionTypeTask || claim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
+			t.Fatalf("claim = %+v, want satisfied task activation service claim", claim)
+		}
+	}
 }
 
 func assertActivationServiceRecord(t *testing.T, board *claims.ClaimsBoard, participantID string, ready bool, reason string) {
