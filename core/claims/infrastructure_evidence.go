@@ -65,7 +65,7 @@ func ensureInfrastructureEvidenceClaim(ctx context.Context, opts InfrastructureE
 		return "", err
 	}
 	claimID := generated.Claims[0].ID
-	if err := postSystemEvidenceClaim(ctx, opts.Board, claimID, SystemEvidenceOptions{ActorID: opts.ActorID, SubjectID: opts.SubjectID}); err != nil {
+	if err := opts.Board.PostGeneratedClaim(ctxOrBackground(ctx), claimID, opts.ActorID, ClaimPostOptions{Reason: "infrastructure evidence claim posted"}); err != nil {
 		return claimID, err
 	}
 	return claimID, nil
@@ -85,7 +85,10 @@ func ensureInfrastructureEvidenceTestament(ctx context.Context, claimID string, 
 		return "", err
 	}
 	testamentID := generated.Testaments[0].ID
-	if err := postSystemEvidenceTestament(ctx, opts.Board, claimID, testamentID, SystemEvidenceOptions{ActorID: opts.ActorID, SubjectID: opts.SubjectID}); err != nil {
+	if err := opts.Board.PostGeneratedTestament(ctxOrBackground(ctx), testamentID, opts.SubjectID, TestamentPostOptions{Reason: "infrastructure evidence testament posted"}); err != nil {
+		return testamentID, err
+	}
+	if err := completeServiceTestamentValidation(ctxOrBackground(ctx), opts.Board, testamentID, opts.ActorID); err != nil {
 		return testamentID, err
 	}
 	return testamentID, nil

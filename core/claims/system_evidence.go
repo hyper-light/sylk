@@ -72,6 +72,7 @@ func RecordBusTransportEvidence(ctx context.Context, board *ClaimsBoard, operati
 	if board != nil {
 		board.RecordNotificationError("bus transport " + strings.TrimSpace(operation))
 	}
+	metadata = normalizeBusEvidenceMetadata(metadata)
 	return RecordSystemEvidence(ctx, SystemEvidenceOptions{
 		Board:        board,
 		ActorID:      systemEvidenceBusActor,
@@ -86,166 +87,181 @@ func RecordBusTransportEvidence(ctx context.Context, board *ClaimsBoard, operati
 	})
 }
 
+func normalizeBusEvidenceMetadata(metadata map[string]any) map[string]any {
+	out := cloneMetadata(metadata)
+	if _, ok := out["dropped_count"]; !ok {
+		if dropped, exists := out["dropped"]; exists {
+			out["dropped_count"] = dropped
+		}
+	}
+	return out
+}
+
 func RecordSystemEvidence(ctx context.Context, opts SystemEvidenceOptions) (SystemEvidenceResult, error) {
 	opts = normalizeSystemEvidenceOptions(opts)
 	if err := validateSystemEvidenceOptions(opts); err != nil {
 		return SystemEvidenceResult{}, err
 	}
-	claimID, err := ensureSystemEvidenceClaim(ctx, opts)
+	participant, err := systemEvidenceParticipant(opts)
 	if err != nil {
 		return SystemEvidenceResult{}, err
 	}
-	testamentID, err := ensureSystemEvidenceTestament(ctx, claimID, opts)
-	if err != nil {
-		return SystemEvidenceResult{ClaimID: claimID}, err
+	handler := systemEvidenceHandler(opts)
+	if handler == nil {
+		return SystemEvidenceResult{}, fmt.Errorf("system evidence handler is required for %s", opts.ArtifactKind)
 	}
-	return SystemEvidenceResult{ClaimID: claimID, TestamentID: testamentID}, nil
-}
-
-func ensureSystemEvidenceClaim(ctx context.Context, opts SystemEvidenceOptions) (string, error) {
-	claim := Claim{
-		Title:       "Record " + opts.Operation,
-		Description: "Record durable claims-plane evidence for " + opts.Operation + ".",
-		ActionType:  ActionTypeArchival,
-		Relations: []Relation{
-			{Related: opts.ActorID, RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
-			{Related: opts.SubjectID, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
-		},
-		Validations: []*Validation{{
-			ID:          validationIDForSystemEvidence(opts.IdempotencyKey),
-			Type:        ValidationTypeReceipt,
-			Required:    true,
-			Description: "system evidence testament received",
-			QualityBar:  systemEvidenceValidationQuality,
-			Status:      ValidationStatusPending,
-		}},
-	}
-	generated, err := opts.Board.GenerateClaimAction(ctx, Action{AgentID: opts.ActorID, Type: ActionTypeArchival}, []Claim{claim}, GenerateClaimActionOptions{IdempotencyKey: opts.IdempotencyKey, Reason: "system evidence claim generated"})
-	if err != nil {
-		return "", err
-	}
-	claimID := generated.Claims[0].ID
-	if err := postSystemEvidenceClaim(ctx, opts.Board, claimID, opts); err != nil {
-		return claimID, err
-	}
-	return claimID, nil
-}
-
-func postSystemEvidenceClaim(ctx context.Context, board *ClaimsBoard, claimID string, opts SystemEvidenceOptions) error {
-	claim, ok := board.CloneClaim(claimID)
-	if !ok || claim.LifecycleStatus == ClaimLifecycleSatisfied {
-		return nil
-	}
-	if claim.LifecycleStatus == ClaimLifecycleGenerated {
-		if err := board.PostGeneratedClaim(ctx, claimID, opts.ActorID, ClaimPostOptions{Reason: "system evidence claim posted"}); err != nil {
-			return err
-		}
-	}
-	if claim, _ = board.CloneClaim(claimID); claim != nil && claim.LifecycleStatus == ClaimLifecyclePosted {
-		if err := board.AcknowledgeClaimReceipt(ctx, claimID, opts.SubjectID); err != nil {
-			return err
-		}
-	}
-	if claim, _ = board.CloneClaim(claimID); claim != nil && claim.LifecycleStatus == ClaimLifecycleReceived {
-		return board.UpdateClaimProgress(ctx, claimID, ClaimProgressUpdate{WorkSummary: "system evidence recorded"}, opts.SubjectID)
-	}
-	return nil
-}
-
-func ensureSystemEvidenceTestament(ctx context.Context, claimID string, opts SystemEvidenceOptions) (string, error) {
-	artifact, err := systemEvidenceArtifact(opts)
-	if err != nil {
-		return "", err
-	}
-	testament := Testament{
-		AgentID:    opts.SubjectID,
-		Summary:    opts.Operation + " " + opts.Status,
-		Confidence: "deterministic",
-		Duration:   0,
-		Relations:  []Relation{{Related: claimID, RelatedType: RelatedTypeClaim, Relationship: RelationshipClaim}},
-		Artifacts:  []*Artifact{artifact},
-	}
-	generated, err := opts.Board.GenerateTestamentAction(ctx, Action{AgentID: opts.SubjectID, Type: ActionTypeTestament, Status: ActionStatusComplete}, []Testament{testament}, GenerateTestamentActionOptions{IdempotencyKey: opts.IdempotencyKey + ":testament", Reason: "system evidence testament generated"})
-	if err != nil {
-		return "", err
-	}
-	testamentID := generated.Testaments[0].ID
-	if err := postSystemEvidenceTestament(ctx, opts.Board, claimID, testamentID, opts); err != nil {
-		return testamentID, err
-	}
-	return testamentID, nil
-}
-
-func postSystemEvidenceTestament(ctx context.Context, board *ClaimsBoard, claimID, testamentID string, opts SystemEvidenceOptions) error {
-	testament, ok := board.CloneTestament(testamentID)
-	if !ok || testament.LifecycleStatus == TestamentLifecycleValidated {
-		return nil
-	}
-	if testament.LifecycleStatus == TestamentLifecycleGenerated {
-		if err := board.PostGeneratedTestament(ctx, testamentID, opts.SubjectID, TestamentPostOptions{Reason: "system evidence testament posted"}); err != nil {
-			return err
-		}
-	}
-	if err := completeReceiptValidationForSystemEvidence(ctx, board, claimID, testamentID, opts); err != nil {
-		return err
-	}
-	return nil
-}
-
-func completeReceiptValidationForSystemEvidence(ctx context.Context, board *ClaimsBoard, claimID, testamentID string, opts SystemEvidenceOptions) error {
-	if testament, ok := board.CloneTestament(testamentID); ok && testament.LifecycleStatus == TestamentLifecyclePosted {
-		if err := board.AcknowledgeTestamentReceipt(ctx, testamentID, opts.ActorID); err != nil {
-			return err
-		}
-	}
-	if testament, ok := board.CloneTestament(testamentID); ok && testament.LifecycleStatus == TestamentLifecycleReceived {
-		if err := board.BeginTestamentValidation(ctx, testamentID, opts.ActorID); err != nil {
-			return err
-		}
-	}
-	if err := evaluateSystemEvidenceReceipt(ctx, board, claimID, opts.ActorID); err != nil {
-		return err
-	}
-	if testament, ok := board.CloneTestament(testamentID); ok && testament.LifecycleStatus == TestamentLifecycleValidating {
-		return board.CompleteTestamentValidation(ctx, testamentID, opts.ActorID, TestamentLifecycleValidated, "system evidence validated")
-	}
-	return nil
-}
-
-func evaluateSystemEvidenceReceipt(ctx context.Context, board *ClaimsBoard, claimID, actorID string) error {
-	claim, ok := board.CloneClaim(claimID)
-	if !ok {
-		return fmt.Errorf("system evidence claim %q not found", claimID)
-	}
-	for _, validation := range claim.Validations {
-		if validation == nil || validation.Type != ValidationTypeReceipt || validation.Status == ValidationStatusPassed {
-			continue
-		}
-		if validation.Status.IsTerminal() {
-			return fmt.Errorf("system evidence validation %q already terminal: %s", validation.ID, validation.Status)
-		}
-		if err := board.EvaluateValidation(ctx, claimID, validation.ID, StatusChange{AgentID: actorID, To: string(ValidationStatusPassed), Reason: "system evidence received"}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func systemEvidenceArtifact(opts SystemEvidenceOptions) (*Artifact, error) {
-	artifact := &Artifact{
-		ArtifactName: opts.ArtifactName,
-		Kind:         opts.ArtifactKind,
-		Reference:    opts.Reference,
-		AgentID:      opts.SubjectID,
-		Metadata:     systemEvidenceMetadata(opts),
-	}
-	err := SetArtifactData(artifact, PresentationEvidenceArtifactData{
-		Kind:      opts.ArtifactKind,
-		Reference: opts.Reference,
-		Title:     opts.ArtifactName,
-		Metadata:  artifact.Metadata,
+	result, err := InvokeServiceClaim(ctx, ServiceInvocationOptions{
+		Board:          opts.Board,
+		Handler:        handler,
+		Participant:    participant,
+		IssuerID:       opts.ActorID,
+		SubjectID:      opts.SubjectID,
+		Title:          "Record " + opts.Operation,
+		Description:    "Record durable claims-plane evidence for " + opts.Operation + ".",
+		ActionType:     ActionTypeTask,
+		ExpectedCall:   ExpectedToolCall{ID: opts.IdempotencyKey, Tool: systemEvidenceTool(opts), Arguments: systemEvidenceArguments(opts)},
+		IdempotencyKey: opts.IdempotencyKey,
+		Reason:         "system evidence service claim generated",
 	})
-	return artifact, err
+	if err != nil {
+		return SystemEvidenceResult{ClaimID: result.ClaimID}, err
+	}
+	return SystemEvidenceResult{ClaimID: result.ClaimID, TestamentID: result.TestamentID}, nil
+}
+
+func systemEvidenceParticipant(opts SystemEvidenceOptions) (ParticipantRegistration, error) {
+	kind := systemEvidenceServiceKind(opts.ArtifactKind)
+	tools := systemParticipantTools(kind)
+	scope := systemEvidenceScope(opts, kind)
+	category := ParticipantCategoryService
+	determinism := HandlerDeterminismSideEffect
+	if kind == systemParticipantFabric {
+		determinism = HandlerDeterminismContent
+	}
+	return NewParticipantRegistration(
+		category,
+		opts.SubjectID,
+		scope,
+		len(tools)*len(systemParticipantRecordClasses()),
+		len(tools),
+		time.Duration(len(tools)*len(systemParticipantRecordClasses()))*time.Second,
+		determinism,
+		[]ActionType{ActionTypeTask},
+	)
+}
+
+func systemEvidenceHandler(opts SystemEvidenceOptions) ServiceHandler {
+	switch systemEvidenceServiceKind(opts.ArtifactKind) {
+	case systemParticipantSession:
+		return NewSessionManagerService(SystemParticipantServiceConfig{ParticipantID: opts.SubjectID})
+	case systemParticipantFabric:
+		return NewFabricSubscriberService(SystemParticipantServiceConfig{ParticipantID: opts.SubjectID})
+	case systemParticipantBus:
+		return NewBusAdministratorService(SystemParticipantServiceConfig{ParticipantID: opts.SubjectID})
+	case systemParticipantGeneric:
+		return NewGenericSystemEvidenceService()
+	default:
+		return nil
+	}
+}
+
+func systemEvidenceServiceKind(artifactKind string) string {
+	switch strings.TrimSpace(artifactKind) {
+	case SystemEvidenceKindSession:
+		return systemParticipantSession
+	case SystemEvidenceKindFabric:
+		return systemParticipantFabric
+	case SystemEvidenceKindBus:
+		return systemParticipantBus
+	default:
+		return systemParticipantGeneric
+	}
+}
+
+func systemEvidenceScope(opts SystemEvidenceOptions, kind string) map[string]string {
+	switch kind {
+	case systemParticipantFabric:
+		return map[string]string{"session_id": opts.SessionID}
+	case systemParticipantBus:
+		return map[string]string{"process_uid": firstNonEmpty(systemEvidenceMetadataString(opts.Metadata, "process_uid"), opts.SessionID, "process")}
+	case systemParticipantGeneric:
+		return map[string]string{"process_uid": firstNonEmpty(systemEvidenceMetadataString(opts.Metadata, "process_uid"), opts.SessionID, "process")}
+	default:
+		return map[string]string{"session_id": opts.SessionID}
+	}
+}
+
+func systemEvidenceTool(opts SystemEvidenceOptions) string {
+	operation := strings.TrimSpace(opts.Operation)
+	switch systemEvidenceServiceKind(opts.ArtifactKind) {
+	case systemParticipantGeneric:
+		return GenericSystemEvidenceToolRecord
+	case systemParticipantFabric:
+		switch operation {
+		case "detach":
+			return FabricSubscriberToolDetach
+		case "query_lens":
+			return FabricSubscriberToolQueryLens
+		case "harvest":
+			return FabricSubscriberToolHarvest
+		case "test_delivery":
+			return FabricSubscriberToolTestDelivery
+		default:
+			return FabricSubscriberToolAttach
+		}
+	case systemParticipantBus:
+		switch operation {
+		case "register_topic":
+			return BusAdministratorToolRegisterTopic
+		case "drain":
+			return BusAdministratorToolDrain
+		case "overflow":
+			return BusAdministratorToolOverflow
+		case "subscriber_failure":
+			return BusAdministratorToolSubscriberFail
+		default:
+			return BusAdministratorToolAdjustCapacity
+		}
+	default:
+		switch operation {
+		case "close":
+			return SessionManagerToolCloseSession
+		case "persist":
+			return SessionManagerToolPersist
+		case "recover", "restore":
+			return SessionManagerToolRestore
+		case "switch":
+			return SessionManagerToolSwitchSession
+		default:
+			return SessionManagerToolOpenSession
+		}
+	}
+}
+
+func systemEvidenceArguments(opts SystemEvidenceOptions) map[string]any {
+	args := cloneMetadata(opts.Metadata)
+	args["operation"] = opts.Operation
+	args["status"] = opts.Status
+	args["session_id"] = opts.SessionID
+	args["artifact_kind"] = opts.ArtifactKind
+	args["artifact_name"] = opts.ArtifactName
+	args["reference"] = opts.Reference
+	args["metadata"] = cloneMetadata(opts.Metadata)
+	if opts.Status == InfrastructureStatusFailed || opts.Status == "failed" {
+		args["failure_reason"] = firstNonEmpty(systemEvidenceMetadataString(opts.Metadata, "failure_reason"), opts.Status)
+	}
+	if opts.Board != nil {
+		args["board_id"] = opts.Board.BoardID()
+	}
+	if dropped, ok := opts.Metadata["dropped"]; ok {
+		args["dropped_count"] = dropped
+	}
+	return args
+}
+
+func systemEvidenceMetadataString(metadata map[string]any, key string) string {
+	value, _ := metadata[key].(string)
+	return strings.TrimSpace(value)
 }
 
 func normalizeSystemEvidenceOptions(opts SystemEvidenceOptions) SystemEvidenceOptions {

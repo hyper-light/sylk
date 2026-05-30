@@ -491,6 +491,116 @@ func TestInfrastructureValidatorsPassAndFail(t *testing.T) {
 	}
 }
 
+func TestSystemParticipantServicesProduceTypedArtifactsAndValidators(t *testing.T) {
+	board := NewClaimsBoard(ClaimsBoardConfig{BoardID: "system-participant-board", SessionID: "system-session", TaskID: "task"})
+	sessionResult, err := NewSessionManagerService(SystemParticipantServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{
+		Board: board,
+		Claim: infrastructureServiceClaim(SessionManagerToolPersist, map[string]any{
+			"session_id": "system-session",
+			"persisted":  true,
+		}),
+	})
+	if err != nil {
+		t.Fatalf("session manager HandleServiceClaim: %v", err)
+	}
+	sessionData, err := ArtifactData[SessionLifecycleArtifactData](sessionResult.Artifacts[0])
+	if err != nil || sessionData.Operation != "persist" || !sessionData.Persisted || sessionData.Status != InfrastructureStatusOK {
+		t.Fatalf("session artifact = %+v err=%v, want persisted ok", sessionData, err)
+	}
+	if result, err := (SessionPersistenceValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: sessionResult.Artifacts[0]}); err != nil || result.Error != nil {
+		t.Fatalf("SessionPersistenceValidator result=%+v err=%v, want pass", result, err)
+	}
+
+	fabricResult, err := NewFabricSubscriberService(SystemParticipantServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(FabricSubscriberToolQueryLens, map[string]any{
+		"session_id":       "system-session",
+		"agent_id":         "guide",
+		"topic":            "claims.system",
+		"lens_query_shape": "claim_id,status",
+	})})
+	if err != nil {
+		t.Fatalf("fabric subscriber HandleServiceClaim: %v", err)
+	}
+	fabricData, err := ArtifactData[FabricSubscriptionArtifactData](fabricResult.Artifacts[0])
+	if err != nil || fabricData.Operation != FabricSubscriberToolQueryLens || fabricData.LensQueryShape == "" {
+		t.Fatalf("fabric artifact = %+v err=%v, want lens query shape", fabricData, err)
+	}
+	if result, err := (LensQueryShapeValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: fabricResult.Artifacts[0]}); err != nil || result.Error != nil {
+		t.Fatalf("LensQueryShapeValidator result=%+v err=%v, want pass", result, err)
+	}
+
+	busResult, err := NewBusAdministratorService(SystemParticipantServiceConfig{}).HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: infrastructureServiceClaim(BusAdministratorToolRegisterTopic, map[string]any{
+		"process_uid": "proc",
+		"topic":       "claims.system",
+		"capacity":    8,
+		"queue_depth": 4,
+	})})
+	if err != nil {
+		t.Fatalf("bus administrator HandleServiceClaim: %v", err)
+	}
+	busData, err := ArtifactData[BusTransportArtifactData](busResult.Artifacts[0])
+	if err != nil || busData.Topic != "claims.system" || busData.Status != InfrastructureStatusOK {
+		t.Fatalf("bus artifact = %+v err=%v, want valid topic ok", busData, err)
+	}
+	if result, err := (TopicNameValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: busResult.Artifacts[0]}); err != nil || result.Error != nil {
+		t.Fatalf("TopicNameValidator result=%+v err=%v, want pass", result, err)
+	}
+}
+
+func TestSystemParticipantValidatorsRejectNegativeAndEdgeCases(t *testing.T) {
+	badSession, err := sessionLifecycleArtifact(SessionLifecycleArtifactData{Operation: "persist", SessionID: "system-session", Persisted: false, Status: InfrastructureStatusFailed, FailureReason: "disk full"}, "session_persist", ArtifactKindPersistOutcome)
+	if err != nil {
+		t.Fatalf("sessionLifecycleArtifact: %v", err)
+	}
+	if result, err := (SessionPersistenceValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: badSession}); err != nil || result.Error == nil {
+		t.Fatalf("SessionPersistenceValidator result=%+v err=%v, want failure", result, err)
+	}
+
+	badFabric, err := fabricSubscriptionArtifact(FabricSubscriptionArtifactData{Operation: FabricSubscriberToolQueryLens, SessionID: "system-session", Attached: true, Status: InfrastructureStatusOK}, "fabric_query_lens", ArtifactKindLensQueryResult)
+	if err != nil {
+		t.Fatalf("fabricSubscriptionArtifact: %v", err)
+	}
+	if result, err := (LensQueryShapeValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: badFabric}); err != nil || result.Error == nil {
+		t.Fatalf("LensQueryShapeValidator result=%+v err=%v, want failure", result, err)
+	}
+
+	badBus, err := busTransportArtifact(BusTransportArtifactData{Operation: BusAdministratorToolRegisterTopic, ProcessUID: "proc", Topic: "bad topic", Status: InfrastructureStatusOK}, "bus_register_topic", ArtifactKindTopicRegistration)
+	if err != nil {
+		t.Fatalf("busTransportArtifact: %v", err)
+	}
+	if result, err := (TopicNameValidator{}).ValidateArtifact(context.Background(), ValidatorHandlerRequest{Artifact: badBus}); err != nil || result.Error == nil {
+		t.Fatalf("TopicNameValidator result=%+v err=%v, want failure", result, err)
+	}
+}
+
+func TestSystemParticipantServiceConcurrentRecordsDoNotDeadlock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	service := NewBusAdministratorService(SystemParticipantServiceConfig{})
+	const workers = 32
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := service.HandleServiceClaim(ctx, ServiceClaimRequest{Claim: infrastructureServiceClaim(BusAdministratorToolAdjustCapacity, map[string]any{
+				"process_uid": "proc",
+				"topic":       "claims.concurrent",
+				"capacity":    64,
+				"queue_depth": 32,
+			})})
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent system participant record: %v", err)
+		}
+	}
+}
+
 func TestRegisterDefaultInfrastructureValidators(t *testing.T) {
 	registry := NewValidatorRegistry()
 	if err := RegisterDefaultInfrastructureValidators(registry); err != nil {

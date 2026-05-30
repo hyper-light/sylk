@@ -68,6 +68,19 @@ func (p RemediationPolicy) maxClaims() int {
 	return defaultMaxCorrectiveClaimsPerOutcome
 }
 
+func (p RemediationPolicy) allowsStatus(status TestamentLifecycleStatus) bool {
+	switch status {
+	case TestamentLifecycleValidationIncomplete:
+		return p.EnableMissingArtifactCorrectives
+	case TestamentLifecycleValidationFailed:
+		return p.EnableValidationFailureCorrectives
+	case TestamentLifecycleValidationErrored:
+		return p.EnableValidationErroredCorrectives
+	default:
+		return false
+	}
+}
+
 func (r *correctiveRL) allow(key string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -133,15 +146,41 @@ func (b *ClaimsBoard) postTerminalTestamentCorrectives(ctx context.Context, test
 	if b == nil || testament == nil || claim == nil || claim.ActionType == ActionTypeCorrective {
 		return
 	}
-	policy := b.remediationPolicySnapshot()
-	if !policy.enabled() || !isTerminalTestamentValidationStatus(status) {
+	if !isTerminalTestamentValidationStatus(status) {
 		return
 	}
-	for _, spec := range b.correctiveSpecsForTerminalTestament(policy, testament, claim, status, actorID) {
+	policy := b.remediationPolicySnapshot()
+	if !policy.enabled() {
+		b.recordCorrectiveSkipped(testament, claim, status, "remediation policy disabled")
+		return
+	}
+	if !policy.allowsStatus(status) {
+		b.recordCorrectiveSkipped(testament, claim, status, "remediation policy disables "+string(status)+" correctives")
+		return
+	}
+	specs := b.correctiveSpecsForTerminalTestament(policy, testament, claim, status, actorID)
+	if len(specs) == 0 {
+		b.recordCorrectiveSkipped(testament, claim, status, "no corrective targets matched terminal outcome")
+		return
+	}
+	for _, spec := range specs {
 		if err := b.postCorrectiveClaimSpec(contextWithoutCancellation(ctx), spec); err != nil {
 			b.RecordNotificationError("corrective claim: " + err.Error())
 		}
 	}
+}
+
+func (b *ClaimsBoard) recordCorrectiveSkipped(testament *Testament, claim *Claim, status TestamentLifecycleStatus, reason string) {
+	if b == nil || testament == nil || claim == nil {
+		return
+	}
+	b.RecordNotificationError(strings.Join([]string{
+		"corrective claim skipped",
+		"claim=" + strings.TrimSpace(claim.ID),
+		"testament=" + strings.TrimSpace(testament.ID),
+		"status=" + strings.TrimSpace(string(status)),
+		"reason=" + strings.TrimSpace(reason),
+	}, " "))
 }
 
 func (b *ClaimsBoard) remediationPolicySnapshot() RemediationPolicy {

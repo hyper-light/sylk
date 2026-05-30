@@ -151,6 +151,9 @@ func TestBuiltinArtifactDataCatalog(t *testing.T) {
 		ArtifactDataTypeGuardianDecision,
 		ArtifactDataTypeProviderGatewayCall,
 		ArtifactDataTypeExternalAdapterEvent,
+		ArtifactDataTypeSessionLifecycle,
+		ArtifactDataTypeFabricSubscription,
+		ArtifactDataTypeBusTransport,
 		ArtifactDataTypeRecoveryIdempotency,
 	} {
 		if _, err := registry.LookupArtifactType(dataType); err != nil {

@@ -21,6 +21,10 @@ const (
 	EnvClaimsInfraGuardian       = "SYLK_CLAIMS_INFRA_GUARDIAN"
 	EnvClaimsInfraProvider       = "SYLK_CLAIMS_INFRA_PROVIDER"
 	EnvClaimsInfraExternal       = "SYLK_CLAIMS_INFRA_EXTERNAL"
+	EnvClaimsInfraActivation     = "SYLK_CLAIMS_INFRA_ACTIVATION"
+	EnvClaimsInfraSession        = "SYLK_CLAIMS_INFRA_SESSION"
+	EnvClaimsInfraFabric         = "SYLK_CLAIMS_INFRA_FABRIC"
+	EnvClaimsInfraBus            = "SYLK_CLAIMS_INFRA_BUS"
 )
 
 type ProjectionRolloutMode string
@@ -54,6 +58,10 @@ type RolloutConfig struct {
 	ClaimsInfraGuardian       InfrastructureRolloutMode `json:"claims_infra_guardian"`
 	ClaimsInfraProvider       InfrastructureRolloutMode `json:"claims_infra_provider"`
 	ClaimsInfraExternal       InfrastructureRolloutMode `json:"claims_infra_external"`
+	ClaimsInfraActivation     InfrastructureRolloutMode `json:"claims_infra_activation"`
+	ClaimsInfraSession        InfrastructureRolloutMode `json:"claims_infra_session"`
+	ClaimsInfraFabric         InfrastructureRolloutMode `json:"claims_infra_fabric"`
+	ClaimsInfraBus            InfrastructureRolloutMode `json:"claims_infra_bus"`
 }
 
 var defaultRolloutConfig = struct {
@@ -79,6 +87,10 @@ func DefaultRolloutConfig() RolloutConfig {
 		ClaimsInfraGuardian:       InfrastructureRolloutEnabled,
 		ClaimsInfraProvider:       InfrastructureRolloutEnabled,
 		ClaimsInfraExternal:       InfrastructureRolloutEnabled,
+		ClaimsInfraActivation:     InfrastructureRolloutEnabled,
+		ClaimsInfraSession:        InfrastructureRolloutEnabled,
+		ClaimsInfraFabric:         InfrastructureRolloutEnabled,
+		ClaimsInfraBus:            InfrastructureRolloutEnabled,
 	}
 }
 
@@ -114,6 +126,10 @@ func RolloutConfigFromEnv(getenv func(string) string) RolloutConfig {
 	cfg.ClaimsInfraGuardian = infrastructureModeEnv(getenv, EnvClaimsInfraGuardian, cfg.ClaimsInfraGuardian)
 	cfg.ClaimsInfraProvider = infrastructureModeEnv(getenv, EnvClaimsInfraProvider, cfg.ClaimsInfraProvider)
 	cfg.ClaimsInfraExternal = infrastructureModeEnv(getenv, EnvClaimsInfraExternal, cfg.ClaimsInfraExternal)
+	cfg.ClaimsInfraActivation = infrastructureModeEnv(getenv, EnvClaimsInfraActivation, cfg.ClaimsInfraActivation)
+	cfg.ClaimsInfraSession = infrastructureModeEnv(getenv, EnvClaimsInfraSession, cfg.ClaimsInfraSession)
+	cfg.ClaimsInfraFabric = infrastructureModeEnv(getenv, EnvClaimsInfraFabric, cfg.ClaimsInfraFabric)
+	cfg.ClaimsInfraBus = infrastructureModeEnv(getenv, EnvClaimsInfraBus, cfg.ClaimsInfraBus)
 	return cfg.Normalized()
 }
 
@@ -132,6 +148,10 @@ func (cfg RolloutConfig) Normalized() RolloutConfig {
 	cfg.ClaimsInfraGuardian = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraGuardian)
 	cfg.ClaimsInfraProvider = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraProvider)
 	cfg.ClaimsInfraExternal = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraExternal)
+	cfg.ClaimsInfraActivation = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraActivation)
+	cfg.ClaimsInfraSession = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraSession)
+	cfg.ClaimsInfraFabric = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraFabric)
+	cfg.ClaimsInfraBus = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraBus)
 	return cfg
 }
 
@@ -171,6 +191,14 @@ func (cfg RolloutConfig) InfrastructureMode(subsystem string) InfrastructureRoll
 		return cfg.ClaimsInfraProvider
 	case "external", "external_adapter":
 		return cfg.ClaimsInfraExternal
+	case "activation", "activation_controller":
+		return cfg.ClaimsInfraActivation
+	case "session", "session_manager":
+		return cfg.ClaimsInfraSession
+	case "fabric", "fabric_subscriber":
+		return cfg.ClaimsInfraFabric
+	case "bus", "bus_administrator":
+		return cfg.ClaimsInfraBus
 	default:
 		return InfrastructureRolloutDisabled
 	}
@@ -198,6 +226,10 @@ func (cfg RolloutConfig) FeatureFlags() map[string]string {
 		EnvClaimsInfraGuardian:       string(cfg.ClaimsInfraGuardian),
 		EnvClaimsInfraProvider:       string(cfg.ClaimsInfraProvider),
 		EnvClaimsInfraExternal:       string(cfg.ClaimsInfraExternal),
+		EnvClaimsInfraActivation:     string(cfg.ClaimsInfraActivation),
+		EnvClaimsInfraSession:        string(cfg.ClaimsInfraSession),
+		EnvClaimsInfraFabric:         string(cfg.ClaimsInfraFabric),
+		EnvClaimsInfraBus:            string(cfg.ClaimsInfraBus),
 	}
 }
 
@@ -218,6 +250,10 @@ func (cfg RolloutConfig) Diagnostics() []string {
 		"rollout " + EnvClaimsInfraGuardian + "=" + flags[EnvClaimsInfraGuardian],
 		"rollout " + EnvClaimsInfraProvider + "=" + flags[EnvClaimsInfraProvider],
 		"rollout " + EnvClaimsInfraExternal + "=" + flags[EnvClaimsInfraExternal],
+		"rollout " + EnvClaimsInfraActivation + "=" + flags[EnvClaimsInfraActivation],
+		"rollout " + EnvClaimsInfraSession + "=" + flags[EnvClaimsInfraSession],
+		"rollout " + EnvClaimsInfraFabric + "=" + flags[EnvClaimsInfraFabric],
+		"rollout " + EnvClaimsInfraBus + "=" + flags[EnvClaimsInfraBus],
 	}
 }
 

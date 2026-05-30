@@ -13,6 +13,9 @@ const (
 	ArtifactDataTypeGuardianDecision     = "sylk.infrastructure.guardian_decision.v1"
 	ArtifactDataTypeProviderGatewayCall  = "sylk.infrastructure.provider_gateway_call.v1"
 	ArtifactDataTypeExternalAdapterEvent = "sylk.infrastructure.external_adapter_event.v1"
+	ArtifactDataTypeSessionLifecycle     = "sylk.infrastructure.session_lifecycle.v1"
+	ArtifactDataTypeFabricSubscription   = "sylk.infrastructure.fabric_subscription.v1"
+	ArtifactDataTypeBusTransport         = "sylk.infrastructure.bus_transport.v1"
 	ArtifactDataTypeRecoveryIdempotency  = "sylk.infrastructure.recovery_idempotency.v1"
 )
 
@@ -34,6 +37,16 @@ const (
 	ArtifactKindGuardianDecision     = "guardian_decision"
 	ArtifactKindProviderGatewayCall  = "provider_gateway_call"
 	ArtifactKindExternalAdapterEvent = "external_adapter_event"
+	ArtifactKindSessionHandle        = "session_handle"
+	ArtifactKindSessionState         = "session_state"
+	ArtifactKindPersistOutcome       = "persist_outcome"
+	ArtifactKindRestoreOutcome       = "restore_outcome"
+	ArtifactKindLensQueryResult      = "lens_query_result"
+	ArtifactKindHarvestOutcome       = "harvest_outcome"
+	ArtifactKindSubscriptionState    = "subscription_state"
+	ArtifactKindTopicRegistration    = "topic_registration"
+	ArtifactKindCapacityRecord       = "capacity_record"
+	ArtifactKindDrainOutcome         = "drain_outcome"
 	ArtifactKindRecoveryIdempotency  = "recovery_idempotency"
 )
 
@@ -251,6 +264,49 @@ type ExternalAdapterEventArtifactData struct {
 	Status            string         `json:"status,omitempty"`
 	FailureReason     string         `json:"failure_reason,omitempty"`
 	Metadata          map[string]any `json:"metadata,omitempty"`
+}
+
+type SessionLifecycleArtifactData struct {
+	Operation     string         `json:"operation"`
+	SessionID     string         `json:"session_id"`
+	BoardID       string         `json:"board_id,omitempty"`
+	Active        bool           `json:"active"`
+	Persisted     bool           `json:"persisted,omitempty"`
+	Restored      bool           `json:"restored,omitempty"`
+	StaleReplaced bool           `json:"stale_replaced,omitempty"`
+	Status        string         `json:"status,omitempty"`
+	FailureReason string         `json:"failure_reason,omitempty"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
+}
+
+type FabricSubscriptionArtifactData struct {
+	Operation         string         `json:"operation"`
+	SessionID         string         `json:"session_id"`
+	AgentID           string         `json:"agent_id,omitempty"`
+	Topic             string         `json:"topic,omitempty"`
+	LensQueryShape    string         `json:"lens_query_shape,omitempty"`
+	HarvestCount      int            `json:"harvest_count,omitempty"`
+	DeliveredCount    int            `json:"delivered_count,omitempty"`
+	DroppedCount      uint64         `json:"dropped_count,omitempty"`
+	Attached          bool           `json:"attached"`
+	SubscriptionState string         `json:"subscription_state,omitempty"`
+	Status            string         `json:"status,omitempty"`
+	FailureReason     string         `json:"failure_reason,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
+}
+
+type BusTransportArtifactData struct {
+	Operation       string         `json:"operation"`
+	ProcessUID      string         `json:"process_uid,omitempty"`
+	Topic           string         `json:"topic,omitempty"`
+	Capacity        int            `json:"capacity,omitempty"`
+	QueueDepth      int            `json:"queue_depth,omitempty"`
+	DroppedCount    uint64         `json:"dropped_count,omitempty"`
+	SubscriberError string         `json:"subscriber_error,omitempty"`
+	Drained         bool           `json:"drained,omitempty"`
+	Status          string         `json:"status,omitempty"`
+	FailureReason   string         `json:"failure_reason,omitempty"`
+	Metadata        map[string]any `json:"metadata,omitempty"`
 }
 
 type RecoveryIdempotencyArtifactData struct {

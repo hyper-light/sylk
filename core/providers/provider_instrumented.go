@@ -415,6 +415,7 @@ func recordLLMDispatchEnd(ctx context.Context, providerName string, req *Request
 		}
 	}
 	acc.RecordArtifact(artifact)
+	recordProviderGatewayServiceClaim(ctx, providerName, req, mode, trace, resp, dispatchErr)
 }
 
 func truncateForDispatchSummary(s string) string {

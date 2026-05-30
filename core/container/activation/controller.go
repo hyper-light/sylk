@@ -92,18 +92,18 @@ func (d *DefaultStatePreserver) Inject(agent container.ContainerAgent, state *ha
 
 // ActivationControllerConfig provides construction parameters.
 type ActivationControllerConfig struct {
-	Runtime      container.ContainerRuntime
-	Registry     *container.ContainerRegistry
-	Scope        *concurrency.GoroutineScope
-	Preserver    StatePreserver
-	Policies     []*ActivationPolicy
-	StorageDir   string          // For CoolStore state files
-	WarmPoolCap  int             // Max Warm containers
-	CoolStoreCap int             // Max Cool entries on disk
-	Predictor    PredictorConfig // Co-activation predictor tuning
-	Pressure     PressureConfig  // Pressure evaluation tuning
-	ScanPeriod   int             // Idle scan period in ms (0 = derived)
-	Logger       *slog.Logger    // Structured logger (nil = slog.Default())
+	Runtime       container.ContainerRuntime
+	Registry      *container.ContainerRegistry
+	Scope         *concurrency.GoroutineScope
+	Preserver     StatePreserver
+	Policies      []*ActivationPolicy
+	StorageDir    string          // For CoolStore state files
+	WarmPoolCap   int             // Max Warm containers
+	CoolStoreCap  int             // Max Cool entries on disk
+	Predictor     PredictorConfig // Co-activation predictor tuning
+	Pressure      PressureConfig  // Pressure evaluation tuning
+	ScanPeriod    int             // Idle scan period in ms (0 = derived)
+	Logger        *slog.Logger    // Structured logger (nil = slog.Default())
 	OnActivated   func(*container.Container)
 	OnRemoved     func(*container.Container)
 	BoardProvider func() *claims.ClaimsBoard // session board lookup (nil-safe)
@@ -163,17 +163,17 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 	coolStore.SetLogger(logger)
 
 	ac := &ActivationController{
-		entries:     make(map[string]*ActivationEntry, len(cfg.Policies)),
-		gate:        NewActivationGate(),
-		warmPool:    NewWarmPool(cfg.WarmPoolCap),
-		coolStore:   coolStore,
-		predictor:   NewActivationPredictor(cfg.Predictor),
-		runtime:     cfg.Runtime,
-		registry:    cfg.Registry,
-		preserver:   preserver,
-		scope:       cfg.Scope,
-		metrics:     &ActivationMetrics{},
-		logger:      logger,
+		entries:       make(map[string]*ActivationEntry, len(cfg.Policies)),
+		gate:          NewActivationGate(),
+		warmPool:      NewWarmPool(cfg.WarmPoolCap),
+		coolStore:     coolStore,
+		predictor:     NewActivationPredictor(cfg.Predictor),
+		runtime:       cfg.Runtime,
+		registry:      cfg.Registry,
+		preserver:     preserver,
+		scope:         cfg.Scope,
+		metrics:       &ActivationMetrics{},
+		logger:        logger,
 		onActivated:   cfg.OnActivated,
 		onRemoved:     cfg.OnRemoved,
 		boardProvider: cfg.BoardProvider,
@@ -271,7 +271,7 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 		"elapsed_ms", time.Since(activateStart).Milliseconds(),
 		"error", err)
 	if err != nil {
-		ac.postActivationError(agentType, err)
+		ac.postActivationError(agentType, err, time.Since(activateStart))
 		return nil, err
 	}
 
@@ -288,7 +288,7 @@ func (ac *ActivationController) EnsureActive(ctx context.Context, agentType stri
 	ac.preWarmAsync(ctx, agentType)
 
 	// Post activation claim (async, best-effort).
-	ac.postActivationSuccess(agentType, c)
+	ac.postActivationSuccess(agentType, c, time.Since(activateStart))
 
 	// Wake the idle monitor: a new entry is now Hot with a fresh
 	// short-threshold countdown the previous scan didn't account for.

@@ -230,9 +230,13 @@ func (b *ClaimsBoard) artifactTerminalPropagationLocked(artifact *Artifact, test
 	if outcome == "" || !CanTransitionTestamentLifecycle(testament.LifecycleStatus, outcome) {
 		return artifactTerminalPropagation{}
 	}
+	claimTo := claimLifecycleForTestamentValidation(outcome)
+	if claimTo != "" && !CanTransitionClaimLifecycle(claim.LifecycleStatus, claimTo) {
+		claimTo = ""
+	}
 	return artifactTerminalPropagation{
 		TestamentTo: outcome,
-		ClaimTo:     claimLifecycleForTestamentValidation(outcome),
+		ClaimTo:     claimTo,
 	}
 }
 

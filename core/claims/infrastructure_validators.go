@@ -58,8 +58,11 @@ type DiffFindingsAbsentValidator = GuardianDiffFindingsAbsentValidator
 type GuardianRollbackReceiptValidator struct{}
 
 type ProviderResponsePresentValidator struct{}
+type ResponsePresentValidator = ProviderResponsePresentValidator
 type ProviderUsageInBudgetValidator struct{}
+type UsageInBudgetValidator = ProviderUsageInBudgetValidator
 type ProviderRateLimitNotExceededValidator struct{ MinimumRemaining int }
+type RateLimitNotExceededValidator = ProviderRateLimitNotExceededValidator
 type ProviderModelAllowedValidator struct{ AllowedModels []string }
 type ProviderIdentityPresentValidator struct{}
 
@@ -67,6 +70,13 @@ type ExternalSourceAuthenticityValidator struct{}
 type ExternalSchemaValidator struct{ ExpectedSchema string }
 type ExternalFreshnessValidator struct{}
 type ExternalReferencedClaimValidator struct{ Board *ClaimsBoard }
+
+type SessionStateConsistentValidator struct{}
+type SessionPersistenceValidator struct{}
+type LensQueryShapeValidator struct{}
+type SubscriptionAttachedValidator struct{}
+type TopicNameValidator struct{}
+type CapacityWithinBudgetValidator struct{}
 
 func RegisterDefaultInfrastructureValidators(registry *ValidatorRegistry) error {
 	if registry == nil {
@@ -611,6 +621,72 @@ func (v ExternalReferencedClaimValidator) ValidateArtifact(_ context.Context, re
 	return infrastructureValidatorFailure(req, "external referenced claim missing", map[string]any{"claim_id": data.ReferencedClaimID})
 }
 
+func (SessionStateConsistentValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[SessionLifecycleArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if strings.TrimSpace(data.SessionID) != "" && data.Status != InfrastructureStatusFailed && data.FailureReason == "" {
+		return infrastructureValidatorPass("session state consistent")
+	}
+	return infrastructureValidatorFailure(req, "session state inconsistent", map[string]any{"session_id": data.SessionID, "status": data.Status, "reason": data.FailureReason})
+}
+
+func (SessionPersistenceValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[SessionLifecycleArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if data.Operation != "persist" || (data.Persisted && data.FailureReason == "") {
+		return infrastructureValidatorPass("session persistence valid")
+	}
+	return infrastructureValidatorFailure(req, "session persistence failed", map[string]any{"session_id": data.SessionID, "persisted": data.Persisted, "reason": data.FailureReason})
+}
+
+func (LensQueryShapeValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[FabricSubscriptionArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if data.Operation != FabricSubscriberToolQueryLens || strings.TrimSpace(data.LensQueryShape) != "" {
+		return infrastructureValidatorPass("fabric lens query shape valid")
+	}
+	return infrastructureValidatorFailure(req, "fabric lens query shape missing", map[string]any{"session_id": data.SessionID, "topic": data.Topic})
+}
+
+func (SubscriptionAttachedValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[FabricSubscriptionArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if data.Operation == FabricSubscriberToolDetach || (data.Attached && data.FailureReason == "") {
+		return infrastructureValidatorPass("fabric subscription attached")
+	}
+	return infrastructureValidatorFailure(req, "fabric subscription not attached", map[string]any{"session_id": data.SessionID, "state": data.SubscriptionState, "reason": data.FailureReason})
+}
+
+func (TopicNameValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[BusTransportArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if data.Operation != BusAdministratorToolRegisterTopic || validBusTopicName(data.Topic) {
+		return infrastructureValidatorPass("bus topic name valid")
+	}
+	return infrastructureValidatorFailure(req, "bus topic name invalid", map[string]any{"topic": data.Topic})
+}
+
+func (CapacityWithinBudgetValidator) ValidateArtifact(_ context.Context, req ValidatorHandlerRequest) (ValidatorHandlerResult, error) {
+	data, err := ArtifactData[BusTransportArtifactData](req.Artifact)
+	if err != nil {
+		return ValidatorHandlerResult{}, err
+	}
+	if data.Capacity <= 0 || data.QueueDepth <= data.Capacity {
+		return infrastructureValidatorPass("bus capacity within budget")
+	}
+	return infrastructureValidatorFailure(req, "bus capacity exceeded", map[string]any{"queue_depth": data.QueueDepth, "capacity": data.Capacity})
+}
+
 func infrastructureValidatorPass(reference string) (ValidatorHandlerResult, error) {
 	artifact := &Artifact{ArtifactName: "infrastructure_validation", Kind: ArtifactKindReadiness, Reference: reference}
 	if err := SetArtifactData(artifact, PresentationEvidenceArtifactData{Kind: "infrastructure_validation", Reference: reference}); err != nil {
@@ -645,6 +721,14 @@ func boundedInt(value, min, max int) bool {
 		return false
 	}
 	return max <= 0 || value <= max
+}
+
+func validBusTopicName(topic string) bool {
+	topic = strings.TrimSpace(topic)
+	if topic == "" {
+		return false
+	}
+	return !strings.ContainsAny(topic, " \t\n\r")
 }
 
 func vfsReadOnlyOperation(operation string) bool {
@@ -749,6 +833,12 @@ func defaultInfrastructureValidatorRegistrations() []ValidatorRegistration {
 		infrastructureValidatorRegistration("external.schema", ArtifactDataTypeExternalAdapterEvent, ExternalSchemaValidator{}),
 		infrastructureValidatorRegistration("external.freshness", ArtifactDataTypeExternalAdapterEvent, ExternalFreshnessValidator{}),
 		infrastructureValidatorRegistration("external.referenced_claim", ArtifactDataTypeExternalAdapterEvent, ExternalReferencedClaimValidator{}),
+		infrastructureValidatorRegistration("session.state_consistent", ArtifactDataTypeSessionLifecycle, SessionStateConsistentValidator{}),
+		infrastructureValidatorRegistration("session.persistence", ArtifactDataTypeSessionLifecycle, SessionPersistenceValidator{}),
+		infrastructureValidatorRegistration("fabric.lens_query_shape", ArtifactDataTypeFabricSubscription, LensQueryShapeValidator{}),
+		infrastructureValidatorRegistration("fabric.subscription_attached", ArtifactDataTypeFabricSubscription, SubscriptionAttachedValidator{}),
+		infrastructureValidatorRegistration("bus.topic_name", ArtifactDataTypeBusTransport, TopicNameValidator{}),
+		infrastructureValidatorRegistration("bus.capacity_budget", ArtifactDataTypeBusTransport, CapacityWithinBudgetValidator{}),
 	}
 }
 

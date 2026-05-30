@@ -173,7 +173,7 @@ func normalizeActivationRecord(in ActivationRecordArtifactData, activating bool)
 	if in.ParticipantID == "" {
 		return ActivationRecordArtifactData{}, fmt.Errorf("%w: participant id is required", ErrActivationControllerServiceInvalid)
 	}
-	if activating && in.ReplicaCount <= 0 {
+	if activating && in.FailureReason == "" && in.ReplicaCount <= 0 {
 		return ActivationRecordArtifactData{}, fmt.Errorf("%w: replica count must be positive", ErrActivationControllerServiceInvalid)
 	}
 	if in.Duration < 0 {

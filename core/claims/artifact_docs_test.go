@@ -59,6 +59,9 @@ func TestArtifactsAndValidationsDocsListBuiltInDataTypes(t *testing.T) {
 		ArtifactDataTypeGuardianDecision,
 		ArtifactDataTypeProviderGatewayCall,
 		ArtifactDataTypeExternalAdapterEvent,
+		ArtifactDataTypeSessionLifecycle,
+		ArtifactDataTypeFabricSubscription,
+		ArtifactDataTypeBusTransport,
 		ArtifactDataTypeRecoveryIdempotency,
 	} {
 		if !strings.Contains(body, dataType) {

@@ -136,9 +136,7 @@ func assertSystemEvidenceSatisfied(t *testing.T, board *ClaimsBoard, artifactNam
 				continue
 			}
 			found = true
-			if _, err := ArtifactData[PresentationEvidenceArtifactData](artifact); err != nil {
-				t.Fatalf("ArtifactData(%s): %v", artifactName, err)
-			}
+			assertSystemEvidenceArtifactData(t, artifactName, artifact)
 		}
 	}
 	if !found {
@@ -148,5 +146,25 @@ func assertSystemEvidenceSatisfied(t *testing.T, board *ClaimsBoard, artifactNam
 		if claim.LifecycleStatus != ClaimLifecycleSatisfied {
 			t.Fatalf("claim %s lifecycle = %s, want satisfied", claim.ID, claim.LifecycleStatus)
 		}
+	}
+}
+
+func assertSystemEvidenceArtifactData(t *testing.T, artifactName string, artifact *Artifact) {
+	t.Helper()
+	switch artifact.DataType {
+	case ArtifactDataTypeSessionLifecycle:
+		if _, err := ArtifactData[SessionLifecycleArtifactData](artifact); err != nil {
+			t.Fatalf("ArtifactData(%s): %v", artifactName, err)
+		}
+	case ArtifactDataTypeFabricSubscription:
+		if _, err := ArtifactData[FabricSubscriptionArtifactData](artifact); err != nil {
+			t.Fatalf("ArtifactData(%s): %v", artifactName, err)
+		}
+	case ArtifactDataTypeBusTransport:
+		if _, err := ArtifactData[BusTransportArtifactData](artifact); err != nil {
+			t.Fatalf("ArtifactData(%s): %v", artifactName, err)
+		}
+	default:
+		t.Fatalf("artifact %s data type = %s, want system participant data type", artifactName, artifact.DataType)
 	}
 }

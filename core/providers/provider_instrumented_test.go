@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 type fakeProvider struct {
@@ -18,11 +19,11 @@ type fakeProvider struct {
 	streamErr error
 }
 
-func (f *fakeProvider) Name() string                                  { return f.name }
-func (f *fakeProvider) SupportedModels() []ModelInfo                  { return nil }
-func (f *fakeProvider) CountTokens(_ []Message) (int, error)          { return 0, nil }
-func (f *fakeProvider) MaxContextTokens(_ string) int                 { return 0 }
-func (f *fakeProvider) HealthCheck(_ context.Context) error           { return nil }
+func (f *fakeProvider) Name() string                         { return f.name }
+func (f *fakeProvider) SupportedModels() []ModelInfo         { return nil }
+func (f *fakeProvider) CountTokens(_ []Message) (int, error) { return 0, nil }
+func (f *fakeProvider) MaxContextTokens(_ string) int        { return 0 }
+func (f *fakeProvider) HealthCheck(_ context.Context) error  { return nil }
 func (f *fakeProvider) Complete(_ context.Context, _ *Request) (*Response, error) {
 	return f.resp, f.err
 }
@@ -126,6 +127,45 @@ func TestInstrument_TagsErrorOnCompleteFailure(t *testing.T) {
 	}
 }
 
+func TestInstrument_CompletePostsProviderGatewayServiceClaim(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "provider-gateway-board", SessionID: "provider-session", TaskID: "task"})
+	acc := claims.NewTestamentAccumulator("guide", board.SessionID()).WithBoard(board).WithClaimID("claim-parent").WithResponseClaimID("claim-parent")
+	ctx := claims.WithTestamentAccumulator(context.Background(), acc)
+	inner := &fakeProvider{
+		name: "anthropic",
+		resp: &Response{
+			Content:          "service response",
+			Model:            "claude-opus-4-7",
+			StopReason:       StopReasonEndTurn,
+			Usage:            Usage{InputTokens: 12, OutputTokens: 8, TotalTokens: 20},
+			ProviderMetadata: map[string]any{"request_id": "provider-req-1"},
+		},
+	}
+	wrapped := Instrument(inner)
+
+	resp, err := wrapped.Complete(ctx, &Request{Model: "claude-opus-4-7", MaxTokens: 64, Messages: []Message{{Role: RoleUser, Content: "hello"}}})
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if resp == nil || resp.Content != "service response" {
+		t.Fatalf("response = %+v, want service response", resp)
+	}
+	assertProviderGatewayServiceClaim(t, board, claims.InfrastructureStatusOK, "provider-req-1", "")
+}
+
+func TestInstrument_CompleteErrorPostsFailedProviderGatewayServiceClaim(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "provider-gateway-failure-board", SessionID: "provider-session", TaskID: "task"})
+	acc := claims.NewTestamentAccumulator("guide", board.SessionID()).WithBoard(board)
+	ctx := claims.WithTestamentAccumulator(context.Background(), acc)
+	inner := &fakeProvider{name: "anthropic", err: errors.New("provider boom")}
+	wrapped := Instrument(inner)
+
+	if _, err := wrapped.Complete(ctx, &Request{Model: "claude-opus-4-7", MaxTokens: 64, Messages: []Message{{Role: RoleUser, Content: "hello"}}}); err == nil {
+		t.Fatal("expected Complete to return provider error")
+	}
+	assertProviderGatewayServiceClaim(t, board, claims.InfrastructureStatusFailed, "", "provider boom")
+}
+
 func TestInstrument_StreamEmitsActivityWithChunkCount(t *testing.T) {
 	col := activity.NewTestCollector()
 	prev := activity.SetDefaultSink(col)
@@ -213,5 +253,30 @@ func TestInstrument_PreservesNativeWebSearchEvidenceCapability(t *testing.T) {
 	wrapped := Instrument(inner)
 	if !wrapped.(NativeWebSearchEvidenceProvider).SupportsNativeWebSearchEvidence() {
 		t.Fatal("wrapper must forward NativeWebSearchEvidenceProvider capability")
+	}
+}
+
+func assertProviderGatewayServiceClaim(t *testing.T, board *claims.ClaimsBoard, status, requestID, reason string) {
+	t.Helper()
+	projection := board.Projection()
+	if len(projection.Claims) != 1 {
+		t.Fatalf("claims = %d, want 1", len(projection.Claims))
+	}
+	if projection.Claims[0].LifecycleStatus != claims.ClaimLifecycleSatisfied {
+		t.Fatalf("claim lifecycle = %s, want satisfied", projection.Claims[0].LifecycleStatus)
+	}
+	testaments := board.TestamentsByClaim(projection.Claims[0].ID)
+	if len(testaments) != 1 {
+		t.Fatalf("testaments = %d, want 1", len(testaments))
+	}
+	data, err := claims.ArtifactData[claims.ProviderGatewayCallArtifactData](testaments[0].Artifacts[0])
+	if err != nil {
+		t.Fatalf("provider gateway artifact data: %v", err)
+	}
+	if data.Status != status || data.ProviderRequestID != requestID && requestID != "" || data.FailureReason != reason {
+		t.Fatalf("provider gateway data = %+v, want status=%s requestID=%q reason=%q", data, status, requestID, reason)
+	}
+	if data.Identity != "guide" {
+		t.Fatalf("provider identity = %q, want guide", data.Identity)
 	}
 }

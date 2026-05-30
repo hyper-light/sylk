@@ -303,6 +303,14 @@ func NewDefaultInfrastructureServiceHandler(participantID string) ServiceHandler
 		return NewGuardianService(cfg)
 	case "sys:provider_gateway":
 		return NewProviderGatewayService(cfg)
+	case "sys:activation_controller":
+		return NewActivationControllerService(ActivationControllerServiceConfig{})
+	case "sys:session_manager":
+		return NewSessionManagerService(SystemParticipantServiceConfig{ParticipantID: participantID})
+	case "sys:fabric_subscriber":
+		return NewFabricSubscriberService(SystemParticipantServiceConfig{ParticipantID: participantID})
+	case "sys:bus_administrator":
+		return NewBusAdministratorService(SystemParticipantServiceConfig{ParticipantID: participantID})
 	default:
 		return nil
 	}
@@ -326,6 +334,14 @@ func InfrastructureSubsystemForParticipantID(participantID string) string {
 		return "guardian"
 	case "sys:provider_gateway", "provider_gateway":
 		return "provider"
+	case "sys:activation_controller", "activation_controller":
+		return "activation"
+	case "sys:session_manager", "session_manager":
+		return systemParticipantSession
+	case "sys:fabric_subscriber", "fabric_subscriber":
+		return systemParticipantFabric
+	case "sys:bus_administrator", "bus_administrator":
+		return systemParticipantBus
 	case "sys:external_adapter", "external_adapter":
 		return "external"
 	default:

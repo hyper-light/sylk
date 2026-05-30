@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
@@ -13,126 +14,133 @@ import (
 )
 
 const activationClaimsAgent = "system:activation"
+const activationControllerParticipantID = "sys:activation_controller"
 
 // ────────────────────────────────────────────────────────────────────
 // Activation claims (async, best-effort, session board)
 // ────────────────────────────────────────────────────────────────────
 
 // postActivationSuccess posts an activation claim and testament to the
-// session board. Async via scope.Go — never blocks the activation
-// path. The scope-provided ctx is threaded into board.PostAction and
-// board.SubmitTestaments so a SignalShutdown immediately aborts these
-// workers instead of leaving them blocked on board IO with a
-// never-cancellable context.Background.
-func (ac *ActivationController) postActivationSuccess(agentType string, c *container.Container) {
+// session board through the activation-controller service participant.
+// Async via scope.Go — never blocks the activation path.
+func (ac *ActivationController) postActivationSuccess(agentType string, c *container.Container, duration time.Duration) {
 	board := ac.loadBoard()
 	if board == nil {
 		return
 	}
+	record := ac.activationRecord(agentType, c, nil, duration)
 	ac.runAsync("activation_claim_"+agentType, func(ctx context.Context) error {
-		claimID := postActivationClaim(ctx, board, agentType)
-		if claimID == "" {
-			return nil
-		}
-		submitActivationTestament(ctx, board, agentType, claimID, c)
-		return nil
+		return invokeActivationServiceClaim(ctx, board, record)
 	})
 }
 
 // postActivationError posts an error testament for a failed activation.
 // Async via scope.Go — never blocks the caller.
-func (ac *ActivationController) postActivationError(agentType string, err error) {
+func (ac *ActivationController) postActivationError(agentType string, err error, duration time.Duration) {
 	board := ac.loadBoard()
 	if board == nil {
 		return
 	}
+	record := ac.activationRecord(agentType, nil, err, duration)
 	ac.runAsync("activation_error_"+agentType, func(ctx context.Context) error {
-		claimID := postActivationClaim(ctx, board, agentType)
-		if claimID == "" {
-			return nil
-		}
-		submitActivationErrorTestament(ctx, board, agentType, claimID, err)
-		return nil
+		return invokeActivationServiceClaim(ctx, board, record)
 	})
 }
 
-func postActivationClaim(ctx context.Context, board *claims.ClaimsBoard, agentType string) string {
+func (ac *ActivationController) activationRecord(agentType string, c *container.Container, activationErr error, duration time.Duration) claims.ActivationRecordArtifactData {
+	tier := TierCold
+	if ac != nil {
+		if current, err := ac.TierOf(agentType); err == nil {
+			tier = current
+		}
+	}
+	record := claims.ActivationRecordArtifactData{
+		ParticipantID:   strings.TrimSpace(agentType),
+		ParticipantType: "agent",
+		Tier:            pod.TierString(tier),
+		Duration:        duration,
+	}
+	if c != nil {
+		record.ReplicaCount = 1
+		record.Ready = true
+	}
+	if activationErr != nil {
+		record.FailureReason = activationErr.Error()
+		record.Ready = false
+		record.ReplicaCount = 0
+	}
+	if activationErr == nil && c == nil {
+		record.FailureReason = "activated container missing"
+	}
+	return record
+}
+
+func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard, record claims.ActivationRecordArtifactData) error {
+	participant, err := activationControllerParticipant(board)
+	if err != nil {
+		return err
+	}
+	_, err = claims.InvokeServiceClaim(ctx, claims.ServiceInvocationOptions{
+		Board:        board,
+		Handler:      claims.NewActivationControllerService(claims.ActivationControllerServiceConfig{MaxRecords: activationControllerRecordCapacity()}),
+		Participant:  participant,
+		IssuerID:     activationClaimsAgent,
+		SubjectID:    activationControllerParticipantID,
+		Title:        fmt.Sprintf("Activate %s", record.ParticipantID),
+		Description:  fmt.Sprintf("Activate agent type %s for the current session.", record.ParticipantID),
+		ActionType:   claims.ActionTypeActivation,
+		ExpectedCall: claims.ExpectedToolCall{Tool: claims.ActivationControllerToolActivate, Arguments: activationServiceArguments(record)},
+		Reason:       "activation controller service claim generated",
+	})
+	return err
+}
+
+func activationControllerParticipant(board *claims.ClaimsBoard) (claims.ParticipantRegistration, error) {
+	return claims.NewParticipantRegistration(
+		claims.ParticipantCategoryService,
+		activationControllerParticipantID,
+		map[string]string{"session_id": activationBoardSessionID(board)},
+		activationControllerRecordCapacity(),
+		len(activationControllerTools()),
+		activationControllerTimeout(),
+		claims.HandlerDeterminismSideEffect,
+		[]claims.ActionType{claims.ActionTypeActivation},
+	)
+}
+
+func activationServiceArguments(record claims.ActivationRecordArtifactData) map[string]any {
+	return map[string]any{
+		"participant_id":   record.ParticipantID,
+		"participant_type": record.ParticipantType,
+		"tier":             record.Tier,
+		"replica_count":    record.ReplicaCount,
+		"ready":            record.Ready,
+		"failure_reason":   record.FailureReason,
+		"duration":         record.Duration,
+	}
+}
+
+func activationControllerTools() []string {
+	return []string{claims.ActivationControllerToolActivate, claims.ActivationControllerToolDeactivate, claims.ActivationControllerToolQueryTier}
+}
+
+func activationControllerRecordClasses() []string {
+	return []string{"ready", "failed", "interrupted"}
+}
+
+func activationControllerRecordCapacity() int {
+	return len(activationControllerTools()) * len(activationControllerRecordClasses())
+}
+
+func activationControllerTimeout() time.Duration {
+	return time.Duration(activationControllerRecordCapacity()) * time.Second
+}
+
+func activationBoardSessionID(board *claims.ClaimsBoard) string {
 	if board == nil {
 		return ""
 	}
-	action := claims.Action{
-		AgentID: activationClaimsAgent,
-		Type:    claims.ActionTypeActivation,
-	}
-	claim := claims.Claim{
-		Title:       fmt.Sprintf("Activate %s", agentType),
-		Description: fmt.Sprintf("Activate agent type %s for the current session", agentType),
-		ActionType:  claims.ActionTypeActivation,
-		Relations: []claims.Relation{
-			{Related: activationClaimsAgent, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-			{Related: agentType, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-		},
-		Validations: []*claims.Validation{{
-			Type:        claims.ValidationTypeReceipt,
-			Required:    true,
-			Description: fmt.Sprintf("Agent %s activation acknowledged", agentType),
-			Status:      claims.ValidationStatusPending,
-		}},
-	}
-	posted := []claims.Claim{claim}
-	if err := board.PostAction(ctx, action, posted); err != nil {
-		slog.Warn("activation_claim_post_failed", "agent_type", agentType, "error", err.Error())
-		return ""
-	}
-	if len(posted) > 0 {
-		return posted[0].ID
-	}
-	return ""
-}
-
-func submitActivationTestament(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, c *container.Container) {
-	if board == nil || claimID == "" {
-		return
-	}
-	agentID := ""
-	ready := false
-	if c != nil {
-		agentID = string(c.ID())
-		ready = c.IsReady()
-	}
-	action := claims.Action{AgentID: activationClaimsAgent, Type: claims.ActionTypeTestament}
-	testament := claims.Testament{
-		AgentID:    activationClaimsAgent,
-		Summary:    fmt.Sprintf("Agent %s activated (ready=%t)", agentType, ready),
-		Confidence: "high",
-		Artifacts: []*claims.Artifact{
-			{Kind: claims.ArtifactKindAgentID, Reference: agentID, AgentID: activationClaimsAgent},
-			{Kind: claims.ArtifactKindReadiness, Reference: fmt.Sprintf("%t", ready), AgentID: activationClaimsAgent},
-		},
-		Relations: lifecycleClaimRelation(claimID),
-	}
-	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
-		slog.Warn("activation_testament_failed", "agent_type", agentType, "error", err.Error())
-	}
-}
-
-func submitActivationErrorTestament(ctx context.Context, board *claims.ClaimsBoard, agentType, claimID string, activationErr error) {
-	if board == nil || claimID == "" {
-		return
-	}
-	action := claims.Action{AgentID: activationClaimsAgent, Type: claims.ActionTypeTestament}
-	testament := claims.Testament{
-		AgentID:    activationClaimsAgent,
-		Summary:    fmt.Sprintf("Agent %s activation failed: %s", agentType, activationErr.Error()),
-		Confidence: "high",
-		Artifacts: []*claims.Artifact{
-			{Kind: claims.ArtifactKindError, Reference: activationErr.Error(), AgentID: activationClaimsAgent},
-		},
-		Relations: lifecycleClaimRelation(claimID),
-	}
-	if err := board.SubmitTestaments(ctx, action, []claims.Testament{testament}); err != nil {
-		slog.Warn("activation_error_testament_failed", "agent_type", agentType, "error", err.Error())
-	}
+	return board.SessionID()
 }
 
 // ────────────────────────────────────────────────────────────────────

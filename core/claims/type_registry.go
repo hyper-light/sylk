@@ -346,6 +346,9 @@ func RegisterBuiltinArtifactDataTypes(registry *TypeRegistry) error {
 		{ArtifactDataTypeGuardianDecision, GuardianDecisionArtifactData{}},
 		{ArtifactDataTypeProviderGatewayCall, ProviderGatewayCallArtifactData{}},
 		{ArtifactDataTypeExternalAdapterEvent, ExternalAdapterEventArtifactData{}},
+		{ArtifactDataTypeSessionLifecycle, SessionLifecycleArtifactData{}},
+		{ArtifactDataTypeFabricSubscription, FabricSubscriptionArtifactData{}},
+		{ArtifactDataTypeBusTransport, BusTransportArtifactData{}},
 		{ArtifactDataTypeRecoveryIdempotency, RecoveryIdempotencyArtifactData{}},
 	}
 	for _, entry := range entries {

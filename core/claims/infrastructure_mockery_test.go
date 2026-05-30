@@ -148,6 +148,76 @@ func TestInfrastructureValidatorDispatcherWithMockeryHandler(t *testing.T) {
 	handler.AssertExpectations(t)
 }
 
+func TestSystemParticipantServiceE2EWithMockerySubscriberAndScope(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "mockery-system-board", SessionID: "mockery-session", TaskID: "task"})
+	participant, err := claims.NewParticipantRegistration(claims.ParticipantCategoryService, "sys:fabric_subscriber", map[string]string{"session_id": board.SessionID()}, 8, 1, time.Second, claims.HandlerDeterminismContent, []claims.ActionType{claims.ActionTypeTask})
+	if err != nil {
+		t.Fatalf("NewParticipantRegistration: %v", err)
+	}
+
+	subscription := &claimsmocks.DeltaSubscription{}
+	subscription.On("Unsubscribe").Return(nil).Once()
+	subscriber := &claimsmocks.DeltaSubscriber{}
+	var captured claims.DeltaHandler
+	wantTopic := claims.CanonicalAgentRefTopic(board.SessionID(), participant.AgentRef(), claims.DeltaActionClaimPosted)
+	subscriber.On("SubscribeDelta", wantTopic, mock.Anything).Run(func(args mock.Arguments) {
+		captured = args.Get(1).(claims.DeltaHandler)
+	}).Return(subscription, nil).Once()
+
+	scope := &claimsmocks.ScopeProvider{}
+	scope.On("Go", mock.Anything, mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		fn := args.Get(2).(func(context.Context) error)
+		if err := fn(context.Background()); err != nil {
+			t.Errorf("scoped fabric dispatch: %v", err)
+		}
+	}).Return(nil).Once()
+
+	dispatcher, err := claims.NewServiceDispatcher(claims.ServiceDispatcherConfig{
+		Board:       board,
+		Subscriber:  subscriber,
+		Scope:       scope,
+		Participant: participant,
+		Handler:     claims.NewFabricSubscriberService(claims.SystemParticipantServiceConfig{}),
+	})
+	if err != nil {
+		t.Fatalf("NewServiceDispatcher: %v", err)
+	}
+	if err := dispatcher.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("mockery subscriber did not capture handler")
+	}
+
+	claimID := postMockeryInfrastructureClaim(t, board, participant.RouteKey, claims.FabricSubscriberToolAttach, map[string]any{
+		"session_id": board.SessionID(),
+		"agent_id":   "guide",
+		"topic":      "claims.guide",
+		"attached":   true,
+	})
+	captured(mockeryClaimPostedDelta(board, claimID, participant, claims.ActionTypeTask))
+
+	testaments := board.TestamentsByClaim(claimID)
+	if len(testaments) != 1 {
+		t.Fatalf("testaments = %d, want 1", len(testaments))
+	}
+	artifact := testaments[0].Artifacts[0]
+	data, err := claims.ArtifactData[claims.FabricSubscriptionArtifactData](artifact)
+	if err != nil {
+		t.Fatalf("fabric artifact data: %v", err)
+	}
+	if data.SessionID != board.SessionID() || data.AgentID != "guide" || !data.Attached || data.Status != claims.InfrastructureStatusOK {
+		t.Fatalf("fabric data = %+v, want attached guide subscription", data)
+	}
+
+	if err := dispatcher.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	subscriber.AssertExpectations(t)
+	subscription.AssertExpectations(t)
+	scope.AssertExpectations(t)
+}
+
 func postMockeryInfrastructureClaim(t *testing.T, board *claims.ClaimsBoard, subject, tool string, args map[string]any) string {
 	t.Helper()
 	generated, err := board.GenerateClaimAction(context.Background(), claims.Action{AgentID: "issuer", Type: claims.ActionTypeTask}, []claims.Claim{{

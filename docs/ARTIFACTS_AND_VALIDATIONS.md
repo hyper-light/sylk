@@ -1413,6 +1413,9 @@ strings:
 | Guardian decision evidence | `sylk.infrastructure.guardian_decision.v1` |
 | Provider gateway call evidence | `sylk.infrastructure.provider_gateway_call.v1` |
 | External adapter event evidence | `sylk.infrastructure.external_adapter_event.v1` |
+| Session lifecycle evidence | `sylk.infrastructure.session_lifecycle.v1` |
+| Fabric subscription evidence | `sylk.infrastructure.fabric_subscription.v1` |
+| Bus transport evidence | `sylk.infrastructure.bus_transport.v1` |
 | Recovery idempotency evidence | `sylk.infrastructure.recovery_idempotency.v1` |
 
 Registration of a typed validator via `RegisterValidator[T, R]`
