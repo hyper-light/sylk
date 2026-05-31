@@ -724,6 +724,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"session_id", cfg.SessionID,
 			"bus_nil", cfg.Bus == nil,
 		)
+		claims.RouteFlowDebugLog().Info("claims_route_flow_intake_skipped_insufficient_config",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"bus_nil", cfg.Bus == nil,
+		)
 		return nil
 	}
 	role := cfg.Role
@@ -752,6 +757,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"session_id", cfg.SessionID,
 			"role", role,
 		)
+		claims.RouteFlowDebugLog().Info("claims_route_flow_intake_missing_identity",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
+		)
 		return nil
 	}
 	// A missing scope means OnResolved would fall back to running
@@ -770,6 +780,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"reason", "ProcessEntry needs a scope to dispatch async; without it accumulator flushes drop and OnResolved blocks the bus",
 		)
 		claims.RouteDebugLog().Info("claims_intake_missing_scope",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
+		)
+		claims.RouteFlowDebugLog().Info("claims_route_flow_intake_missing_scope",
 			"agent_id", cfg.AgentID,
 			"session_id", cfg.SessionID,
 			"role", role,
@@ -800,6 +815,16 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 		"factory_present", cfg.Factory != nil,
 		"patterns", claims.InboxPatternsFor(role, cfg.SessionID, cfg.AgentID),
 	)
+	claims.RouteFlowDebugLog().Info("claims_route_flow_intake_wiring",
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"role", role,
+		"board_present", cfg.Board != nil,
+		"scope_present", cfg.Scope != nil,
+		"identity_present", cfg.Identity != nil,
+		"factory_present", cfg.Factory != nil,
+		"patterns", claims.InboxPatternsFor(role, cfg.SessionID, cfg.AgentID),
+	)
 
 	inbox, err := claims.NewClaimsInbox(claims.InboxConfig{
 		AgentID:        cfg.AgentID,
@@ -812,6 +837,15 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			if entry == nil {
 				return
 			}
+			claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_start", entry.Delta,
+				"agent_id", cfg.AgentID,
+				"session_id", cfg.SessionID,
+				"role", role,
+				"claim_id", entryClaimID(entry),
+				"node_has_claim", entry.Node.Claim != nil,
+				"node_has_testament", entry.Node.Testament != nil,
+				"node_has_validation", entry.Node.Validation != nil,
+			)
 			if !acknowledgeLifecycleReceipt(cfg, role, entry) {
 				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
 					append([]any{
@@ -819,6 +853,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 						"session_id", cfg.SessionID,
 						"reason", "lifecycle_receipt_not_acknowledged",
 					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_stopped", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"reason", "lifecycle_receipt_not_acknowledged",
 				)
 				return
 			}
@@ -831,6 +870,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 						"reason", "delivered_to_continuation",
 					}, claims.DeltaDebugArgs(entry.Delta)...)...,
 				)
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_stopped", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"reason", "delivered_to_continuation",
+				)
 				return
 			}
 			if expectedValidationToolsScheduled {
@@ -840,6 +884,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 						"session_id", cfg.SessionID,
 						"reason", "expected_validation_tools_scheduled",
 					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_stopped", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"reason", "expected_validation_tools_scheduled",
 				)
 				return
 			}
@@ -862,6 +911,13 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 						"reason", "suppressed_forwarded_prompt_entry",
 						"claim_id", claimID,
 					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_stopped", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"role", role,
+					"reason", "suppressed_forwarded_prompt_entry",
+					"claim_id", claimID,
 				)
 				return
 			}
@@ -887,11 +943,45 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 					"factory_present", cfg.Factory != nil,
 				}, claims.DeltaDebugArgs(entry.Delta)...)...,
 			)
+			claims.TraceRouteFlowDelta("claims_route_flow_intake_resolved", entry.Delta,
+				"agent_id", cfg.AgentID,
+				"session_id", cfg.SessionID,
+				"node_has_claim", entry.Node.Claim != nil,
+				"node_has_testament", entry.Node.Testament != nil,
+				"node_has_validation", entry.Node.Validation != nil,
+				"identity_present", cfg.Identity != nil,
+				"factory_present", cfg.Factory != nil,
+			)
 			if cfg.Scope != nil && cfg.ProcessEntry != nil {
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_dispatch_scope_start", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"claim_id", entryClaimID(entry),
+				)
 				if err := cfg.Scope.Go("process_claim", 0, func(ctx context.Context) error {
 					runCtx, reg := claimIntakeContext(ctx, cfg, entryClaimID(entry))
 					defer reg.Done()
-					return cfg.ProcessEntry(stampClaimsIntakeContext(runCtx, cfg, entry), entry)
+					claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_start", entry.Delta,
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"claim_id", entryClaimID(entry),
+					)
+					err := cfg.ProcessEntry(stampClaimsIntakeContext(runCtx, cfg, entry), entry)
+					if err != nil {
+						claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_failed", entry.Delta,
+							"agent_id", cfg.AgentID,
+							"session_id", cfg.SessionID,
+							"claim_id", entryClaimID(entry),
+							"error", err.Error(),
+						)
+						return err
+					}
+					claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_done", entry.Delta,
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"claim_id", entryClaimID(entry),
+					)
+					return nil
 				}); err != nil {
 					slog.Error("claims_intake_dispatch_failed",
 						"agent_id", cfg.AgentID,
@@ -904,13 +994,29 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 							"error", err.Error(),
 						}, claims.DeltaDebugArgs(entry.Delta)...)...,
 					)
+					claims.TraceRouteFlowDelta("claims_route_flow_intake_dispatch_failed", entry.Delta,
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"claim_id", entryClaimID(entry),
+						"error", err.Error(),
+					)
 				}
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_dispatch_scheduled", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"claim_id", entryClaimID(entry),
+				)
 				return
 			}
 			if cfg.ProcessEntry != nil {
 				runCtx, reg := claimIntakeContext(context.Background(), cfg, entryClaimID(entry))
 				defer reg.Done()
 				ctx := stampClaimsIntakeContext(runCtx, cfg, entry)
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_inline_start", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"claim_id", entryClaimID(entry),
+				)
 				if err := cfg.ProcessEntry(ctx, entry); err != nil {
 					slog.Error("claims_intake_process_failed",
 						"agent_id", cfg.AgentID,
@@ -923,7 +1029,19 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 							"error", err.Error(),
 						}, claims.DeltaDebugArgs(entry.Delta)...)...,
 					)
+					claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_inline_failed", entry.Delta,
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"claim_id", entryClaimID(entry),
+						"error", err.Error(),
+					)
+					return
 				}
+				claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_inline_done", entry.Delta,
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"claim_id", entryClaimID(entry),
+				)
 			}
 		},
 	})
@@ -933,6 +1051,12 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"error", err.Error(),
 		)
 		claims.RouteDebugLog().Info("claims_intake_create_failed",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
+			"error", err.Error(),
+		)
+		claims.RouteFlowDebugLog().Info("claims_route_flow_intake_create_failed",
 			"agent_id", cfg.AgentID,
 			"session_id", cfg.SessionID,
 			"role", role,
@@ -1052,6 +1176,11 @@ func acknowledgeClaimPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDelta)
 	if claimID == "" {
 		return true
 	}
+	claims.TraceRouteFlowDelta("claims_route_flow_intake_claim_receipt_ack_start", delta,
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", claimID,
+	)
 	if err := cfg.Board.AcknowledgeClaimReceipt(context.Background(), claimID, cfg.AgentID); err != nil {
 		_ = cfg.Board.RecordClaimReceiptFailure(context.Background(), claimID, cfg.AgentID, claims.LifecycleFailureOptions{
 			Reason:       err.Error(),
@@ -1063,8 +1192,19 @@ func acknowledgeClaimPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDelta)
 			"claim_id", claimID,
 			"error", err.Error(),
 		)
+		claims.TraceRouteFlowDelta("claims_route_flow_intake_claim_receipt_ack_failed", delta,
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
 		return false
 	}
+	claims.TraceRouteFlowDelta("claims_route_flow_intake_claim_receipt_ack_done", delta,
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", claimID,
+	)
 	return true
 }
 
@@ -1073,6 +1213,12 @@ func acknowledgeTestamentPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDe
 	if testamentID == "" {
 		return true
 	}
+	claims.TraceRouteFlowDelta("claims_route_flow_intake_testament_receipt_ack_start", delta,
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", strings.TrimSpace(delta.ClaimID()),
+		"testament_id", testamentID,
+	)
 	if err := cfg.Board.AcknowledgeTestamentReceipt(context.Background(), testamentID, cfg.AgentID); err != nil {
 		claimID := strings.TrimSpace(delta.ClaimID())
 		if claimID != "" {
@@ -1087,8 +1233,21 @@ func acknowledgeTestamentPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDe
 			"testament_id", testamentID,
 			"error", err.Error(),
 		)
+		claims.TraceRouteFlowDelta("claims_route_flow_intake_testament_receipt_ack_failed", delta,
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", claimID,
+			"testament_id", testamentID,
+			"error", err.Error(),
+		)
 		return false
 	}
+	claims.TraceRouteFlowDelta("claims_route_flow_intake_testament_receipt_ack_done", delta,
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"claim_id", strings.TrimSpace(delta.ClaimID()),
+		"testament_id", testamentID,
+	)
 	return true
 }
 
@@ -1338,20 +1497,58 @@ type EventBusDeltaSubscriber struct {
 // message matching the pattern.
 func (s *EventBusDeltaSubscriber) SubscribeDelta(pattern string, handler claims.DeltaHandler) (claims.DeltaSubscription, error) {
 	if s.bus == nil {
+		claims.RouteFlowDebugLog().Info("claims_route_flow_event_bus_subscribe_noop",
+			"pattern", pattern,
+		)
 		return claims.NoopDeltaBus{}.SubscribeDelta(pattern, handler)
 	}
 	sub, err := s.bus.SubscribeAsync(pattern, func(msg *guide.Message) error {
 		delta, extractErr := guide.ExtractClaimsDelta(msg)
-		if extractErr != nil || delta == nil {
+		if extractErr != nil {
+			claims.RouteFlowDebugLog().Info("claims_route_flow_event_bus_extract_failed",
+				"pattern", pattern,
+				"message_id", messageIDForClaimsDebug(msg),
+				"message_type", messageTypeForClaimsDebug(msg),
+				"error", extractErr.Error(),
+			)
 			return nil
 		}
+		if delta == nil {
+			return nil
+		}
+		claims.TraceRouteFlowDelta("claims_route_flow_event_bus_delivered", delta,
+			"pattern", pattern,
+			"message_id", messageIDForClaimsDebug(msg),
+			"message_type", messageTypeForClaimsDebug(msg),
+		)
 		handler(delta)
 		return nil
 	})
 	if err != nil {
+		claims.RouteFlowDebugLog().Info("claims_route_flow_event_bus_subscribe_failed",
+			"pattern", pattern,
+			"error", err.Error(),
+		)
 		return nil, err
 	}
+	claims.RouteFlowDebugLog().Info("claims_route_flow_event_bus_subscribed",
+		"pattern", pattern,
+	)
 	return &eventBusDeltaSub{sub: sub}, nil
+}
+
+func messageIDForClaimsDebug(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.ID
+}
+
+func messageTypeForClaimsDebug(msg *guide.Message) string {
+	if msg == nil {
+		return ""
+	}
+	return string(msg.Type)
 }
 
 type eventBusDeltaSub struct {

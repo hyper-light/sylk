@@ -84,6 +84,13 @@ func truncateLogStr(s string, max int) string {
 	return s[:max] + "..."
 }
 
+func errStringForRouteFlow(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 // defaultGuideRequestTimeout bounds the entire request lifecycle:
 // classification + activation + self-response (or routing handoff).
 // Individual phases (classification 60s, self-response 90s) inherit and
@@ -1521,6 +1528,13 @@ func classificationTargetAgentID(targetAgentID string, classification *RouteResu
 	return string(classification.TargetAgent)
 }
 
+func classificationIntentForDebug(classification *RouteResult) string {
+	if classification == nil {
+		return ""
+	}
+	return string(classification.Intent)
+}
+
 func (g *Guide) classificationSupportedByTarget(classification *RouteResult, targetAgentID string) bool {
 	if classification == nil || targetAgentID == "" {
 		return false
@@ -1741,16 +1755,36 @@ func (g *Guide) persistentPodID(idOrName string) string {
 // agent cannot be activated or remains unresolvable after activation.
 func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID string) (string, error) {
 	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
+		claims.RouteFlowDebugLog().Info("guide_target_ready_existing",
+			"target_agent", targetAgentID,
+			"resolved_agent", resolved,
+			"pod_id", g.resolvePodID(targetAgentID),
+			"activation_type", g.resolveActivationType(targetAgentID),
+		)
 		return resolved, nil
 	}
 	if g.activator == nil && g.agentRegistrar == nil && g.resolveAgent(targetAgentID) != nil {
-		return g.resolveAgentID(targetAgentID), nil
+		resolved := g.resolveAgentID(targetAgentID)
+		claims.RouteFlowDebugLog().Info("guide_target_ready_registry_only",
+			"target_agent", targetAgentID,
+			"resolved_agent", resolved,
+			"pod_id", g.resolvePodID(targetAgentID),
+			"activation_type", g.resolveActivationType(targetAgentID),
+		)
+		return resolved, nil
 	}
 
 	// Resolve UUID → pod ID for the activation controller, which indexes
 	// by pod ID, not by agent UUID.
 	activationType := g.resolveActivationType(targetAgentID)
 	podID := g.resolvePodID(targetAgentID)
+	claims.RouteFlowDebugLog().Info("guide_target_activation_resolution",
+		"target_agent", targetAgentID,
+		"pod_id", podID,
+		"activation_type", activationType,
+		"activator_present", g.activator != nil,
+		"registrar_present", g.agentRegistrar != nil,
+	)
 
 	if g.activator != nil {
 		deadline, hasDL := ctx.Deadline()
@@ -1759,17 +1793,37 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 			"pod_id", podID,
 			"has_deadline", hasDL,
 			"deadline", deadline)
+		claims.RouteFlowDebugLog().Info("guide_target_activation_start",
+			"target_agent", targetAgentID,
+			"pod_id", podID,
+			"activation_type", activationType,
+			"has_deadline", hasDL,
+			"deadline", deadline,
+		)
 		activateStart := time.Now()
 		if err := g.activator.EnsurePodActive(ctx, podID); err != nil {
 			guideFileLog().Info("DEBUG: guide_ensure_active_failed",
 				"target", targetAgentID,
 				"elapsed_ms", time.Since(activateStart).Milliseconds(),
 				"error", err)
+			claims.RouteFlowDebugLog().Info("guide_target_activation_failed",
+				"target_agent", targetAgentID,
+				"pod_id", podID,
+				"activation_type", activationType,
+				"elapsed_ms", time.Since(activateStart).Milliseconds(),
+				"error", err.Error(),
+			)
 			return "", fmt.Errorf("activate %s: %w", targetAgentID, err)
 		}
 		guideFileLog().Info("DEBUG: guide_ensure_active_ok",
 			"target", targetAgentID,
 			"elapsed_ms", time.Since(activateStart).Milliseconds())
+		claims.RouteFlowDebugLog().Info("guide_target_activation_done",
+			"target_agent", targetAgentID,
+			"pod_id", podID,
+			"activation_type", activationType,
+			"elapsed_ms", time.Since(activateStart).Milliseconds(),
+		)
 
 		// Activation testament.
 		g.guideSubmitTestamentAsync(g.sessionID, guideTestament(
@@ -1784,12 +1838,33 @@ func (g *Guide) ensureExplicitTargetReady(ctx context.Context, targetAgentID str
 		))
 	}
 	if g.agentRegistrar != nil {
+		claims.RouteFlowDebugLog().Info("guide_target_registrar_start",
+			"target_agent", targetAgentID,
+			"pod_id", podID,
+			"activation_type", activationType,
+		)
 		g.agentRegistrar(podID, activationType)
+		claims.RouteFlowDebugLog().Info("guide_target_registrar_done",
+			"target_agent", targetAgentID,
+			"pod_id", podID,
+			"activation_type", activationType,
+		)
 	}
 
 	if resolved := g.resolveReadyAgentID(targetAgentID); resolved != "" {
+		claims.RouteFlowDebugLog().Info("guide_target_ready_after_activation",
+			"target_agent", targetAgentID,
+			"resolved_agent", resolved,
+			"pod_id", podID,
+			"activation_type", activationType,
+		)
 		return resolved, nil
 	}
+	claims.RouteFlowDebugLog().Info("guide_target_ready_missing_after_activation",
+		"target_agent", targetAgentID,
+		"pod_id", podID,
+		"activation_type", activationType,
+	)
 	return "", fmt.Errorf("agent %q not available after activation", targetAgentID)
 }
 
@@ -2263,6 +2338,17 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 		"target_agent", classificationTargetAgentID("", classification),
 		"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
 	)
+	claims.RouteFlowDebugLog().Info("guide_route_build_forwarded_start",
+		"session_id", request.SessionID,
+		"correlation_id", correlationID,
+		"source_agent", request.SourceAgentID,
+		"target_agent", classificationTargetAgentID("", classification),
+		"intent", classificationIntentForDebug(classification),
+		"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
+		"fire_and_forget", request.FireAndForget,
+		"has_parent_claim_id", metadataHasNonEmptyString(metadata, "parent_claim_id"),
+		"has_control_plane_kind", metadataHasNonEmptyString(metadata, "control_plane_kind"),
+	)
 
 	if board := g.sessionClaimsBoard(request.SessionID); board != nil {
 		metadata = mergeForwardMetadata(metadata, map[string]any{
@@ -2274,7 +2360,19 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 			"board_id", board.BoardID(),
 			"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
 		)
+		claims.RouteFlowDebugLog().Info("guide_route_board_resolved",
+			"session_id", request.SessionID,
+			"correlation_id", correlationID,
+			"board_id", board.BoardID(),
+			"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
+		)
 		if shouldPostRoutedWorkClaim(request, metadata) {
+			claims.RouteFlowDebugLog().Info("guide_route_claim_native_target_ready_check_start",
+				"session_id", request.SessionID,
+				"correlation_id", correlationID,
+				"target_agent", classificationTargetAgentID("", classification),
+				"board_id", board.BoardID(),
+			)
 			if err := g.ensureClaimNativeRoutedWorkTarget(ctx, classification); err != nil {
 				claims.RouteDebugLog().Info("guide_claim_native_target_failed",
 					"session_id", request.SessionID,
@@ -2282,11 +2380,37 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 					"target_agent", classificationTargetAgentID("", classification),
 					"error", err.Error(),
 				)
+				claims.RouteFlowDebugLog().Info("guide_route_claim_native_target_ready_check_failed",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"board_id", board.BoardID(),
+					"error", err.Error(),
+				)
 				return nil, err
 			}
+			claims.RouteFlowDebugLog().Info("guide_route_claim_native_target_ready_check_done",
+				"session_id", request.SessionID,
+				"correlation_id", correlationID,
+				"target_agent", classificationTargetAgentID("", classification),
+				"board_id", board.BoardID(),
+			)
+			claims.RouteFlowDebugLog().Info("guide_route_routed_work_claim_dispatch_start",
+				"session_id", request.SessionID,
+				"correlation_id", correlationID,
+				"target_agent", classificationTargetAgentID("", classification),
+				"board_id", board.BoardID(),
+			)
 			routeClaimID, err := g.dispatchRoutedWorkClaim(board, request, classification)
 			if err != nil {
 				claims.RouteDebugLog().Info("guide_routed_work_claim_dispatch_failed",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"board_id", board.BoardID(),
+					"error", err.Error(),
+				)
+				claims.RouteFlowDebugLog().Info("guide_route_routed_work_claim_dispatch_failed",
 					"session_id", request.SessionID,
 					"correlation_id", correlationID,
 					"target_agent", classificationTargetAgentID("", classification),
@@ -2302,9 +2426,22 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 					"target_agent", classificationTargetAgentID("", classification),
 					"board_id", board.BoardID(),
 				)
+				claims.RouteFlowDebugLog().Info("guide_route_routed_work_claim_dispatch_empty",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"board_id", board.BoardID(),
+				)
 				return nil, fmt.Errorf("claim-native routed work claim was not posted")
 			}
 			claims.RouteDebugLog().Info("guide_routed_work_claim_dispatched",
+				"session_id", request.SessionID,
+				"correlation_id", correlationID,
+				"target_agent", classificationTargetAgentID("", classification),
+				"board_id", board.BoardID(),
+				"claim_id", routeClaimID,
+			)
+			claims.RouteFlowDebugLog().Info("guide_route_routed_work_claim_dispatch_done",
 				"session_id", request.SessionID,
 				"correlation_id", correlationID,
 				"target_agent", classificationTargetAgentID("", classification),
@@ -2319,6 +2456,11 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 		}
 	} else if shouldPostRoutedWorkClaim(request, metadata) {
 		claims.RouteDebugLog().Info("guide_session_board_missing",
+			"session_id", request.SessionID,
+			"correlation_id", correlationID,
+			"target_agent", classificationTargetAgentID("", classification),
+		)
+		claims.RouteFlowDebugLog().Info("guide_route_session_board_missing",
 			"session_id", request.SessionID,
 			"correlation_id", correlationID,
 			"target_agent", classificationTargetAgentID("", classification),
@@ -2345,6 +2487,14 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 		ConversationHistory:  g.conversationHistory(request.SessionID, string(classification.TargetAgent)),
 		Metadata:             metadata,
 	}
+	claims.RouteFlowDebugLog().Info("guide_route_build_forwarded_done",
+		"session_id", request.SessionID,
+		"correlation_id", correlationID,
+		"target_agent", fwd.TargetAgentID,
+		"intent", string(fwd.Intent),
+		"claim_native_routing", metadataBool(metadata, "claim_native_routing"),
+		"routed_work_claim_id", metadataString(metadata, "routed_work_claim_id"),
+	)
 	return fwd, nil
 }
 
@@ -2446,13 +2596,28 @@ func metadataHasNonEmptyString(metadata map[string]any, key string) bool {
 func (g *Guide) ensureClaimNativeRoutedWorkTarget(ctx context.Context, classification *RouteResult) error {
 	target := classificationTargetAgentID("", classification)
 	if strings.TrimSpace(target) == "" {
+		claims.RouteFlowDebugLog().Info("guide_claim_native_target_missing")
 		return fmt.Errorf("claim-native routed work target agent is required")
 	}
 	if g.isGuideTarget(target) {
+		claims.RouteFlowDebugLog().Info("guide_claim_native_target_is_guide",
+			"target_agent", target,
+		)
 		return nil
 	}
+	start := time.Now()
+	claims.RouteFlowDebugLog().Info("guide_claim_native_target_ready_start",
+		"target_agent", target,
+		"pod_id", g.resolvePodID(target),
+		"activation_type", g.resolveActivationType(target),
+	)
 	resolved, err := g.ensureExplicitTargetReady(ctx, target)
 	if err != nil {
+		claims.RouteFlowDebugLog().Info("guide_claim_native_target_ready_failed",
+			"target_agent", target,
+			"elapsed_ms", time.Since(start).Milliseconds(),
+			"error", err.Error(),
+		)
 		return fmt.Errorf("claim-native route target %s not ready: %w", target, err)
 	}
 	if strings.TrimSpace(resolved) != "" {
@@ -2461,6 +2626,11 @@ func (g *Guide) ensureClaimNativeRoutedWorkTarget(ctx context.Context, classific
 	if g.activator != nil {
 		g.activator.TouchPodActivity(g.resolvePodID(firstNonEmptyString(resolved, target)))
 	}
+	claims.RouteFlowDebugLog().Info("guide_claim_native_target_ready_done",
+		"target_agent", target,
+		"resolved_agent", resolved,
+		"elapsed_ms", time.Since(start).Milliseconds(),
+	)
 	return nil
 }
 
@@ -3849,14 +4019,38 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 
 	routeStart := time.Now()
 	guideFileLog().Info("DEBUG: route_start", "correlation_id", correlationID, "input_preview", truncateLogStr(req.Input, 80))
+	claims.RouteFlowDebugLog().Info("guide_route_request_route_start",
+		"session_id", req.SessionID,
+		"correlation_id", correlationID,
+		"source_agent", req.SourceAgentID,
+		"target_agent", req.TargetAgentID,
+		"input_len", len(req.Input),
+		"input_preview", truncateLogStr(req.Input, 120),
+	)
 	forwarded, err := g.routeWithRetry(reqCtx, req, correlationID, req.SourceAgentID, vis)
 	guideFileLog().Info("DEBUG: route_done", "correlation_id", correlationID, "elapsed_ms", time.Since(routeStart).Milliseconds(), "error", err)
+	claims.RouteFlowDebugLog().Info("guide_route_request_route_done",
+		"session_id", req.SessionID,
+		"correlation_id", correlationID,
+		"elapsed_ms", time.Since(routeStart).Milliseconds(),
+		"error", errStringForRouteFlow(err),
+	)
 	if err != nil {
 		if g.isInterruptError(err) {
 			guideFileLog().Info("DEBUG: route_interrupted", "correlation_id", correlationID, "error", err)
+			claims.RouteFlowDebugLog().Info("guide_route_request_interrupted",
+				"session_id", req.SessionID,
+				"correlation_id", correlationID,
+				"error", err.Error(),
+			)
 			return nil
 		}
 		guideFileLog().Info("DEBUG: route_error", "correlation_id", correlationID, "error", err)
+		claims.RouteFlowDebugLog().Info("guide_route_request_failed",
+			"session_id", req.SessionID,
+			"correlation_id", correlationID,
+			"error", err.Error(),
+		)
 		return g.publishRouteError(correlationID, req.SourceAgentID, err)
 	}
 	if g.requestInterrupted(req) {
@@ -3881,6 +4075,17 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		return fmt.Errorf("no pending request found for correlation ID: %s", forwarded.CorrelationID)
 	}
 	guideFileLog().Info("DEBUG: route_resolved", "correlation_id", correlationID, "target", resolvedTarget, "is_guide", g.isGuideTarget(resolvedTarget))
+	claims.RouteFlowDebugLog().Info("guide_route_request_resolved",
+		"session_id", req.SessionID,
+		"correlation_id", correlationID,
+		"forwarded_correlation_id", forwarded.CorrelationID,
+		"resolved_source", resolvedSource,
+		"resolved_target", resolvedTarget,
+		"is_guide", g.isGuideTarget(resolvedTarget),
+		"fire_and_forget", forwarded.FireAndForget,
+		"claim_native_routing", isClaimNativeRoutedWork(forwarded),
+		"routed_work_claim_id", metadataString(forwarded.Metadata, "routed_work_claim_id"),
+	)
 	if g.isGuideTarget(resolvedTarget) {
 		if pending == nil {
 			return fmt.Errorf("fire-and-forget guide-target requests require explicit handling: %s", forwarded.CorrelationID)
@@ -3893,10 +4098,23 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 			"correlation_id", forwarded.CorrelationID,
 			"target", resolvedTarget,
 			"claim_id", metadataString(forwarded.Metadata, "routed_work_claim_id"))
+		claims.RouteFlowDebugLog().Info("guide_route_request_claim_native_handoff_done",
+			"session_id", req.SessionID,
+			"correlation_id", forwarded.CorrelationID,
+			"resolved_source", resolvedSource,
+			"resolved_target", resolvedTarget,
+			"routed_work_claim_id", metadataString(forwarded.Metadata, "routed_work_claim_id"),
+		)
 		g.pending.Remove(forwarded.CorrelationID)
 		return nil
 	}
 	g.publishRouteHandoffProgress(forwarded.CorrelationID, resolvedSource, resolvedTarget, vis)
+	claims.RouteFlowDebugLog().Info("guide_route_request_publish_forwarded_legacy",
+		"session_id", req.SessionID,
+		"correlation_id", forwarded.CorrelationID,
+		"resolved_source", resolvedSource,
+		"resolved_target", resolvedTarget,
+	)
 	return g.publishForwardedRequest(resolvedTarget, forwarded, msg.ReplyTo)
 }
 

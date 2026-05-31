@@ -260,6 +260,9 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	if entry == nil {
 		return nil
 	}
+	claims.RouteFlowDebugLog().Info("architect_route_flow_process_claims_entry_start",
+		append(a.claimsEntryRouteFlowArgs(entry), claims.DeltaDebugArgs(entry.Delta)...)...,
+	)
 	claims.RouteDebugLog().Info("architect_process_claims_entry_start",
 		append([]any{
 			"agent_id", a.id,
@@ -271,6 +274,10 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	)
 	planner := a.ensurePlanner(ctx)
 	if planner == nil {
+		claims.RouteFlowDebugLog().Info("architect_route_flow_process_claims_entry_failed",
+			append(a.claimsEntryRouteFlowArgs(entry),
+				append([]any{"reason", "planner_not_configured"}, claims.DeltaDebugArgs(entry.Delta)...)...)...,
+		)
 		claims.RouteDebugLog().Info("architect_process_claims_entry_failed",
 			append([]any{
 				"agent_id", a.id,
@@ -320,12 +327,18 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 		SessionID:     a.config.SessionID,
 	})
 
+	claims.RouteFlowDebugLog().Info("architect_route_flow_llm_turn_start",
+		append(a.claimsEntryRouteFlowArgs(entry), claims.DeltaDebugArgs(entry.Delta)...)...,
+	)
 	result, err := shared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {
 		return a.executeToolLoop(ctx, req, "claims_entry", nil, ledger)
 	})
 	if err != nil {
 		if shared.IsConsultYielded(err) {
 			slog.Info("architect_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			claims.RouteFlowDebugLog().Info("architect_route_flow_process_claims_entry_yielded",
+				append(a.claimsEntryRouteFlowArgs(entry), claims.DeltaDebugArgs(entry.Delta)...)...,
+			)
 			claims.RouteDebugLog().Info("architect_process_claims_entry_yielded",
 				append([]any{
 					"agent_id", a.id,
@@ -335,6 +348,10 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 			return nil
 		}
 		slog.Error("architect_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
+		claims.RouteFlowDebugLog().Info("architect_route_flow_process_claims_entry_failed",
+			append(a.claimsEntryRouteFlowArgs(entry),
+				append([]any{"error", err.Error()}, claims.DeltaDebugArgs(entry.Delta)...)...)...,
+		)
 		claims.RouteDebugLog().Info("architect_process_claims_entry_failed",
 			append([]any{
 				"agent_id", a.id,
@@ -354,7 +371,36 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 			"result_length", len(result),
 		}, claims.DeltaDebugArgs(entry.Delta)...)...,
 	)
+	claims.RouteFlowDebugLog().Info("architect_route_flow_process_claims_entry_done",
+		append(a.claimsEntryRouteFlowArgs(entry),
+			append([]any{"result_length", len(result)}, claims.DeltaDebugArgs(entry.Delta)...)...)...,
+	)
 	return nil
+}
+
+func (a *Architect) claimsEntryRouteFlowArgs(entry *claims.GraphEntryPoint) []any {
+	args := []any{
+		"agent_id", a.id,
+		"session_id", a.config.SessionID,
+	}
+	if entry == nil || entry.Node.Claim == nil {
+		return append(args,
+			"node_has_claim", false,
+			"node_has_testament", entry != nil && entry.Node.Testament != nil,
+			"node_has_validation", entry != nil && entry.Node.Validation != nil,
+		)
+	}
+	claim := entry.Node.Claim
+	return append(args,
+		"node_has_claim", true,
+		"node_has_testament", entry.Node.Testament != nil,
+		"node_has_validation", entry.Node.Validation != nil,
+		"claim_id", strings.TrimSpace(claim.ID),
+		"claim_title", strings.TrimSpace(claim.Title),
+		"claim_action", string(claim.ActionType),
+		"claim_status", string(claim.Status),
+		"claim_lifecycle", string(claim.LifecycleStatus),
+	)
 }
 
 // truncateArchitectString truncates a string for claim titles.

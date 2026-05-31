@@ -67,6 +67,10 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 	if delta == nil {
 		return fmt.Errorf("nil delta")
 	}
+	claims.TraceRouteFlowDelta("claims_route_flow_bus_publish_start", delta,
+		"topic", topic,
+		"subscriber_count", a.bus.TopicSubscriberCount(topic),
+	)
 	claims.RouteDebugLog().Info("claims_bus_publish_delta_start",
 		append([]any{
 			"topic", topic,
@@ -94,6 +98,11 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 				"error", err.Error(),
 			}, claims.DeltaDebugArgs(delta)...)...,
 		)
+		claims.TraceRouteFlowDelta("claims_route_flow_bus_publish_failed", delta,
+			"topic", topic,
+			"message_id", msg.ID,
+			"error", err.Error(),
+		)
 		return err
 	}
 	claims.RouteDebugLog().Info("claims_bus_publish_delta_done",
@@ -101,6 +110,10 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 			"topic", topic,
 			"message_id", msg.ID,
 		}, claims.DeltaDebugArgs(delta)...)...,
+	)
+	claims.TraceRouteFlowDelta("claims_route_flow_bus_publish_done", delta,
+		"topic", topic,
+		"message_id", msg.ID,
 	)
 	return nil
 }
@@ -138,6 +151,10 @@ func (a *ClaimsBusAdapter) SubscribeDelta(pattern string, handler claims.DeltaHa
 			)
 			return nil
 		}
+		claims.TraceRouteFlowDelta("claims_route_flow_bus_subscribe_delta_delivered", delta,
+			"pattern", pattern,
+			"message_id", messageIDForDebug(msg),
+		)
 		claims.RouteDebugLog().Info("claims_bus_subscribe_delta_delivered",
 			append([]any{
 				"pattern", pattern,
@@ -156,6 +173,9 @@ func (a *ClaimsBusAdapter) SubscribeDelta(pattern string, handler claims.DeltaHa
 		return nil, fmt.Errorf("subscribe %q: %w", pattern, err)
 	}
 	claims.RouteDebugLog().Info("claims_bus_subscribed",
+		"pattern", pattern,
+	)
+	claims.RouteFlowDebugLog().Info("claims_route_flow_bus_subscribed",
 		"pattern", pattern,
 	)
 	return &claimsSubscriptionAdapter{inner: sub, pattern: pattern}, nil

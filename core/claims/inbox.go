@@ -501,6 +501,13 @@ func (i *ClaimsInbox) Start(patterns []string) error {
 		"patterns", patterns,
 		"queue_cap", i.queueCap,
 	)
+	RouteFlowDebugLog().Info("claims_route_flow_inbox_start",
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"role", i.role,
+		"patterns", patterns,
+		"queue_cap", i.queueCap,
+	)
 	// Resize the dedup LRU now that we know the actual pattern count.
 	dedupCap := i.queueCap * len(patterns)
 	if dedupCap < i.queueCap {
@@ -540,6 +547,13 @@ func (i *ClaimsInbox) Subscribe(pattern string) error {
 			"pattern", pattern,
 			"error", err.Error(),
 		)
+		RouteFlowDebugLog().Info("claims_route_flow_inbox_subscribe_failed",
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"role", i.role,
+			"pattern", pattern,
+			"error", err.Error(),
+		)
 		return fmt.Errorf("subscribe %q: %w", pattern, err)
 	}
 	slog.Info("claims_inbox_subscribed",
@@ -549,6 +563,12 @@ func (i *ClaimsInbox) Subscribe(pattern string) error {
 		"pattern", pattern,
 	)
 	RouteDebugLog().Info("claims_inbox_subscribed",
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"role", i.role,
+		"pattern", pattern,
+	)
+	RouteFlowDebugLog().Info("claims_route_flow_inbox_subscribed",
 		"agent_id", i.agentID,
 		"session_id", i.sessionID,
 		"role", i.role,
@@ -634,6 +654,11 @@ func (i *ClaimsInbox) Expect(e *Expectation) {
 			"delta_kind", entry.Delta.DeltaKind(),
 			"delta_key", entry.Delta.DeltaKey(),
 		)
+		TraceRouteFlowDelta("claims_route_flow_inbox_expectation_replayed_orphan", entry.Delta,
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"claim_id", claimID,
+		)
 		if i.onResolved != nil {
 			i.onResolved(entry)
 		}
@@ -694,6 +719,13 @@ func (i *ClaimsInbox) subscribeExpectationTopics(claimID string, topics []string
 				"topic", topic,
 				"error", err.Error(),
 			)
+			RouteFlowDebugLog().Info("claims_route_flow_inbox_expectation_subscribe_failed",
+				"agent_id", i.agentID,
+				"session_id", i.sessionID,
+				"claim_id", claimID,
+				"topic", topic,
+				"error", err.Error(),
+			)
 			for _, prior := range subs {
 				_ = prior.Unsubscribe()
 			}
@@ -725,6 +757,12 @@ func (i *ClaimsInbox) subscribeExpectationTopics(claimID string, topics []string
 		"claim_id", claimID,
 		"topics", topics,
 	)
+	RouteFlowDebugLog().Info("claims_route_flow_inbox_expectation_subscribed",
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"claim_id", claimID,
+		"topics", topics,
+	)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -741,6 +779,12 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 		return
 	}
 	class := DeltaClass(d)
+	TraceRouteFlowDelta("claims_route_flow_inbox_ingest_start", d,
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"role", i.role,
+		"class", class.String(),
+	)
 	RouteDebugLog().Info("claims_inbox_delta_ingest_start",
 		append([]any{
 			"agent_id", i.agentID,
@@ -779,6 +823,14 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 			"directed_agent_id", deltaDirectedAgentID(d),
 		}, DeltaDebugArgs(d)...)...,
 	)
+	TraceRouteFlowDelta("claims_route_flow_inbox_ingest_done", d,
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"role", i.role,
+		"class", class.String(),
+		"matched", entry != nil,
+		"directed_agent_id", deltaDirectedAgentID(d),
+	)
 
 	if entry != nil && i.onResolved != nil {
 		RouteDebugLog().Info("claims_inbox_on_resolved_start",
@@ -786,6 +838,10 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 				"agent_id", i.agentID,
 				"session_id", i.sessionID,
 			}, DeltaDebugArgs(d)...)...,
+		)
+		TraceRouteFlowDelta("claims_route_flow_inbox_on_resolved_start", d,
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
 		)
 		i.onResolved(entry)
 	}
@@ -829,6 +885,11 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 	key := deltaDedupKey(d)
 	seq := d.DeltaSequence()
 	if i.seen == nil {
+		TraceRouteFlowDelta("claims_route_flow_inbox_delta_discarded", d,
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"reason", "dedup_lru_uninitialized",
+		)
 		RouteDebugLog().Info("claims_inbox_delta_discarded",
 			append([]any{
 				"agent_id", i.agentID,
@@ -839,6 +900,12 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 		return nil, nil
 	}
 	if !i.seen.observe(key, seq) {
+		TraceRouteFlowDelta("claims_route_flow_inbox_delta_discarded", d,
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"reason", "duplicate",
+			"dedup_key", key,
+		)
 		RouteDebugLog().Info("claims_inbox_delta_discarded",
 			append([]any{
 				"agent_id", i.agentID,
@@ -865,6 +932,12 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 					"expected_delta", exp.ExpectedDelta,
 				}, DeltaDebugArgs(d)...)...,
 			)
+			TraceRouteFlowDelta("claims_route_flow_inbox_delta_matched", d,
+				"agent_id", i.agentID,
+				"session_id", i.sessionID,
+				"match_type", "expectation",
+				"expected_delta", exp.ExpectedDelta,
+			)
 			return ResolveEntryPoint(i.board, d, exp.Priority, exp), releaseSubs
 		}
 	}
@@ -881,6 +954,12 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 				"priority", priority,
 			}, DeltaDebugArgs(d)...)...,
 		)
+		TraceRouteFlowDelta("claims_route_flow_inbox_delta_matched", d,
+			"agent_id", i.agentID,
+			"session_id", i.sessionID,
+			"match_type", "standing_subscription",
+			"priority", priority,
+		)
 		return ResolveEntryPoint(i.board, d, priority, nil), nil
 	}
 
@@ -896,6 +975,13 @@ func (i *ClaimsInbox) ingestLocked(d Delta) (*GraphEntryPoint, []DeltaSubscripti
 			"claim_id", claimID,
 			"directed_agent_id", deltaDirectedAgentID(d),
 		}, DeltaDebugArgs(d)...)...,
+	)
+	TraceRouteFlowDelta("claims_route_flow_inbox_delta_discarded", d,
+		"agent_id", i.agentID,
+		"session_id", i.sessionID,
+		"reason", "no_expectation_or_standing_match",
+		"claim_id", claimID,
+		"directed_agent_id", deltaDirectedAgentID(d),
 	)
 	return nil, nil
 }

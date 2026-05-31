@@ -851,19 +851,43 @@ type guideDeltaSubscriber struct {
 
 func (s *guideDeltaSubscriber) SubscribeDelta(pattern string, handler claims.DeltaHandler) (claims.DeltaSubscription, error) {
 	if s.bus == nil {
+		claims.RouteFlowDebugLog().Info("claims_route_flow_guide_delta_subscribe_noop",
+			"pattern", pattern,
+		)
 		return claims.NoopDeltaBus{}.SubscribeDelta(pattern, handler)
 	}
 	sub, err := s.bus.SubscribeAsync(pattern, func(msg *Message) error {
 		delta, extractErr := ExtractClaimsDelta(msg)
-		if extractErr != nil || delta == nil {
+		if extractErr != nil {
+			claims.RouteFlowDebugLog().Info("claims_route_flow_guide_delta_extract_failed",
+				"pattern", pattern,
+				"message_id", messageIDForDebug(msg),
+				"message_type", messageTypeForDebug(msg),
+				"error", extractErr.Error(),
+			)
 			return nil
 		}
+		if delta == nil {
+			return nil
+		}
+		claims.TraceRouteFlowDelta("claims_route_flow_guide_delta_delivered", delta,
+			"pattern", pattern,
+			"message_id", messageIDForDebug(msg),
+			"message_type", messageTypeForDebug(msg),
+		)
 		handler(delta)
 		return nil
 	})
 	if err != nil {
+		claims.RouteFlowDebugLog().Info("claims_route_flow_guide_delta_subscribe_failed",
+			"pattern", pattern,
+			"error", err.Error(),
+		)
 		return nil, err
 	}
+	claims.RouteFlowDebugLog().Info("claims_route_flow_guide_delta_subscribed",
+		"pattern", pattern,
+	)
 	return &guideDeltaSub{sub: sub}, nil
 }
 
