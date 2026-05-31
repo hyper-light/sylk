@@ -183,12 +183,12 @@ func TestBuildForwardedRequestRequiresSessionBoardForClaimNativeTUIRoute(t *test
 	}
 	result := &RouteResult{TargetAgent: TargetAgent("architect"), Intent: IntentExecute, Confidence: 0.91}
 
-	if _, err := g.buildForwardedRequest(req, result, req.CorrelationID); err == nil || !strings.Contains(err.Error(), "session claims board") {
+	if _, err := g.buildForwardedRequest(context.Background(), req, result, req.CorrelationID); err == nil || !strings.Contains(err.Error(), "session claims board") {
 		t.Fatalf("buildForwardedRequest error = %v, want missing session claims board", err)
 	}
 }
 
-func TestShouldSuppressForwardedExecutionOnlyForClaimNativeTUIRoutes(t *testing.T) {
+func TestClaimNativeRoutedWorkMarkerOnlyForTUITopLevelClaims(t *testing.T) {
 	forwarded := &ForwardedRequest{
 		SourceAgentID: sourceAgentTUI,
 		Metadata: map[string]any{
@@ -196,12 +196,95 @@ func TestShouldSuppressForwardedExecutionOnlyForClaimNativeTUIRoutes(t *testing.
 			"routed_work_claim_id": "claim-1",
 		},
 	}
-	if !shouldSuppressForwardedExecution(forwarded) {
-		t.Fatal("claim-native TUI route should suppress forwarded execution")
+	if !isClaimNativeRoutedWork(forwarded) {
+		t.Fatal("claim-native TUI route should be recognized as claims-dispatched work")
 	}
 	forwarded.SourceAgentID = "architect"
-	if shouldSuppressForwardedExecution(forwarded) {
-		t.Fatal("agent-originated routes must not suppress forwarded execution")
+	if isClaimNativeRoutedWork(forwarded) {
+		t.Fatal("agent-originated routes must not be treated as TUI claim-native work")
+	}
+}
+
+func TestBuildForwardedRequestClaimNativeActivatesTargetBeforePostingClaim(t *testing.T) {
+	const sessionID = "sess-claim-native-activation"
+	const deliveryTimeout = time.Second
+
+	bus := NewChannelBus(DefaultChannelBusConfig())
+	t.Cleanup(func() { _ = bus.Close() })
+
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:   "board-" + sessionID,
+		SessionID: sessionID,
+		TaskID:    "task",
+		DeltaBus:  NewClaimsBusAdapter(bus),
+	})
+	claims.DefaultSessionBoardRegistry().ReplaceForReason(sessionID, board, "test claim-native activation")
+	t.Cleanup(func() { claims.DefaultSessionBoardRegistry().Remove(sessionID) })
+
+	g := newActivationRecoveryGuide()
+	g.sessionID = sessionID
+	g.conversation = NewConversationFlowManager(ConversationFlowConfig{})
+	registerActivationRecoveryAgent(g, "architect", "architect", "architect", false)
+
+	delivered := make(chan string, 1)
+	var inbox *claims.ClaimsInbox
+	activator := &recordingPodActivator{}
+	g.activator = activator
+	g.agentRegistrar = func(_ string, agentType string) {
+		registerActivationRecoveryAgent(g, agentType, agentType, agentType, true)
+		var err error
+		inbox, err = claims.NewClaimsInbox(claims.InboxConfig{
+			AgentID:    agentType,
+			SessionID:  sessionID,
+			Role:       claims.RoleSubject,
+			Subscriber: NewClaimsBusAdapter(bus),
+			Board:      board,
+			OnResolved: func(entry *claims.GraphEntryPoint) {
+				if entry != nil && entry.Node.Claim != nil {
+					delivered <- entry.Node.Claim.ID
+				}
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewClaimsInbox: %v", err)
+		}
+		if err := inbox.Start(nil); err != nil {
+			t.Fatalf("ClaimsInbox.Start: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		if inbox != nil {
+			_ = inbox.Close()
+		}
+	})
+
+	req := &RouteRequest{
+		SourceAgentID: sourceAgentTUI,
+		SessionID:     sessionID,
+		CorrelationID: "corr-claim-native-activation",
+		Input:         "build a cli",
+	}
+	result := &RouteResult{TargetAgent: TargetAgent("architect"), Intent: IntentExecute, Confidence: 0.91}
+
+	forwarded, err := g.buildForwardedRequest(context.Background(), req, result, req.CorrelationID)
+	if err != nil {
+		t.Fatalf("buildForwardedRequest: %v", err)
+	}
+	if !isClaimNativeRoutedWork(forwarded) {
+		t.Fatal("forwarded metadata does not mark claims-dispatched work")
+	}
+	if len(activator.ensureCalls) != 1 || activator.ensureCalls[0] != "architect" {
+		t.Fatalf("EnsurePodActive calls = %v, want [architect]", activator.ensureCalls)
+	}
+
+	claimID := metadataString(forwarded.Metadata, "routed_work_claim_id")
+	select {
+	case got := <-delivered:
+		if got != claimID {
+			t.Fatalf("delivered claim = %q, want %q", got, claimID)
+		}
+	case <-time.After(deliveryTimeout):
+		t.Fatalf("claim %q was not delivered to architect claims inbox", claimID)
 	}
 }
 

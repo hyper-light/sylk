@@ -916,7 +916,7 @@ func (g *Guide) Route(ctx context.Context, request *RouteRequest) (*ForwardedReq
 		}
 	}
 
-	forwarded, err := g.buildForwardedRequest(request, classification, corrID)
+	forwarded, err := g.buildForwardedRequest(ctx, request, classification, corrID)
 	if err != nil {
 		g.pending.Remove(corrID)
 		return nil, err
@@ -941,7 +941,7 @@ func (g *Guide) RouteAndForward(ctx context.Context, request *RouteRequest) (*Fo
 	if g.isGuideTarget(pending.TargetAgentID) {
 		return forwarded, nil
 	}
-	if shouldSuppressForwardedExecution(forwarded) {
+	if isClaimNativeRoutedWork(forwarded) {
 		g.pending.Remove(forwarded.CorrelationID)
 		return forwarded, nil
 	}
@@ -2251,7 +2251,7 @@ func (g *Guide) resolveCorrelationID(request *RouteRequest) string {
 	return fmt.Sprintf("corr_%d", time.Now().UnixNano())
 }
 
-func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *RouteResult, correlationID string) (*ForwardedRequest, error) {
+func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest, classification *RouteResult, correlationID string) (*ForwardedRequest, error) {
 	metadata := mergeForwardMetadata(
 		g.conversationWorkMetadata(request.SessionID),
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
@@ -2262,6 +2262,9 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 			"session_board_id": board.BoardID(),
 		})
 		if shouldPostRoutedWorkClaim(request, metadata) {
+			if err := g.ensureClaimNativeRoutedWorkTarget(ctx, classification); err != nil {
+				return nil, err
+			}
 			routeClaimID, err := g.dispatchRoutedWorkClaim(board, request, classification)
 			if err != nil {
 				return nil, err
@@ -2270,10 +2273,9 @@ func (g *Guide) buildForwardedRequest(request *RouteRequest, classification *Rou
 				return nil, fmt.Errorf("claim-native routed work claim was not posted")
 			}
 			metadata = mergeForwardMetadata(metadata, map[string]any{
-				"parent_claim_id":        routeClaimID,
-				"routed_work_claim_id":   routeClaimID,
-				"claim_native_routing":   true,
-				"forwarded_execution_ok": false,
+				"parent_claim_id":      routeClaimID,
+				"routed_work_claim_id": routeClaimID,
+				"claim_native_routing": true,
 			})
 		}
 	} else if shouldPostRoutedWorkClaim(request, metadata) {
@@ -2397,7 +2399,28 @@ func metadataHasNonEmptyString(metadata map[string]any, key string) bool {
 	return strings.TrimSpace(str) != ""
 }
 
-func shouldSuppressForwardedExecution(forwarded *ForwardedRequest) bool {
+func (g *Guide) ensureClaimNativeRoutedWorkTarget(ctx context.Context, classification *RouteResult) error {
+	target := classificationTargetAgentID("", classification)
+	if strings.TrimSpace(target) == "" {
+		return fmt.Errorf("claim-native routed work target agent is required")
+	}
+	if g.isGuideTarget(target) {
+		return nil
+	}
+	resolved, err := g.ensureExplicitTargetReady(ctx, target)
+	if err != nil {
+		return fmt.Errorf("claim-native route target %s not ready: %w", target, err)
+	}
+	if strings.TrimSpace(resolved) != "" {
+		classification.TargetAgent = TargetAgent(resolved)
+	}
+	if g.activator != nil {
+		g.activator.TouchPodActivity(g.resolvePodID(firstNonEmptyString(resolved, target)))
+	}
+	return nil
+}
+
+func isClaimNativeRoutedWork(forwarded *ForwardedRequest) bool {
 	if forwarded == nil {
 		return false
 	}
@@ -3736,8 +3759,9 @@ func (g *Guide) handleRouteRequestMessage(ctx context.Context, msg *Message) err
 		}
 		return g.respondToGuideRequest(reqCtx, pending, req)
 	}
-	if shouldSuppressForwardedExecution(forwarded) {
-		guideFileLog().Info("guide: claim-native route posted; suppressing forwarded execution",
+	if isClaimNativeRoutedWork(forwarded) {
+		g.publishRouteHandoffProgress(forwarded.CorrelationID, resolvedSource, resolvedTarget, vis)
+		guideFileLog().Info("guide: claim-native routed work claim dispatched",
 			"correlation_id", forwarded.CorrelationID,
 			"target", resolvedTarget,
 			"claim_id", metadataString(forwarded.Metadata, "routed_work_claim_id"))
