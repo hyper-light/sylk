@@ -27,6 +27,7 @@ func (p *CanonicalDeltaProjector) Project(ctx context.Context, record *ClaimsOut
 	amp := NewBoardAmplifier(record.SessionID, record.TaskID, record.BoardID).
 		WithDeltaBus(p.publisher).
 		WithAgentRefResolver(firstNonNilAgentRefResolver(p.resolver, board.agentRefResolver)).
+		WithMetricsSink(board.metrics).
 		WithCanonicalDirectEnabled(true)
 	dispatches := amp.canonicalDispatchesForOutboxRecord(ctx, record, board)
 	if len(dispatches) == 0 {

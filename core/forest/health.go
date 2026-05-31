@@ -222,10 +222,56 @@ func (m *MemoryForest) probeAllSubsystems(ctx context.Context) []SubsystemHealth
 		out = append(out, m.probeProjectorRow(ctx, name, now))
 	}
 	out = append(out, m.probeRuntime())
+	out = append(out, m.probeNodeGraphProjection(ctx, now))
 	out = append(out, m.probeAuditDrainer())
 	out = append(out, m.probePageRankCache())
 	out = append(out, m.probeSubstrateState(ctx, now))
 	return out
+}
+
+func (m *MemoryForest) probeNodeGraphProjection(ctx context.Context, now time.Time) SubsystemHealth {
+	sub := SubsystemHealth{Name: projectorNodeGraphName, Status: HealthStatusOK, Extras: map[string]any{}}
+	var lastSeq, lastAppliedAt int64
+	var status, lastError string
+	err := m.db.QueryRowContext(ctx, `
+		SELECT last_seq, last_applied_at, health_status, last_error
+		FROM forest_projection_offsets
+		WHERE projection_name = ?
+	`, projectorNodeGraphName).Scan(&lastSeq, &lastAppliedAt, &status, &lastError)
+	if err != nil && err != sql.ErrNoRows {
+		sub.Status = HealthStatusUnhealthy
+		sub.LastError = err.Error()
+		sub.LastErrorAt = now
+		return sub
+	}
+	sub.LastAppliedSeq = lastSeq
+	var lastAppliedTime time.Time
+	if lastAppliedAt > 0 {
+		lastAppliedTime = time.Unix(lastAppliedAt, 0).UTC()
+		sub.Extras["last_applied_at"] = lastAppliedTime.Format(time.RFC3339)
+	}
+	sub.Extras["health_status"] = status
+	var activeFailures int
+	if err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_projection_failures
+		WHERE projection_name = ? AND resolved_at = 0
+	`, projectorNodeGraphName).Scan(&activeFailures); err != nil {
+		sub.Status = HealthStatusUnhealthy
+		sub.LastError = err.Error()
+		sub.LastErrorAt = now
+		return sub
+	}
+	if activeFailures > 0 {
+		worsenSubsystemStatus(&sub, HealthStatusDegraded)
+		sub.Extras["active_failures"] = activeFailures
+	}
+	if strings.TrimSpace(lastError) != "" {
+		worsenSubsystemStatus(&sub, HealthStatusDegraded)
+		sub.LastError = lastError
+		sub.LastErrorAt = lastAppliedTime
+	}
+	return sub
 }
 
 func (m *MemoryForest) probeRuntime() SubsystemHealth {

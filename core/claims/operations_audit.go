@@ -47,6 +47,7 @@ type OperationsAuditOptions struct {
 	SessionID           string
 	ActorID             string
 	Disabled            bool
+	Metrics             ClaimsMetricsSink
 }
 
 type OperationsAuditResult struct {
@@ -93,9 +94,24 @@ func RunClaimsOperationsAudit(ctx context.Context, opts OperationsAuditOptions) 
 	result.Truncated = collector.truncated
 	if opts.EvidenceBoard != nil && len(result.Findings) > 0 {
 		err := RecordClaimsOperationsAuditEvidence(ctxOrBackground(ctx), opts.EvidenceBoard, opts.ActorID, result)
+		recordOperationsAuditMetrics(ctx, opts, result)
 		return result, err
 	}
+	recordOperationsAuditMetrics(ctx, opts, result)
 	return result, nil
+}
+
+func recordOperationsAuditMetrics(ctx context.Context, opts OperationsAuditOptions, result OperationsAuditResult) {
+	sink := opts.Metrics
+	if sink == nil && opts.EvidenceBoard != nil {
+		sink = opts.EvidenceBoard.metrics
+	}
+	for _, finding := range result.Findings {
+		if finding.Kind == "inbox_overflow" {
+			recordClaimsCounter(ctx, sink, "claims_delta_subscriber_overflow_total", metricLabels("topic", firstNonEmpty(finding.ResourceID, finding.ParticipantID, "unknown")))
+		}
+	}
+	recordClaimsGauge(ctx, sink, "claims_session_count", float64(len(opts.Boards)+len(opts.DurableBoards)), nil)
 }
 
 func StartClaimsOperationsAudits(ctx context.Context, scope ScopeProvider, opts OperationsAuditOptions) error {

@@ -52,6 +52,8 @@ var allowedDirectClaimsLifecycleMutationFiles = []string{
 	"core/claims/board_lifecycle.go",
 }
 
+var claimsOpsSuppressionRegistry = map[string]map[string]struct{}{}
+
 var claimsLifecycleMutationFields = map[string]struct{}{
 	"LifecycleHistory": {},
 	"LifecycleStatus":  {},
@@ -66,64 +68,71 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			continue
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
-			checkNode(pass, filename, n)
+			checkNode(pass, filename, file, n)
 			return true
 		})
 	}
 	return nil, nil
 }
 
-func checkNode(pass *analysis.Pass, filename string, n ast.Node) {
+func checkNode(pass *analysis.Pass, filename string, file *ast.File, n ast.Node) {
 	switch node := n.(type) {
 	case *ast.GoStmt:
-		checkGoStmt(pass, filename, node)
+		checkGoStmt(pass, filename, file, node)
 	case *ast.CallExpr:
-		checkCall(pass, filename, node)
+		checkCall(pass, filename, file, node)
 	case *ast.CompositeLit:
-		checkComposite(pass, node)
+		checkComposite(pass, filename, file, node)
 	case *ast.AssignStmt:
-		checkAssign(pass, filename, node)
+		checkAssign(pass, filename, file, node)
 	}
 }
 
-func checkGoStmt(pass *analysis.Pass, filename string, node *ast.GoStmt) {
+func checkGoStmt(pass *analysis.Pass, filename string, file *ast.File, node *ast.GoStmt) {
 	if !checksClaimsConcurrency(pass.Pkg.Path()) || rawGoAllowed(filename) {
 		return
 	}
-	pass.Reportf(node.Pos(), "raw go statement is forbidden in claims infrastructure; launch work through core/concurrency.GoroutineScope.Go or claims.ScopeProvider")
+	reportClaimsOpsRule(pass, filename, file, node.Pos(), "raw_go", "raw go statement is forbidden in claims infrastructure; launch work through core/concurrency.GoroutineScope.Go or claims.ScopeProvider")
 }
 
-func checkCall(pass *analysis.Pass, filename string, call *ast.CallExpr) {
+func checkCall(pass *analysis.Pass, filename string, file *ast.File, call *ast.CallExpr) {
 	if checksClaimsConcurrency(pass.Pkg.Path()) && literalUnboundedChannel(call) {
-		pass.Reportf(call.Pos(), "literal unbounded work channel is forbidden; derive a bounded capacity from participant registration or runtime config")
+		reportClaimsOpsRule(pass, filename, file, call.Pos(), "unbounded_channel", "literal unbounded work channel is forbidden; derive a bounded capacity from participant registration or runtime config")
 	}
 	if broadClaimsSubscription(call) {
-		pass.Reportf(call.Pos(), "broad claims subscription is forbidden; subscribe with CanonicalAgentRefTopic, InboxPatternsFor, or another bounded participant topic")
+		reportClaimsOpsRule(pass, filename, file, call.Pos(), "broad_subscription", "broad claims subscription is forbidden; subscribe with CanonicalAgentRefTopic, InboxPatternsFor, or another bounded participant topic")
 	}
 	if missingRegistrationDeterminism(pass.TypesInfo, call) {
-		pass.Reportf(call.Pos(), "participant registration must declare HandlerDeterminism; use HandlerDeterminismPure, Content, SideEffect, or Nondeterministic")
+		reportClaimsOpsRule(pass, filename, file, call.Pos(), "missing_determinism", "participant registration must declare HandlerDeterminism; use HandlerDeterminismPure, Content, SideEffect, or Nondeterministic")
 	}
 	if directVFSBypass(pass, call) && !directVFSBypassAllowedAt(pass.Pkg.Path(), filename) {
-		pass.Reportf(call.Pos(), "direct VFS mutation bypasses claims evidence; route through the infrastructure service dispatcher or a documented claim-synthesizing wrapper")
+		reportClaimsOpsRule(pass, filename, file, call.Pos(), "direct_vfs_bypass", "direct VFS mutation bypasses claims evidence; route through the infrastructure service dispatcher or a documented claim-synthesizing wrapper")
 	}
 }
 
-func checkComposite(pass *analysis.Pass, lit *ast.CompositeLit) {
+func checkComposite(pass *analysis.Pass, filename string, file *ast.File, lit *ast.CompositeLit) {
 	if !artifactLiteralMissingDataType(lit) {
 		return
 	}
-	pass.Reportf(lit.Pos(), "claims Artifact with Data must set DataType; use SetArtifactData or a typed artifact constructor")
+	reportClaimsOpsRule(pass, filename, file, lit.Pos(), "artifact_missing_data_type", "claims Artifact with Data must set DataType; use SetArtifactData or a typed artifact constructor")
 }
 
-func checkAssign(pass *analysis.Pass, filename string, stmt *ast.AssignStmt) {
+func checkAssign(pass *analysis.Pass, filename string, file *ast.File, stmt *ast.AssignStmt) {
 	if directClaimsLifecycleMutationAllowed(filename) {
 		return
 	}
 	for _, lhs := range stmt.Lhs {
 		if directClaimsLifecycleMutation(pass, lhs) {
-			pass.Reportf(lhs.Pos(), "direct claims lifecycle/status mutation is forbidden; use board lifecycle transition APIs or explicit replay helpers")
+			reportClaimsOpsRule(pass, filename, file, lhs.Pos(), "direct_lifecycle_mutation", "direct claims lifecycle/status mutation is forbidden; use board lifecycle transition APIs or explicit replay helpers")
 		}
 	}
+}
+
+func reportClaimsOpsRule(pass *analysis.Pass, filename string, file *ast.File, pos token.Pos, ruleID, message string) {
+	if claimsOpsSuppressed(filename, file, ruleID) {
+		return
+	}
+	pass.Reportf(pos, "%s [%s]", message, ruleID)
 }
 
 func literalUnboundedChannel(call *ast.CallExpr) bool {
@@ -356,6 +365,32 @@ func inGeneratedOrMocks(filename string, file *ast.File) bool {
 	}
 	for _, group := range file.Comments {
 		if strings.Contains(group.Text(), "Code generated") {
+			return true
+		}
+	}
+	return false
+}
+
+func claimsOpsSuppressed(filename string, file *ast.File, ruleID string) bool {
+	if !fileHasClaimsOpsSuppression(file, ruleID) {
+		return false
+	}
+	for suffix, rules := range claimsOpsSuppressionRegistry {
+		if strings.HasSuffix(filename, suffix) {
+			_, ok := rules[ruleID]
+			return ok
+		}
+	}
+	return false
+}
+
+func fileHasClaimsOpsSuppression(file *ast.File, ruleID string) bool {
+	if file == nil || strings.TrimSpace(ruleID) == "" {
+		return false
+	}
+	needle := "claimsops:ignore " + ruleID
+	for _, group := range file.Comments {
+		if strings.Contains(group.Text(), needle) {
 			return true
 		}
 	}

@@ -23,6 +23,7 @@ type ServiceRecoveryOptions struct {
 	Continuations       []PendingContinuationRecoverer
 	ScanLimit           int
 	ActorID             string
+	Metrics             ClaimsMetricsSink
 }
 
 type ServiceRecoveryResult struct {
@@ -70,7 +71,21 @@ func RecoverServiceWork(ctx context.Context, opts ServiceRecoveryOptions) (Servi
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	start := time.Now()
+	recordClaimsCounter(ctx, opts.recoveryMetrics(), "claims_recovery_initiated_total", nil)
 	result := ServiceRecoveryResult{}
+	defer func() {
+		recordClaimsHistogram(ctx, opts.recoveryMetrics(), "claims_recovery_completion_duration_seconds", time.Since(start).Seconds(), nil)
+		if result.ValidationFailed > 0 {
+			recordClaimsCounter(ctx, opts.recoveryMetrics(), "claims_recovery_orphan_validations_total", nil)
+		}
+		if result.ContinuationsRecovered > 0 {
+			recordClaimsCounter(ctx, opts.recoveryMetrics(), "claims_recovery_orphan_continuations_total", nil)
+		}
+		if result.Failed+result.ValidationFailed > 0 {
+			recordClaimsCounter(ctx, opts.recoveryMetrics(), "claims_recovery_failed_total", metricLabels("reason", "recovery_failures"))
+		}
+	}()
 	limit := positiveOrDefault(opts.ScanLimit, defaultServiceRecoveryScanLimit)
 	participants := participantLookup(opts.Participants)
 	for _, claim := range serviceRecoveryClaims(opts.Board.Projection(), participants) {
@@ -96,6 +111,16 @@ func RecoverServiceWork(ctx context.Context, opts ServiceRecoveryOptions) (Servi
 		recoverPendingContinuations(ctx, opts.Continuations, &result)
 	}
 	return result, nil
+}
+
+func (opts ServiceRecoveryOptions) recoveryMetrics() ClaimsMetricsSink {
+	if opts.Metrics != nil {
+		return opts.Metrics
+	}
+	if opts.Board != nil {
+		return opts.Board.metrics
+	}
+	return NoopClaimsMetricsSink{}
 }
 
 func recoverServiceClaim(ctx context.Context, opts ServiceRecoveryOptions, claim Claim, participants map[string]ParticipantRegistration) ServiceRecoveryOutcome {
@@ -520,6 +545,7 @@ type ClaimCancellationOptions struct {
 	ActorID             string
 	Reason              string
 	ScanLimit           int
+	Metrics             ClaimsMetricsSink
 }
 
 type ClaimCancellationResult struct {
@@ -539,7 +565,20 @@ func CancelClaimTree(ctx context.Context, opts ClaimCancellationOptions) (ClaimC
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	start := time.Now()
+	source := cancellationMetricSource(opts)
+	recordClaimsCounter(ctx, opts.cancellationMetrics(), "claims_cancellation_initiated_total", metricLabels("source", source))
 	result := ClaimCancellationResult{OriginClaimID: strings.TrimSpace(opts.OriginClaimID)}
+	defer func() {
+		recordClaimsHistogram(ctx, opts.cancellationMetrics(), "claims_cancellation_completion_duration_seconds", time.Since(start).Seconds(), metricLabels("source", source))
+		recordClaimsGauge(ctx, opts.cancellationMetrics(), "claims_active_claim_count", float64(len(activeClaimIDs(opts.Board.Projection()))), metricLabels("participant_category", "unknown"))
+		if len(result.CancelledClaimIDs) > 0 {
+			recordClaimsCounter(ctx, opts.cancellationMetrics(), "claims_cancellation_propagated_claims_total", metricLabels("source", source))
+		}
+		if len(result.StuckClaimIDs) > 0 {
+			recordClaimsCounter(ctx, opts.cancellationMetrics(), "claims_cancellation_stuck_total", metricLabels("source", source))
+		}
+	}()
 	proj := opts.Board.Projection()
 	graph := cancellationGraph(proj)
 	order, missing, cycles, bounded := cancellationOrder(opts.RootClaimIDs, graph, positiveOrDefault(opts.ScanLimit, defaultServiceRecoveryScanLimit))
@@ -565,6 +604,20 @@ func CancelClaimTree(ctx context.Context, opts ClaimCancellationOptions) (ClaimC
 		result.CancelledClaimIDs = append(result.CancelledClaimIDs, claimID)
 	}
 	return result, ctx.Err()
+}
+
+func (opts ClaimCancellationOptions) cancellationMetrics() ClaimsMetricsSink {
+	if opts.Metrics != nil {
+		return opts.Metrics
+	}
+	if opts.Board != nil {
+		return opts.Board.metrics
+	}
+	return NoopClaimsMetricsSink{}
+}
+
+func cancellationMetricSource(opts ClaimCancellationOptions) string {
+	return firstNonEmpty(opts.ActorID, opts.OriginClaimID, claimCancellationActorID)
 }
 
 func CancelAllActiveRootClaims(ctx context.Context, opts ClaimCancellationOptions) (ClaimCancellationResult, error) {

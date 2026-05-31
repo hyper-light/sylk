@@ -28,7 +28,7 @@ claims-infra-lint:
 	go run ./cmd/sylk-lint ./...
 
 claims-infra-race:
-	go test -race ./core/claims ./ui/bridge ./core/ci/analyzers/claimsops
+	go test -race ./core/claims ./core/boot ./agents/shared ./ui/bridge ./core/ci/analyzers/claimsops
 
 mockery-check:
 	$(MOCKERY) --config .mockery.yaml --dry-run

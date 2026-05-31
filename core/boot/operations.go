@@ -102,6 +102,7 @@ type OperationsConfig struct {
 	ServiceSubscriber         claims.DeltaSubscriber
 	ServiceScope              claims.ScopeProvider
 	ServiceDispatchers        []ServiceDispatcherBootRegistration
+	Metrics                   claims.ClaimsMetricsSink
 }
 
 type OperationsSequencer struct {
@@ -111,6 +112,7 @@ type OperationsSequencer struct {
 	serviceSubscriber         claims.DeltaSubscriber
 	serviceScope              claims.ScopeProvider
 	serviceDispatchers        []ServiceDispatcherBootRegistration
+	metrics                   claims.ClaimsMetricsSink
 	mu                        sync.Mutex
 }
 
@@ -253,6 +255,10 @@ func NewOperationsSequencer(cfg OperationsConfig) (*OperationsSequencer, error) 
 		serviceDispatcherRegistry: registry,
 		serviceSubscriber:         cfg.ServiceSubscriber,
 		serviceScope:              scope,
+		metrics:                   claims.NoopClaimsMetricsSink{},
+	}
+	if cfg.Metrics != nil {
+		seq.metrics = cfg.Metrics
 	}
 	seq.serviceDispatchers = seq.normalizeServiceDispatcherSpecs(cfg.ServiceDispatchers)
 	return seq, nil
@@ -367,13 +373,16 @@ func (s *OperationsSequencer) CommitPhase1(ctx context.Context, status Phase1Sta
 	start := time.Now()
 	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(BootPhaseDurableSubstrate, bootPhase1Order, s.identity.BootSequencerUID))
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, BootPhaseDurableSubstrate, start, err)
 		return PhaseCommitResult{Phase: BootPhaseDurableSubstrate}, err
 	}
 	if err := validatePhase1Status(status); err != nil {
 		testamentID, failureErr := s.completeClaimFailure(ctx, claim.ID, phaseFailureTestamentSpec(BootPhaseDurableSubstrate, err, status.Context, s.identity))
+		s.recordBootPhaseMetric(ctx, BootPhaseDurableSubstrate, start, err)
 		return phaseResult(BootPhaseDurableSubstrate, claim.ID, testamentID, nil, nil), errors.Join(err, failureErr)
 	}
 	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, phase1TestamentSpec(status, time.Since(start), s.identity))
+	s.recordBootPhaseMetric(ctx, BootPhaseDurableSubstrate, start, err)
 	return phaseResult(BootPhaseDurableSubstrate, claim.ID, testamentID, nil, nil), err
 }
 
@@ -455,20 +464,32 @@ func (s *OperationsSequencer) CommitPhase6(ctx context.Context, status Phase6Sta
 func (s *OperationsSequencer) CommitPhase7(ctx context.Context, status Phase7Status) (PhaseCommitResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	start := time.Now()
 	if err := s.requirePhaseSatisfied(BootPhaseUserSurfaces); err != nil {
+		s.recordBootPhaseMetric(ctx, BootPhaseComplete, start, err)
 		return PhaseCommitResult{Phase: BootPhaseComplete}, err
 	}
 	if existing := s.phaseResultIfSatisfied(BootPhaseComplete); existing.ClaimID != "" {
+		s.recordBootPhaseMetric(ctx, BootPhaseComplete, start, nil)
 		return existing, nil
 	}
-	start := time.Now()
 	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(BootPhaseComplete, bootPhase7Order, s.identity.BootSequencerUID))
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, BootPhaseComplete, start, err)
 		return PhaseCommitResult{Phase: BootPhaseComplete}, err
 	}
 	spec := phase7TestamentSpec(status, time.Since(start), s.identity, s.bootPhaseSummary())
 	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, spec)
+	s.recordBootPhaseMetric(ctx, BootPhaseComplete, start, err)
 	return phaseResult(BootPhaseComplete, claim.ID, testamentID, nil, nil), err
+}
+
+func (s *OperationsSequencer) recordBootPhaseMetric(ctx context.Context, phase BootOperationPhase, start time.Time, err error) {
+	outcome := "success"
+	if err != nil {
+		outcome = "failure"
+	}
+	claims.RecordClaimsBootPhaseMetric(ctx, s.metrics, string(phase), outcome, time.Since(start))
 }
 
 func (s *OperationsSequencer) BootHealth() BootHealth {
@@ -501,35 +522,43 @@ func BootHealthFromBoard(board *claims.ClaimsBoard) BootHealth {
 }
 
 func (s *OperationsSequencer) commitReadinessPhase(ctx context.Context, cfg readinessPhaseConfig) (PhaseCommitResult, error) {
+	start := time.Now()
 	if err := s.requirePhaseSatisfied(cfg.prerequisite); err != nil {
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 		return PhaseCommitResult{Phase: cfg.phase}, err
 	}
 	if existing := s.phaseResultIfSatisfied(cfg.phase); existing.ClaimID != "" {
 		_, err := s.registerServiceDispatchersForPhase(ctx, cfg, nil)
 		if err != nil {
+			s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 			return existing, err
 		}
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, nil)
 		return existing, nil
 	}
 	participants, err := validatePhaseParticipants(cfg.phase, cfg.participants, cfg.requiredIDs)
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 		return s.commitPhaseFailure(ctx, cfg, nil, nil, err)
 	}
 	participantClaimIDs, participantTestamentIDs, err := s.commitPhaseParticipants(ctx, cfg, participants)
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 		return s.commitPhaseFailure(ctx, cfg, participantClaimIDs, participantTestamentIDs, err)
 	}
 	dispatcherArtifacts, err := s.registerServiceDispatchersForPhase(ctx, cfg, participants)
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 		return s.commitPhaseFailure(ctx, cfg, participantClaimIDs, participantTestamentIDs, err)
 	}
 	cfg.extraArtifacts = dispatcherArtifacts
-	start := time.Now()
 	claim, err := s.ensureClaimActive(ctx, phaseClaimSpec(cfg.phase, cfg.order, s.identity.BootSequencerUID))
 	if err != nil {
+		s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 		return PhaseCommitResult{Phase: cfg.phase, ParticipantClaimIDs: participantClaimIDs, ParticipantTestamentIDs: participantTestamentIDs}, err
 	}
 	testamentID, err := s.completeClaimSuccess(ctx, claim.ID, phaseReadinessTestamentSpec(cfg, participants, time.Since(start), s.identity))
+	s.recordBootPhaseMetric(ctx, cfg.phase, start, err)
 	return phaseResult(cfg.phase, claim.ID, testamentID, participantClaimIDs, participantTestamentIDs), err
 }
 

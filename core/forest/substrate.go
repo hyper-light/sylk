@@ -110,6 +110,8 @@ func (m *MemoryForest) loadStoredSubstrateState(
 		args = append(args, branchID)
 	}
 
+	m.substrateStateMu.RLock()
+	defer m.substrateStateMu.RUnlock()
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT branch_id, nutrient_potential, frontier_score, inhibition, conductance_mass
 		FROM forest_substrate_state
@@ -426,6 +428,8 @@ func (m *MemoryForest) refreshSubstrateState(
 		frontiers = frontiers[:8]
 	}
 
+	m.substrateStateMu.Lock()
+	defer m.substrateStateMu.Unlock()
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, SubstrateResult{}, fmt.Errorf("begin substrate tx: %w", err)
@@ -537,6 +541,8 @@ func (m *MemoryForest) clearSubstrateState(ctx context.Context, sessionID string
 	contextKey := substrateContextKey(sessionID)
 	now := time.Now().UTC()
 
+	m.substrateStateMu.Lock()
+	defer m.substrateStateMu.Unlock()
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin clear substrate tx: %w", err)
@@ -806,6 +812,29 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 		limit = 64
 	}
 	sessionID = normalizeForestSessionID(sessionID)
+	branchRows, err := m.countSubstrateBranches(ctx, sessionID)
+	if err != nil {
+		return SubstrateResult{}, err
+	}
+	if branchRows > 0 {
+		branches, err := m.queryBranches(ctx, sessionID, "", false, defaultFamilies(), limit)
+		if err != nil {
+			return SubstrateResult{}, err
+		}
+		canopyRoots, err := m.loadSessionCanopyRoots(ctx, sessionID)
+		if err != nil {
+			return SubstrateResult{}, err
+		}
+		_, refreshed, err := m.refreshSubstrateState(ctx, sessionID, branches, canopyRoots)
+		return refreshed, err
+	}
+	hasNodes, err := m.hasSubstrateNodes(ctx, sessionID)
+	if err != nil {
+		return SubstrateResult{}, err
+	}
+	if hasNodes {
+		return m.refreshSubstrateChannelState(ctx, sessionID, limit)
+	}
 	branches, err := m.queryBranches(ctx, sessionID, "", false, defaultFamilies(), limit)
 	if err != nil {
 		return SubstrateResult{}, err
@@ -818,7 +847,39 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 	return refreshed, err
 }
 
+func (m *MemoryForest) countSubstrateBranches(ctx context.Context, sessionID string) (int, error) {
+	var count int
+	if err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_branches
+		WHERE session_id = ? OR ? = 'global'
+	`, normalizeForestSessionID(sessionID), normalizeForestSessionID(sessionID)).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count substrate branches: %w", err)
+	}
+	return count, nil
+}
+
+func (m *MemoryForest) hasSubstrateNodes(ctx context.Context, sessionID string) (bool, error) {
+	var count int
+	err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_nodes
+		WHERE session_id = ? OR ? = 'global'
+	`, normalizeForestSessionID(sessionID), normalizeForestSessionID(sessionID)).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("count substrate nodes: %w", err)
+	}
+	return count > 0, nil
+}
+
 func (m *MemoryForest) recentSubstrateSessions(ctx context.Context) ([]string, error) {
+	nodeSessions, err := m.recentNodeSubstrateSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodeSessions) > 0 {
+		return nodeSessions, nil
+	}
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT session_id
 		FROM (
@@ -840,6 +901,33 @@ func (m *MemoryForest) recentSubstrateSessions(ctx context.Context) ([]string, e
 		var sessionID string
 		if err := rows.Scan(&sessionID); err != nil {
 			return nil, fmt.Errorf("scan recent substrate session: %w", err)
+		}
+		sessions = append(sessions, normalizeForestSessionID(sessionID))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return dedupeStrings(sessions), nil
+}
+
+func (m *MemoryForest) recentNodeSubstrateSessions(ctx context.Context) ([]string, error) {
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT session_id
+		FROM forest_nodes
+		WHERE session_id != ''
+		GROUP BY session_id
+		ORDER BY MAX(last_seen_at) DESC
+		LIMIT ?
+	`, m.substrateLimit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent node substrate sessions: %w", err)
+	}
+	defer rows.Close()
+	var sessions []string
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, fmt.Errorf("scan recent node substrate session: %w", err)
 		}
 		sessions = append(sessions, normalizeForestSessionID(sessionID))
 	}

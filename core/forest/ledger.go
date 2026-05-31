@@ -73,6 +73,9 @@ func (m *MemoryForest) AppendLedgerRecord(ctx context.Context, record LedgerReco
 	if err := tx.Commit(); err != nil {
 		return LedgerAppendResult{}, fmt.Errorf("commit forest ledger tx: %w", err)
 	}
+	if result.Inserted {
+		m.notifyProjector()
+	}
 	return result, nil
 }
 
@@ -103,11 +106,15 @@ func (m *MemoryForest) AppendCanonicalDelta(ctx context.Context, delta claims.Ca
 			if commitErr := tx.Commit(); commitErr != nil {
 				return LedgerAppendResult{}, fmt.Errorf("commit rejected canonical delta ledger tx: %w", commitErr)
 			}
+			m.notifyProjector()
 			return result, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return LedgerAppendResult{}, fmt.Errorf("commit canonical delta ledger tx: %w", err)
+	}
+	if result.Inserted {
+		m.notifyProjector()
 	}
 	return result, nil
 }

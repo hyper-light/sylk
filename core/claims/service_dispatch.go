@@ -63,6 +63,7 @@ type ServiceDispatcherConfig struct {
 	Handler        ServiceHandler
 	SessionID      string
 	CancelRegistry *ClaimCancelRegistry
+	Metrics        ClaimsMetricsSink
 }
 
 type ServiceDispatcher struct {
@@ -80,6 +81,7 @@ type ServiceDispatcher struct {
 	active         map[string]context.CancelFunc
 	subscriptions  []DeltaSubscription
 	cancelRegistry *ClaimCancelRegistry
+	metrics        ClaimsMetricsSink
 	started        bool
 	closed         bool
 }
@@ -115,6 +117,7 @@ func NewServiceDispatcher(cfg ServiceDispatcherConfig) (*ServiceDispatcher, erro
 		inflight:       make(chan struct{}, participant.ConcurrencyBudget),
 		active:         make(map[string]context.CancelFunc, participant.ConcurrencyBudget),
 		cancelRegistry: firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
+		metrics:        normalizeClaimsMetricsSink(cfg.Metrics),
 	}, nil
 }
 
@@ -214,6 +217,7 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 	if err := d.acceptDelta(delta); err != nil {
 		return err
 	}
+	d.recordQueueMetrics(ctx)
 	if !d.dispatchEnabled() {
 		return d.recordFailure(ctx, delta, ValidationErrorCategoryDispatcher, "infrastructure dispatch disabled by rollout gate", nil)
 	}
@@ -224,6 +228,7 @@ func (d *ServiceDispatcher) DispatchDelta(ctx context.Context, delta CanonicalDe
 		return nil
 	}
 	if !d.acquire(delta) {
+		d.recordDispatcherOverflow(ctx)
 		return d.recordOverflow(ctx, delta)
 	}
 	if err := d.scope.Go("claims.service."+d.participant.RouteKey, d.participant.HandlerTimeout, func(runCtx context.Context) error {
@@ -251,6 +256,7 @@ func (d *ServiceDispatcher) ingest(ctx context.Context, delta Delta) {
 func (d *ServiceDispatcher) invoke(ctx context.Context, delta CanonicalDelta) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
+			d.recordHandlerInvocation(context.Background(), "panic")
 			err = d.recordFailure(context.Background(), delta, ValidationErrorCategoryPanic, fmt.Sprintf("%v", recovered), debug.Stack())
 		}
 	}()
@@ -259,12 +265,15 @@ func (d *ServiceDispatcher) invoke(ctx context.Context, delta CanonicalDelta) (e
 		return err
 	}
 	if d.testamentAlreadyRecorded(claim) {
+		d.recordHandlerInvocation(ctx, "deduped")
 		return nil
 	}
 	result, err := d.handler.HandleServiceClaim(ctx, ServiceClaimRequest{Board: d.board, Claim: claim, Delta: delta, Participant: d.participant})
 	if err != nil {
+		d.recordHandlerInvocation(ctx, "failure")
 		return d.recordFailure(ctx, delta, ValidationErrorCategoryHandler, err.Error(), nil)
 	}
+	d.recordHandlerInvocation(ctx, "success")
 	return d.postSuccess(ctx, claim, result)
 }
 
@@ -346,6 +355,37 @@ func claimValidationActorID(claim *Claim) string {
 
 func (d *ServiceDispatcher) recordOverflow(ctx context.Context, delta CanonicalDelta) error {
 	return d.recordFailure(ctx, delta, ValidationErrorCategoryDispatcher, ErrServiceDispatchOverflow.Error(), nil)
+}
+
+func (d *ServiceDispatcher) recordQueueMetrics(ctx context.Context) {
+	if d == nil {
+		return
+	}
+	depth := len(d.inflight)
+	capacity := cap(d.inflight)
+	queue := d.participant.RouteKey
+	recordClaimsGauge(ctx, d.metrics, "claims_dispatcher_queue_depth", float64(depth), metricLabels("queue", queue))
+	recordClaimsGauge(ctx, d.metrics, "claims_in_flight_handler_count", float64(depth), metricLabels("participant_type", string(d.participant.Category)))
+	if capacity > 0 && depth+1 >= capacity {
+		recordClaimsCounter(ctx, d.metrics, "claims_dispatcher_queue_near_capacity_total", metricLabels("queue", queue))
+	}
+}
+
+func (d *ServiceDispatcher) recordDispatcherOverflow(ctx context.Context) {
+	if d == nil {
+		return
+	}
+	recordClaimsCounter(ctx, d.metrics, "claims_dispatcher_queue_overflow_total", metricLabels("queue", d.participant.RouteKey))
+}
+
+func (d *ServiceDispatcher) recordHandlerInvocation(ctx context.Context, outcome string) {
+	if d == nil {
+		return
+	}
+	recordClaimsCounter(ctx, d.metrics, "claims_dispatcher_handler_invocations_total", metricLabels(
+		"participant_type", string(d.participant.Category),
+		"outcome", outcome,
+	))
 }
 
 func (d *ServiceDispatcher) recordServiceShutdown(ctx context.Context) error {

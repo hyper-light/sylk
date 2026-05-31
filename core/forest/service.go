@@ -55,6 +55,12 @@ type Config struct {
 	// ingestion and immediate snapshot queries.
 	DisableBackgroundWorkers bool
 
+	// EnableLegacyBranchProjection starts the pre-phase-4 async branch
+	// projector instead of the node graph projector. Production must
+	// leave this false; it exists for legacy projector tests and
+	// migration diagnostics that still exercise forest_branches.
+	EnableLegacyBranchProjection bool
+
 	// ── Issue #3 — selection-bias correction ──
 
 	// CounterfactualLabelWeight is the magnitude applied to training
@@ -279,17 +285,23 @@ type Config struct {
 	ClaimsDeltaSubscriber    claims.DeltaSubscriber
 	ClaimsDeltaSessionFilter string
 	DeltaIngestQueueCapacity int
+
+	// NeighborIndex supplies semantic neighborhoods for density
+	// clustering. When nil, the clusterer derives bounded neighborhoods
+	// from the node graph edges.
+	NeighborIndex NeighborIndex
 }
 
 // MemoryForest provides forest projection, retrieval, and learning services.
 type MemoryForest struct {
-	db           *sql.DB
-	contentStore *ctxpkg.UniversalContentStore
-	searcher     *ctxpkg.TieredSearcher
-	logger       *slog.Logger
-	warmth       *WarmthStore
-	models       *learnedModelStore
-	booster      boosterConfig
+	db            *sql.DB
+	contentStore  *ctxpkg.UniversalContentStore
+	searcher      *ctxpkg.TieredSearcher
+	logger        *slog.Logger
+	warmth        *WarmthStore
+	models        *learnedModelStore
+	booster       boosterConfig
+	neighborIndex NeighborIndex
 
 	// tuner is the integrated hyperparameter system (see
 	// hyperparameters.go). Single source of truth for every
@@ -314,24 +326,25 @@ type MemoryForest struct {
 
 	maintenanceRunMu sync.Mutex
 	maintenanceMu    sync.Mutex
+	substrateStateMu sync.RWMutex
 	maintenanceWake  chan struct{}
 	pendingSubstrate map[string]scheduledForestWork
 	replayDue        time.Time
 	trainingWork     scheduledForestWork
 	trainingDirty    bool
 
-	// CQRS branch projector — single tracked goroutine consumes
-	// events from forest_event_seq_log in seq order and applies
-	// them to the Branch projection (and downstream relay edges,
-	// canopy, substrate-dirty marker, replay queue, warmth, training
-	// labels). Lease-coordinated for multi-process safety.
+	// CQRS node projector — single tracked goroutine consumes
+	// forest_ledger in seq order and applies the emergent node graph.
+	// The legacy branch projector is no longer started in production;
+	// SynchronousProjection keeps inline branch materialization only
+	// for compatibility tests that still assert old branch tables.
 	//
 	// One wake channel per projector. Sharing one wake across
 	// projectors causes the signal to be "stolen" — whichever
 	// projector reads first consumes it, leaving the other to wait
 	// out the poll interval. Separate channels means each projector
 	// is notified independently when its source advances.
-	projectorWake           chan struct{} // branch projector wake
+	projectorWake           chan struct{} // node projector wake
 	retrievalCandidatesWake chan struct{} // retrieval candidates projector wake
 	projectorID             string
 	synchronousProjection   bool
@@ -481,6 +494,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		warmth:                           newWarmthStore(cfg.DB, cfg.MaxTraces),
 		models:                           models,
 		booster:                          booster,
+		neighborIndex:                    cfg.NeighborIndex,
 		tuner:                            tuner,
 		runCtx:                           runCtx,
 		runCancel:                        runCancel,
@@ -526,7 +540,7 @@ func New(cfg Config) (*MemoryForest, error) {
 	}
 	service.baseScoreStore = newBaseScoreModelStore(service.db)
 	service.registerRuntimeQueue("maintenance_wake", cap(service.maintenanceWake))
-	service.registerRuntimeQueue("branch_projector_wake", cap(service.projectorWake))
+	service.registerRuntimeQueue("node_projector_wake", cap(service.projectorWake))
 	service.registerRuntimeQueue("retrieval_candidates_wake", cap(service.retrievalCandidatesWake))
 	service.registerRuntimeQueue("retrieval_audit_idle", cap(service.retrievalAuditIdle))
 	if err := service.runtime.RegisterLease(projectorBranchName, service.projectorID); err != nil {
@@ -568,14 +582,18 @@ func New(cfg Config) (*MemoryForest, error) {
 		service.startMaintenance()
 	}
 	if !service.synchronousProjection && !cfg.DisableBackgroundWorkers {
-		// Async-only goroutines: branch projector,
+		// Async-only goroutines: node projector,
 		// retrieval-candidates projector, audit drainer,
 		// implicit-negative sweeper, AntiPattern promoter, and
 		// storage pruners. Tests using SynchronousProjection=true
-		// write branch projections inline but still rely on the
+		// write compatibility branch projections inline but still rely on the
 		// maintenance worker for replay, substrate, and training
 		// schedules.
-		service.startBranchProjector()
+		if cfg.EnableLegacyBranchProjection {
+			service.startBranchProjector()
+		} else {
+			service.startNodeProjector()
+		}
 		service.startRetrievalCandidatesProjector()
 		service.startRetrievalAuditDrainer()
 		service.startImplicitNegativeSweeper()
@@ -845,6 +863,14 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 		return nil
 	}
 	if m.synchronousProjection {
+		if err := m.projectNodeGraphThroughSeq(ctx, result.Seq); err != nil {
+			slog.Error("forest_inline_node_projection_failed",
+				"event_id", prepared.ID,
+				"branch_id", prepared.BranchID,
+				"err", err.Error(),
+			)
+			return err
+		}
 		if err := m.projectInlineForTests(ctx, prepared); err != nil {
 			slog.Error("forest_inline_projection_failed",
 				"event_id", prepared.ID,
@@ -949,7 +975,7 @@ func (m *MemoryForest) notifyProjector() {
 	select {
 	case m.projectorWake <- struct{}{}:
 	default:
-		m.recordRuntimeQueueOverflow("branch_projector_wake", "branch projector wake already pending")
+		m.recordRuntimeQueueOverflow("node_projector_wake", "node projector wake already pending")
 	}
 }
 

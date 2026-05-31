@@ -65,6 +65,7 @@ func newAsyncTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql
 	}
 
 	cfg.DB = db
+	cfg.EnableLegacyBranchProjection = true
 	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)

@@ -1029,6 +1029,11 @@ type ClaimsBoardConfig struct {
 	// audit budgets for the claims operations plane. Zero values normalize
 	// to bounded defaults; they never mean unbounded queues.
 	Operations ClaimsOperationsConfig
+
+	// Metrics records bounded claims operations telemetry. Nil is safe and
+	// normalizes to NoopClaimsMetricsSink. Metrics emission is best-effort
+	// and must never fail board mutations.
+	Metrics ClaimsMetricsSink
 }
 
 // ScopeProvider launches tracked goroutines. Matches the signature of

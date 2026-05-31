@@ -25,31 +25,31 @@ type ViewSnapshot struct {
 
 // ViewTree is a single family projection rendered as a distinct tree.
 type ViewTree struct {
-	Family    TreeFamily   `json:"family"`
-	Label     string       `json:"label"`
-	Nodes     []ViewNode   `json:"nodes,omitempty"`
-	Roots     []string     `json:"roots,omitempty"`
-	UpdatedAt time.Time    `json:"updated_at"`
-	Scope     MemoryScope  `json:"scope,omitempty"`
-	State     BranchState  `json:"state,omitempty"`
+	Family    TreeFamily  `json:"family"`
+	Label     string      `json:"label"`
+	Nodes     []ViewNode  `json:"nodes,omitempty"`
+	Roots     []string    `json:"roots,omitempty"`
+	UpdatedAt time.Time   `json:"updated_at"`
+	Scope     MemoryScope `json:"scope,omitempty"`
+	State     BranchState `json:"state,omitempty"`
 }
 
 // ViewNode captures the minimal structural branch state required by the TUI.
 type ViewNode struct {
-	ID         string       `json:"id"`
-	ParentID   string       `json:"parent_id,omitempty"`
-	RootID     string       `json:"root_id"`
-	Family     TreeFamily   `json:"family"`
-	Title      string       `json:"title"`
-	Summary    string       `json:"summary"`
-	Depth      int          `json:"depth"`
-	Leaf       bool         `json:"leaf"`
-	Scope      MemoryScope  `json:"scope"`
-	State      BranchState  `json:"state"`
-	Confidence float64      `json:"confidence"`
-	Salience   float64      `json:"salience"`
-	CreatedAt  time.Time    `json:"created_at"`
-	UpdatedAt  time.Time    `json:"updated_at"`
+	ID         string      `json:"id"`
+	ParentID   string      `json:"parent_id,omitempty"`
+	RootID     string      `json:"root_id"`
+	Family     TreeFamily  `json:"family"`
+	Title      string      `json:"title"`
+	Summary    string      `json:"summary"`
+	Depth      int         `json:"depth"`
+	Leaf       bool        `json:"leaf"`
+	Scope      MemoryScope `json:"scope"`
+	State      BranchState `json:"state"`
+	Confidence float64     `json:"confidence"`
+	Salience   float64     `json:"salience"`
+	CreatedAt  time.Time   `json:"created_at"`
+	UpdatedAt  time.Time   `json:"updated_at"`
 }
 
 // Snapshot returns a forest-structured view tailored for the TUI memory mode.
@@ -117,7 +117,88 @@ func (m *MemoryForest) loadViewBranches(ctx context.Context, sessionID string) (
 			return sessionBranches, nil
 		}
 	}
-	return m.loadViewBranchesWithScope(ctx, "", true)
+	semanticBranches, err := m.loadViewBranchesWithScope(ctx, "", true)
+	if err != nil {
+		return nil, err
+	}
+	if len(semanticBranches) > 0 {
+		return semanticBranches, nil
+	}
+	return m.loadViewNodesAsBranches(ctx, sessionID)
+}
+
+func (m *MemoryForest) loadViewNodesAsBranches(ctx context.Context, sessionID string) ([]*Branch, error) {
+	query := `
+		SELECT node_id, node_kind, source_partition, subject_id, session_id, task_id,
+		       title, summary, confidence, salience, utility, evidence_grade,
+		       first_seen_at, last_seen_at, source_seq
+		FROM forest_nodes
+		WHERE 1 = 1
+	`
+	args := []any{}
+	if strings.TrimSpace(sessionID) != "" {
+		query += " AND session_id = ?"
+		args = append(args, normalizeForestSessionID(sessionID))
+	}
+	query += " ORDER BY source_seq ASC, first_seen_at ASC LIMIT ?"
+	args = append(args, m.substrateLimit)
+	rows, err := m.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query memory view nodes: %w", err)
+	}
+	defer rows.Close()
+	branches := make([]*Branch, 0, m.substrateLimit)
+	for rows.Next() {
+		var (
+			id, kind, partition, subjectID, nodeSessionID, taskID string
+			title, summary, grade                                 string
+			confidence, salience, utility                         float64
+			firstSeen, lastSeen, seq                              int64
+		)
+		if err := rows.Scan(&id, &kind, &partition, &subjectID, &nodeSessionID, &taskID, &title, &summary,
+			&confidence, &salience, &utility, &grade, &firstSeen, &lastSeen, &seq); err != nil {
+			return nil, fmt.Errorf("scan memory view node: %w", err)
+		}
+		family := treeFamilyForNodeKind(ForestNodeKind(kind))
+		state := BranchStateActive
+		if EvidenceGrade(grade) == EvidenceGradeFailed || EvidenceGrade(grade) == EvidenceGradeContradicted {
+			state = BranchStateContradicted
+		}
+		branches = append(branches, &Branch{
+			ID:             id,
+			RootID:         stableID("node_root", partition, string(family)),
+			Family:         family,
+			Scope:          ScopeEpisodic,
+			State:          state,
+			SessionID:      nodeSessionID,
+			TaskID:         taskID,
+			IntentID:       subjectID,
+			Title:          title,
+			Summary:        summary,
+			Confidence:     confidence,
+			Salience:       salience,
+			Utility:        utility,
+			CreatedAt:      time.Unix(firstSeen, 0).UTC(),
+			UpdatedAt:      time.Unix(lastSeen, 0).UTC(),
+			LastAppliedSeq: seq,
+		})
+	}
+	return branches, rows.Err()
+}
+
+func treeFamilyForNodeKind(kind ForestNodeKind) TreeFamily {
+	switch kind {
+	case ForestNodeClaim, ForestNodeInteraction, ForestNodePolicyTrial, ForestNodeSkillCandidate, ForestNodeTestament:
+		return TreeFamilyIntent
+	case ForestNodeValidation, ForestNodeArtifact, ForestNodeContent:
+		return TreeFamilyEvidence
+	case ForestNodeContradiction:
+		return TreeFamilyAntiPattern
+	case ForestNodeOutcome, ForestNodeRemediation:
+		return TreeFamilyOutcome
+	default:
+		return TreeFamilyEvidence
+	}
 }
 
 func (m *MemoryForest) loadViewBranchesWithScope(ctx context.Context, sessionID string, semanticOnly bool) ([]*Branch, error) {

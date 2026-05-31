@@ -42,6 +42,7 @@ type BoardAmplifier struct {
 	scope                  ScopeProvider
 	agentRefResolver       AgentRefResolver
 	canonicalDirectEnabled bool
+	metrics                ClaimsMetricsSink
 
 	// errorSink receives emission failures. When nil, errors are
 	// dropped silently (tests). Wired by the board so agents see
@@ -57,6 +58,7 @@ func NewBoardAmplifier(sessionID, taskID, boardID string) *BoardAmplifier {
 		taskID:                 taskID,
 		boardID:                boardID,
 		deltaBus:               NoopDeltaBus{},
+		metrics:                NoopClaimsMetricsSink{},
 		canonicalDirectEnabled: true,
 	}
 }
@@ -110,6 +112,14 @@ func (a *BoardAmplifier) WithErrorSink(sink func(message string)) *BoardAmplifie
 		return nil
 	}
 	a.errorSink = sink
+	return a
+}
+
+func (a *BoardAmplifier) WithMetricsSink(sink ClaimsMetricsSink) *BoardAmplifier {
+	if a == nil {
+		return nil
+	}
+	a.metrics = normalizeClaimsMetricsSink(sink)
 	return a
 }
 
@@ -913,9 +923,12 @@ func (a *BoardAmplifier) buildCanonicalClaimLifecycleFromStatusDelta(ctx context
 func (a *BoardAmplifier) dispatchSingle(ctx context.Context, topic string, delta Delta) {
 	publisher := a.deltaBus
 	emit := func(runCtx context.Context) error {
+		start := time.Now()
 		if err := publisher.PublishDelta(runCtx, topic, delta); err != nil {
 			a.reportEmitError("delta_publish_failed", topic, err)
+			a.recordDeltaPublishFailure(runCtx, err)
 		}
+		a.recordDeltaEmission(runCtx, delta, time.Since(start))
 		return nil
 	}
 	a.runTracked(ctx, "claims_amplifier_delta", emit)
@@ -939,14 +952,35 @@ func (a *BoardAmplifier) dispatchCanonical(ctx context.Context, deltas []canonic
 func (a *BoardAmplifier) publishCanonicalBatch(ctx context.Context, publisher DeltaPublisher, deltas []canonicalDispatch) error {
 	var firstErr error
 	for _, d := range deltas {
+		start := time.Now()
 		if err := publisher.PublishDelta(ctx, d.topic, d.delta); err != nil {
 			a.reportEmitError("canonical_delta_publish_failed", d.topic, err)
+			a.recordDeltaPublishFailure(ctx, err)
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
+		a.recordDeltaEmission(ctx, d.delta, time.Since(start))
 	}
 	return firstErr
+}
+
+func (a *BoardAmplifier) recordDeltaEmission(ctx context.Context, delta Delta, dur time.Duration) {
+	if a == nil {
+		return
+	}
+	recordClaimsCounter(ctx, a.metrics, "claims_delta_emitted_total", metricLabels(
+		"action", deltaMetricAction(delta),
+		"participant_category", deltaMetricParticipantCategory(delta),
+	))
+	recordClaimsHistogram(ctx, a.metrics, "claims_delta_emission_duration_seconds", dur.Seconds(), nil)
+}
+
+func (a *BoardAmplifier) recordDeltaPublishFailure(ctx context.Context, err error) {
+	if a == nil || err == nil {
+		return
+	}
+	recordClaimsCounter(ctx, a.metrics, "claims_delta_publish_failure_total", metricLabels("reason", errMetricReason(err)))
 }
 
 func (a *BoardAmplifier) canonicalDispatchesWithBoardTopic(deltas []canonicalDispatch) []canonicalDispatch {

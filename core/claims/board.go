@@ -100,6 +100,7 @@ type ClaimsBoard struct {
 	legacySessionNoWAL bool
 	rollout            RolloutConfig
 	operations         ClaimsOperationsConfig
+	metrics            ClaimsMetricsSink
 	canonicalViaOutbox bool
 	durable            *DurableBoard
 }
@@ -151,12 +152,14 @@ func NewClaimsBoard(cfg ClaimsBoardConfig) *ClaimsBoard {
 		legacySessionNoWAL:        cfg.LegacySessionNoWAL,
 		rollout:                   boardRolloutConfig(cfg.Rollout),
 		operations:                operations,
+		metrics:                   normalizeClaimsMetricsSink(cfg.Metrics),
 	}
 	if cfg.SessionID != "" {
 		amp := NewBoardAmplifier(cfg.SessionID, cfg.TaskID, boardID).
 			WithDeltaBus(cfg.DeltaBus).
 			WithAgentRefResolver(cfg.AgentRefResolver).
 			WithScope(cfg.Scope).
+			WithMetricsSink(b.metrics).
 			WithErrorSink(b.RecordNotificationError)
 		b.amplifier = amp
 	}
@@ -2184,6 +2187,7 @@ func (b *ClaimsBoard) notifyDelta(delta BoardMutationDelta) {
 	// just triggered the delta.
 	b.invalidateProjectionCache()
 	delta.Summary = b.Summary()
+	b.recordBoardMutationMetric(delta)
 
 	b.subscribersMu.Lock()
 	subs := make([]BoardDeltaSubscriber, len(b.deltaSubscribers))
@@ -2196,6 +2200,53 @@ func (b *ClaimsBoard) notifyDelta(delta BoardMutationDelta) {
 		if err := fn(delta); err != nil {
 			b.RecordNotificationError("delta subscriber: " + err.Error())
 		}
+	}
+}
+
+func (b *ClaimsBoard) recordBoardMutationMetric(delta BoardMutationDelta) {
+	if b == nil {
+		return
+	}
+	entity, action := boardMutationMetricParts(delta)
+	recordClaimsCounter(context.Background(), b.metrics, "claims_board_transitions_total", metricLabels("entity_type", entity, "action", action))
+	b.recordClaimLifecycleMetric(delta)
+}
+
+func (b *ClaimsBoard) recordClaimLifecycleMetric(delta BoardMutationDelta) {
+	switch strings.TrimSpace(delta.Kind) {
+	case "claim_generated", "claim_created":
+		recordClaimsCounter(context.Background(), b.metrics, "claims_claim_generated_total", metricLabels("action_type", "unknown", "issuer_category", "unknown"))
+	case "claim_posted":
+		recordClaimsCounter(context.Background(), b.metrics, "claims_claim_posted_total", metricLabels("action_type", "unknown", "target_category", "unknown"))
+	case "claim_status_changed":
+		b.recordClaimStatusMetric(delta)
+	case "validation_evaluated":
+		recordClaimsCounter(context.Background(), b.metrics, "claims_validation_dispatched_total", metricLabels("validator_id", firstNonEmpty(delta.AgentID, "unknown")))
+	}
+}
+
+func (b *ClaimsBoard) recordClaimStatusMetric(delta BoardMutationDelta) {
+	switch delta.ToStatus {
+	case ClaimStatusAccepted:
+		recordClaimsCounter(context.Background(), b.metrics, "claims_claim_satisfied_total", metricLabels("action_type", "unknown"))
+	case ClaimStatusRejected:
+		recordClaimsCounter(context.Background(), b.metrics, "claims_claim_validation_failed_total", metricLabels("action_type", "unknown", "error_category", "rejected"))
+	}
+}
+
+func boardMutationMetricParts(delta BoardMutationDelta) (string, string) {
+	kind := strings.TrimSpace(delta.Kind)
+	switch kind {
+	case "testament_submitted", "testament_posted":
+		return "testament", kind
+	case "validation_evaluated":
+		return "validation", kind
+	case "phase_changed":
+		return "phase", kind
+	case "claim_context_changed", "testament_context_changed":
+		return "context", kind
+	default:
+		return "claim", firstNonEmpty(kind, "unknown")
 	}
 }
 
@@ -2763,9 +2814,14 @@ func (b *ClaimsBoard) appendDurableEventLocked(kind, agentID string, payload any
 	if b == nil || b.durable == nil {
 		return nil
 	}
+	start := time.Now()
 	if err := b.durable.appendCommittedEvent(kind, agentID, payload, outboxRecords); err != nil {
+		recordClaimsCounter(context.Background(), b.metrics, "claims_board_wal_write_total", metricLabels("result", "failure"))
+		recordClaimsHistogram(context.Background(), b.metrics, "claims_board_wal_write_duration_seconds", time.Since(start).Seconds(), nil)
 		return err
 	}
+	recordClaimsCounter(context.Background(), b.metrics, "claims_board_wal_write_total", metricLabels("result", "success"))
+	recordClaimsHistogram(context.Background(), b.metrics, "claims_board_wal_write_duration_seconds", time.Since(start).Seconds(), nil)
 	return nil
 }
 

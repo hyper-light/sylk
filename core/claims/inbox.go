@@ -321,6 +321,9 @@ type InboxConfig struct {
 	// session-level cancellation can still stop work dispatched through
 	// this inbox.
 	CancelRegistry *ClaimCancelRegistry
+
+	// Metrics records inbox delivery/overflow gauges. Nil is safe.
+	Metrics ClaimsMetricsSink
 }
 
 // ClaimsInbox is the per-replica event-driven intake surface.
@@ -370,6 +373,7 @@ type ClaimsInbox struct {
 	onResolved func(entry *GraphEntryPoint)
 
 	cancelRegistry *ClaimCancelRegistry
+	metrics        ClaimsMetricsSink
 
 	// queueCap is the bus per-sub queue cap, used to size the dedup
 	// LRU once the actual pattern count is known at Start.
@@ -437,6 +441,7 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 		board:            cfg.Board,
 		onResolved:       cfg.OnResolved,
 		cancelRegistry:   firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
+		metrics:          normalizeClaimsMetricsSink(cfg.Metrics),
 		seen:             newDedupLRU(queueCap),
 		expectations:     make(map[string]*Expectation),
 		orphans:          make(map[string][]orphanedInboxDelta),
@@ -715,7 +720,9 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 	if i == nil || d == nil || i.closed.Load() {
 		return
 	}
-	i.deliveredByClass[DeltaClass(d)].Add(1)
+	class := DeltaClass(d)
+	i.deliveredByClass[class].Add(1)
+	i.recordInboxDelivery(d, class)
 	i.mu.Lock()
 	entry, releaseSubs := i.ingestLocked(d)
 	i.mu.Unlock()
@@ -737,6 +744,16 @@ func (i *ClaimsInbox) Ingest(d Delta) {
 
 	if entry != nil && i.onResolved != nil {
 		i.onResolved(entry)
+	}
+}
+
+func (i *ClaimsInbox) recordInboxDelivery(d Delta, class InboxClass) {
+	if i == nil {
+		return
+	}
+	recordClaimsGauge(context.Background(), i.metrics, "claims_dispatcher_queue_depth", float64(i.Len()), metricLabels("queue", "inbox:"+i.agentID+":"+class.String()))
+	if overflow := i.OverflowCount(); overflow > 0 {
+		recordClaimsCounter(context.Background(), i.metrics, "claims_delta_subscriber_overflow_total", metricLabels("topic", deltaMetricAction(d)))
 	}
 }
 

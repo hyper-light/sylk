@@ -107,6 +107,19 @@ func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start
 	}
 	audit.Query = normalized.Query
 
+	hasNodes, err := m.hasRetrievalNodes(ctx, normalized.SessionID)
+	if err != nil {
+		return nil, audit, err
+	}
+	if hasNodes {
+		packets, err := m.retrieveNodePackets(ctx, normalized)
+		if err != nil {
+			return nil, audit, err
+		}
+		populateAuditCandidates(audit, packets, nil, normalized.Limit)
+		return packets, audit, nil
+	}
+
 	staged, err := m.loadRetrievalStage(ctx, normalized, audit.SubstrateMode)
 	if err != nil {
 		return nil, audit, err

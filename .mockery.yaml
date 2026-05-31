@@ -323,6 +323,17 @@ packages:
         config:
           mockname: "ExternalAdapterBackend"
 
+  github.com/adalundhe/sylk/core/forest:
+    config:
+      dir: "core/forest"
+      outpkg: "forest"
+      inpackage: true
+      filename: "mock_{{.InterfaceName | snakecase}}_test.go"
+    interfaces:
+      NeighborIndex:
+        config:
+          mockname: "MockNeighborIndex"
+
   github.com/adalundhe/sylk/ui/bridge:
     config:
       dir: "ui/bridge/mocks"

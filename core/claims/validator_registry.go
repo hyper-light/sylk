@@ -61,6 +61,7 @@ type ProgrammaticValidatorDispatcher struct {
 	limits   map[string]chan struct{}
 	clock    ClaimsClock
 	scope    ScopeProvider
+	metrics  ClaimsMetricsSink
 	workers  sync.WaitGroup
 }
 
@@ -169,7 +170,17 @@ func newProgrammaticValidatorDispatcher(registry *ValidatorRegistry, clock Claim
 		limits:   make(map[string]chan struct{}),
 		clock:    firstNonNilClock(clock),
 		scope:    scope,
+		metrics:  NoopClaimsMetricsSink{},
 	}
+}
+
+func (d *ProgrammaticValidatorDispatcher) SetMetricsSink(sink ClaimsMetricsSink) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.metrics = normalizeClaimsMetricsSink(sink)
+	d.mu.Unlock()
 }
 
 func (d *ProgrammaticValidatorDispatcher) Wait() {
@@ -207,11 +218,14 @@ func (d *ProgrammaticValidatorDispatcher) DispatchValidation(ctx context.Context
 	if !ok {
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorNotRegistered.Error(), d.clock.Now()), ErrValidatorNotRegistered
 	}
+	d.recordValidationDispatched(ctx, reg)
 	types := d.registry.typeRegistry()
 	if err := validateDispatchInput(types, reg, req); err != nil {
+		d.recordValidationFailed(ctx, reg, req, ValidationErrorCategoryArtifactType)
 		return validationDispatchError(req, ValidationErrorCategoryArtifactType, err.Error(), d.clock.Now()), nil
 	}
 	if !d.acquire(reg) {
+		d.recordValidationFailed(ctx, reg, req, ValidationErrorCategoryDispatcher)
 		return validationDispatchError(req, ValidationErrorCategoryDispatcher, ErrValidatorConcurrencyExhausted.Error(), d.clock.Now()), nil
 	}
 	return d.invoke(ctx, types, reg, req, func() { d.release(reg) })
@@ -239,6 +253,7 @@ func (d *ProgrammaticValidatorDispatcher) invokeDirect(ctx context.Context, type
 	case outcome := <-done:
 		return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
 	case <-runCtx.Done():
+		d.recordValidationTimeout(ctx, reg)
 		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
 	}
 }
@@ -263,6 +278,7 @@ func (d *ProgrammaticValidatorDispatcher) invokeTracked(ctx context.Context, typ
 	case outcome := <-done:
 		return d.resultFromValidatorOutcome(types, reg, req, runCtx, outcome)
 	case <-runCtx.Done():
+		d.recordValidationTimeout(ctx, reg)
 		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
 	}
 }
@@ -287,21 +303,63 @@ func (d *ProgrammaticValidatorDispatcher) callValidatorHandler(ctx context.Conte
 
 func (d *ProgrammaticValidatorDispatcher) resultFromValidatorOutcome(types *TypeRegistry, reg ValidatorRegistration, req ValidationDispatchRequest, runCtx context.Context, outcome validatorHandlerOutcome) (ValidationDispatchResult, error) {
 	if outcome.recovered != nil {
+		d.recordValidationPanic(runCtx, reg)
 		result := validationDispatchError(req, ValidationErrorCategoryPanic, fmt.Sprintf("%v", outcome.recovered), d.clock.Now())
 		result.ResultArtifact = validatorErrorArtifact(reg, req, result.Error, outcome.stack)
 		return result, nil
 	}
 	if runCtx.Err() != nil {
+		d.recordValidationTimeout(runCtx, reg)
 		return validationDispatchError(req, ValidationErrorCategoryTimeout, runCtx.Err().Error(), d.clock.Now()), nil
 	}
 	if outcome.err != nil {
+		d.recordValidationFailed(runCtx, reg, req, ValidationErrorCategoryHandler)
 		return validationDispatchError(req, ValidationErrorCategoryHandler, outcome.err.Error(), d.clock.Now()), nil
 	}
 	result := outcome.result
 	if err := validateDispatchResult(types, reg, req, result); err != nil {
+		d.recordValidationFailed(runCtx, reg, req, ValidationErrorCategoryArtifactType)
 		return validationDispatchError(req, ValidationErrorCategoryArtifactType, err.Error(), d.clock.Now()), nil
 	}
+	d.recordValidationValidated(runCtx, reg)
 	return validationDispatchSuccess(req, result, d.clock.Now()), nil
+}
+
+func (d *ProgrammaticValidatorDispatcher) recordValidationDispatched(ctx context.Context, reg ValidatorRegistration) {
+	recordClaimsCounter(ctx, d.metricSink(), "claims_validation_dispatched_total", metricLabels("validator_id", reg.ValidatorID))
+}
+
+func (d *ProgrammaticValidatorDispatcher) recordValidationValidated(ctx context.Context, reg ValidatorRegistration) {
+	recordClaimsCounter(ctx, d.metricSink(), "claims_validation_validated_total", metricLabels("validator_id", reg.ValidatorID))
+}
+
+func (d *ProgrammaticValidatorDispatcher) recordValidationFailed(ctx context.Context, reg ValidatorRegistration, req ValidationDispatchRequest, category ValidationErrorCategory) {
+	recordClaimsCounter(ctx, d.metricSink(), "claims_validation_failed_total", metricLabels(
+		"validator_id", reg.ValidatorID,
+		"required", fmt.Sprintf("%t", validationRequired(req.Validation)),
+		"error_category", string(category),
+	))
+}
+
+func (d *ProgrammaticValidatorDispatcher) recordValidationTimeout(ctx context.Context, reg ValidatorRegistration) {
+	recordClaimsCounter(ctx, d.metricSink(), "claims_validation_handler_timeout_total", metricLabels("validator_id", reg.ValidatorID))
+}
+
+func (d *ProgrammaticValidatorDispatcher) recordValidationPanic(ctx context.Context, reg ValidatorRegistration) {
+	recordClaimsCounter(ctx, d.metricSink(), "claims_validation_handler_panic_total", metricLabels("validator_id", reg.ValidatorID))
+}
+
+func (d *ProgrammaticValidatorDispatcher) metricSink() ClaimsMetricsSink {
+	if d == nil {
+		return NoopClaimsMetricsSink{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return normalizeClaimsMetricsSink(d.metrics)
+}
+
+func validationRequired(validation *Validation) bool {
+	return validation != nil && validation.Required
 }
 
 func (d *ProgrammaticValidatorDispatcher) acquire(reg ValidatorRegistration) bool {
@@ -646,6 +704,7 @@ type BoardValidatorDispatcherConfig struct {
 	MaxOutputBytes       int64
 	ApprovedValidatorIDs map[string]bool
 	CancelRegistry       *ClaimCancelRegistry
+	Metrics              ClaimsMetricsSink
 }
 
 type BoardValidatorDispatcher struct {
@@ -682,10 +741,12 @@ func NewBoardValidatorDispatcher(cfg BoardValidatorDispatcherConfig) (*BoardVali
 	if scope == nil && cfg.Board != nil {
 		scope = cfg.Board.scope
 	}
+	programmatic := newProgrammaticValidatorDispatcher(cfg.Registry, clock, scope)
+	programmatic.SetMetricsSink(cfg.Metrics)
 	return &BoardValidatorDispatcher{
 		board:                cfg.Board,
 		registry:             cfg.Registry,
-		programmatic:         newProgrammaticValidatorDispatcher(cfg.Registry, clock, scope),
+		programmatic:         programmatic,
 		clock:                clock,
 		policy:               cfg.Policy,
 		redactor:             cfg.Redactor,
