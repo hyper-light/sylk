@@ -25,6 +25,8 @@ const (
 	EnvClaimsInfraSession        = "SYLK_CLAIMS_INFRA_SESSION"
 	EnvClaimsInfraFabric         = "SYLK_CLAIMS_INFRA_FABRIC"
 	EnvClaimsInfraBus            = "SYLK_CLAIMS_INFRA_BUS"
+	EnvClaimsTelemetryExporters  = "SYLK_CLAIMS_TELEMETRY_EXPORTERS"
+	EnvClaimsUIOperationsPanel   = "SYLK_CLAIMS_UI_OPERATIONS_PANEL"
 )
 
 type ProjectionRolloutMode string
@@ -62,6 +64,8 @@ type RolloutConfig struct {
 	ClaimsInfraSession        InfrastructureRolloutMode `json:"claims_infra_session"`
 	ClaimsInfraFabric         InfrastructureRolloutMode `json:"claims_infra_fabric"`
 	ClaimsInfraBus            InfrastructureRolloutMode `json:"claims_infra_bus"`
+	ClaimsTelemetryExporters  InfrastructureRolloutMode `json:"claims_telemetry_exporters"`
+	ClaimsUIOperationsPanel   InfrastructureRolloutMode `json:"claims_ui_operations_panel"`
 }
 
 var defaultRolloutConfig = struct {
@@ -91,6 +95,8 @@ func DefaultRolloutConfig() RolloutConfig {
 		ClaimsInfraSession:        InfrastructureRolloutEnabled,
 		ClaimsInfraFabric:         InfrastructureRolloutEnabled,
 		ClaimsInfraBus:            InfrastructureRolloutEnabled,
+		ClaimsTelemetryExporters:  InfrastructureRolloutEnabled,
+		ClaimsUIOperationsPanel:   InfrastructureRolloutEnabled,
 	}
 }
 
@@ -130,6 +136,8 @@ func RolloutConfigFromEnv(getenv func(string) string) RolloutConfig {
 	cfg.ClaimsInfraSession = infrastructureModeEnv(getenv, EnvClaimsInfraSession, cfg.ClaimsInfraSession)
 	cfg.ClaimsInfraFabric = infrastructureModeEnv(getenv, EnvClaimsInfraFabric, cfg.ClaimsInfraFabric)
 	cfg.ClaimsInfraBus = infrastructureModeEnv(getenv, EnvClaimsInfraBus, cfg.ClaimsInfraBus)
+	cfg.ClaimsTelemetryExporters = infrastructureModeEnv(getenv, EnvClaimsTelemetryExporters, cfg.ClaimsTelemetryExporters)
+	cfg.ClaimsUIOperationsPanel = infrastructureModeEnv(getenv, EnvClaimsUIOperationsPanel, cfg.ClaimsUIOperationsPanel)
 	return cfg.Normalized()
 }
 
@@ -152,6 +160,8 @@ func (cfg RolloutConfig) Normalized() RolloutConfig {
 	cfg.ClaimsInfraSession = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraSession)
 	cfg.ClaimsInfraFabric = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraFabric)
 	cfg.ClaimsInfraBus = normalizeInfrastructureRolloutMode(cfg.ClaimsInfraBus)
+	cfg.ClaimsTelemetryExporters = normalizeInfrastructureRolloutMode(cfg.ClaimsTelemetryExporters)
+	cfg.ClaimsUIOperationsPanel = normalizeInfrastructureRolloutMode(cfg.ClaimsUIOperationsPanel)
 	return cfg
 }
 
@@ -199,6 +209,10 @@ func (cfg RolloutConfig) InfrastructureMode(subsystem string) InfrastructureRoll
 		return cfg.ClaimsInfraFabric
 	case "bus", "bus_administrator":
 		return cfg.ClaimsInfraBus
+	case "telemetry", "telemetry_exporters":
+		return cfg.ClaimsTelemetryExporters
+	case "ui_operations", "ui_operations_panel":
+		return cfg.ClaimsUIOperationsPanel
 	default:
 		return InfrastructureRolloutDisabled
 	}
@@ -230,6 +244,8 @@ func (cfg RolloutConfig) FeatureFlags() map[string]string {
 		EnvClaimsInfraSession:        string(cfg.ClaimsInfraSession),
 		EnvClaimsInfraFabric:         string(cfg.ClaimsInfraFabric),
 		EnvClaimsInfraBus:            string(cfg.ClaimsInfraBus),
+		EnvClaimsTelemetryExporters:  string(cfg.ClaimsTelemetryExporters),
+		EnvClaimsUIOperationsPanel:   string(cfg.ClaimsUIOperationsPanel),
 	}
 }
 
@@ -254,6 +270,8 @@ func (cfg RolloutConfig) Diagnostics() []string {
 		"rollout " + EnvClaimsInfraSession + "=" + flags[EnvClaimsInfraSession],
 		"rollout " + EnvClaimsInfraFabric + "=" + flags[EnvClaimsInfraFabric],
 		"rollout " + EnvClaimsInfraBus + "=" + flags[EnvClaimsInfraBus],
+		"rollout " + EnvClaimsTelemetryExporters + "=" + flags[EnvClaimsTelemetryExporters],
+		"rollout " + EnvClaimsUIOperationsPanel + "=" + flags[EnvClaimsUIOperationsPanel],
 	}
 }
 

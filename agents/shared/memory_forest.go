@@ -26,6 +26,8 @@ import (
 // partitioning rules each method applies.
 type MemoryForestService interface {
 	ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
+	RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
+	CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
 	Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error

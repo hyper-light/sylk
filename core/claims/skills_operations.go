@@ -174,10 +174,20 @@ func claimsOperationsQueueHealth(cfg ClaimsOperationsSkillConfig, sessionID stri
 func runClaimsOperationsRepair(ctx context.Context, cfg ClaimsOperationsSkillConfig, board *ClaimsBoard, params claimsOperationsRepairParams) (any, error) {
 	switch params.Operation {
 	case "outbox_projection":
+		if board.durable == nil && params.DryRun {
+			return &ProjectionRebuildResult{
+				BoardID:   board.BoardID(),
+				SessionID: board.SessionID(),
+				DryRun:    true,
+				Warnings:  []string{"claims board is not durable; projection rebuild requires durable outbox records"},
+			}, nil
+		}
 		return board.RebuildProjections(ctx, ProjectionRebuildOptions{DryRun: params.DryRun, EmitReport: params.EmitReport, Limit: params.Limit})
 	case "resource_audit":
 		opts := auditOptionsForOperationsSkill(cfg, board)
-		opts.EvidenceBoard = board
+		if !params.EmitReport {
+			opts.EvidenceBoard = nil
+		}
 		opts.Disabled = false
 		return RunClaimsOperationsAudit(ctx, opts)
 	default:

@@ -108,6 +108,9 @@ func (m *MemoryForest) Snapshot(ctx context.Context, input ViewSnapshotInput) (*
 }
 
 func (m *MemoryForest) loadViewBranches(ctx context.Context, sessionID string) ([]*Branch, error) {
+	if !m.legacyBranchReadModel {
+		return m.loadViewNodesAsBranches(ctx, sessionID)
+	}
 	if sessionID != "" {
 		sessionBranches, err := m.loadViewBranchesWithScope(ctx, sessionID, false)
 		if err != nil {

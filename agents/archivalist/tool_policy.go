@@ -32,6 +32,7 @@ func archivalistVisibleSkillNames() []string {
 		"traverse",
 		"carry_forward",
 		"claims_projection_health",
+		"claims_operations_status",
 		"rebuild_claims_projections",
 	}
 }
@@ -60,6 +61,7 @@ func archivalistMutatingSkillNames() []string {
 		"update_claim_progress",
 		"carry_forward",
 		"rebuild_claims_projections",
+		"claims_operations_repair",
 	})
 }
 

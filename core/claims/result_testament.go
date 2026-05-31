@@ -240,8 +240,7 @@ func (b *ClaimsBoard) stampResultTestamentArtifactLocked(artifact *Artifact, req
 	artifact.Created = firstNonZeroTime(artifact.Created, now)
 	artifact.Accessed = now
 	if artifact.Status == "" {
-		artifact.Status = ArtifactStatusGenerated
-		artifact.StatusHistory = capStatusHistory(append(artifact.StatusHistory, statusChange("", ArtifactStatusGenerated, req.ActorID, "validation result artifact generated", now)))
+		_, _ = TransitionArtifactStatus(artifact, ArtifactStatusGenerated, req.ActorID, "validation result artifact generated", now)
 	}
 	artifact.Size = artifactSize(artifact)
 	return artifact

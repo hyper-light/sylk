@@ -109,6 +109,7 @@ func claimsInfrastructureMockerySpecs() []claimsMockerySpec {
 		{claimsPackage, "core/claims", "core/claims/mocks", "ArtifactLifecycleBusSink", "ArtifactLifecycleBusSink"},
 		{claimsPackage, "core/claims", "core/claims/mocks", "ValidationLifecycleBusSink", "ValidationLifecycleBusSink"},
 		{claimsPackage, "core/claims", "core/claims/mocks", "ClaimsClock", "ClaimsClock"},
+		{claimsPackage, "core/claims", "core/claims/mocks", "ClaimsMetricsSink", "ClaimsMetricsSink"},
 		{claimsPackage, "core/claims", "core/claims/mocks", "TestamentGenerator", "TestamentGenerator"},
 		{claimsPackage, "core/claims", "core/claims/mocks", "DeltaPublisher", "DeltaPublisher"},
 		{claimsPackage, "core/claims", "core/claims/mocks", "DeltaSubscriber", "DeltaSubscriber"},

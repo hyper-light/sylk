@@ -101,9 +101,12 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.invariant.cancellation_context_registry", OperationsSurfaceImplemented, "core/claims", "ClaimCancelRegistry"},
 		{"ops.invariant.backpressure_observable", OperationsSurfaceImplemented, "core/claims", "BackpressureReporter"},
 		{"ops.invariant.resource_audit", OperationsSurfaceImplemented, "core/claims", "RunClaimsOperationsAudit"},
-		{"ops.telemetry.exporters", OperationsSurfacePlanned, "core/claims", "telemetry exporter"},
-		{"ops.ui.observer_intake", OperationsSurfacePartial, "ui/bridge", "ClaimsBridge.startClaimsIntake"},
-		{"ops.delta.legacy_compatibility", OperationsSurfacePartial, "core/claims", "deltas.go"},
+		{"ops.telemetry.exporters", OperationsSurfaceImplemented, "core/claims", "ClaimsMetricsSink"},
+		{"ops.ui.observer_intake", OperationsSurfaceImplemented, "ui/bridge", "ClaimsBridge.startClaimsIntake"},
+		{"ops.delta.legacy_compatibility", OperationsSurfaceImplemented, "core/claims", "UnmarshalDeltaTolerant"},
+		{"ops.operator.skills", OperationsSurfaceImplemented, "core/claims", "AllOperationsSkills"},
+		{"ops.runbook.scenarios", OperationsSurfaceImplemented, "core/claims", "claims operations runbook scenario tests"},
+		{"ops.production_readiness", OperationsSurfaceImplemented, "core/claims", "RecordProductionReadinessEvidence"},
 		{"ops.service.identity_registry", OperationsSurfaceImplemented, "core/claims", "IdentityRegistryService"},
 		{"ops.service.activation_controller", OperationsSurfaceImplemented, "core/claims", "ActivationControllerService"},
 		{"ops.service.dag_processor", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
@@ -112,6 +115,7 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 		{"ops.service.global_vfs_merger", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
 		{"ops.service.kg_writer", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
 		{"ops.service.kg_reader", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
+		{"ops.service.memory_forest", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
 		{"ops.service.doc_db_writer", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
 		{"ops.service.doc_db_reader", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
 		{"ops.service.guardian", OperationsSurfaceImplemented, "core/claims", "InfrastructureService"},
@@ -125,13 +129,7 @@ func baseOperationsInventory() []OperationsInventoryEntry {
 }
 
 func OperationsInventoryOwners() map[string]OperationsInventoryOwner {
-	return map[string]OperationsInventoryOwner{
-		"ops.telemetry.exporters": {
-			Requirement:  "ops.telemetry.exporters",
-			OwnerClaimID: "claims-infra-telemetry-exporters",
-			Deadline:     "2026-06-30",
-		},
-	}
+	return map[string]OperationsInventoryOwner{}
 }
 
 func ValidateOperationsInventoryPlanning(entries []OperationsInventoryEntry, owners map[string]OperationsInventoryOwner) error {

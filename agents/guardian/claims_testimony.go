@@ -154,16 +154,24 @@ func guardianValidation(vtype claims.ValidationType, required bool, description,
 
 // guardianPassedValidation builds a validation that has already been evaluated as passed.
 func guardianPassedValidation(vtype claims.ValidationType, required bool, description, qualityBar string) *claims.Validation {
-	v := guardianValidation(vtype, required, description, qualityBar)
-	v.Status = claims.ValidationStatusPassed
-	return v
+	return &claims.Validation{
+		Type:        vtype,
+		Required:    required,
+		Description: description,
+		QualityBar:  qualityBar,
+		Status:      claims.ValidationStatusPassed,
+	}
 }
 
 // guardianFailedValidation builds a validation that has already been evaluated as failed.
 func guardianFailedValidation(vtype claims.ValidationType, required bool, description, qualityBar string) *claims.Validation {
-	v := guardianValidation(vtype, required, description, qualityBar)
-	v.Status = claims.ValidationStatusFailed
-	return v
+	return &claims.Validation{
+		Type:        vtype,
+		Required:    required,
+		Description: description,
+		QualityBar:  qualityBar,
+		Status:      claims.ValidationStatusFailed,
+	}
 }
 
 func (g *Guardian) processClaimsEntry(ctx context.Context, entry *claims.GraphEntryPoint) error {

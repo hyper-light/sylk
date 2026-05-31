@@ -60,6 +60,7 @@ func (m *MemoryForest) runClusterMaintenance(ctx context.Context, limit int) (Cl
 		}
 		result.ClustersUpdated += updated.ClustersUpdated
 		result.MembershipsUpdated += updated.MembershipsUpdated
+		result.LineageRecorded += updated.LineageRecorded
 	}
 	bridges, err := m.refreshBridgeNodesAndPOI(ctx, limit)
 	if err != nil {
@@ -132,6 +133,17 @@ func (m *MemoryForest) clusterAroundNode(ctx context.Context, node ForestNode, l
 		return ClusterMaintenanceResult{}, fmt.Errorf("begin cluster tx: %w", err)
 	}
 	defer tx.Rollback()
+	existed, firstSeen, err := loadClusterExistenceTx(ctx, tx, clusterID)
+	if err != nil {
+		return ClusterMaintenanceResult{}, err
+	}
+	priorClusters, err := loadPriorClustersForMembersTx(ctx, tx, sortedClusterMemberIDs(members), clusterID)
+	if err != nil {
+		return ClusterMaintenanceResult{}, err
+	}
+	if !existed {
+		firstSeen = now
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_clusters
 			(cluster_id, policy_version, status, candidate_name, stable_name, signature, first_seen_at, last_seen_at, metadata)
@@ -163,10 +175,14 @@ func (m *MemoryForest) clusterAroundNode(ctx context.Context, node ForestNode, l
 	if err := upsertClusterMetricsTx(ctx, tx, metrics, now); err != nil {
 		return ClusterMaintenanceResult{}, err
 	}
+	lineageCount, err := recordClusterLineageTx(ctx, tx, clusterID, priorClusters, !existed, firstSeen, now, node.SourceSeq)
+	if err != nil {
+		return ClusterMaintenanceResult{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return ClusterMaintenanceResult{}, fmt.Errorf("commit cluster tx: %w", err)
 	}
-	return ClusterMaintenanceResult{ClustersUpdated: 1, MembershipsUpdated: len(members)}, nil
+	return ClusterMaintenanceResult{ClustersUpdated: 1, MembershipsUpdated: len(members), LineageRecorded: lineageCount}, nil
 }
 
 func (m *MemoryForest) neighborsForCluster(ctx context.Context, node ForestNode, limit int) ([]NodeNeighbor, error) {
@@ -359,10 +375,10 @@ func candidateClusterName(members []NodeNeighbor) string {
 }
 
 func stableClusterName(metrics clusterMetrics) string {
-	if metrics.MemberCount == 0 {
+	if metrics.MemberCount < nodeProjectionRetryLimit() {
 		return ""
 	}
-	evidenceGate := metrics.ValidationDensity >= metrics.ContradictionLoad
+	evidenceGate := metrics.ValidationDensity > 0 && metrics.ValidationDensity >= metrics.ContradictionLoad
 	cohesionGate := metrics.Cohesion >= metrics.Novelty
 	if evidenceGate && cohesionGate {
 		return "validated " + metrics.ClusterID[:12]
@@ -370,8 +386,93 @@ func stableClusterName(metrics clusterMetrics) string {
 	return ""
 }
 
+func loadClusterExistenceTx(ctx context.Context, tx *sql.Tx, clusterID string) (bool, int64, error) {
+	var firstSeen int64
+	err := tx.QueryRowContext(ctx, `
+		SELECT first_seen_at
+		FROM forest_clusters
+		WHERE cluster_id = ?
+	`, clusterID).Scan(&firstSeen)
+	if err == sql.ErrNoRows {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, fmt.Errorf("load cluster existence: %w", err)
+	}
+	return true, firstSeen, nil
+}
+
+func loadPriorClustersForMembersTx(ctx context.Context, tx *sql.Tx, memberIDs []string, targetClusterID string) ([]string, error) {
+	if len(memberIDs) == 0 {
+		return nil, nil
+	}
+	placeholders, args := placeholdersForStrings(memberIDs)
+	args = append(args, targetClusterID)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT DISTINCT cluster_id
+		FROM forest_cluster_membership
+		WHERE node_id IN (`+placeholders+`) AND cluster_id != ?
+		ORDER BY cluster_id ASC
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query prior clusters for lineage: %w", err)
+	}
+	defer rows.Close()
+	var clusters []string
+	for rows.Next() {
+		var clusterID string
+		if err := rows.Scan(&clusterID); err != nil {
+			return nil, fmt.Errorf("scan prior cluster lineage: %w", err)
+		}
+		clusters = append(clusters, clusterID)
+	}
+	return clusters, rows.Err()
+}
+
+func recordClusterLineageTx(ctx context.Context, tx *sql.Tx, targetClusterID string, priorClusters []string, created bool, firstSeen, now, sourceSeq int64) (int, error) {
+	count := 0
+	if created {
+		if err := insertClusterLineageTx(ctx, tx, "speciation", "", targetClusterID, firstSeen, now, sourceSeq, "new density cluster"); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	for _, prior := range priorClusters {
+		if err := insertClusterLineageTx(ctx, tx, "merge", prior, targetClusterID, firstSeen, now, sourceSeq, "overlapping member density"); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func insertClusterLineageTx(ctx context.Context, tx *sql.Tx, operation, sourceClusterID, targetClusterID string, firstSeen, now, sourceSeq int64, reason string) error {
+	lineageID := stableID("cluster_lineage", clusterPolicyVersion, operation, sourceClusterID, targetClusterID, fmt.Sprint(sourceSeq))
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_cluster_lineage
+			(lineage_id, operation, source_cluster_id, target_cluster_id, source_ledger_id,
+			 policy_version, reason, created_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(lineage_id) DO UPDATE SET
+			reason = excluded.reason,
+			metadata = excluded.metadata
+	`, lineageID, operation, sourceClusterID, targetClusterID, fmt.Sprint(sourceSeq),
+		clusterPolicyVersion, reason, now, marshalJSON(map[string]any{
+			"first_seen_at": firstSeen,
+			"source_seq":    sourceSeq,
+		}))
+	if err != nil {
+		return fmt.Errorf("insert cluster lineage: %w", err)
+	}
+	return nil
+}
+
 func (m *MemoryForest) refreshBridgeNodesAndPOI(ctx context.Context, limit int) (ClusterMaintenanceResult, error) {
 	bridges, err := m.computeBridgeCandidates(ctx, limit)
+	if err != nil {
+		return ClusterMaintenanceResult{}, err
+	}
+	pois, err := m.computePOICandidates(ctx, limit)
 	if err != nil {
 		return ClusterMaintenanceResult{}, err
 	}
@@ -406,27 +507,29 @@ func (m *MemoryForest) refreshBridgeNodesAndPOI(ctx context.Context, limit int) 
 			clusterPolicyVersion, now, marshalJSON(bridge)); err != nil {
 			return ClusterMaintenanceResult{}, fmt.Errorf("upsert bridge node: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO forest_poi_cache
-				(poi_id, cluster_id, node_id, reason, priority, source_metrics, expires_at,
-				 invalidation_sequence, policy_version, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(poi_id) DO UPDATE SET
-				priority = excluded.priority,
-				source_metrics = excluded.source_metrics,
-				expires_at = excluded.expires_at,
-				invalidation_sequence = excluded.invalidation_sequence,
-				policy_version = excluded.policy_version,
-				updated_at = excluded.updated_at
-		`, "poi:"+bridge.id, bridge.sourceClusterID, bridge.nodeID, "bridge_node", bridge.score, marshalJSON(bridge),
-			now+int64(limit), bridge.maxSeq, clusterPolicyVersion, now); err != nil {
-			return ClusterMaintenanceResult{}, fmt.Errorf("upsert poi cache: %w", err)
+		if err := upsertPOICacheTx(ctx, tx, poiCandidate{
+			id:                  "poi:" + bridge.id,
+			clusterID:           bridge.sourceClusterID,
+			nodeID:              bridge.nodeID,
+			reason:              "bridge_node",
+			priority:            bridge.score,
+			sourceMetrics:       bridge,
+			expiresAt:           now + int64(limit),
+			invalidationSeq:     bridge.maxSeq,
+			sourcePolicyVersion: clusterPolicyVersion,
+		}, now); err != nil {
+			return ClusterMaintenanceResult{}, err
+		}
+	}
+	for _, poi := range pois {
+		if err := upsertPOICacheTx(ctx, tx, poi, now); err != nil {
+			return ClusterMaintenanceResult{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return ClusterMaintenanceResult{}, fmt.Errorf("commit bridge tx: %w", err)
 	}
-	return ClusterMaintenanceResult{BridgeNodesUpdated: len(bridges), POIUpdated: len(bridges)}, nil
+	return ClusterMaintenanceResult{BridgeNodesUpdated: len(bridges), POIUpdated: len(bridges) + len(pois)}, nil
 }
 
 type bridgeCandidate struct {
@@ -440,6 +543,7 @@ type bridgeCandidate struct {
 	validationSupport  float64
 	contradictionRisk  float64
 	edgeIDs            []string
+	edgeKindWeights    map[string]float64
 	maxSeq             int64
 }
 
@@ -474,10 +578,16 @@ func (m *MemoryForest) computeBridgeCandidates(ctx context.Context, limit int) (
 			candidate.nodeID = nodeID
 			candidate.sourceClusterID = sourceCluster
 			candidate.targetClusterID = targetCluster
+			candidate.edgeKindWeights = map[string]float64{}
+		}
+		if candidate.edgeKindWeights == nil {
+			candidate.edgeKindWeights = map[string]float64{}
 		}
 		candidate.crossEdgeCount++
 		candidate.edgeIDs = append(candidate.edgeIDs, edgeID)
-		candidate.score += clampFinite01(weight)
+		edgeWeight := clampFinite01(weight)
+		candidate.score += edgeWeight
+		candidate.edgeKindWeights[edgeKind] += edgeWeight
 		if edgeKind == string(ForestEdgeTraversal) {
 			candidate.traversalFrequency += weight
 		}
@@ -497,10 +607,12 @@ func (m *MemoryForest) computeBridgeCandidates(ctx context.Context, limit int) (
 	}
 	bridges := make([]bridgeCandidate, 0, len(byKey))
 	for _, candidate := range byKey {
-		candidate.score = clamp01(candidate.score / float64(candidate.crossEdgeCount))
-		candidate.traversalFrequency = clamp01(candidate.traversalFrequency)
-		candidate.validationSupport = clamp01(candidate.validationSupport)
-		candidate.contradictionRisk = clamp01(candidate.contradictionRisk)
+		meanWeight := candidate.score / float64(candidate.crossEdgeCount)
+		diversity := float64(len(candidate.edgeKindWeights)) / float64(len(allForestEdgeKinds()))
+		candidate.traversalFrequency = clamp01(candidate.traversalFrequency / float64(candidate.crossEdgeCount))
+		candidate.validationSupport = clamp01(candidate.validationSupport / float64(candidate.crossEdgeCount))
+		candidate.contradictionRisk = clamp01(candidate.contradictionRisk / float64(candidate.crossEdgeCount))
+		candidate.score = averageClamped01(meanWeight, diversity, candidate.traversalFrequency, candidate.validationSupport, 1-candidate.contradictionRisk)
 		bridges = append(bridges, candidate)
 	}
 	sort.Slice(bridges, func(i, j int) bool {
@@ -510,6 +622,140 @@ func (m *MemoryForest) computeBridgeCandidates(ctx context.Context, limit int) (
 		return bridges[i].score > bridges[j].score
 	})
 	return bridges, nil
+}
+
+type poiCandidate struct {
+	id                  string
+	clusterID           string
+	nodeID              string
+	reason              string
+	priority            float64
+	sourceMetrics       any
+	expiresAt           int64
+	invalidationSeq     int64
+	sourcePolicyVersion string
+}
+
+func (m *MemoryForest) computePOICandidates(ctx context.Context, limit int) ([]poiCandidate, error) {
+	rows, err := m.db.QueryContext(ctx, `
+		SELECT cm.cluster_id, cm.node_id, n.node_kind, n.evidence_grade, n.confidence,
+		       n.salience, n.utility, n.novelty, n.source_seq, met.validation_density,
+		       met.contradiction_load, met.utility
+		FROM forest_cluster_membership cm
+		JOIN forest_nodes n ON n.node_id = cm.node_id
+		LEFT JOIN forest_cluster_metrics met ON met.cluster_id = cm.cluster_id
+		ORDER BY cm.membership_weight DESC, n.source_seq DESC, cm.cluster_id ASC, cm.node_id ASC
+		LIMIT ?
+	`, limit*len(defaultEcologyPolicy().Channels))
+	if err != nil {
+		return nil, fmt.Errorf("query poi candidates: %w", err)
+	}
+	defer rows.Close()
+	byID := map[string]poiCandidate{}
+	now := time.Now().UTC().Unix()
+	for rows.Next() {
+		candidate, ok, err := scanPOICandidate(rows, now, limit)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		current := byID[candidate.id]
+		if candidate.priority >= current.priority {
+			byID[candidate.id] = candidate
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	pois := make([]poiCandidate, 0, len(byID))
+	for _, candidate := range byID {
+		pois = append(pois, candidate)
+	}
+	sort.Slice(pois, func(i, j int) bool {
+		if pois[i].priority == pois[j].priority {
+			return pois[i].id < pois[j].id
+		}
+		return pois[i].priority > pois[j].priority
+	})
+	if len(pois) > limit {
+		pois = pois[:limit]
+	}
+	return pois, nil
+}
+
+func scanPOICandidate(rows interface {
+	Scan(dest ...any) error
+}, now int64, limit int) (poiCandidate, bool, error) {
+	var clusterID, nodeID, kind, grade string
+	var sourceSeq int64
+	var confidence, salience, utility, novelty, validationDensity, contradictionLoad, clusterUtility float64
+	if err := rows.Scan(&clusterID, &nodeID, &kind, &grade, &confidence, &salience, &utility, &novelty,
+		&sourceSeq, &validationDensity, &contradictionLoad, &clusterUtility); err != nil {
+		return poiCandidate{}, false, fmt.Errorf("scan poi candidate: %w", err)
+	}
+	reason, priority := poiReasonAndPriority(ForestNodeKind(kind), EvidenceGrade(grade), confidence, salience, utility, novelty, validationDensity, contradictionLoad, clusterUtility)
+	if reason == "" {
+		return poiCandidate{}, false, nil
+	}
+	return poiCandidate{
+		id:                  "poi:" + stableID("cluster_poi", clusterID, nodeID, reason),
+		clusterID:           clusterID,
+		nodeID:              nodeID,
+		reason:              reason,
+		priority:            priority,
+		expiresAt:           now + int64(limit),
+		invalidationSeq:     sourceSeq,
+		sourcePolicyVersion: clusterPolicyVersion,
+		sourceMetrics: map[string]any{
+			"confidence":         confidence,
+			"salience":           salience,
+			"utility":            utility,
+			"novelty":            novelty,
+			"validation_density": validationDensity,
+			"contradiction_load": contradictionLoad,
+			"cluster_utility":    clusterUtility,
+		},
+	}, true, nil
+}
+
+func poiReasonAndPriority(kind ForestNodeKind, grade EvidenceGrade, confidence, salience, utility, novelty, validationDensity, contradictionLoad, clusterUtility float64) (string, float64) {
+	if kind == ForestNodeContradiction || grade == EvidenceGradeContradicted || grade == EvidenceGradeFailed {
+		return "contradiction_center", averageClamped01(contradictionLoad, salience, 1-confidence)
+	}
+	if kind == ForestNodeValidation || grade == EvidenceGradeValidated {
+		return "validation_hub", averageClamped01(validationDensity, confidence, salience)
+	}
+	if kind == ForestNodeArtifact && utility >= clusterUtility {
+		return "high_value_artifact", averageClamped01(utility, salience, confidence)
+	}
+	if contradictionLoad > validationDensity && confidence < salience {
+		return "brittle_node", averageClamped01(contradictionLoad, salience, novelty)
+	}
+	return "", 0
+}
+
+func upsertPOICacheTx(ctx context.Context, tx *sql.Tx, poi poiCandidate, now int64) error {
+	policyVersion := firstNonEmptyString(poi.sourcePolicyVersion, clusterPolicyVersion)
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_poi_cache
+			(poi_id, cluster_id, node_id, reason, priority, source_metrics, expires_at,
+			 invalidation_sequence, policy_version, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(poi_id) DO UPDATE SET
+			priority = excluded.priority,
+			source_metrics = excluded.source_metrics,
+			expires_at = excluded.expires_at,
+			invalidation_sequence = excluded.invalidation_sequence,
+			policy_version = excluded.policy_version,
+			updated_at = excluded.updated_at
+	`, poi.id, poi.clusterID, poi.nodeID, poi.reason, clampFinite01(poi.priority), marshalJSON(poi.sourceMetrics),
+		poi.expiresAt, poi.invalidationSeq, policyVersion, now)
+	if err != nil {
+		return fmt.Errorf("upsert poi cache: %w", err)
+	}
+	return nil
 }
 
 func placeholdersForStrings(values []string) (string, []any) {

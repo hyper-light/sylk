@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -90,6 +91,38 @@ func TestOperationsPhase1ReadinessFailurePostsFailedTestament(t *testing.T) {
 	assertClaimLifecycle(t, db.Board(), result.ClaimID, claims.ClaimLifecycleValidationFailed)
 	assertTestamentLifecycle(t, db.Board(), result.TestamentID, claims.TestamentLifecycleValidationFailed, "boot.phase_1_failed")
 	assertProjectionCounts(t, db.Board(), 1, 1)
+}
+
+func TestOperationsPhase1PostFailureDoesNotSatisfyDurableSubstrate(t *testing.T) {
+	cfg := operationsDurableConfig(t)
+	cfg.ClaimPostPolicy = claims.ClaimPostPolicyFunc(func(context.Context, claims.ClaimPostPolicyRequest) claims.ClaimPostPolicyDecision {
+		return claims.ClaimPostPolicyDecision{Allowed: false, Reason: "denied by boot policy", FailureKind: claims.ArtifactKindPolicyDenied}
+	})
+	db, err := claims.OpenDurableBoard(cfg)
+	if err != nil {
+		t.Fatalf("OpenDurableBoard: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	seq, err := NewOperationsSequencer(OperationsConfig{Board: db.Board(), ProcessIdentity: testProcessIdentity()})
+	if err != nil {
+		t.Fatalf("NewOperationsSequencer: %v", err)
+	}
+
+	result, err := seq.CommitPhase1(context.Background(), readyPhase1Status(db.Board()))
+	if err == nil || !strings.Contains(err.Error(), "denied by boot policy") {
+		t.Fatalf("CommitPhase1 error = %v, want policy denial", err)
+	}
+	if result.ClaimID != "" || result.TestamentID != "" {
+		t.Fatalf("CommitPhase1 result = %+v, want no satisfied phase artifacts", result)
+	}
+	projection := db.Board().Projection()
+	if got := len(projection.Claims); got != 1 {
+		t.Fatalf("projection claims = %d, want 1", got)
+	}
+	assertClaimLifecycle(t, db.Board(), projection.Claims[0].ID, claims.ClaimLifecyclePostFailed)
+	if _, err := seq.CommitPhase2(context.Background(), Phase2Status{Participants: RequiredSystemParticipants()}); !errors.Is(err, ErrBootPhaseNotSatisfied) {
+		t.Fatalf("CommitPhase2 after failed phase1 error = %v, want ErrBootPhaseNotSatisfied", err)
+	}
 }
 
 func TestOperationsPhase2ActivatesRequiredSystemParticipantsAndCompletes(t *testing.T) {

@@ -736,9 +736,13 @@ func guideValidation(vtype claims.ValidationType, required bool, description, qu
 
 // guidePassedValidation builds an already-passed validation.
 func guidePassedValidation(vtype claims.ValidationType, required bool, description, qualityBar string) *claims.Validation {
-	v := guideValidation(vtype, required, description, qualityBar)
-	v.Status = claims.ValidationStatusPassed
-	return v
+	return &claims.Validation{
+		Type:        vtype,
+		Required:    required,
+		Description: description,
+		QualityBar:  qualityBar,
+		Status:      claims.ValidationStatusPassed,
+	}
 }
 
 // wireClaimsCallbacks sets up claims-posting callbacks on standalone

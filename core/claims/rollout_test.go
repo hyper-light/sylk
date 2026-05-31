@@ -101,6 +101,8 @@ func TestRolloutConfigFromEnv(t *testing.T) {
 		EnvScribeContinuityNarration: "no",
 		EnvClaimsInfraVFS:            "shadow",
 		EnvClaimsInfraProvider:       "disabled",
+		EnvClaimsTelemetryExporters:  "shadow",
+		EnvClaimsUIOperationsPanel:   "enabled",
 	}
 	cfg := RolloutConfigFromEnv(func(key string) string { return values[key] })
 	if cfg.DurableSessionClaims || cfg.ClaimsOutbox || cfg.RecallForwardCrossSession || cfg.ScribeContinuityNarration {
@@ -114,6 +116,12 @@ func TestRolloutConfigFromEnv(t *testing.T) {
 	}
 	if cfg.InfrastructureMode("provider") != InfrastructureRolloutDisabled || cfg.InfrastructureDispatchEnabled("provider") {
 		t.Fatalf("provider infrastructure mode not parsed: %+v", cfg)
+	}
+	if cfg.InfrastructureMode("telemetry") != InfrastructureRolloutShadow || !cfg.InfrastructureDispatchEnabled("telemetry") {
+		t.Fatalf("telemetry rollout mode not parsed: %+v", cfg)
+	}
+	if cfg.InfrastructureMode("ui_operations_panel") != InfrastructureRolloutEnabled {
+		t.Fatalf("ui operations rollout mode not parsed: %+v", cfg)
 	}
 }
 

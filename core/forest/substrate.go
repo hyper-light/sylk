@@ -812,6 +812,16 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 		limit = 64
 	}
 	sessionID = normalizeForestSessionID(sessionID)
+	if !m.legacyBranchReadModel {
+		hasNodes, err := m.hasSubstrateNodes(ctx, sessionID)
+		if err != nil {
+			return SubstrateResult{}, err
+		}
+		if hasNodes {
+			return m.refreshSubstrateChannelState(ctx, sessionID, limit)
+		}
+		return SubstrateResult{}, nil
+	}
 	branchRows, err := m.countSubstrateBranches(ctx, sessionID)
 	if err != nil {
 		return SubstrateResult{}, err

@@ -2,16 +2,17 @@ package forest
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
 const (
-	forestSchemaVersionPhase123     = forestSchemaVersionPhase456
+	forestSchemaVersionPhase123     = forestSchemaVersionPhase789
 	forestSchemaReplacesVersion     = 1
-	forestSchemaMigrationPhase123   = forestSchemaMigrationPhase456
-	forestProjectionVersionPhase123 = forestProjectionVersionPhase456
+	forestSchemaMigrationPhase123   = forestSchemaMigrationPhase789
+	forestProjectionVersionPhase123 = forestProjectionVersionPhase789
 )
 
 func ensurePhase123Schema(db *sql.DB) error {
@@ -32,27 +33,45 @@ func ensureForestSchemaMeta(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("create forest_schema_meta: %w", err)
 	}
+	exists, err := forestActiveSchemaMetaExists(db)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return verifyForestSchemaMeta(db)
+	}
 	if _, err := db.Exec(`
 		INSERT INTO forest_schema_meta
 			(meta_key, schema_version, replaces_version, projection_version, migration_id, code_version, applied_at)
 		VALUES
 			('active', ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(meta_key) DO NOTHING
 	`, forestSchemaVersionPhase123, forestSchemaReplacesVersion, forestProjectionVersionPhase123, forestSchemaMigrationPhase123, expectedSchemaHash(), time.Now().UTC().Unix()); err != nil {
 		return fmt.Errorf("record forest_schema_meta: %w", err)
 	}
 	return verifyForestSchemaMeta(db)
 }
 
+func forestActiveSchemaMetaExists(db *sql.DB) (bool, error) {
+	var active int
+	err := db.QueryRow(`SELECT 1 FROM forest_schema_meta WHERE meta_key = 'active'`).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check forest_schema_meta active row: %w", err)
+	}
+	return true, nil
+}
+
 func verifyForestSchemaMeta(db *sql.DB) error {
 	row := db.QueryRow(`
-		SELECT schema_version, replaces_version, projection_version, migration_id
+		SELECT schema_version, replaces_version, projection_version, migration_id, code_version
 		FROM forest_schema_meta
 		WHERE meta_key = 'active'
 	`)
 	var schemaVersion, replacesVersion int
-	var projectionVersion, migrationID string
-	if err := row.Scan(&schemaVersion, &replacesVersion, &projectionVersion, &migrationID); err != nil {
+	var projectionVersion, migrationID, codeVersion string
+	if err := row.Scan(&schemaVersion, &replacesVersion, &projectionVersion, &migrationID, &codeVersion); err != nil {
 		return fmt.Errorf("verify forest_schema_meta: %w", err)
 	}
 	if schemaVersion != forestSchemaVersionPhase123 {
@@ -66,6 +85,9 @@ func verifyForestSchemaMeta(db *sql.DB) error {
 	}
 	if migrationID != forestSchemaMigrationPhase123 {
 		return fmt.Errorf("unsupported forest migration id %q", migrationID)
+	}
+	if codeVersion != expectedSchemaHash() {
+		return fmt.Errorf("unsupported forest code version %q", codeVersion)
 	}
 	return nil
 }

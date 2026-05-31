@@ -122,7 +122,7 @@ func checkAssign(pass *analysis.Pass, filename string, file *ast.File, stmt *ast
 		return
 	}
 	for _, lhs := range stmt.Lhs {
-		if directClaimsLifecycleMutation(pass, lhs) {
+		if directClaimsLifecycleMutation(pass, lhs) && !defensiveStatusHistoryClone(stmt) {
 			reportClaimsOpsRule(pass, filename, file, lhs.Pos(), "direct_lifecycle_mutation", "direct claims lifecycle/status mutation is forbidden; use board lifecycle transition APIs or explicit replay helpers")
 		}
 	}
@@ -282,6 +282,74 @@ func directClaimsLifecycleMutation(pass *analysis.Pass, expr ast.Expr) bool {
 		return false
 	}
 	return claimsLifecycleReceiverType(pass, sel.X)
+}
+
+func defensiveStatusHistoryClone(stmt *ast.AssignStmt) bool {
+	if len(stmt.Lhs) != len(stmt.Rhs) {
+		return false
+	}
+	matched := false
+	for i, lhs := range stmt.Lhs {
+		sel, ok := lhs.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		if _, lifecycleField := claimsLifecycleMutationFields[sel.Sel.Name]; !lifecycleField {
+			continue
+		}
+		if !statusHistoryField(sel.Sel.Name) {
+			return false
+		}
+		if !appendNilStatusChangeSlice(stmt.Rhs[i]) {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
+func statusHistoryField(name string) bool {
+	return name == "StatusHistory" || name == "LifecycleHistory"
+}
+
+func appendNilStatusChangeSlice(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || calleeIdentName(call.Fun) != "append" || len(call.Args) == 0 {
+		return false
+	}
+	return nilStatusChangeSliceConversion(call.Args[0])
+}
+
+func nilStatusChangeSliceConversion(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	if ident, ok := call.Args[0].(*ast.Ident); !ok || ident.Name != "nil" {
+		return false
+	}
+	array, ok := call.Fun.(*ast.ArrayType)
+	if !ok || array.Len != nil {
+		return false
+	}
+	return exprTypeName(array.Elt) == "StatusChange"
+}
+
+func calleeIdentName(expr ast.Expr) string {
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	return ""
+}
+
+func exprTypeName(expr ast.Expr) string {
+	if ident, ok := expr.(*ast.Ident); ok {
+		return ident.Name
+	}
+	if sel, ok := expr.(*ast.SelectorExpr); ok {
+		return sel.Sel.Name
+	}
+	return ""
 }
 
 func claimsLifecycleReceiverType(pass *analysis.Pass, expr ast.Expr) bool {

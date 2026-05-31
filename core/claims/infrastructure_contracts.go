@@ -42,6 +42,7 @@ func ClaimsOwnedInfrastructureServiceContracts() []InfrastructureServiceContract
 		globalVFSContract(),
 		knowledgeWriterContract(),
 		knowledgeReaderContract(),
+		memoryForestContract(),
 		documentWriterContract(),
 		documentReaderContract(),
 		guardianContract(),
@@ -278,6 +279,12 @@ func knowledgeReaderContract() InfrastructureServiceContract {
 	return infrastructureServiceContract("kg_reader", "sys:knowledge_graph_reader", HandlerDeterminismContent, "core/claims.NewKnowledgeService", func() ServiceHandler {
 		return NewKnowledgeService(InfrastructureServiceConfig{})
 	}, []string{KnowledgeToolQueryGraph, KnowledgeToolQuerySemantic, KnowledgeToolQueryHybrid, KnowledgeToolReadiness}, []string{"infrastructure.knowledge.query_shape", "infrastructure.knowledge.score_range", "infrastructure.knowledge.readiness"})
+}
+
+func memoryForestContract() InfrastructureServiceContract {
+	return infrastructureServiceContract("memory_forest", "sys:memory_forest", HandlerDeterminismContent, "core/claims.NewMemoryForestService", func() ServiceHandler {
+		return NewMemoryForestService(InfrastructureServiceConfig{})
+	}, []string{MemoryToolCarryForwardPreview, MemoryToolCarryForwardAdvance, MemoryToolRepairProjection, MemoryToolRecall}, []string{"infrastructure.memory.source_availability", "infrastructure.memory.cursor_monotonicity", "infrastructure.memory.digest_consistency", "infrastructure.memory.contradiction_state"})
 }
 
 func documentWriterContract() InfrastructureServiceContract {

@@ -2,6 +2,8 @@ package skills
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -14,6 +16,9 @@ import (
 // ForestService captures the forest capabilities exposed to skills.
 type ForestService interface {
 	ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
+	RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
+	CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
+	ProposeForestClaim(ctx context.Context, proposal forest.ForestClaimProposal) error
 	Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error
@@ -33,7 +38,8 @@ type ForestRecallInput struct {
 
 // ForestRecallOutput returns forest packets.
 type ForestRecallOutput struct {
-	Packets []*forest.BranchPacket `json:"packets"`
+	Packets []*forest.ForestPacket `json:"packets"`
+	Cursor  *forest.ForestCursor   `json:"cursor,omitempty"`
 }
 
 // RecallRecentInput requests recent preserved context from the Memory Forest.
@@ -53,7 +59,8 @@ type RecallRecentOutput struct {
 	Summary string                   `json:"summary"`
 	Focus   []string                 `json:"focus,omitempty"`
 	Intent  *forest.IntentResolution `json:"intent,omitempty"`
-	Packets []*forest.BranchPacket   `json:"packets,omitempty"`
+	Packets []*forest.ForestPacket   `json:"packets,omitempty"`
+	Cursor  *forest.ForestCursor     `json:"cursor,omitempty"`
 }
 
 // ForestOutcomeInput records explicit branch outcome feedback.
@@ -70,6 +77,27 @@ type ForestOutcomeInput struct {
 // ForestOutcomeOutput reports write success.
 type ForestOutcomeOutput struct {
 	Recorded bool `json:"recorded"`
+}
+
+type ForestProposalInput struct {
+	Summary                string   `json:"summary"`
+	ClusterID              string   `json:"cluster_id,omitempty"`
+	Dimension              string   `json:"dimension,omitempty"`
+	EvidenceRefs           []string `json:"evidence_refs,omitempty"`
+	CounterEvidenceRefs    []string `json:"counter_evidence_refs,omitempty"`
+	GuardianReviewRequired bool     `json:"guardian_review_required,omitempty"`
+}
+
+type ForestValidationSuggestionOutput struct {
+	Packets         []*forest.ForestPacket                 `json:"packets"`
+	Cursor          *forest.ForestCursor                   `json:"cursor,omitempty"`
+	ValidationNeeds []string                               `json:"validation_needs,omitempty"`
+	ProposedClaims  []forest.ForestClaimProposalTemplate   `json:"proposed_claims,omitempty"`
+}
+
+type ForestProposalOutput struct {
+	Proposed bool                  `json:"proposed"`
+	Proposal forest.ForestClaimProposal `json:"proposal"`
 }
 
 // NewForestSkill returns the consolidated `forest(op=…)` skill that
@@ -132,6 +160,100 @@ func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
 			default:
 				return nil, fmt.Errorf("unknown forest op: %q (expected resolve_intent|recall|recall_recent|predict_next)", probe.Op)
 			}
+		}).
+		Build()
+}
+
+func NewForestRetrieveEvidenceSkill(deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill("forest.retrieve_evidence").
+		Description("Retrieve evidence-backed ForestPackets with node, cluster, artifact, validation, cursor, risk, and counter-evidence refs.").
+		Domain(RetrievalDomain).
+		Keywords("forest", "evidence", "cursor", "validation", "artifact").
+		Priority(110).
+		StringParam("query", "Natural language evidence query", true).
+		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier", false).
+		StringParam("intent_id", "Optional intent identifier", false).
+		IntParam("limit", "Maximum packets to return", false).
+		BoolParam("include_counter_evidence", "Include quarantined or contradictory evidence", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return NewForestRecallSkill(deps).Handler(ctx, input)
+		}).
+		Build()
+}
+
+func NewForestSuggestValidationsSkill(deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill("forest.suggest_validations").
+		Description("Suggest validation needs from ForestPackets, quarantine state, and missing validation evidence.").
+		Domain(RetrievalDomain).
+		Keywords("forest", "validation", "suggest", "evidence").
+		Priority(105).
+		StringParam("query", "Claim, artifact, or node area needing validation", true).
+		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier", false).
+		IntParam("limit", "Maximum packets to inspect", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			output, err := executeForestEvidenceQuery(ctx, input, deps, true)
+			if err != nil {
+				return nil, err
+			}
+			return validationSuggestionsFromPackets(output), nil
+		}).
+		Build()
+}
+
+func NewForestProposeClaimSkill(deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill("forest.propose_claim").
+		Description("Create a proposal-only forest claim artifact with evidence refs; cannot install skills or alter permissions.").
+		Domain(RetrievalDomain).
+		Keywords("forest", "claim", "proposal", "remediation").
+		Priority(95).
+		StringParam("summary", "Proposal summary", true).
+		StringParam("cluster_id", "Optional source cluster", false).
+		StringParam("dimension", "Optional outbreak or risk dimension", false).
+		ArrayParam("evidence_refs", "Evidence refs supporting the proposal", "string", false).
+		ArrayParam("counter_evidence_refs", "Counter-evidence refs", "string", false).
+		BoolParam("guardian_review_required", "Require Guardian review", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			if deps == nil || deps.Forest == nil {
+				return nil, fmt.Errorf("forest is not configured")
+			}
+			var params ForestProposalInput
+			if err := json.Unmarshal(input, &params); err != nil {
+				return nil, fmt.Errorf("invalid input: %w", err)
+			}
+			if err := rejectPrivilegedForestProposal(params.Summary); err != nil {
+				return nil, err
+			}
+			proposal := forest.ForestClaimProposal{
+				ClusterID:              strings.TrimSpace(params.ClusterID),
+				Dimension:              strings.TrimSpace(params.Dimension),
+				Summary:                strings.TrimSpace(params.Summary),
+				EvidenceRefs:           params.EvidenceRefs,
+				CounterEvidenceRefs:    params.CounterEvidenceRefs,
+				GuardianReviewRequired: params.GuardianReviewRequired,
+			}
+			proposal.ID = "forest_claim_proposal:" + stableSkillID(proposal.Summary, proposal.ClusterID, proposal.Dimension)
+			if err := deps.Forest.ProposeForestClaim(ctx, proposal); err != nil {
+				return nil, err
+			}
+			return ForestProposalOutput{Proposed: true, Proposal: proposal}, nil
+		}).
+		Build()
+}
+
+func NewForestReviewSkill(name, description string, deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill(name).
+		Description(description).
+		Domain(RetrievalDomain).
+		Keywords("forest", "review", "evidence", "risk").
+		Priority(100).
+		StringParam("query", "Review query", true).
+		StringParam("session_id", "Optional session identifier", false).
+		StringParam("task_id", "Optional task identifier", false).
+		IntParam("limit", "Maximum packets to inspect", false).
+		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
+			return executeForestEvidenceQuery(ctx, input, deps, true)
 		}).
 		Build()
 }
@@ -208,20 +330,24 @@ func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
-			packets, err := deps.Forest.Retrieve(ctx, forest.Query{
+			query := forest.Query{
 				Query:                  params.Query,
 				SessionID:              sessionID,
 				TaskID:                 taskID,
 				IntentID:               params.IntentID,
 				Horizon:                horizon,
-				Families:               parseForestFamilies(params.Families),
 				Limit:                  params.Limit,
 				IncludeCounterEvidence: params.IncludeCounterEvidence,
-			})
+			}
+			packets, err := deps.Forest.RetrieveForest(ctx, query)
 			if err != nil {
 				return nil, err
 			}
-			return &ForestRecallOutput{Packets: packets}, nil
+			cursor, err := deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{SessionID: sessionID, TaskID: taskID, Packets: packets, Limit: params.Limit})
+			if err != nil {
+				return nil, err
+			}
+			return &ForestRecallOutput{Packets: packets, Cursor: cursor}, nil
 		}).
 		Build()
 }
@@ -289,13 +415,14 @@ func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 			if err != nil {
 				return nil, err
 			}
-			packets, err := deps.Forest.PredictNextBranches(ctx, forest.Query{
-				Query:     params.Query,
-				SessionID: sessionID,
-				TaskID:    taskID,
-				IntentID:  params.IntentID,
-				Horizon:   horizon,
-				Limit:     params.Limit,
+			packets, err := deps.Forest.RetrieveForest(ctx, forest.Query{
+				Query:                  params.Query,
+				SessionID:              sessionID,
+				TaskID:                 taskID,
+				IntentID:               params.IntentID,
+				Horizon:                horizon,
+				Limit:                  params.Limit,
+				IncludeCounterEvidence: true,
 			})
 			if err != nil {
 				return nil, err
@@ -344,6 +471,92 @@ func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
 		Build()
 }
 
+func executeForestEvidenceQuery(ctx context.Context, input json.RawMessage, deps *RetrievalDependencies, includeCounter bool) (*ForestRecallOutput, error) {
+	if deps == nil || deps.Forest == nil {
+		return nil, fmt.Errorf("forest is not configured")
+	}
+	var params ForestRecallInput
+	if err := json.Unmarshal(input, &params); err != nil {
+		return nil, fmt.Errorf("invalid input: %w", err)
+	}
+	sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+	packets, err := deps.Forest.RetrieveForest(ctx, forest.Query{
+		Query:                  params.Query,
+		SessionID:              sessionID,
+		TaskID:                 taskID,
+		IntentID:               params.IntentID,
+		Limit:                  params.Limit,
+		IncludeCounterEvidence: includeCounter || params.IncludeCounterEvidence,
+	})
+	if err != nil {
+		return nil, err
+	}
+	cursor, err := deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{SessionID: sessionID, TaskID: taskID, Packets: packets, Limit: params.Limit})
+	if err != nil {
+		return nil, err
+	}
+	return &ForestRecallOutput{Packets: packets, Cursor: cursor}, nil
+}
+
+func validationSuggestionsFromPackets(output *ForestRecallOutput) *ForestValidationSuggestionOutput {
+	if output == nil {
+		return &ForestValidationSuggestionOutput{}
+	}
+	var needs []string
+	var proposals []forest.ForestClaimProposalTemplate
+	for _, packet := range output.Packets {
+		if packet == nil {
+			continue
+		}
+		if packet.ValidationNeed > 0 {
+			needs = append(needs, fmt.Sprintf("%s:%.3f", packet.Node.ID, packet.ValidationNeed))
+		}
+		proposals = append(proposals, packet.ProposedClaims...)
+	}
+	return &ForestValidationSuggestionOutput{
+		Packets:         output.Packets,
+		Cursor:          output.Cursor,
+		ValidationNeeds: dedupeSkillStrings(needs),
+		ProposedClaims:  proposals,
+	}
+}
+
+func rejectPrivilegedForestProposal(summary string) error {
+	normalized := strings.ToLower(summary)
+	for _, blocked := range []string{"install skill", "alter permission", "change permission", "grant permission"} {
+		if strings.Contains(normalized, blocked) {
+			return fmt.Errorf("forest proposal rejected: generated skills and permission changes require governance outside forest skills")
+		}
+	}
+	return nil
+}
+
+func stableSkillID(values ...string) string {
+	hash := sha256.New()
+	for _, value := range values {
+		hash.Write([]byte(strings.TrimSpace(value)))
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil))[:16]
+}
+
+func dedupeSkillStrings(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
 // ExecuteRecallRecent performs the continuity-oriented retrieval behind the
 // recall_recent skill so agents can reuse it programmatically.
 func ExecuteRecallRecent(
@@ -363,25 +576,24 @@ func ExecuteRecallRecent(
 	if limit <= 0 {
 		limit = 6
 	}
-	families := parseForestFamilies(params.Families)
-	if len(families) == 0 {
-		families = recallRecentFamilies()
-	}
 	includeCounterEvidence := true
 	if params.IncludeCounterEvidence != nil {
 		includeCounterEvidence = *params.IncludeCounterEvidence
 	}
 	queryText := strings.TrimSpace(params.Query)
-	packets, err := deps.Forest.Retrieve(ctx, forest.Query{
+	packets, err := deps.Forest.RetrieveForest(ctx, forest.Query{
 		Query:                  queryText,
 		SessionID:              sessionID,
 		TaskID:                 taskID,
 		IntentID:               strings.TrimSpace(params.IntentID),
 		Horizon:                horizon,
-		Families:               families,
 		Limit:                  limit,
 		IncludeCounterEvidence: includeCounterEvidence,
 	})
+	if err != nil {
+		return nil, err
+	}
+	cursor, err := deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{SessionID: sessionID, TaskID: taskID, Packets: packets, Limit: limit})
 	if err != nil {
 		return nil, err
 	}
@@ -402,6 +614,7 @@ func ExecuteRecallRecent(
 		Focus:   focus,
 		Intent:  intent,
 		Packets: packets,
+		Cursor:  cursor,
 	}, nil
 }
 
@@ -487,7 +700,7 @@ func recallRecentFamilies() []forest.TreeFamily {
 func summarizeRecentRecall(
 	query string,
 	intent *forest.IntentResolution,
-	packets []*forest.BranchPacket,
+	packets []*forest.ForestPacket,
 ) (string, []string) {
 	focus := collectRecentRecallFocus(packets)
 	primaryIntent := ""
@@ -496,12 +709,12 @@ func summarizeRecentRecall(
 	}
 	if primaryIntent == "" {
 		for _, packet := range packets {
-			if packet == nil || packet.Branch == nil || packet.Branch.Family != forest.TreeFamilyIntent {
+			if packet == nil || packet.Node.Kind != forest.ForestNodeClaim {
 				continue
 			}
-			primaryIntent = strings.TrimSpace(packet.Branch.Summary)
+			primaryIntent = strings.TrimSpace(packet.Node.Summary)
 			if primaryIntent == "" {
-				primaryIntent = strings.TrimSpace(packet.Branch.Title)
+				primaryIntent = strings.TrimSpace(packet.Node.Title)
 			}
 			if primaryIntent != "" {
 				break
@@ -534,7 +747,7 @@ func summarizeRecentRecall(
 	return summary.String(), focus
 }
 
-func collectRecentRecallFocus(packets []*forest.BranchPacket) []string {
+func collectRecentRecallFocus(packets []*forest.ForestPacket) []string {
 	focus := make([]string, 0, len(packets))
 	seen := make(map[string]struct{}, len(packets))
 	for _, packet := range packets {
@@ -555,18 +768,18 @@ func collectRecentRecallFocus(packets []*forest.BranchPacket) []string {
 	return focus
 }
 
-func formatRecentRecallFocus(packet *forest.BranchPacket) string {
-	if packet == nil || packet.Branch == nil {
+func formatRecentRecallFocus(packet *forest.ForestPacket) string {
+	if packet == nil {
 		return ""
 	}
-	summary := strings.TrimSpace(packet.Branch.Summary)
+	summary := strings.TrimSpace(packet.Node.Summary)
 	if summary == "" {
-		summary = strings.TrimSpace(packet.Branch.Title)
+		summary = strings.TrimSpace(packet.Node.Title)
 	}
 	if summary == "" {
 		return ""
 	}
-	label := strings.TrimSpace(recallFamilyLabel(packet.Branch.Family))
+	label := strings.TrimSpace(string(packet.Node.Kind))
 	if label == "" {
 		return trimRecallSentence(summary)
 	}

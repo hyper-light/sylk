@@ -52,7 +52,6 @@ const (
 	bootPhase7Order = 7
 
 	bootOperationKeyPrefix = "boot.operations"
-	bootValidationQuality  = "receipt.received"
 	bootTaskID             = "boot"
 	phase0BoardIDPrefix    = "boot.phase0"
 	processScopeSegment    = "proc"
@@ -831,32 +830,35 @@ func (s *OperationsSequencer) findSatisfiedClaimAndTestament(key string) (string
 
 func (s *OperationsSequencer) claimBeyondGenerated(claimID string) bool {
 	claim, ok := s.board.CloneClaim(claimID)
-	return ok && claim.LifecycleStatus != claims.ClaimLifecycleGenerated
+	return ok && claim.LifecycleStatus != claims.ClaimLifecycleGenerated && !claim.LifecycleStatus.IsFailure()
 }
 
 func (s *OperationsSequencer) claimBeyondPosted(claimID string) bool {
 	claim, ok := s.board.CloneClaim(claimID)
-	return ok && claim.LifecycleStatus != claims.ClaimLifecyclePosted
+	return ok && claim.LifecycleStatus != claims.ClaimLifecyclePosted && !claim.LifecycleStatus.IsFailure()
 }
 
 func (s *OperationsSequencer) claimBeyondReceived(claimID string) bool {
 	claim, ok := s.board.CloneClaim(claimID)
-	return ok && claim.LifecycleStatus != claims.ClaimLifecyclePosted && claim.LifecycleStatus != claims.ClaimLifecycleReceived
+	return ok &&
+		claim.LifecycleStatus != claims.ClaimLifecyclePosted &&
+		claim.LifecycleStatus != claims.ClaimLifecycleReceived &&
+		!claim.LifecycleStatus.IsFailure()
 }
 
 func (s *OperationsSequencer) testamentBeyondGenerated(testamentID string) bool {
 	testament, ok := s.board.CloneTestament(testamentID)
-	return ok && testament.LifecycleStatus != claims.TestamentLifecycleGenerated
+	return ok && testament.LifecycleStatus != claims.TestamentLifecycleGenerated && !testament.LifecycleStatus.IsFailure()
 }
 
 func (s *OperationsSequencer) testamentBeyondPosted(testamentID string) bool {
 	testament, ok := s.board.CloneTestament(testamentID)
-	return ok && testament.LifecycleStatus != claims.TestamentLifecyclePosted
+	return ok && testament.LifecycleStatus != claims.TestamentLifecyclePosted && !testament.LifecycleStatus.IsFailure()
 }
 
 func (s *OperationsSequencer) testamentBeyondReceived(testamentID string) bool {
 	testament, ok := s.board.CloneTestament(testamentID)
-	return ok && testament.LifecycleStatus != claims.TestamentLifecycleReceived
+	return ok && testament.LifecycleStatus != claims.TestamentLifecycleReceived && !testament.LifecycleStatus.IsFailure()
 }
 
 func phaseClaimSpec(phase BootOperationPhase, order int, bootSequencerUID string) bootClaimSpec {
@@ -901,7 +903,6 @@ func newBootClaim(spec bootClaimSpec) claims.Claim {
 			Type:        claims.ValidationTypeReceipt,
 			Required:    true,
 			Description: spec.validationDescription,
-			QualityBar:  bootValidationQuality,
 			Status:      claims.ValidationStatusPending,
 		}},
 	}

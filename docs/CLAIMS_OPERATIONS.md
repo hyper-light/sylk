@@ -2594,7 +2594,8 @@ Existing APIs and integration points:
 Acceptance criteria:
 
 - CI has a command for normal tests, claims-critical race tests,
-  mockery drift checks, and claims operations lint.
+  mockery drift checks, and claims operations lint: `make
+  claims-infra-ci`.
 - Mockery drift check fails if generated mocks are stale.
 - Documentation traceability check fails if a required phase lacks
   acceptance criteria or tests.

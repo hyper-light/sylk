@@ -211,6 +211,10 @@ packages:
         config:
           mockname: "ClaimsClock"
 
+      ClaimsMetricsSink:
+        config:
+          mockname: "ClaimsMetricsSink"
+
       TestamentGenerator:
         config:
           mockname: "TestamentGenerator"

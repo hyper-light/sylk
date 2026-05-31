@@ -34,6 +34,10 @@ type ForestPreloadInput struct {
 // empty preload means "no memory context available" and callers
 // should degrade silently — memory is an assist, not a gate.
 type ForestPreload struct {
+	Projection *forest.ForestRoleProjection
+	Cursor     *forest.ForestCursor
+	Packets    []*forest.ForestPacket
+
 	Intents       *forest.IntentProjection
 	Constraints   *forest.ConstraintProjection
 	Evidence      *forest.EvidenceProjection
@@ -44,17 +48,10 @@ type ForestPreload struct {
 	Opportunities *forest.OpportunityProjection
 }
 
-// PreloadFor dispatches to the agent-specific projection set.
-//
-// Per MEMORY_FOREST.md the "specialized trees" are consumer-shaped:
-// Architect cares about Intent / Constraint / Decision; Librarian
-// wants Preference / Capability (plus Intent to ground retrievals);
-// Academic wants Evidence / Outcome. Asking every agent for every
-// family would inflate prompt size and dilute ranking signal, so we
-// keep these lanes narrow on purpose.
-//
-// Returns (nil, nil) when the service is nil or the agent type is
-// unknown — memory preload is best-effort, never a gate.
+// PreloadFor assembles a phase-9 role projection from ForestPacket and
+// ForestCursor state for every role that participates in emergent agency.
+// Returns (nil, nil) when the service is nil; memory preload is best-effort,
+// never a gate.
 func PreloadFor(
 	ctx context.Context,
 	svc MemoryForestService,
@@ -63,6 +60,59 @@ func PreloadFor(
 	if svc == nil {
 		return nil, nil
 	}
+	role := strings.ToLower(strings.TrimSpace(input.AgentType))
+	if !forestPreloadRoleSupported(role) {
+		return nil, nil
+	}
+	limit := input.Limit
+	if limit <= 0 {
+		limit = preloadBucketMax
+	}
+	packets, err := svc.RetrieveForest(ctx, forest.Query{
+		Query:                  input.Query,
+		SessionID:              input.SessionID,
+		TaskID:                 input.TaskID,
+		AgentID:                input.AgentID,
+		AgentType:              input.AgentType,
+		IntentID:               input.IntentID,
+		Horizon:                input.Horizon,
+		Limit:                  limit,
+		IncludeCounterEvidence: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("preload retrieve forest packets: %w", err)
+	}
+	cursor, err := svc.CreateForestCursor(ctx, forest.ForestCursorInput{
+		SessionID: input.SessionID,
+		TaskID:    input.TaskID,
+		AgentID:  input.AgentID,
+		Packets:  packets,
+		Limit:    limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("preload create forest cursor: %w", err)
+	}
+	projection, err := forest.BuildRoleForestProjection(role, packets, cursor, limit)
+	if err != nil {
+		return nil, fmt.Errorf("preload role projection: %w", err)
+	}
+	return &ForestPreload{Projection: projection, Cursor: cursor, Packets: packets}, nil
+}
+
+func forestPreloadRoleSupported(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "architect", "engineer", "tester", "guardian", "inspector", "librarian", "academic", "designer", "orchestrator", "scribe", "archivalist", "guide":
+		return true
+	default:
+		return false
+	}
+}
+
+func legacyPreloadFor(
+	ctx context.Context,
+	svc MemoryForestService,
+	input ForestPreloadInput,
+) (*ForestPreload, error) {
 	projInput := forest.ProjectionInput{
 		Query:     input.Query,
 		SessionID: input.SessionID,
@@ -169,6 +219,9 @@ func (p *ForestPreload) Render() string {
 	if p.IsEmpty() {
 		return ""
 	}
+	if p.Projection != nil && strings.TrimSpace(p.Projection.Text) != "" {
+		return p.Projection.Text
+	}
 	var b strings.Builder
 	b.WriteString("MEMORY CONTEXT (pre-LLM forest preload):\n")
 	renderIntent(&b, p.Intents)
@@ -187,6 +240,9 @@ func (p *ForestPreload) Render() string {
 func (p *ForestPreload) IsEmpty() bool {
 	if p == nil {
 		return true
+	}
+	if p.Projection != nil && p.Projection.NoProjectionReason == "" {
+		return false
 	}
 	return intentEmpty(p.Intents) &&
 		constraintEmpty(p.Constraints) &&

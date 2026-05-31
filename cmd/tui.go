@@ -490,12 +490,26 @@ type busReadinessPublisher struct {
 }
 
 type containerIdentityAgentRefResolver struct {
-	registry *container.AgentIdentityRegistry
+	registry     *container.AgentIdentityRegistry
+	bootIdentity boot.ProcessIdentity
 }
 
 func (r containerIdentityAgentRefResolver) ResolveAgentRef(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
 	agentID = strings.TrimSpace(agentID)
-	if r.registry == nil || agentID == "" {
+	if agentID == "" {
+		return claims.AgentRef{}, false
+	}
+	if ref, ok := r.resolveBootProcessRef(sessionID, agentID); ok {
+		return ref, true
+	}
+	if ref, ok := r.resolveRegisteredAgentRef(sessionID, agentID); ok {
+		return ref, true
+	}
+	return r.resolveInfrastructureParticipantRef(sessionID, agentID)
+}
+
+func (r containerIdentityAgentRefResolver) resolveRegisteredAgentRef(sessionID, agentID string) (claims.AgentRef, bool) {
+	if r.registry == nil {
 		return claims.AgentRef{}, false
 	}
 	agentType, ok := r.registry.TypeOf(agentID)
@@ -521,6 +535,123 @@ func (r containerIdentityAgentRefResolver) ResolveAgentRef(_ context.Context, se
 		Generation: claims.InitialParticipantGeneration,
 		Labels:     labels,
 	}.Normalized(), true
+}
+
+func (r containerIdentityAgentRefResolver) resolveBootProcessRef(sessionID, agentID string) (claims.AgentRef, bool) {
+	processUID := strings.TrimSpace(r.bootIdentity.ProcessUID)
+	if processUID == "" {
+		return claims.AgentRef{}, false
+	}
+	switch agentID {
+	case r.bootIdentity.BootSequencerUID, boot.BootSequencerAgentID:
+		return r.bootProcessAgentRef(sessionID, r.bootIdentity.BootSequencerUID, boot.BootSequencerAgentID), true
+	case r.bootIdentity.IdentityRegistryUID, boot.IdentityRegistryAgentID:
+		return r.bootProcessAgentRef(sessionID, r.bootIdentity.IdentityRegistryUID, boot.IdentityRegistryAgentID), true
+	default:
+		return claims.AgentRef{}, false
+	}
+}
+
+func (r containerIdentityAgentRefResolver) bootProcessAgentRef(sessionID, uid, agentType string) claims.AgentRef {
+	labels := map[string]string{"process_uid": strings.TrimSpace(r.bootIdentity.ProcessUID)}
+	if strings.TrimSpace(sessionID) != "" {
+		labels["session_id"] = strings.TrimSpace(sessionID)
+	}
+	return claims.AgentRef{
+		UID:        strings.TrimSpace(uid),
+		Type:       strings.TrimSpace(agentType),
+		Name:       strings.TrimSpace(agentType),
+		Category:   string(claims.ParticipantCategorySystem),
+		Generation: claims.InitialParticipantGeneration,
+		Labels:     labels,
+	}.Normalized()
+}
+
+func (r containerIdentityAgentRefResolver) resolveInfrastructureParticipantRef(sessionID, participantID string) (claims.AgentRef, bool) {
+	contract, ok := tuiInfrastructureParticipantContract(participantID)
+	if !ok {
+		return r.resolveBootReadinessParticipantRef(sessionID, participantID)
+	}
+	scope, ok := tuiInfrastructureParticipantScope(contract.ScopeKeys, sessionID, r.bootIdentity.ProcessUID)
+	if !ok {
+		return claims.AgentRef{}, false
+	}
+	uid, err := claims.DeriveParticipantUID(contract.Category, contract.ParticipantID, scope)
+	if err != nil {
+		return claims.AgentRef{}, false
+	}
+	return claims.AgentRef{
+		UID:        uid,
+		Type:       contract.ParticipantID,
+		Name:       contract.ParticipantType,
+		Category:   string(contract.Category),
+		Generation: claims.InitialParticipantGeneration,
+		Labels:     scope,
+	}.Normalized(), true
+}
+
+func (r containerIdentityAgentRefResolver) resolveBootReadinessParticipantRef(sessionID, participantID string) (claims.AgentRef, bool) {
+	participantType, ok := tuiBootReadinessParticipantType(participantID)
+	if !ok {
+		return claims.AgentRef{}, false
+	}
+	scope, ok := tuiInfrastructureParticipantScope([]string{"session_id"}, sessionID, r.bootIdentity.ProcessUID)
+	if !ok {
+		return claims.AgentRef{}, false
+	}
+	uid, err := claims.DeriveParticipantUID(claims.ParticipantCategoryService, participantID, scope)
+	if err != nil {
+		return claims.AgentRef{}, false
+	}
+	return claims.AgentRef{
+		UID:        uid,
+		Type:       strings.TrimSpace(participantID),
+		Name:       participantType,
+		Category:   string(claims.ParticipantCategoryService),
+		Generation: claims.InitialParticipantGeneration,
+		Labels:     scope,
+	}.Normalized(), true
+}
+
+func tuiInfrastructureParticipantContract(participantID string) (claims.InfrastructureServiceContract, bool) {
+	participantID = strings.TrimSpace(participantID)
+	for _, contract := range claims.InfrastructureServiceContracts() {
+		if contract.ParticipantID == participantID && contract.ParticipantID != boot.BootSequencerAgentID && contract.ParticipantID != boot.IdentityRegistryAgentID {
+			return contract, true
+		}
+	}
+	return claims.InfrastructureServiceContract{}, false
+}
+
+func tuiInfrastructureParticipantScope(scopeKeys []string, sessionID, processUID string) (map[string]string, bool) {
+	values := map[string]string{
+		"process_uid": strings.TrimSpace(processUID),
+		"session_id":  strings.TrimSpace(sessionID),
+	}
+	scope := make(map[string]string, len(scopeKeys))
+	for _, key := range scopeKeys {
+		key = strings.TrimSpace(key)
+		if key == "" || values[key] == "" {
+			return nil, false
+		}
+		scope[key] = values[key]
+	}
+	return scope, len(scope) != 0
+}
+
+func tuiBootReadinessParticipantType(participantID string) (string, bool) {
+	for _, participant := range tuiBootReadinessParticipants() {
+		if participant.ParticipantID == strings.TrimSpace(participantID) {
+			return participant.ParticipantType, true
+		}
+	}
+	return "", false
+}
+
+func tuiBootReadinessParticipants() []boot.SystemParticipantActivation {
+	participants := append([]boot.SystemParticipantActivation{}, boot.RequiredKnowledgeBackends()...)
+	participants = append(participants, boot.RequiredInfrastructureServices()...)
+	return append(participants, boot.RequiredUserFacingSurfaces()...)
 }
 
 func (p *busReadinessPublisher) PublishKnowledgeReady(event knowledge.ReadinessEvent) {
@@ -963,11 +1094,11 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		claimsProjectors = append(claimsProjectors, knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend))
 	}
 	phase1.identityReg = container.NewAgentIdentityRegistryWithUID(phase1.bootIdentity.IdentityRegistryUID, []string{
-		"architect", "engineer", "designer", "inspector", "tester",
+		"guide", "architect", "engineer", "designer", "inspector", "tester",
 		"inspector-pipeline", "tester-pipeline",
 		"librarian", "archivalist", "academic", "orchestrator",
 	})
-	claimsResolver := containerIdentityAgentRefResolver{registry: phase1.identityReg}
+	claimsResolver := containerIdentityAgentRefResolver{registry: phase1.identityReg, bootIdentity: phase1.bootIdentity}
 	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
 		Scope:            phase1.scope,
 		DeltaBus:         claimsDeltaBus,

@@ -84,6 +84,7 @@ func TestOperationsInventoryCoversInfrastructureServiceCatalog(t *testing.T) {
 		"ops.service.global_vfs_merger",
 		"ops.service.kg_writer",
 		"ops.service.kg_reader",
+		"ops.service.memory_forest",
 		"ops.service.doc_db_writer",
 		"ops.service.doc_db_reader",
 		"ops.service.guardian",

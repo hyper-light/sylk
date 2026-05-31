@@ -227,9 +227,11 @@ func architectValidation(vtype claims.ValidationType, required bool, description
 
 // architectPassedValidation builds a validation already evaluated as passed.
 func architectPassedValidation(vtype claims.ValidationType, required bool, description, qualityBar string) *claims.Validation {
-	v := architectValidation(vtype, required, description, qualityBar)
-	v.Status = claims.ValidationStatusPassed
-	return v
+	return &claims.Validation{
+		Type: vtype, Required: required,
+		Description: description, QualityBar: qualityBar,
+		Status: claims.ValidationStatusPassed,
+	}
 }
 
 // architectStageClaim posts a planning stage claim and returns a function

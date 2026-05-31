@@ -89,6 +89,12 @@ func (m *MemoryForest) runNodeProjectorLoop(ctx context.Context) {
 				if _, err := m.runSubstrateMaintenance(ctx, m.substrateLimit); err != nil {
 					m.logger.Warn("forest_ecological_substrate_failed", "err", err.Error())
 				}
+				if _, err := m.runAntigenicMaintenance(ctx, m.substrateLimit); err != nil {
+					m.logger.Warn("forest_antigenic_maintenance_failed", "err", err.Error())
+				}
+				if _, err := m.runOutbreakMaintenance(ctx, m.substrateLimit); err != nil {
+					m.logger.Warn("forest_outbreak_maintenance_failed", "err", err.Error())
+				}
 			}
 			if result.RecordsProcessed < projectorBatchSize {
 				break
@@ -132,16 +138,16 @@ func (m *MemoryForest) runNodeProjection(ctx context.Context, limit int) (NodePr
 	if limit <= 0 {
 		limit = projectorBatchSize
 	}
-	lastSeq, err := m.nodeProjectionOffset(ctx)
+	globalSeq, err := m.nodeProjectionOffset(ctx)
 	if err != nil {
 		return NodeProjectionResult{}, err
 	}
-	records, err := m.loadLedgerProjectionRecords(ctx, lastSeq, limit)
+	records, err := m.loadLedgerProjectionRecords(ctx, globalSeq, limit)
 	if err != nil {
 		return NodeProjectionResult{}, err
 	}
 	if len(records) == 0 {
-		return NodeProjectionResult{LastSeq: lastSeq}, nil
+		return NodeProjectionResult{LastSeq: globalSeq}, nil
 	}
 
 	var total NodeProjectionResult
@@ -195,7 +201,7 @@ func (m *MemoryForest) applyNodeProjectionRecord(ctx context.Context, record for
 			return NodeProjectionResult{}, err
 		}
 	}
-	if err := markNodeProjectionOffsetTx(ctx, tx, record.Seq, record.SourcePartition(), nodeGraphProjectionPolicy); err != nil {
+	if err := markNodeProjectionOffsetTx(ctx, tx, record.Seq, record.SourceKind, record.SourcePartition(), nodeGraphProjectionPolicy); err != nil {
 		return NodeProjectionResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -222,10 +228,22 @@ func (m *MemoryForest) recordNodeProjectionFailure(ctx context.Context, record f
 	if err := upsertProjectionFailureArtifactTx(ctx, tx, record, artifactID, cause); err != nil {
 		return NodeProjectionResult{}, err
 	}
+	if err := attachNodeProjectionFailureArtifactTx(ctx, tx, record, artifactID); err != nil {
+		return NodeProjectionResult{}, err
+	}
+	if nodeProjectionFailureCritical(record, cause) {
+		if err := markNodeProjectionPartitionFailureTx(ctx, tx, record, cause); err != nil {
+			return NodeProjectionResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return NodeProjectionResult{}, fmt.Errorf("commit critical node projection failure tx: %w", err)
+		}
+		return NodeProjectionResult{Failures: 1, LastSeq: record.Seq}, fmt.Errorf("critical node projection failure for %s: %w", record.SourceKey, cause)
+	}
 	if err := resolveNodeProjectionFailureTx(ctx, tx, record, artifactID); err != nil {
 		return NodeProjectionResult{}, err
 	}
-	if err := markNodeProjectionOffsetTx(ctx, tx, record.Seq, record.SourcePartition(), nodeGraphProjectionPolicy); err != nil {
+	if err := markNodeProjectionOffsetTx(ctx, tx, record.Seq, record.SourceKind, record.SourcePartition(), nodeGraphProjectionPolicy); err != nil {
 		return NodeProjectionResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -239,15 +257,16 @@ func (m *MemoryForest) incrementNodeProjectionFailure(ctx context.Context, recor
 	_, err := m.db.ExecContext(ctx, `
 		INSERT INTO forest_projection_failures
 			(projection_name, source_key, source_seq, source_partition, attempts, failure_kind, message, critical, last_attempt_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?, 0, ?)
+		VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
 		ON CONFLICT(projection_name, source_key) DO UPDATE SET
 			attempts = forest_projection_failures.attempts + 1,
 			source_seq = excluded.source_seq,
-			source_partition = excluded.source_partition,
-			failure_kind = excluded.failure_kind,
-			message = excluded.message,
-			last_attempt_at = excluded.last_attempt_at
-	`, projectorNodeGraphName, record.SourceKey, record.Seq, record.SourcePartition(), nodeProjectionFailureKind, truncateRuntimeError(cause.Error()), now)
+				source_partition = excluded.source_partition,
+				failure_kind = excluded.failure_kind,
+				message = excluded.message,
+				critical = excluded.critical,
+				last_attempt_at = excluded.last_attempt_at
+	`, projectorNodeGraphName, record.SourceKey, record.Seq, record.SourcePartition(), nodeProjectionFailureKind, truncateRuntimeError(cause.Error()), boolInt(nodeProjectionFailureCritical(record, cause)), now)
 	if err != nil {
 		return 0, fmt.Errorf("record node projection failure: %w", err)
 	}
@@ -266,6 +285,16 @@ func nodeProjectionRetryLimit() int {
 	return len([]ForestEdgeKind{ForestEdgeCausality, ForestEdgeSupport, ForestEdgeValidation})
 }
 
+func nodeProjectionFailureCritical(record forestLedgerProjectionRecord, cause error) bool {
+	if record.SourceKind == string(LedgerSourceMaintenance) {
+		return false
+	}
+	if strings.Contains(strings.ToLower(cause.Error()), "unsupported") {
+		return true
+	}
+	return record.SourceKind == string(LedgerSourceClaimsDelta) || record.SourceKind == string(LedgerSourceForestEvent)
+}
+
 func (m *MemoryForest) nodeProjectionOffset(ctx context.Context) (int64, error) {
 	var lastSeq int64
 	err := m.db.QueryRowContext(ctx, `
@@ -282,7 +311,7 @@ func (m *MemoryForest) nodeProjectionOffset(ctx context.Context) (int64, error) 
 	return lastSeq, nil
 }
 
-func (m *MemoryForest) loadLedgerProjectionRecords(ctx context.Context, afterSeq int64, limit int) ([]forestLedgerProjectionRecord, error) {
+func (m *MemoryForest) loadLedgerProjectionRecords(ctx context.Context, globalSeq int64, limit int) ([]forestLedgerProjectionRecord, error) {
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT l.seq, l.id, l.source_kind, l.source_id, l.source_key, l.event_kind,
 		       l.session_id, l.task_id, l.board_id, l.subject_type, l.subject_id,
@@ -290,10 +319,19 @@ func (m *MemoryForest) loadLedgerProjectionRecords(ctx context.Context, afterSeq
 		       l.payload_hash, COALESCE(p.payload, '')
 		FROM forest_ledger l
 		LEFT JOIN forest_ledger_payloads p ON p.ledger_id = l.id
-		WHERE l.seq > ?
+		LEFT JOIN forest_node_projection_partitions part
+			ON part.source_partition = CASE
+				WHEN l.board_id != '' THEN l.source_kind || ':board:' || l.board_id
+				WHEN l.session_id != '' THEN l.source_kind || ':session:' || l.session_id
+				ELSE l.source_kind || ':global'
+			END
+		WHERE l.seq > CASE
+			WHEN part.source_partition IS NULL THEN ?
+			ELSE part.last_seq
+		END
 		ORDER BY l.seq ASC
 		LIMIT ?
-	`, afterSeq, limit)
+	`, globalSeq, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query ledger projection records: %w", err)
 	}
@@ -809,7 +847,7 @@ func upsertForestEdgeTx(ctx context.Context, tx *sql.Tx, edge ForestEdge) (bool,
 	return affected > 0, nil
 }
 
-func markNodeProjectionOffsetTx(ctx context.Context, tx *sql.Tx, seq int64, partition, policy string) error {
+func markNodeProjectionOffsetTx(ctx context.Context, tx *sql.Tx, seq int64, sourceKind, partition, policy string) error {
 	now := time.Now().UTC().Unix()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_projection_offsets
@@ -822,7 +860,7 @@ func markNodeProjectionOffsetTx(ctx context.Context, tx *sql.Tx, seq int64, part
 			health_status = excluded.health_status,
 			last_error = '',
 			updated_at = excluded.updated_at
-	`, projectorNodeGraphName, LedgerSourceClaimsDelta, seq, now, policy, now); err != nil {
+	`, projectorNodeGraphName, sourceKind, seq, now, policy, now); err != nil {
 		return fmt.Errorf("mark node projection offset: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -865,6 +903,18 @@ func upsertProjectionFailureArtifactTx(ctx context.Context, tx *sql.Tx, record f
 	return nil
 }
 
+func attachNodeProjectionFailureArtifactTx(ctx context.Context, tx *sql.Tx, record forestLedgerProjectionRecord, artifactID string) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE forest_projection_failures
+		SET artifact_id = ?
+		WHERE projection_name = ? AND source_key = ?
+	`, artifactID, projectorNodeGraphName, record.SourceKey)
+	if err != nil {
+		return fmt.Errorf("attach node projection failure artifact: %w", err)
+	}
+	return nil
+}
+
 func resolveNodeProjectionFailureTx(ctx context.Context, tx *sql.Tx, record forestLedgerProjectionRecord, artifactID string) error {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE forest_projection_failures
@@ -873,6 +923,22 @@ func resolveNodeProjectionFailureTx(ctx context.Context, tx *sql.Tx, record fore
 	`, artifactID, time.Now().UTC().Unix(), projectorNodeGraphName, record.SourceKey)
 	if err != nil {
 		return fmt.Errorf("resolve node projection failure: %w", err)
+	}
+	return nil
+}
+
+func markNodeProjectionPartitionFailureTx(ctx context.Context, tx *sql.Tx, record forestLedgerProjectionRecord, cause error) error {
+	now := time.Now().UTC().Unix()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_node_projection_partitions
+			(source_partition, last_seq, last_projected_at, policy_version, health_status, last_error, updated_at)
+		VALUES (?, 0, 0, ?, 'degraded', ?, ?)
+		ON CONFLICT(source_partition) DO UPDATE SET
+			health_status = excluded.health_status,
+			last_error = excluded.last_error,
+			updated_at = excluded.updated_at
+	`, record.SourcePartition(), nodeGraphProjectionPolicy, truncateRuntimeError(cause.Error()), now); err != nil {
+		return fmt.Errorf("mark node projection partition failure: %w", err)
 	}
 	return nil
 }

@@ -126,6 +126,8 @@ func (a *Archivalist) registerFabricSkills() {
 	a.skills.Register(claims.ProjectionHealthSkill(boardProvider))
 	a.skills.Register(claims.ClaimsInfrastructureHealthSkill(claims.InfrastructureHealthSkillConfig{BoardProvider: boardProvider}))
 	a.skills.Register(claims.RebuildClaimsProjectionsSkill(boardProvider))
+	a.skills.Register(claims.ClaimsOperationsStatusSkill(claims.ClaimsOperationsSkillConfig{BoardProvider: boardProvider}))
+	a.skills.Register(claims.ClaimsOperationsRepairSkill(claims.ClaimsOperationsSkillConfig{BoardProvider: boardProvider}))
 
 	fabricCfg := fabric.AwarenessSkillConfig{
 		SourceProvider: activity.DefaultSource,

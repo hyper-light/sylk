@@ -48,6 +48,7 @@ func newTestForestWithConfig(t testing.TB, cfg Config) (*MemoryForest, *sql.DB) 
 	// projector is correct for production but breaks that
 	// assumption, so tests run with inline projection.
 	cfg.SynchronousProjection = true
+	cfg.EnableLegacyBranchReadModel = true
 	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)

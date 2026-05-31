@@ -3,7 +3,8 @@
 LLAMA_DIR := third_party/go-llama.cpp
 LIBRARY_PATH := $(shell pwd)/$(LLAMA_DIR)
 C_INCLUDE_PATH := $(shell pwd)/$(LLAMA_DIR)
-MOCKERY ?= go run github.com/vektra/mockery/v2@v2.53.6
+GOCACHE ?= /tmp/sylk-gocache
+MOCKERY ?= GOCACHE=$(GOCACHE) go tool mockery
 
 all: build
 
@@ -14,21 +15,21 @@ libbinding: submodules
 	$(MAKE) -C $(LLAMA_DIR) libbinding.a
 
 build:
-	go build ./...
+	GOCACHE=$(GOCACHE) go build ./...
 
 build-gguf: libbinding
-	LIBRARY_PATH=$(LIBRARY_PATH) C_INCLUDE_PATH=$(C_INCLUDE_PATH) go build -tags gguf ./...
+	GOCACHE=$(GOCACHE) LIBRARY_PATH=$(LIBRARY_PATH) C_INCLUDE_PATH=$(C_INCLUDE_PATH) go build -tags gguf ./...
 
 test:
-	go test ./...
+	GOCACHE=$(GOCACHE) go test ./...
 
 claims-infra-ci: test claims-infra-race mockery-check docs-traceability claims-infra-lint
 
 claims-infra-lint:
-	go run ./cmd/sylk-lint ./...
+	GOCACHE=$(GOCACHE) go run ./cmd/sylk-lint ./...
 
 claims-infra-race:
-	go test -race ./core/claims ./core/boot ./agents/shared ./ui/bridge ./core/ci/analyzers/claimsops
+	GOCACHE=$(GOCACHE) go test -race ./core/claims ./core/boot ./agents/shared ./ui/bridge ./core/ci/analyzers/claimsops
 
 mockery-check:
 	$(MOCKERY) --config .mockery.yaml --dry-run
@@ -37,7 +38,7 @@ docs-traceability:
 	scripts/ci/docs-traceability.sh
 
 test-gguf: libbinding
-	LIBRARY_PATH=$(LIBRARY_PATH) C_INCLUDE_PATH=$(C_INCLUDE_PATH) go test -tags gguf ./...
+	GOCACHE=$(GOCACHE) LIBRARY_PATH=$(LIBRARY_PATH) C_INCLUDE_PATH=$(C_INCLUDE_PATH) go test -tags gguf ./...
 
 clean:
 	$(MAKE) -C $(LLAMA_DIR) clean 2>/dev/null || true

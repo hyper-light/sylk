@@ -28,6 +28,8 @@ type Config struct {
 	MaxTraces    int
 	Booster      boosterConfig
 
+	ClaimProposalSink ClaimProposalSink
+
 	ReplayDelay         time.Duration
 	SubstrateDebounce   time.Duration
 	TrainingDebounce    time.Duration
@@ -35,11 +37,11 @@ type Config struct {
 	SubstrateLimit      int
 	TrainingMaxExamples int
 
-	// SynchronousProjection forces AppendEvent to run the branch
+	// SynchronousProjection forces AppendEvent to run the node graph
 	// projection inline (single transaction, single connection) and
 	// disables the async projector goroutine. Used by tests and any
-	// caller that needs read-your-writes semantics on the branch
-	// projection without WaitForBranchSeq.
+	// caller that needs read-your-writes semantics without waiting on
+	// the async node projector.
 	//
 	// Production deployments leave this false; the async projector
 	// is what makes CQRS valuable (decoupled write throughput, lease-
@@ -60,6 +62,12 @@ type Config struct {
 	// leave this false; it exists for legacy projector tests and
 	// migration diagnostics that still exercise forest_branches.
 	EnableLegacyBranchProjection bool
+
+	// EnableLegacyBranchReadModel allows production callers to opt back
+	// into the pre-phase-4 branch read/substrate model while migrating.
+	// The default false path is the phase-4/5/6 node graph, density
+	// cluster, and multi-channel substrate implementation.
+	EnableLegacyBranchReadModel bool
 
 	// ── Issue #3 — selection-bias correction ──
 
@@ -301,6 +309,7 @@ type MemoryForest struct {
 	warmth        *WarmthStore
 	models        *learnedModelStore
 	booster       boosterConfig
+	proposalSink  ClaimProposalSink
 	neighborIndex NeighborIndex
 
 	// tuner is the integrated hyperparameter system (see
@@ -348,6 +357,7 @@ type MemoryForest struct {
 	retrievalCandidatesWake chan struct{} // retrieval candidates projector wake
 	projectorID             string
 	synchronousProjection   bool
+	legacyBranchReadModel   bool
 
 	// seqNotify broadcasts projection watermark advances so
 	// WaitForBranchSeq is event-driven (no DB polling). Updated
@@ -494,6 +504,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		warmth:                           newWarmthStore(cfg.DB, cfg.MaxTraces),
 		models:                           models,
 		booster:                          booster,
+		proposalSink:                     cfg.ClaimProposalSink,
 		neighborIndex:                    cfg.NeighborIndex,
 		tuner:                            tuner,
 		runCtx:                           runCtx,
@@ -508,6 +519,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		retrievalCandidatesWake:          make(chan struct{}, 1),
 		projectorID:                      generateProjectorID(),
 		synchronousProjection:            cfg.SynchronousProjection,
+		legacyBranchReadModel:            cfg.EnableLegacyBranchReadModel || cfg.EnableLegacyBranchProjection,
 		seqNotify:                        newSeqNotifier(),
 		retrievalAuditIdle:               make(chan struct{}, 1),
 		explorationRng:                   newExplorationRng(cfg.ExplorationSeed),
@@ -871,13 +883,17 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 			)
 			return err
 		}
-		if err := m.projectInlineForTests(ctx, prepared); err != nil {
-			slog.Error("forest_inline_projection_failed",
-				"event_id", prepared.ID,
-				"branch_id", prepared.BranchID,
-				"err", err.Error(),
-			)
-			return err
+		if m.legacyBranchReadModel {
+			if err := m.projectInlineForTests(ctx, prepared); err != nil {
+				slog.Error("forest_inline_projection_failed",
+					"event_id", prepared.ID,
+					"branch_id", prepared.BranchID,
+					"err", err.Error(),
+				)
+				return err
+			}
+		} else if m.seqNotify != nil {
+			m.seqNotify.Advance(result.Seq)
 		}
 		return nil
 	}

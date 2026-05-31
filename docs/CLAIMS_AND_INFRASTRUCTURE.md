@@ -1995,7 +1995,19 @@ priority in §17.
 | Artifact kinds | `query_result`, `similarity_scores`, `retrieval_count` |
 | Programmatic validators | `QueryResultShapeValidator`, `SimilarityScoreRangeValidator` |
 
-### 14.9 Document DB Writer
+### 14.9 Memory Forest
+
+| Field | Value |
+|---|---|
+| Participant type | `memory_forest` |
+| Category | service |
+| Scope keys | `{session_id}` |
+| Determinism | content |
+| Common actions | `task` (carry_forward_preview, carry_forward_advance, repair_projection, recall) |
+| Artifact kinds | `memory_continuity`, `session_cursor`, `recall_window`, `projection_repair` |
+| Programmatic validators | `CarryForwardSourceAvailabilityValidator`, `CarryForwardCursorMonotonicityValidator`, `CarryForwardDigestConsistencyValidator`, `CarryForwardContradictionStateValidator` |
+
+### 14.10 Document DB Writer
 
 | Field | Value |
 |---|---|
@@ -2007,7 +2019,7 @@ priority in §17.
 | Artifact kinds | `document_id`, `fulltext_index_status`, `attachment_list`, `ingestion_failure` |
 | Programmatic validators | `DocumentIndexedValidator`, `AttachmentListValidator` |
 
-### 14.10 Document DB Reader
+### 14.11 Document DB Reader
 
 | Field | Value |
 |---|---|
@@ -2019,7 +2031,7 @@ priority in §17.
 | Artifact kinds | `documents`, `relevance_scores` |
 | Programmatic validators | `DocumentResultShapeValidator` |
 
-### 14.11 Guardian Subsystem
+### 14.12 Guardian Subsystem
 
 `CLAIMS.md §14.8` already converts conversation-flow guardian work to
 claims. This document extends the conversion to every guardian gate,
@@ -2041,7 +2053,7 @@ user-facing dialog. The deterministic gates (policy match, content
 scan, git mutation, diff review) become a parallel guardian service
 participant that handles the programmatic side.
 
-### 14.12 Boot Sequencer
+### 14.13 Boot Sequencer
 
 | Field | Value |
 |---|---|
@@ -2053,7 +2065,7 @@ participant that handles the programmatic side.
 | Artifact kinds | `setup_complete`, `detect_result`, `allocate_outcome`, `ingest_status`, `commit_ref`, `finalize_signal`, `boot_failure` |
 | Programmatic validators | per-phase contract validators, `BootPhaseOrderValidator`, `BootDurationValidator` |
 
-### 14.13 Tool Runtime
+### 14.14 Tool Runtime
 
 | Field | Value |
 |---|---|
@@ -2065,7 +2077,7 @@ participant that handles the programmatic side.
 | Artifact kinds | `tool_started`, `tool_completed`, `tool_audit_record`, `tool_blocked`, `tool_policy_decision` |
 | Programmatic validators | `ToolPolicyAllowValidator`, `ToolExecutionModeValidator`, `ToolScopeBoundaryValidator`, `ToolDurationValidator` |
 
-### 14.14 LLM Provider Gateway
+### 14.15 LLM Provider Gateway
 
 | Field | Value |
 |---|---|
@@ -2077,7 +2089,7 @@ participant that handles the programmatic side.
 | Artifact kinds | `llm_response`, `usage`, `cache_hit`, `retry_record`, `provider_failure`, `rate_limit_encounter` |
 | Programmatic validators | `ResponsePresentValidator`, `UsageInBudgetValidator`, `RateLimitNotExceededValidator` |
 
-### 14.15 Session Manager
+### 14.16 Session Manager
 
 | Field | Value |
 |---|---|
@@ -2089,7 +2101,7 @@ participant that handles the programmatic side.
 | Artifact kinds | `session_handle`, `session_state`, `persist_outcome`, `restore_outcome` |
 | Programmatic validators | `SessionStateConsistentValidator`, `SessionPersistenceValidator` |
 
-### 14.16 Fabric Subscriber
+### 14.17 Fabric Subscriber
 
 | Field | Value |
 |---|---|
@@ -2101,7 +2113,7 @@ participant that handles the programmatic side.
 | Artifact kinds | `lens_query_result`, `harvest_outcome`, `subscription_state` |
 | Programmatic validators | `LensQueryShapeValidator`, `SubscriptionAttachedValidator` |
 
-### 14.17 Bus Transport
+### 14.18 Bus Transport
 
 The Guide event bus itself is unusual: it is the transport for every
 claim and delta, including claims about its own state. To avoid

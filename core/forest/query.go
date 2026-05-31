@@ -37,6 +37,32 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 	return packets, err
 }
 
+// RetrieveForest is the phase-4 primary retrieval path. It returns node,
+// cluster, graph, artifact, validation, and ecology signals without reading
+// forest_branches. Retrieve remains as a compatibility adapter for legacy
+// callers until the public API moves fully to ForestPacket.
+func (m *MemoryForest) RetrieveForest(ctx context.Context, query Query) ([]*ForestPacket, error) {
+	normalized, err := normalizeQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	hasNodes, err := m.hasRetrievalNodes(ctx, normalized.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	if !hasNodes {
+		return []*ForestPacket{}, nil
+	}
+	packets, err := m.retrieveForestPackets(ctx, normalized)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.recordForestRetrievalAccounting(ctx, normalized, packets); err != nil {
+		return nil, err
+	}
+	return packets, nil
+}
+
 // pinHyperparameterSnapshotForRetrieve resolves the hyperparameter
 // snapshot for one Retrieve call. Routes through the tuner's
 // SnapshotForTrial when an A/B trial is active so a deterministic
@@ -107,11 +133,11 @@ func (m *MemoryForest) retrieveWithAudit(ctx context.Context, query Query, start
 	}
 	audit.Query = normalized.Query
 
-	hasNodes, err := m.hasRetrievalNodes(ctx, normalized.SessionID)
+	nodeFirst, err := m.shouldRetrieveFromNodes(ctx, normalized.SessionID)
 	if err != nil {
 		return nil, audit, err
 	}
-	if hasNodes {
+	if nodeFirst {
 		packets, err := m.retrieveNodePackets(ctx, normalized)
 		if err != nil {
 			return nil, audit, err

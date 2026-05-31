@@ -12,7 +12,13 @@ import (
 // single `forest(op=resolve_intent|recall|recall_recent|predict_next)`
 // so the LLM sees one name and selects the op.
 var genericForestSkillNames = []string{
-	"forest",
+	"forest.retrieve_evidence",
+	"forest.suggest_validations",
+	"forest.propose_claim",
+	"forest.review_contradiction",
+	"forest.review_bridge",
+	"forest.review_skill_candidate",
+	"forest.record_outcome",
 }
 
 // forestMutatingSkillNames lists the write-side forest skill.
@@ -20,7 +26,8 @@ var genericForestSkillNames = []string{
 // deserve their own catalog entry rather than hiding inside the
 // read verb's op enum.
 var forestMutatingSkillNames = []string{
-	"forest_record_outcome",
+	"forest.propose_claim",
+	"forest.record_outcome",
 }
 
 // NormalizeAdaptiveAgentType maps runtime agent identifiers to the role family
@@ -49,6 +56,13 @@ func registerGenericForestSkills(registry *skills.Registry, deps *RetrievalDepen
 	// per-op builders above stay exported for direct programmatic use
 	// but are no longer registered on the LLM-visible catalog.
 	for _, skill := range []*skills.Skill{
+		NewForestRetrieveEvidenceSkill(deps),
+		NewForestSuggestValidationsSkill(deps),
+		NewForestProposeClaimSkill(deps),
+		NewForestReviewSkill("forest.review_contradiction", "Review contradiction evidence and quarantine state for a claim, artifact, or cluster.", deps),
+		NewForestReviewSkill("forest.review_bridge", "Review bridge-node risk and cross-cluster evidence before a context crossing.", deps),
+		NewForestReviewSkill("forest.review_skill_candidate", "Review skill-candidate evidence, validation needs, and quarantine state.", deps),
+		NewForestRecordOutcomeSkill(deps).WithName("forest.record_outcome"),
 		NewForestSkill(deps),
 		NewForestRecordOutcomeSkill(deps),
 	} {

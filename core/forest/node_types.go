@@ -105,12 +105,103 @@ type ForestEdge struct {
 }
 
 type ForestPacket struct {
-	Node        ForestNode
-	ClusterIDs  []string
-	Edges       []ForestEdge
-	Artifacts   []ArtifactEvidenceRecord
-	Validations []ValidationEvidenceRecord
-	Score       float64
+	Node              ForestNode                    `json:"node"`
+	ClusterIDs        []string                      `json:"cluster_ids,omitempty"`
+	Edges             []ForestEdge                  `json:"edges,omitempty"`
+	Paths             []ForestPath                  `json:"paths,omitempty"`
+	Evidence          []ForestEvidence              `json:"evidence,omitempty"`
+	CounterEvidence   []ForestEvidence              `json:"counter_evidence,omitempty"`
+	Artifacts         []ArtifactEvidenceRecord      `json:"artifacts,omitempty"`
+	Validations       []ValidationEvidenceRecord    `json:"validations,omitempty"`
+	POIs              []ForestPOI                   `json:"pois,omitempty"`
+	BridgeRisks       []ForestBridgeRisk            `json:"bridge_risks,omitempty"`
+	Quarantine        ForestQuarantine              `json:"quarantine"`
+	ProposedClaims    []ForestClaimProposalTemplate `json:"proposed_claims,omitempty"`
+	SkippedEvidence   string                        `json:"skipped_evidence,omitempty"`
+	Score             float64                       `json:"score"`
+	RiskScore         float64                       `json:"risk_score"`
+	ValidationNeed    float64                       `json:"validation_need"`
+	PolicyVersion     string                        `json:"policy_version,omitempty"`
+	AssemblyTimestamp time.Time                     `json:"assembly_timestamp,omitempty"`
+}
+
+type ForestPath struct {
+	PathID      string         `json:"path_id"`
+	NodeIDs     []string       `json:"node_ids"`
+	EdgeIDs     []string       `json:"edge_ids"`
+	Kinds       []ForestEdgeKind `json:"kinds"`
+	Weight      float64        `json:"weight"`
+	Explanation string         `json:"explanation"`
+}
+
+type ForestEvidence struct {
+	RefType      string        `json:"ref_type"`
+	RefID        string        `json:"ref_id"`
+	NodeID       string        `json:"node_id,omitempty"`
+	ArtifactID   string        `json:"artifact_id,omitempty"`
+	ValidationID string        `json:"validation_id,omitempty"`
+	EdgeID       string        `json:"edge_id,omitempty"`
+	Grade        EvidenceGrade `json:"grade"`
+	Summary      string        `json:"summary"`
+	Confidence   float64       `json:"confidence"`
+	Counter       bool          `json:"counter"`
+}
+
+type ForestPOI struct {
+	POIID                string  `json:"poi_id"`
+	ClusterID            string  `json:"cluster_id"`
+	NodeID               string  `json:"node_id"`
+	Reason               string  `json:"reason"`
+	Priority             float64 `json:"priority"`
+	InvalidationSequence int64   `json:"invalidation_sequence"`
+}
+
+type ForestBridgeRisk struct {
+	BridgeID               string   `json:"bridge_id"`
+	NodeID                 string   `json:"node_id"`
+	SourceClusterID        string   `json:"source_cluster_id"`
+	TargetClusterID        string   `json:"target_cluster_id"`
+	Score                  float64  `json:"score"`
+	ContradictionRisk      float64  `json:"contradiction_risk"`
+	GuardianReviewRequired bool     `json:"guardian_review_required"`
+	SourceEdgeIDs          []string `json:"source_edge_ids,omitempty"`
+}
+
+type ForestQuarantine struct {
+	Quarantined     bool     `json:"quarantined"`
+	Factor          float64  `json:"factor"`
+	Corruption      float64  `json:"corruption"`
+	Immunity         float64  `json:"immunity"`
+	Dimensions      []string `json:"dimensions,omitempty"`
+	EvidenceRefs     []string `json:"evidence_refs,omitempty"`
+	RecoveryRequired bool     `json:"recovery_required"`
+}
+
+type ForestClaimProposalTemplate struct {
+	ProposalID             string   `json:"proposal_id"`
+	ClusterID              string   `json:"cluster_id,omitempty"`
+	Dimension              string   `json:"dimension,omitempty"`
+	Summary                string   `json:"summary"`
+	EvidenceRefs           []string `json:"evidence_refs,omitempty"`
+	CounterEvidenceRefs    []string `json:"counter_evidence_refs,omitempty"`
+	GuardianReviewRequired bool     `json:"guardian_review_required"`
+}
+
+type ForestCursor struct {
+	ID               string    `json:"id"`
+	SessionID        string    `json:"session_id,omitempty"`
+	TaskID           string    `json:"task_id,omitempty"`
+	AgentID          string    `json:"agent_id,omitempty"`
+	TurnID           string    `json:"turn_id,omitempty"`
+	ActiveClusterIDs []string  `json:"active_cluster_ids,omitempty"`
+	ActiveNodeIDs    []string  `json:"active_node_ids,omitempty"`
+	POIRefs          []string  `json:"poi_refs,omitempty"`
+	BridgeRefs       []string  `json:"bridge_refs,omitempty"`
+	RiskFlags        []string  `json:"risk_flags,omitempty"`
+	NoCursorReason   string    `json:"no_cursor_reason,omitempty"`
+	PolicyVersion    string    `json:"policy_version"`
+	CreatedAt        time.Time `json:"created_at"`
+	Metadata         map[string]any `json:"metadata,omitempty"`
 }
 
 func allForestNodeKinds() map[ForestNodeKind]struct{} {

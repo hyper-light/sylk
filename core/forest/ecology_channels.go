@@ -120,8 +120,11 @@ func (m *MemoryForest) refreshSubstrateChannelState(ctx context.Context, session
 	}
 	defer tx.Rollback()
 	for nodeID, channelValues := range fields {
-		threshold := adaptiveThreshold(channelValues)
 		for channel, value := range channelValues {
+			threshold, err := adaptiveThresholdForScopeTx(ctx, tx, "node", nodeID, channel, value, now)
+			if err != nil {
+				return SubstrateResult{}, err
+			}
 			if _, err := tx.ExecContext(ctx, `
 				INSERT INTO forest_substrate_field
 					(scope_type, scope_id, channel, value, adaptive_threshold, policy_version, source_seq, updated_at, metadata)
@@ -142,6 +145,12 @@ func (m *MemoryForest) refreshSubstrateChannelState(ctx context.Context, session
 		if err := recordResourceBalanceTx(ctx, tx, "node", nodeID, "substrate_update", resourceDelta(channelValues), "substrate:"+nodeID+":"+fmt.Sprint(maxNodeSeq(nodes, nodeID)), now); err != nil {
 			return SubstrateResult{}, err
 		}
+	}
+	if err := recordClusterResourceBudgetsTx(ctx, tx, fields, now); err != nil {
+		return SubstrateResult{}, err
+	}
+	if err := pruneActivationHistoryTx(ctx, tx, now); err != nil {
+		return SubstrateResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return SubstrateResult{}, fmt.Errorf("commit ecological substrate tx: %w", err)
@@ -258,6 +267,7 @@ func diffuseSubstrate(fields map[string]map[string]float64, edges []ForestEdge) 
 		return
 	}
 	next := cloneSubstrateFields(fields)
+	degrees := substrateDegrees(edges)
 	for _, edge := range edges {
 		source, okSource := fields[edge.SourceNodeID]
 		target, okTarget := fields[edge.TargetNodeID]
@@ -274,7 +284,7 @@ func diffuseSubstrate(fields map[string]map[string]float64, edges []ForestEdge) 
 	}
 	for nodeID, values := range next {
 		for channel, value := range values {
-			values[channel] = value / (1 + degreeForNode(edges, nodeID, channel))
+			values[channel] = value / (1 + degrees[nodeID])
 		}
 	}
 	for nodeID, values := range next {
@@ -293,17 +303,14 @@ func cloneSubstrateFields(fields map[string]map[string]float64) map[string]map[s
 	return cloned
 }
 
-func degreeForNode(edges []ForestEdge, nodeID, channel string) float64 {
-	degree := 0.0
+func substrateDegrees(edges []ForestEdge) map[string]float64 {
+	degrees := make(map[string]float64, len(edges))
 	for _, edge := range edges {
-		if edge.SourceNodeID == nodeID || edge.TargetNodeID == nodeID {
-			degree += clampFinite01(edge.Weight)
-		}
+		weight := clampFinite01(edge.Weight)
+		degrees[edge.SourceNodeID] += weight
+		degrees[edge.TargetNodeID] += weight
 	}
-	if degree == 0 {
-		return 0
-	}
-	return degree
+	return degrees
 }
 
 func normalizeSubstrateFields(fields map[string]map[string]float64) {
@@ -327,6 +334,41 @@ func adaptiveThreshold(values map[string]float64) float64 {
 	}
 	sort.Float64s(samples)
 	return samples[len(samples)/2]
+}
+
+func adaptiveThresholdForScopeTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID, channel string, coldStart float64, now int64) (float64, error) {
+	policy := defaultEcologyPolicy()
+	window := activationHistoryWindow(policy)
+	if window <= 0 {
+		window = 1
+	}
+	cutoff := activationBucket(now) - int64(window)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT threshold, success_count, weak_exposure_count
+		FROM forest_activation_history
+		WHERE scope_type = ? AND scope_id = ? AND channel = ? AND policy_version = ? AND bucket >= ?
+		ORDER BY bucket DESC
+		LIMIT ?
+	`, scopeType, scopeID, channel, ecologyPolicyVersion, cutoff, window)
+	if err != nil {
+		return 0, fmt.Errorf("query adaptive threshold history: %w", err)
+	}
+	defer rows.Close()
+	samples := []float64{clampFinite01(coldStart)}
+	for rows.Next() {
+		var threshold float64
+		var success, weak int
+		if err := rows.Scan(&threshold, &success, &weak); err != nil {
+			return 0, fmt.Errorf("scan adaptive threshold history: %w", err)
+		}
+		pressure := float64(weak-success) / float64(window+success+weak)
+		samples = append(samples, clampFinite01(threshold+(pressure/float64(window))))
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	sort.Float64s(samples)
+	return samples[len(samples)/2], nil
 }
 
 func maxNodeSeq(nodes []ForestNode, nodeID string) int64 {
@@ -369,10 +411,38 @@ func updateActivationHistoryTx(ctx context.Context, tx *sql.Tx, scopeType, scope
 
 func activationBucket(unix int64) int64 {
 	policy := defaultEcologyPolicy()
-	if len(policy.Channels) == 0 {
+	span := activationBucketSpanSeconds(policy)
+	if span <= 0 {
 		return unix
 	}
-	return unix / int64(len(policy.Channels))
+	return unix / span
+}
+
+func activationBucketSpanSeconds(policy EcologyPolicy) int64 {
+	return int64(len(policy.Channels))
+}
+
+func activationHistoryWindow(policy EcologyPolicy) int {
+	return len(policy.Channels) * nodeProjectionRetryLimit()
+}
+
+func activationHistoryRetentionBuckets(policy EcologyPolicy) int64 {
+	return int64(activationHistoryWindow(policy) * nodeProjectionRetryLimit())
+}
+
+func pruneActivationHistoryTx(ctx context.Context, tx *sql.Tx, now int64) error {
+	retention := activationHistoryRetentionBuckets(defaultEcologyPolicy())
+	if retention <= 0 {
+		return nil
+	}
+	cutoff := activationBucket(now) - retention
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM forest_activation_history
+		WHERE policy_version = ? AND bucket < ?
+	`, ecologyPolicyVersion, cutoff); err != nil {
+		return fmt.Errorf("prune activation history: %w", err)
+	}
+	return nil
 }
 
 func resourceDelta(values map[string]float64) float64 {
@@ -395,6 +465,10 @@ func clampFiniteSigned(v float64) float64 {
 }
 
 func recordResourceBalanceTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID, eventKind string, amount float64, sourceKey string, now int64) error {
+	return recordResourceBalanceWithAgentTx(ctx, tx, scopeType, scopeID, "", eventKind, amount, sourceKey, now)
+}
+
+func recordResourceBalanceWithAgentTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID, agentID, eventKind string, amount float64, sourceKey string, now int64) error {
 	var prior sql.NullFloat64
 	if err := tx.QueryRowContext(ctx, `
 		SELECT balance_after
@@ -412,12 +486,89 @@ func recordResourceBalanceTx(ctx context.Context, tx *sql.Tx, scopeType, scopeID
 	accountingID := stableID("resource", scopeType, scopeID, eventKind, sourceKey, ecologyPolicyVersion)
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_resource_accounting
-			(accounting_id, scope_type, scope_id, event_kind, amount, balance_after,
+			(accounting_id, scope_type, scope_id, agent_id, event_kind, amount, balance_after,
 			 source_key, policy_version, recorded_at, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(scope_type, scope_id, event_kind, source_key, policy_version) DO NOTHING
-	`, accountingID, scopeType, scopeID, eventKind, amount, balance, sourceKey, ecologyPolicyVersion, now, "{}"); err != nil {
+	`, accountingID, scopeType, scopeID, strings.TrimSpace(agentID), eventKind, amount, balance, sourceKey, ecologyPolicyVersion, now, "{}"); err != nil {
 		return fmt.Errorf("record resource accounting: %w", err)
+	}
+	return nil
+}
+
+func recordClusterResourceBudgetsTx(ctx context.Context, tx *sql.Tx, fields map[string]map[string]float64, now int64) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	nodeIDs := make([]string, 0, len(fields))
+	for nodeID := range fields {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Strings(nodeIDs)
+	placeholders, args := placeholdersForStrings(nodeIDs)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT cluster_id, node_id
+		FROM forest_cluster_membership
+		WHERE node_id IN (`+placeholders+`)
+	`, args...)
+	if err != nil {
+		return fmt.Errorf("query cluster resource memberships: %w", err)
+	}
+	amounts := map[string]float64{}
+	for rows.Next() {
+		var clusterID, nodeID string
+		if err := rows.Scan(&clusterID, &nodeID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan cluster resource membership: %w", err)
+		}
+		amounts[clusterID] += resourceDelta(fields[nodeID])
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close cluster resource memberships: %w", err)
+	}
+	for clusterID, amount := range amounts {
+		sourceKey := "cluster_substrate:" + clusterID + ":" + fmt.Sprint(now)
+		if err := recordResourceBalanceTx(ctx, tx, "cluster", clusterID, "substrate_budget", clampFiniteSigned(amount), sourceKey, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func recordClusterExposureTx(ctx context.Context, tx *sql.Tx, nodeID, agentID string, amount float64, sourceKey string, now int64) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT cluster_id
+		FROM forest_cluster_membership
+		WHERE node_id = ?
+		ORDER BY membership_weight DESC, cluster_id ASC
+	`, nodeID)
+	if err != nil {
+		return fmt.Errorf("query cluster exposure memberships: %w", err)
+	}
+	clusterIDs := []string{}
+	for rows.Next() {
+		var clusterID string
+		if err := rows.Scan(&clusterID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan cluster exposure membership: %w", err)
+		}
+		clusterIDs = append(clusterIDs, clusterID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close cluster exposure memberships: %w", err)
+	}
+	for _, clusterID := range clusterIDs {
+		if err := recordResourceBalanceWithAgentTx(ctx, tx, "cluster", clusterID, agentID, "retrieval_exposure", -clampFinite01(amount), sourceKey, now); err != nil {
+			return err
+		}
 	}
 	return nil
 }
