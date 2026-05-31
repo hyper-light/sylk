@@ -88,6 +88,34 @@ func TestIdentityRegistryServiceHandlerProducesTypedAllocationArtifact(t *testin
 	}
 }
 
+func TestIdentityRegistryServiceHandlerFailuresBecomeArtifacts(t *testing.T) {
+	service := NewIdentityRegistryService(IdentityRegistryServiceConfig{})
+	tests := []struct {
+		name     string
+		tool     string
+		args     map[string]any
+		dataType string
+	}{
+		{name: "allocate invalid", tool: IdentityRegistryToolAllocate, args: map[string]any{"category": string(ParticipantCategoryService)}, dataType: ArtifactDataTypeIdentityAllocation},
+		{name: "lookup missing", tool: IdentityRegistryToolLookup, args: map[string]any{"uid": "participant:missing"}, dataType: ArtifactDataTypeIdentityAllocation},
+		{name: "lineage missing", tool: IdentityRegistryToolLineage, args: map[string]any{"uid": "participant:missing"}, dataType: ArtifactDataTypeIdentityLineage},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{Tool: tt.tool, Arguments: tt.args}}}})
+			if err != nil {
+				t.Fatalf("HandleServiceClaim: %v", err)
+			}
+			if len(result.Artifacts) != 1 || result.Artifacts[0].Kind != ArtifactKindErrorDiagnostic {
+				t.Fatalf("artifacts = %+v, want one error diagnostic", result.Artifacts)
+			}
+			if result.Artifacts[0].DataType != tt.dataType || len(result.Artifacts[0].Errors) == 0 {
+				t.Fatalf("artifact = %+v, want typed failure artifact with errors", result.Artifacts[0])
+			}
+		})
+	}
+}
+
 func TestIdentityValidatorsPassAndFailDeterministically(t *testing.T) {
 	service := NewIdentityRegistryService(IdentityRegistryServiceConfig{})
 	allocation, err := service.allocate(context.Background(), IdentityAllocationArtifactData{Category: ParticipantCategoryService, RouteKey: "guardian", Scope: map[string]string{"session": "sess"}, Generation: 1})

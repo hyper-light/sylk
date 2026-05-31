@@ -77,8 +77,10 @@ func (m *MemoryForest) startRetrievalCandidatesPruner() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorRetrievalCandidatesPrunerName, retrievalCandidatesPruneBatchSize, func() {
+	m.registerRuntimeTicker("retrieval_candidates_pruner_interval", m.retrievalCandidatesPruneInterval)
+	m.startWorker(projectorRetrievalCandidatesPrunerName, retrievalCandidatesPruneBatchSize, func(context.Context) error {
 		m.runRetrievalCandidatesPrunerLoop()
+		return nil
 	})
 }
 

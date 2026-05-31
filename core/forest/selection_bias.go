@@ -275,8 +275,10 @@ func (m *MemoryForest) startImplicitNegativeSweeper() {
 	if m == nil {
 		return
 	}
-	m.startWorker("implicit_negative_sweeper", implicitNegativeSweepBatchSize, func() {
+	m.registerRuntimeTicker("implicit_negative_sweeper_interval", m.hyperparams().ImplicitNegativeSweepInterval())
+	m.startWorker("implicit_negative_sweeper", implicitNegativeSweepBatchSize, func(context.Context) error {
 		m.runImplicitNegativeSweeperLoop()
+		return nil
 	})
 }
 

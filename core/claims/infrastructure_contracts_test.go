@@ -3,6 +3,9 @@ package claims
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -43,6 +46,7 @@ func TestInfrastructureServiceContractsRejectMissingHandlerValidatorAndReceipt(t
 		ScopeKeys:       []string{"session_id"},
 		Determinism:     HandlerDeterminismPure,
 		HandlerBoundary: "core/claims.NewSyntheticService",
+		HandlerFactory:  func() ServiceHandler { return syntheticContractHandler{tools: []string{"synthetic_tool"}} },
 		Actions: []InfrastructureServiceActionContract{{
 			Action:                    ActionTypeTask,
 			Tools:                     []string{"synthetic_tool"},
@@ -55,12 +59,14 @@ func TestInfrastructureServiceContractsRejectMissingHandlerValidatorAndReceipt(t
 		name     string
 		contract InfrastructureServiceContract
 	}{
-		{name: "missing handler", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.HandlerBoundary = "" })},
+		{name: "missing handler boundary", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.HandlerBoundary = "" })},
+		{name: "missing handler factory", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.HandlerFactory = nil })},
 		{name: "missing determinism", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Determinism = "" })},
 		{name: "missing validator", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Actions[0].ValidatorIDs = nil })},
 		{name: "missing action handler coverage", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Actions[0].Tools = nil })},
 		{name: "missing receipt validation", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Actions[0].RequiresReceiptValidation = false })},
 		{name: "unregistered validator", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Actions[0].ValidatorIDs = []string{"infrastructure.missing"} })},
+		{name: "unhandled action tool", contract: mutateInfrastructureContract(base, func(c *InfrastructureServiceContract) { c.Actions[0].Tools = []string{"unhandled_tool"} })},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -72,9 +78,41 @@ func TestInfrastructureServiceContractsRejectMissingHandlerValidatorAndReceipt(t
 	}
 }
 
+type syntheticContractHandler struct {
+	tools []string
+}
+
+func (h syntheticContractHandler) HandleServiceClaim(context.Context, ServiceClaimRequest) (ServiceClaimResult, error) {
+	return ServiceClaimResult{}, nil
+}
+
+func (h syntheticContractHandler) ServiceTools() []string {
+	return append([]string(nil), h.tools...)
+}
+
 func TestInfrastructureServicesDoNotExposeLegacyMutationBypassAPIs(t *testing.T) {
 	assertNoExportedMethods(t, &IdentityRegistryService{}, []string{"Allocate", "Lineage"})
 	assertNoExportedMethods(t, &ActivationControllerService{}, []string{"Activate", "Deactivate", "DeactivateRecord", "QueryTier"})
+}
+
+func TestInfrastructureServiceHandlersDoNotReturnOperationalGoErrorBypasses(t *testing.T) {
+	root := claimsRepoRoot(t)
+	tests := []struct {
+		path  string
+		funcs []string
+	}{
+		{path: "core/claims/identity_registry_service.go", funcs: []string{"HandleServiceClaim", "handleIdentityRegistryCall", "handleAllocate", "handleLookup", "handleLineage", "serviceClaimResultWithArtifact"}},
+		{path: "core/claims/activation_controller_service.go", funcs: []string{"HandleServiceClaim", "handleActivationControllerCall", "handleActivate", "handleDeactivate", "handleQueryTier", "activationRecordResult"}},
+		{path: "core/claims/infrastructure_services.go", funcs: []string{"HandleServiceClaim", "ShutdownService", "handleDAG", "handleVFS", "handleToolRuntime", "handleKnowledge", "handleMemory", "handleDocument", "handleGuardian", "handleProvider", "handleExternal"}},
+		{path: "core/claims/system_participant_services.go", funcs: []string{"HandleServiceClaim", "handleSessionLifecycle", "handleFabricSubscription", "handleBusTransport"}},
+		{path: "core/boot/service.go", funcs: []string{"HandleServiceClaim", "recordPhase", "bootServiceClaimResultWithArtifact"}},
+		{path: "core/boot/operations.go", funcs: []string{"HandleServiceClaim"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			assertNoEmptyServiceResultErrorReturns(t, filepath.Join(root, tt.path), tt.funcs)
+		})
+	}
 }
 
 func TestDefaultInfrastructureValidatorsCoverPassFailIncompleteErrored(t *testing.T) {
@@ -221,6 +259,60 @@ func assertNoExportedMethods(t *testing.T, value any, methods []string) {
 		if _, ok := typ.MethodByName(method); ok {
 			t.Fatalf("%s exposes legacy bypass method %s", typ.String(), method)
 		}
+	}
+}
+
+func assertNoEmptyServiceResultErrorReturns(t *testing.T, path string, funcs []string) {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	wanted := stringSet(funcs)
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if _, ok := wanted[fn.Name.Name]; !ok {
+			continue
+		}
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			ret, ok := node.(*ast.ReturnStmt)
+			if ok && returnsEmptyServiceResultWithError(ret) {
+				t.Fatalf("%s:%s returns a Go error instead of an infrastructure failure artifact", path, fn.Name.Name)
+			}
+			return true
+		})
+	}
+}
+
+func returnsEmptyServiceResultWithError(ret *ast.ReturnStmt) bool {
+	if len(ret.Results) != 2 || !isEmptyServiceResult(ret.Results[0]) {
+		return false
+	}
+	if ident, ok := ret.Results[1].(*ast.Ident); ok && ident.Name == "nil" {
+		return false
+	}
+	return true
+}
+
+func isEmptyServiceResult(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.CompositeLit)
+	if !ok || len(lit.Elts) != 0 {
+		return false
+	}
+	return exprNamesType(lit.Type, "ServiceClaimResult")
+}
+
+func exprNamesType(expr ast.Expr, name string) bool {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name == name
+	case *ast.SelectorExpr:
+		return typed.Sel.Name == name
+	default:
+		return false
 	}
 }
 

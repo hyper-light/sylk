@@ -37,6 +37,7 @@ type ForestHarvestFunc func(ctx context.Context, activity activity.AgentActivity
 type ForestFabricBridge struct {
 	logger  *FabricLogger
 	harvest ForestHarvestFunc
+	scope   context.Context
 
 	consumesForwarded atomic.Uint64
 	resolvesForwarded atomic.Uint64
@@ -49,9 +50,17 @@ type ForestFabricBridge struct {
 // activities whose ActionKind is forest-eligible. Call Subscribe on
 // the returned bridge to wire it up.
 func NewForestFabricBridge(logger *FabricLogger, harvest ForestHarvestFunc) *ForestFabricBridge {
+	return NewForestFabricBridgeWithContext(context.TODO(), logger, harvest)
+}
+
+func NewForestFabricBridgeWithContext(ctx context.Context, logger *FabricLogger, harvest ForestHarvestFunc) *ForestFabricBridge {
+	if ctx == nil {
+		ctx = context.TODO()
+	}
 	return &ForestFabricBridge{
 		logger:  logger,
 		harvest: harvest,
+		scope:   ctx,
 	}
 }
 
@@ -120,7 +129,7 @@ func (b *ForestFabricBridge) handleConsume(record FabricLogRecord) {
 		latencyHuman(record.Consume.LatencyMicros),
 		lensLabelFromRecord(record),
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(b.scope, 5*time.Second)
 	defer cancel()
 	_ = b.harvest(ctx, orig, reason)
 	b.consumesForwarded.Add(1)
@@ -145,7 +154,7 @@ func (b *ForestFabricBridge) handleResolve(record FabricLogRecord) {
 		record.Resolve.ResolverKind,
 		latencyHuman(record.Resolve.LatencyMicros),
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(b.scope, 5*time.Second)
 	defer cancel()
 	_ = b.harvest(ctx, orig, reason)
 	b.resolvesForwarded.Add(1)

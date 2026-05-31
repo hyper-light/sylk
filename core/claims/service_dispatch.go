@@ -47,6 +47,10 @@ type ServiceHandler interface {
 	HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error)
 }
 
+type ServiceToolCatalog interface {
+	ServiceTools() []string
+}
+
 type serviceShutdownHandler interface {
 	ShutdownService(ctx context.Context, req ServiceShutdownRequest) (ServiceClaimResult, error)
 }

@@ -517,6 +517,13 @@ func New(cfg Config) (*MemoryForest, error) {
 		stopCh:                           make(chan struct{}),
 	}
 	service.baseScoreStore = newBaseScoreModelStore(service.db)
+	service.registerRuntimeQueue("maintenance_wake", cap(service.maintenanceWake))
+	service.registerRuntimeQueue("branch_projector_wake", cap(service.projectorWake))
+	service.registerRuntimeQueue("retrieval_candidates_wake", cap(service.retrievalCandidatesWake))
+	service.registerRuntimeQueue("retrieval_audit_idle", cap(service.retrievalAuditIdle))
+	if err := service.runtime.RegisterLease(projectorBranchName, service.projectorID); err != nil {
+		service.logger.Error("forest_runtime_lease_register_failed", "lease", projectorBranchName, "err", err.Error())
+	}
 
 	// Subscribe to tuner promotions so runtime adaptation
 	// updates the cached snapshot atomically. Subscribe fires
@@ -542,22 +549,22 @@ func New(cfg Config) (*MemoryForest, error) {
 	}
 
 	if cfg.ClaimsDeltaSubscriber != nil {
-		if _, err := service.MountClaimsDeltaIngestion(cfg.ClaimsDeltaSubscriber, cfg.ClaimsDeltaSessionFilter, cfg.DeltaIngestQueueCapacity); err != nil {
+		if _, err := service.MountClaimsDeltaIngestion(cfg.ClaimsDeltaSubscriber, cfg.ClaimsDeltaSessionFilter, resolveDeltaIngestQueueCapacity(cfg.DeltaIngestQueueCapacity)); err != nil {
 			runCancel()
 			tuner.Stop()
 			return nil, fmt.Errorf("forest: mount claims delta ingestion: %w", err)
 		}
 	}
 
-	service.startMaintenance()
 	if !service.synchronousProjection {
-		// Async-only goroutines: branch projector, retrieval-
-		// candidates projector, audit drainer, implicit-negative
-		// sweeper, AntiPattern promoter. Tests using
-		// SynchronousProjection=true write audits inline (via
-		// emitRetrievalAudit's nil-queue fallback) and skip the
-		// periodic scanners to avoid shared-cache lock contention
-		// with parallel test writes.
+		// Async-only goroutines: maintenance scheduler, branch
+		// projector, retrieval-candidates projector, audit drainer,
+		// implicit-negative sweeper, AntiPattern promoter, and
+		// storage pruners. Tests using SynchronousProjection=true
+		// write branch projections inline and skip background
+		// schedulers to avoid shared-cache lock contention with
+		// same-tick assertions.
+		service.startMaintenance()
 		service.startBranchProjector()
 		service.startRetrievalCandidatesProjector()
 		service.startRetrievalAuditDrainer()
@@ -639,42 +646,52 @@ func (m *MemoryForest) CloseWithContext(ctx context.Context) error {
 	})
 	if m.runtime != nil {
 		if err := m.runtime.Close(ctx); err != nil {
+			m.recordRuntimeShutdownTimeout(ctx, err)
 			return err
 		}
 	} else {
-		waitDone := make(chan struct{})
-		go func() {
-			m.wg.Wait()
-			close(waitDone)
-		}()
-		select {
-		case <-waitDone:
-		case <-ctx.Done():
-			return fmt.Errorf("forest close: workers did not drain: %w", ctx.Err())
-		}
+		m.logger.Error("forest_runtime_missing_close")
 	}
 	m.closeTuner()
 	return nil
 }
 
-func (m *MemoryForest) startWorker(name string, queueLimit int, run func()) {
+func (m *MemoryForest) startWorker(name string, queueLimit int, run func(context.Context) error) {
 	if m == nil || run == nil {
 		return
 	}
 	if m.runtime != nil {
-		if err := m.runtime.StartWorker(name, queueLimit, func(context.Context) error {
-			run()
-			return nil
-		}); err != nil {
+		if err := m.runtime.StartWorker(name, queueLimit, run); err != nil {
 			m.logger.Error("forest_runtime_start_failed", "worker", name, "err", err.Error())
 		}
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		run()
-	}()
+	m.logger.Error("forest_runtime_missing_worker_not_started", "worker", name)
+}
+
+func (m *MemoryForest) recordRuntimeShutdownTimeout(ctx context.Context, cause error) {
+	if m == nil || cause == nil {
+		return
+	}
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	_, err := m.AppendLedgerRecord(recordCtx, LedgerRecord{
+		SourceKind:  LedgerSourceMaintenance,
+		SourceID:    "runtime_shutdown",
+		SourceKey:   "runtime_shutdown_timeout:" + stableID(time.Now().UTC().Format(time.RFC3339Nano), cause.Error()),
+		EventKind:   "runtime.shutdown_timeout",
+		SessionID:   "global",
+		SubjectType: "runtime",
+		SubjectID:   "shutdown",
+		Reason:      cause.Error(),
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"error": cause.Error(),
+		},
+	})
+	if err != nil {
+		m.logger.Warn("forest_runtime_shutdown_timeout_artifact_failed", "err", err.Error())
+	}
 }
 
 func (m *MemoryForest) RuntimeSnapshot() RuntimeSnapshot {
@@ -682,6 +699,31 @@ func (m *MemoryForest) RuntimeSnapshot() RuntimeSnapshot {
 		return RuntimeSnapshot{}
 	}
 	return m.runtime.Snapshot()
+}
+
+func (m *MemoryForest) registerRuntimeQueue(name string, capacity int) {
+	if m == nil || m.runtime == nil {
+		return
+	}
+	if err := m.runtime.RegisterQueue(name, capacity); err != nil {
+		m.logger.Error("forest_runtime_queue_register_failed", "queue", name, "err", err.Error())
+	}
+}
+
+func (m *MemoryForest) registerRuntimeTicker(name string, interval time.Duration) {
+	if m == nil || m.runtime == nil {
+		return
+	}
+	if err := m.runtime.RegisterTicker(name, interval); err != nil {
+		m.logger.Error("forest_runtime_ticker_register_failed", "ticker", name, "err", err.Error())
+	}
+}
+
+func (m *MemoryForest) recordRuntimeQueueOverflow(name, reason string) {
+	if m == nil || m.runtime == nil {
+		return
+	}
+	m.runtime.RecordQueueOverflow(name, reason)
 }
 
 func normalizeLogger(logger *slog.Logger) *slog.Logger {
@@ -897,6 +939,7 @@ func (m *MemoryForest) notifyProjector() {
 	select {
 	case m.projectorWake <- struct{}{}:
 	default:
+		m.recordRuntimeQueueOverflow("branch_projector_wake", "branch projector wake already pending")
 	}
 }
 

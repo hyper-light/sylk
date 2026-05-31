@@ -312,6 +312,43 @@ func TestCancelClaimTreeCallsMockeryWorkCanceller(t *testing.T) {
 	canceller.AssertExpectations(t)
 }
 
+func TestCancelClaimTreeCancelsRegisteredInboxWork(t *testing.T) {
+	sessionID := "cancel-inbox-session"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "cancel-inbox-board", SessionID: sessionID, TaskID: "task"})
+	postCancellationClaim(t, board, "root", "")
+	registry := claims.NewClaimCancelRegistry()
+	runCtx, registration := registry.Context(context.Background(), "root")
+	defer registration.Done()
+	inbox, err := claims.NewClaimsInbox(claims.InboxConfig{
+		AgentID:        "worker",
+		SessionID:      sessionID,
+		CancelRegistry: registry,
+	})
+	if err != nil {
+		t.Fatalf("NewClaimsInbox: %v", err)
+	}
+	claims.DefaultSessionInboxRegistry().Register(sessionID, "worker", inbox)
+	defer claims.DefaultSessionInboxRegistry().Remove(sessionID, "worker")
+
+	result, err := claims.CancelClaimTree(context.Background(), claims.ClaimCancellationOptions{
+		Board:         board,
+		InboxRegistry: claims.DefaultSessionInboxRegistry(),
+		RootClaimIDs:  []string{"root"},
+		Reason:        "user interrupt",
+	})
+	if err != nil {
+		t.Fatalf("CancelClaimTree: %v", err)
+	}
+	if len(result.CancelledClaimIDs) != 1 || result.CancelledClaimIDs[0] != "root" {
+		t.Fatalf("cancellation result = %+v", result)
+	}
+	select {
+	case <-runCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("registered inbox work was not cancelled")
+	}
+}
+
 func TestCancelClaimTreeRecordsMissingRootEvidence(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "cancel-board", SessionID: "cancel-session", TaskID: "task"})
 	result, err := claims.CancelClaimTree(context.Background(), claims.ClaimCancellationOptions{
@@ -445,6 +482,24 @@ func TestSessionShutdownCoordinatorOrdersResourcesAndIsIdempotent(t *testing.T) 
 	}
 	if !second.AlreadyStopped {
 		t.Fatalf("second shutdown should report AlreadyStopped: %+v", second)
+	}
+}
+
+func TestSessionShutdownCoordinatorCancelsActiveRootsByDefault(t *testing.T) {
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "shutdown-default-board", SessionID: "shutdown-default-session", TaskID: "task"})
+	postCancellationClaim(t, board, "active", "")
+	result, err := claims.NewSessionShutdownCoordinator().Shutdown(context.Background(), claims.SessionShutdownOptions{
+		Board: board,
+	})
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if len(result.Cancelled) != 1 || result.Cancelled[0] != "active" {
+		t.Fatalf("shutdown cancellation = %+v", result)
+	}
+	claim, ok := board.CloneClaim("active")
+	if !ok || !claim.LifecycleStatus.IsTerminal() {
+		t.Fatalf("claim after shutdown = %+v ok=%v", claim, ok)
 	}
 }
 

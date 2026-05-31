@@ -20,6 +20,7 @@ func TestBootSequencerInfrastructureServiceContract(t *testing.T) {
 		t.Fatalf("RegisterDefaultBootValidators: %v", err)
 	}
 	contract := claims.BootSequencerInfrastructureServiceContract()
+	contract.HandlerFactory = func() claims.ServiceHandler { return NewBootSequencerService(BootSequencerServiceConfig{}) }
 	if err := claims.ValidateInfrastructureServiceContracts([]claims.InfrastructureServiceContract{contract}, registry.List()); err != nil {
 		t.Fatalf("ValidateInfrastructureServiceContracts: %v", err)
 	}

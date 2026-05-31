@@ -1564,6 +1564,30 @@ func recoverBootstrapClaimsWork(phase1 *bootstrapPhase1) error {
 	return err
 }
 
+func startBootstrapClaimsOperationsAudits(phase1 *bootstrapPhase1) error {
+	board := bootstrapClaimsBoard(phase1)
+	if board == nil || phase1 == nil || phase1.scope == nil {
+		return nil
+	}
+	return claims.StartClaimsOperationsAudits(phase1.ctx, &concurrency.ScopeAdapter{Scope: phase1.scope}, claims.OperationsAuditOptions{
+		Config:             board.OperationsConfig(),
+		BoardRegistry:      claims.DefaultSessionBoardRegistry(),
+		InboxRegistry:      claims.DefaultSessionInboxRegistry(),
+		ServiceDispatchers: phase1.bootDispatchers,
+		Boards:             []*claims.ClaimsBoard{board},
+		DurableBoards:      bootstrapDurableClaimsBoards(phase1),
+		EvidenceBoard:      board,
+		SessionID:          board.SessionID(),
+	})
+}
+
+func bootstrapDurableClaimsBoards(phase1 *bootstrapPhase1) []*claims.DurableBoard {
+	if phase1 == nil || phase1.defaultSession == nil || phase1.defaultSession.DurableClaimsBoard() == nil {
+		return nil
+	}
+	return []*claims.DurableBoard{phase1.defaultSession.DurableClaimsBoard()}
+}
+
 func bootstrapClaimsBoard(phase1 *bootstrapPhase1) *claims.ClaimsBoard {
 	if phase1 == nil || phase1.defaultSession == nil {
 		return nil
@@ -2436,6 +2460,9 @@ func buildBootstrapDeps(
 			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		}); err != nil {
 			return ui.Deps{}, fmt.Errorf("claims operations phase 7: %w", err)
+		}
+		if err := startBootstrapClaimsOperationsAudits(phase1); err != nil {
+			return ui.Deps{}, fmt.Errorf("claims operations audits: %w", err)
 		}
 	}
 	return deps, nil

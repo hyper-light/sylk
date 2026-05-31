@@ -101,8 +101,10 @@ func (m *MemoryForest) startAntiPatternPromoter() {
 	if m == nil {
 		return
 	}
-	m.startWorker("anti_pattern_promoter", antiPatternPromotionBatchSize, func() {
+	m.registerRuntimeTicker("anti_pattern_promoter_interval", m.antiPatternPromotionInterval)
+	m.startWorker("anti_pattern_promoter", antiPatternPromotionBatchSize, func(context.Context) error {
 		m.runAntiPatternPromoterLoop()
+		return nil
 	})
 }
 

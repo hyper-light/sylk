@@ -62,8 +62,10 @@ func (m *MemoryForest) startBranchTracePruner() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorBranchTracePrunerName, m.branchTraceRetentionPerBranch, func() {
+	m.registerRuntimeTicker("branch_trace_pruner_interval", m.branchTracePruneInterval)
+	m.startWorker(projectorBranchTracePrunerName, m.branchTraceRetentionPerBranch, func(context.Context) error {
 		m.runBranchTracePrunerLoop()
+		return nil
 	})
 }
 

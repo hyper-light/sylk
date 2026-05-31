@@ -48,8 +48,10 @@ func (m *MemoryForest) startEventArchivalWorker() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorEventArchivalName, m.eventArchiveBatchSize, func() {
+	m.registerRuntimeTicker("event_archival_interval", m.eventArchiveInterval)
+	m.startWorker(projectorEventArchivalName, m.eventArchiveBatchSize, func(context.Context) error {
 		m.runEventArchivalLoop()
+		return nil
 	})
 }
 

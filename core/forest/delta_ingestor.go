@@ -12,7 +12,7 @@ import (
 	"github.com/adalundhe/sylk/core/claims"
 )
 
-const defaultDeltaIngestQueueCapacity = 256
+const defaultDeltaIngestQueueCapacity = projectorBatchSize * 8
 
 // DeltaIngestor is the claims-native replacement for activity-payload claims
 // harvesting. It subscribes to canonical claims delta topics, deduplicates
@@ -22,7 +22,7 @@ type DeltaIngestor struct {
 	subscriber    claims.DeltaSubscriber
 	sessionFilter string
 	queue         chan claims.CanonicalDelta
-	subscription  claims.DeltaSubscription
+	subscriptions []claims.DeltaSubscription
 	stopped       atomic.Bool
 	received      atomic.Uint64
 	enqueued      atomic.Uint64
@@ -42,6 +42,13 @@ type DeltaIngestorSnapshot struct {
 	LastError     string
 }
 
+func resolveDeltaIngestQueueCapacity(capacity int) int {
+	if capacity > 0 {
+		return capacity
+	}
+	return defaultDeltaIngestQueueCapacity
+}
+
 func (m *MemoryForest) MountClaimsDeltaIngestion(subscriber claims.DeltaSubscriber, sessionFilter string, capacity int) (*DeltaIngestor, error) {
 	if m == nil {
 		return nil, errors.New("forest is required")
@@ -50,7 +57,7 @@ func (m *MemoryForest) MountClaimsDeltaIngestion(subscriber claims.DeltaSubscrib
 		return nil, errors.New("claims delta subscriber is required")
 	}
 	if capacity <= 0 {
-		capacity = defaultDeltaIngestQueueCapacity
+		return nil, fmt.Errorf("claims delta ingest queue capacity must be positive")
 	}
 	ingestor := &DeltaIngestor{
 		forest:        m,
@@ -58,15 +65,18 @@ func (m *MemoryForest) MountClaimsDeltaIngestion(subscriber claims.DeltaSubscrib
 		sessionFilter: strings.TrimSpace(sessionFilter),
 		queue:         make(chan claims.CanonicalDelta, capacity),
 	}
-	pattern := claims.CanonicalSessionPattern(firstNonEmptyString(ingestor.sessionFilter, claims.TopicWildcard))
-	sub, err := subscriber.SubscribeDelta(pattern, ingestor.handleDelta)
-	if err != nil {
-		return nil, fmt.Errorf("subscribe claims canonical delta pattern %q: %w", pattern, err)
+	for _, pattern := range canonicalDeltaIngestPatterns(firstNonEmptyString(ingestor.sessionFilter, claims.TopicWildcard)) {
+		sub, err := subscriber.SubscribeDelta(pattern, ingestor.handleDelta)
+		if err != nil {
+			ingestor.stopSubscription()
+			return nil, fmt.Errorf("subscribe claims canonical delta pattern %q: %w", pattern, err)
+		}
+		ingestor.subscriptions = append(ingestor.subscriptions, sub)
 	}
-	ingestor.subscription = sub
 	m.deltaIngestor = ingestor
-	m.startWorker("claims_delta_ingestor", capacity, func() {
-		ingestor.run(m.runCtx)
+	m.registerRuntimeQueue("claims_delta_ingestor", cap(ingestor.queue))
+	m.startWorker("claims_delta_ingestor", capacity, func(ctx context.Context) error {
+		return ingestor.run(ctx)
 	})
 	return ingestor, nil
 }
@@ -79,6 +89,7 @@ func (i *DeltaIngestor) handleDelta(delta claims.Delta) {
 	canonical, ok := canonicalDeltaFromBusDelta(delta)
 	if !ok {
 		i.ignoredLegacy.Add(1)
+		i.recordIgnoredLegacy(delta)
 		return
 	}
 	select {
@@ -86,6 +97,7 @@ func (i *DeltaIngestor) handleDelta(delta claims.Delta) {
 		i.enqueued.Add(1)
 	default:
 		i.overflowed.Add(1)
+		i.forest.recordRuntimeQueueOverflow("claims_delta_ingestor", "claims delta ingest queue full")
 		i.recordOverflow(canonical)
 	}
 }
@@ -104,13 +116,39 @@ func canonicalDeltaFromBusDelta(delta claims.Delta) (claims.CanonicalDelta, bool
 	}
 }
 
-func (i *DeltaIngestor) run(ctx context.Context) {
+func canonicalDeltaIngestPatterns(sessionFilter string) []string {
+	actions := claims.KnownDeltaActions()
+	patterns := make([]string, 0, len(actions)*5)
+	seen := make(map[string]struct{}, len(actions)*5)
+	add := func(pattern string) {
+		if _, exists := seen[pattern]; exists {
+			return
+		}
+		seen[pattern] = struct{}{}
+		patterns = append(patterns, pattern)
+	}
+	for _, action := range actions {
+		add(claims.CanonicalBoardActionPattern(sessionFilter, claims.TopicWildcard, action))
+		add(claims.CanonicalAgentActionPattern(sessionFilter, claims.TopicWildcard, action))
+		add(claims.CanonicalAgentTypeActionPattern(sessionFilter, claims.TopicWildcard, action))
+		add(claims.CanonicalClaimActionPattern(sessionFilter, claims.TopicWildcard, action))
+		if _, ok := claims.DeltaActionArtifactLifecycleStatus(action); ok {
+			add(claims.CanonicalArtifactActionPattern(sessionFilter, claims.TopicWildcard, action))
+		}
+		if _, ok := claims.DeltaActionValidationLifecycleStatus(action); ok || action == claims.DeltaActionValidationEvaluated {
+			add(claims.CanonicalValidationActionPattern(sessionFilter, claims.TopicWildcard, action))
+		}
+	}
+	return patterns
+}
+
+func (i *DeltaIngestor) run(ctx context.Context) error {
 	defer i.stopSubscription()
 	for {
 		select {
 		case <-ctx.Done():
 			i.drain()
-			return
+			return nil
 		case delta := <-i.queue:
 			i.ingest(ctx, delta)
 		}
@@ -121,7 +159,7 @@ func (i *DeltaIngestor) drain() {
 	for {
 		select {
 		case delta := <-i.queue:
-			drainCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			drainCtx, cancel := context.WithTimeout(context.WithoutCancel(i.forest.runCtx), time.Second)
 			i.ingest(drainCtx, delta)
 			cancel()
 		default:
@@ -134,16 +172,50 @@ func (i *DeltaIngestor) drain() {
 func (i *DeltaIngestor) ingest(ctx context.Context, delta claims.CanonicalDelta) {
 	if _, err := i.forest.AppendCanonicalDelta(ctx, delta); err != nil {
 		i.setError(err)
+		if !errors.Is(err, errEvidenceProjectionRejected) {
+			i.recordRejectedCanonical(delta, err)
+		}
 		return
 	}
 	i.ingested.Add(1)
+}
+
+func (i *DeltaIngestor) recordRejectedCanonical(delta claims.CanonicalDelta, cause error) {
+	if i == nil || i.forest == nil || cause == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(i.forest.runCtx), time.Second)
+	defer cancel()
+	_, err := i.forest.AppendLedgerRecord(ctx, LedgerRecord{
+		SourceKind:  LedgerSourceMaintenance,
+		SourceID:    delta.DeltaID,
+		SourceKey:   "claims_delta_rejected:" + firstNonEmptyString(delta.DeltaKey(), delta.DeltaID),
+		EventKind:   "claims_delta_rejected",
+		SessionID:   firstNonEmptyString(delta.SessionID, "global"),
+		BoardID:     delta.BoardID,
+		SubjectType: "delta",
+		SubjectID:   firstNonEmptyString(delta.DeltaID, delta.DeltaKey()),
+		Actor:       delta.Actor,
+		Reason:      cause.Error(),
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"delta_id":  delta.DeltaID,
+			"delta_key": delta.DeltaKey(),
+			"action":    string(delta.Action),
+			"error":     cause.Error(),
+		},
+		Refs: delta.Refs,
+	})
+	if err != nil {
+		i.setError(err)
+	}
 }
 
 func (i *DeltaIngestor) recordOverflow(delta claims.CanonicalDelta) {
 	if i == nil || i.forest == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(i.forest.runCtx, time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(i.forest.runCtx), time.Second)
 	defer cancel()
 	_, err := i.forest.AppendLedgerRecord(ctx, LedgerRecord{
 		SourceKind:  LedgerSourceMaintenance,
@@ -168,6 +240,39 @@ func (i *DeltaIngestor) recordOverflow(delta claims.CanonicalDelta) {
 	}
 }
 
+func (i *DeltaIngestor) recordIgnoredLegacy(delta claims.Delta) {
+	if i == nil || i.forest == nil || delta == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(i.forest.runCtx), time.Second)
+	defer cancel()
+	key := fmt.Sprintf("legacy_delta_ignored:%s:%s:%d:%s",
+		firstNonEmptyString(delta.DeltaSessionID(), "global"),
+		delta.DeltaKind(),
+		delta.DeltaSequence(),
+		delta.DeltaKey(),
+	)
+	_, err := i.forest.AppendLedgerRecord(ctx, LedgerRecord{
+		SourceKind:  LedgerSourceMaintenance,
+		SourceID:    delta.DeltaKey(),
+		SourceKey:   key,
+		EventKind:   "claims_delta_legacy_ignored",
+		SessionID:   firstNonEmptyString(delta.DeltaSessionID(), "global"),
+		SubjectType: "legacy_delta",
+		SubjectID:   delta.DeltaKey(),
+		Reason:      "production forest ingestion accepts canonical claims deltas only",
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"kind":     delta.DeltaKind(),
+			"key":      delta.DeltaKey(),
+			"sequence": delta.DeltaSequence(),
+		},
+	})
+	if err != nil {
+		i.setError(err)
+	}
+}
+
 func (i *DeltaIngestor) setError(err error) {
 	if err == nil {
 		return
@@ -182,8 +287,11 @@ func (i *DeltaIngestor) stopSubscription() {
 		return
 	}
 	i.stopped.Store(true)
-	if i.subscription != nil {
-		if err := i.subscription.Unsubscribe(); err != nil {
+	for _, subscription := range i.subscriptions {
+		if subscription == nil {
+			continue
+		}
+		if err := subscription.Unsubscribe(); err != nil {
 			i.setError(err)
 		}
 	}

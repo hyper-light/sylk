@@ -24,10 +24,18 @@ type Runtime struct {
 	cancel context.CancelFunc
 	logger *slog.Logger
 
-	mu      sync.Mutex
-	workers map[string]*runtimeWorkerState
-	started bool
-	closed  bool
+	mu          sync.Mutex
+	workers     map[string]*runtimeWorkerState
+	queues      map[string]*runtimeQueueState
+	tickers     map[string]*runtimeTickerState
+	leases      map[string]*runtimeLeaseState
+	started     bool
+	closed      bool
+	active      int
+	drainDone   chan struct{}
+	drainClosed bool
+	timeoutAt   time.Time
+	timeoutErr  string
 
 	wg sync.WaitGroup
 }
@@ -42,6 +50,27 @@ type runtimeWorkerState struct {
 	lastError   string
 	lastErrorAt time.Time
 	panicStack  string
+}
+
+type runtimeQueueState struct {
+	name       string
+	capacity   int
+	registered time.Time
+	overflows  uint64
+	lastReason string
+	lastAt     time.Time
+}
+
+type runtimeTickerState struct {
+	name       string
+	interval   time.Duration
+	registered time.Time
+}
+
+type runtimeLeaseState struct {
+	name       string
+	holder     string
+	registered time.Time
 }
 
 // RuntimeWorkerStatus is the external status value exposed by RuntimeSnapshot.
@@ -67,11 +96,37 @@ type RuntimeWorkerSnapshot struct {
 	LastErrorAt time.Time
 }
 
+type RuntimeQueueSnapshot struct {
+	Name       string
+	Capacity   int
+	Registered time.Time
+	Overflows  uint64
+	LastReason string
+	LastAt     time.Time
+}
+
+type RuntimeTickerSnapshot struct {
+	Name       string
+	Interval   time.Duration
+	Registered time.Time
+}
+
+type RuntimeLeaseSnapshot struct {
+	Name       string
+	Holder     string
+	Registered time.Time
+}
+
 // RuntimeSnapshot is an immutable view of all workers known to the runtime.
 type RuntimeSnapshot struct {
-	Started bool
-	Closed  bool
-	Workers []RuntimeWorkerSnapshot
+	Started      bool
+	Closed       bool
+	TimeoutAt    time.Time
+	TimeoutError string
+	Workers      []RuntimeWorkerSnapshot
+	Queues       []RuntimeQueueSnapshot
+	Tickers      []RuntimeTickerSnapshot
+	Leases       []RuntimeLeaseSnapshot
 }
 
 func newRuntime(parent context.Context, logger *slog.Logger) *Runtime {
@@ -80,10 +135,14 @@ func newRuntime(parent context.Context, logger *slog.Logger) *Runtime {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	return &Runtime{
-		ctx:     ctx,
-		cancel:  cancel,
-		logger:  normalizeLogger(logger),
-		workers: make(map[string]*runtimeWorkerState),
+		ctx:       ctx,
+		cancel:    cancel,
+		logger:    normalizeLogger(logger),
+		workers:   make(map[string]*runtimeWorkerState),
+		queues:    make(map[string]*runtimeQueueState),
+		tickers:   make(map[string]*runtimeTickerState),
+		leases:    make(map[string]*runtimeLeaseState),
+		drainDone: make(chan struct{}),
 	}
 }
 
@@ -95,8 +154,8 @@ func (r *Runtime) StartWorker(name string, queueLimit int, run func(context.Cont
 	if name == "" {
 		return errors.New("forest runtime worker name is required")
 	}
-	if queueLimit < 0 {
-		return fmt.Errorf("forest runtime worker %q queue limit cannot be negative", name)
+	if queueLimit <= 0 {
+		return fmt.Errorf("forest runtime worker %q queue limit must be positive", name)
 	}
 	if run == nil {
 		return fmt.Errorf("forest runtime worker %q run func is required", name)
@@ -117,6 +176,7 @@ func (r *Runtime) StartWorker(name string, queueLimit int, run func(context.Cont
 	}
 	r.workers[name] = state
 	r.started = true
+	r.active++
 	r.wg.Add(1)
 	r.mu.Unlock()
 
@@ -172,6 +232,10 @@ func (r *Runtime) finishWorker(name string, status RuntimeWorkerStatus, errText,
 			state.panicStack = stack
 		}
 	}
+	r.active--
+	if r.active == 0 && r.closed {
+		r.closeDrainLocked()
+	}
 }
 
 func truncateRuntimeError(errText string) string {
@@ -192,23 +256,104 @@ func (r *Runtime) Close(ctx context.Context) error {
 	if !r.closed {
 		r.closed = true
 		r.cancel()
+		if r.active == 0 {
+			r.closeDrainLocked()
+		}
 	}
+	done := r.drainDone
 	r.mu.Unlock()
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	done := make(chan struct{})
-	go func() {
-		r.wg.Wait()
-		close(done)
-	}()
 	select {
 	case <-done:
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("forest runtime close: workers did not drain: %w", ctx.Err())
+		err := fmt.Errorf("forest runtime close: workers did not drain: %w", ctx.Err())
+		r.recordCloseTimeout(err)
+		return err
 	}
+}
+
+func (r *Runtime) closeDrainLocked() {
+	if r.drainClosed {
+		return
+	}
+	close(r.drainDone)
+	r.drainClosed = true
+}
+
+func (r *Runtime) recordCloseTimeout(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.timeoutAt = time.Now().UTC()
+	r.timeoutErr = truncateRuntimeError(err.Error())
+}
+
+func (r *Runtime) RegisterQueue(name string, capacity int) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("forest runtime queue name is required")
+	}
+	if capacity <= 0 {
+		return fmt.Errorf("forest runtime queue %q capacity must be positive", name)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.queues[name]; exists {
+		return fmt.Errorf("forest runtime queue %q already registered", name)
+	}
+	r.queues[name] = &runtimeQueueState{name: name, capacity: capacity, registered: time.Now().UTC()}
+	return nil
+}
+
+func (r *Runtime) RegisterTicker(name string, interval time.Duration) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("forest runtime ticker name is required")
+	}
+	if interval <= 0 {
+		return fmt.Errorf("forest runtime ticker %q interval must be positive", name)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.tickers[name]; exists {
+		return fmt.Errorf("forest runtime ticker %q already registered", name)
+	}
+	r.tickers[name] = &runtimeTickerState{name: name, interval: interval, registered: time.Now().UTC()}
+	return nil
+}
+
+func (r *Runtime) RegisterLease(name, holder string) error {
+	name = strings.TrimSpace(name)
+	holder = strings.TrimSpace(holder)
+	if name == "" {
+		return errors.New("forest runtime lease name is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.leases[name]; exists {
+		return fmt.Errorf("forest runtime lease %q already registered", name)
+	}
+	r.leases[name] = &runtimeLeaseState{name: name, holder: holder, registered: time.Now().UTC()}
+	return nil
+}
+
+func (r *Runtime) RecordQueueOverflow(name, reason string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.queues[name]
+	if state == nil {
+		return
+	}
+	state.overflows++
+	state.lastReason = truncateRuntimeError(reason)
+	state.lastAt = time.Now().UTC()
 }
 
 func (r *Runtime) Snapshot() RuntimeSnapshot {
@@ -218,9 +363,14 @@ func (r *Runtime) Snapshot() RuntimeSnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := RuntimeSnapshot{
-		Started: r.started,
-		Closed:  r.closed,
-		Workers: make([]RuntimeWorkerSnapshot, 0, len(r.workers)),
+		Started:      r.started,
+		Closed:       r.closed,
+		TimeoutAt:    r.timeoutAt,
+		TimeoutError: r.timeoutErr,
+		Workers:      make([]RuntimeWorkerSnapshot, 0, len(r.workers)),
+		Queues:       make([]RuntimeQueueSnapshot, 0, len(r.queues)),
+		Tickers:      make([]RuntimeTickerSnapshot, 0, len(r.tickers)),
+		Leases:       make([]RuntimeLeaseSnapshot, 0, len(r.leases)),
 	}
 	for _, state := range r.workers {
 		out.Workers = append(out.Workers, RuntimeWorkerSnapshot{
@@ -234,8 +384,41 @@ func (r *Runtime) Snapshot() RuntimeSnapshot {
 			LastErrorAt: state.lastErrorAt,
 		})
 	}
+	for _, state := range r.queues {
+		out.Queues = append(out.Queues, RuntimeQueueSnapshot{
+			Name:       state.name,
+			Capacity:   state.capacity,
+			Registered: state.registered,
+			Overflows:  state.overflows,
+			LastReason: state.lastReason,
+			LastAt:     state.lastAt,
+		})
+	}
+	for _, state := range r.tickers {
+		out.Tickers = append(out.Tickers, RuntimeTickerSnapshot{
+			Name:       state.name,
+			Interval:   state.interval,
+			Registered: state.registered,
+		})
+	}
+	for _, state := range r.leases {
+		out.Leases = append(out.Leases, RuntimeLeaseSnapshot{
+			Name:       state.name,
+			Holder:     state.holder,
+			Registered: state.registered,
+		})
+	}
 	sort.Slice(out.Workers, func(i, j int) bool {
 		return out.Workers[i].Name < out.Workers[j].Name
+	})
+	sort.Slice(out.Queues, func(i, j int) bool {
+		return out.Queues[i].Name < out.Queues[j].Name
+	})
+	sort.Slice(out.Tickers, func(i, j int) bool {
+		return out.Tickers[i].Name < out.Tickers[j].Name
+	})
+	sort.Slice(out.Leases, func(i, j int) bool {
+		return out.Leases[i].Name < out.Leases[j].Name
 	})
 	return out
 }

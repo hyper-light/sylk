@@ -94,9 +94,9 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 
 	// Forest subscriber: delegates to the real ClaimsHarvester when
 	// registered via SetForestHarvester, otherwise logs candidates.
-	harvestFn := func(_ context.Context, a activity.AgentActivity, reason string) error {
+	harvestFn := func(ctx context.Context, a activity.AgentActivity, reason string) error {
 		if h := installedForestHarvester.Load(); h != nil {
-			return h.fn(context.Background(), activitystore.ForestCandidate{Activity: a, Reason: reason})
+			return h.fn(ctx, activitystore.ForestCandidate{Activity: a, Reason: reason})
 		}
 		slog.Info("fabric: forest candidate",
 			"session_id", string(a.SessionID),

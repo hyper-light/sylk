@@ -218,18 +218,23 @@ func closeServiceDispatchers(opts SessionShutdownOptions) error {
 }
 
 func cancelShutdownClaims(ctx context.Context, opts SessionShutdownOptions) (ClaimCancellationResult, error) {
-	if opts.Board == nil || len(opts.ActiveRootClaimIDs) == 0 {
+	if opts.Board == nil {
 		return ClaimCancellationResult{}, nil
 	}
-	return CancelClaimTree(ctx, ClaimCancellationOptions{
+	cancelOpts := ClaimCancellationOptions{
 		Board:               opts.Board,
 		Dispatchers:         opts.ServiceDispatchers,
 		ValidatorDispatcher: opts.ValidatorDispatcher,
-		RootClaimIDs:        opts.ActiveRootClaimIDs,
-		OriginClaimID:       strings.Join(normalizeStringList(opts.ActiveRootClaimIDs), ","),
+		InboxRegistry:       opts.SessionInboxes,
 		ActorID:             opts.ActorID,
 		Reason:              firstNonEmpty(opts.Reason, "session shutdown"),
-	})
+	}
+	if len(opts.ActiveRootClaimIDs) == 0 {
+		return CancelAllActiveRootClaims(ctx, cancelOpts)
+	}
+	cancelOpts.RootClaimIDs = opts.ActiveRootClaimIDs
+	cancelOpts.OriginClaimID = strings.Join(normalizeStringList(opts.ActiveRootClaimIDs), ",")
+	return CancelClaimTree(ctx, cancelOpts)
 }
 
 func shutdownScope(scope ShutdownScope, opts SessionShutdownOptions) error {

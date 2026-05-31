@@ -221,10 +221,48 @@ func (m *MemoryForest) probeAllSubsystems(ctx context.Context) []SubsystemHealth
 	for _, name := range leaseSubsystems {
 		out = append(out, m.probeProjectorRow(ctx, name, now))
 	}
+	out = append(out, m.probeRuntime())
 	out = append(out, m.probeAuditDrainer())
 	out = append(out, m.probePageRankCache())
 	out = append(out, m.probeSubstrateState(ctx, now))
 	return out
+}
+
+func (m *MemoryForest) probeRuntime() SubsystemHealth {
+	snapshot := m.RuntimeSnapshot()
+	sub := SubsystemHealth{
+		Name:   "forest_runtime",
+		Status: HealthStatusOK,
+		Extras: map[string]any{
+			"workers": len(snapshot.Workers),
+			"queues":  len(snapshot.Queues),
+			"tickers": len(snapshot.Tickers),
+			"leases":  len(snapshot.Leases),
+		},
+	}
+	if snapshot.TimeoutError != "" {
+		worsenSubsystemStatus(&sub, HealthStatusUnhealthy)
+		sub.LastError = snapshot.TimeoutError
+		sub.LastErrorAt = snapshot.TimeoutAt
+	}
+	for _, worker := range snapshot.Workers {
+		if worker.Status == RuntimeWorkerPanicked || worker.Status == RuntimeWorkerErrored {
+			worsenSubsystemStatus(&sub, HealthStatusUnhealthy)
+			if sub.LastError == "" {
+				sub.LastError = worker.Name + ": " + worker.LastError
+				sub.LastErrorAt = worker.LastErrorAt
+			}
+		}
+	}
+	var overflows uint64
+	for _, queue := range snapshot.Queues {
+		overflows += queue.Overflows
+	}
+	if overflows > 0 {
+		worsenSubsystemStatus(&sub, HealthStatusDegraded)
+		sub.Extras["queue_overflows"] = overflows
+	}
+	return sub
 }
 
 // probeProjectorRow reads one forest_projector_state row and maps
@@ -369,6 +407,14 @@ func (m *MemoryForest) probeSubstrateState(ctx context.Context, now time.Time) S
 var expectedAppendOnlyTriggers = []string{
 	"forest_events_no_update",
 	"forest_events_no_delete",
+	"forest_ledger_no_update",
+	"forest_ledger_no_delete",
+	"forest_ledger_payloads_no_update",
+	"forest_ledger_payloads_no_delete",
+	"forest_ledger_refs_no_update",
+	"forest_ledger_refs_no_delete",
+	"forest_ledger_delivery_no_update",
+	"forest_ledger_delivery_no_delete",
 	"forest_retrieval_events_no_update",
 	"forest_retrieval_events_no_delete",
 	"forest_events_archive_no_update",

@@ -116,8 +116,31 @@ func validateInfrastructureServiceIdentityContract(contract InfrastructureServic
 	if len(contract.ScopeKeys) == 0 || strings.TrimSpace(contract.HandlerBoundary) == "" {
 		return fmt.Errorf("%w: %s requires scope keys and handler boundary", ErrInfrastructureServiceContractInvalid, contract.ParticipantType)
 	}
-	if contract.HandlerFactory != nil && contract.HandlerFactory() == nil {
+	if contract.HandlerFactory == nil {
+		return fmt.Errorf("%w: %s requires handler factory", ErrInfrastructureServiceContractInvalid, contract.ParticipantType)
+	}
+	handler := contract.HandlerFactory()
+	if handler == nil {
 		return fmt.Errorf("%w: %s handler factory returned nil", ErrInfrastructureServiceContractInvalid, contract.ParticipantType)
+	}
+	if err := validateInfrastructureHandlerToolCoverage(contract, handler); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateInfrastructureHandlerToolCoverage(contract InfrastructureServiceContract, handler ServiceHandler) error {
+	catalog, ok := handler.(ServiceToolCatalog)
+	if !ok {
+		return fmt.Errorf("%w: %s handler does not expose tool catalog", ErrInfrastructureServiceContractInvalid, contract.ParticipantType)
+	}
+	tools := trimmedStringSet(catalog.ServiceTools())
+	for _, action := range contract.Actions {
+		for _, tool := range action.Tools {
+			if _, ok := tools[strings.TrimSpace(tool)]; !ok {
+				return fmt.Errorf("%w: %s action %q references unhandled tool %s", ErrInfrastructureServiceContractInvalid, contract.ParticipantType, action.Action, tool)
+			}
+		}
 	}
 	return nil
 }
@@ -156,6 +179,14 @@ func contractValidatorIDs(contract InfrastructureServiceContract) []string {
 		out = append(out, action.ValidatorIDs...)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func trimmedStringSet(values []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[strings.TrimSpace(value)] = struct{}{}
+	}
 	return out
 }
 

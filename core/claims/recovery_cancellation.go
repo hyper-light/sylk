@@ -513,6 +513,7 @@ type ClaimCancellationOptions struct {
 	Board               *ClaimsBoard
 	Dispatchers         *ServiceDispatcherRegistry
 	ValidatorDispatcher *BoardValidatorDispatcher
+	InboxRegistry       *SessionInboxRegistry
 	WorkCancellers      []ClaimWorkCanceller
 	RootClaimIDs        []string
 	OriginClaimID       string
@@ -590,6 +591,9 @@ func cancelActiveClaimWork(ctx context.Context, opts ClaimCancellationOptions, c
 	if opts.ValidatorDispatcher != nil {
 		cancelled += opts.ValidatorDispatcher.CancelClaimValidations(claim)
 	}
+	if opts.InboxRegistry != nil {
+		cancelled += opts.InboxRegistry.CancelClaimWorkInSession(ctx, cancellationSessionID(opts, claim), claim.ID, firstNonEmpty(opts.Reason, "claim cancellation requested"))
+	}
 	for _, canceller := range opts.WorkCancellers {
 		if canceller == nil {
 			continue
@@ -600,6 +604,16 @@ func cancelActiveClaimWork(ctx context.Context, opts ClaimCancellationOptions, c
 		}
 	}
 	return cancelled
+}
+
+func cancellationSessionID(opts ClaimCancellationOptions, claim *Claim) string {
+	if claim != nil && strings.TrimSpace(claim.SessionID) != "" {
+		return strings.TrimSpace(claim.SessionID)
+	}
+	if opts.Board != nil {
+		return opts.Board.SessionID()
+	}
+	return ""
 }
 
 type cancellationGraphSnapshot struct {

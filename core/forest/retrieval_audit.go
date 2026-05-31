@@ -106,6 +106,7 @@ func (m *MemoryForest) notifyRetrievalCandidatesProjector() {
 	select {
 	case m.retrievalCandidatesWake <- struct{}{}:
 	default:
+		m.recordRuntimeQueueOverflow("retrieval_candidates_wake", "retrieval candidates wake already pending")
 	}
 }
 
@@ -467,8 +468,8 @@ func auditCandidatesContain(candidates []RetrievalAuditCandidate, branchID strin
 // emitRetrievalAudit hands the audit event to the async drainer.
 // Non-blocking — never delays the Retrieve response path. If the
 // queue is full, the drainer has shut down, or the forest is closed,
-// the audit is logged and dropped (audit is observational; loss is
-// acceptable under extreme back-pressure).
+// the audit cannot be queued, a bounded overflow ledger record is written so
+// back-pressure is observable instead of becoming a silent drop.
 func (m *MemoryForest) emitRetrievalAudit(ctx context.Context, event *RetrievalAuditEvent) {
 	if m == nil || event == nil {
 		return
@@ -495,15 +496,47 @@ func (m *MemoryForest) emitRetrievalAudit(ctx context.Context, event *RetrievalA
 	select {
 	case m.retrievalAuditQueue <- event:
 	default:
-		// Queue full — drop with warning, decrement in-flight since
-		// this event will never be processed.
 		m.retrievalAuditInFlight.Add(-1)
+		m.recordRuntimeQueueOverflow("retrieval_audit", "retrieval audit queue full")
+		m.recordRetrievalAuditOverflow(ctx, event)
 		slog.Warn("forest_retrieval_audit_queue_full",
 			"retrieval_id", event.ID,
 			"session_id", event.SessionID,
 			"queue_capacity", retrievalAuditQueueCapacity,
 		)
 		m.signalAuditIdleIfDone()
+	}
+}
+
+func (m *MemoryForest) recordRetrievalAuditOverflow(ctx context.Context, event *RetrievalAuditEvent) {
+	if m == nil || event == nil {
+		return
+	}
+	recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retrievalAuditDrainTimeout)
+	defer cancel()
+	_, err := m.AppendLedgerRecord(recordCtx, LedgerRecord{
+		SourceKind:  LedgerSourceMaintenance,
+		SourceID:    event.ID,
+		SourceKey:   "retrieval_audit_overflow:" + event.ID,
+		EventKind:   "retrieval_audit_overflow",
+		SessionID:   firstNonEmptyString(event.SessionID, "global"),
+		TaskID:      event.TaskID,
+		SubjectType: "retrieval_audit",
+		SubjectID:   event.ID,
+		Reason:      "retrieval audit queue full",
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"retrieval_id": event.ID,
+			"query":        event.Query,
+			"limit":        event.RequestedLimit,
+		},
+	})
+	if err != nil {
+		slog.Warn("forest_retrieval_audit_overflow_record_failed",
+			"retrieval_id", event.ID,
+			"session_id", event.SessionID,
+			"err", err.Error(),
+		)
 	}
 }
 
@@ -532,8 +565,10 @@ func (m *MemoryForest) startRetrievalAuditDrainer() {
 		return
 	}
 	m.retrievalAuditQueue = make(chan *RetrievalAuditEvent, retrievalAuditQueueCapacity)
-	m.startWorker("retrieval_audit_drainer", retrievalAuditQueueCapacity, func() {
+	m.registerRuntimeQueue("retrieval_audit", cap(m.retrievalAuditQueue))
+	m.startWorker("retrieval_audit_drainer", retrievalAuditQueueCapacity, func(context.Context) error {
 		m.runRetrievalAuditDrainerLoop()
+		return nil
 	})
 }
 

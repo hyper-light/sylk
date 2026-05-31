@@ -12,11 +12,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func newTestForest(t *testing.T) (*MemoryForest, *sql.DB) {
+func newTestForest(t testing.TB) (*MemoryForest, *sql.DB) {
 	return newTestForestWithConfig(t, Config{})
 }
 
-func newTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql.DB) {
+func newTestForestWithConfig(t testing.TB, cfg Config) (*MemoryForest, *sql.DB) {
 	t.Helper()
 
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", stableID("forest-test", t.Name()))

@@ -31,8 +31,10 @@ func (m *MemoryForest) startRetrievalCandidatesProjector() {
 	if m == nil {
 		return
 	}
-	m.startWorker("retrieval_candidates_projector", retrievalCandidatesBatchSize, func() {
+	m.registerRuntimeTicker("retrieval_candidates_projector_lease_renewal", projectorRenewInterval)
+	m.startWorker("retrieval_candidates_projector", retrievalCandidatesBatchSize, func(context.Context) error {
 		m.runRetrievalCandidatesProjectorLoop()
+		return nil
 	})
 }
 

@@ -39,8 +39,10 @@ func (m *MemoryForest) startBaseScoreTrainer() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorBaseScoreTrainerName, m.baseScoreTrainBatch, func() {
+	m.registerRuntimeTicker("base_score_trainer_interval", m.baseScoreTrainInterval)
+	m.startWorker(projectorBaseScoreTrainerName, m.baseScoreTrainBatch, func(context.Context) error {
 		m.runBaseScoreTrainerLoop()
+		return nil
 	})
 }
 

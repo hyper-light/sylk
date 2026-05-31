@@ -234,8 +234,10 @@ func (m *MemoryForest) startBranchProjector() {
 	if m == nil {
 		return
 	}
-	m.startWorker("branch_projector", projectorBatchSize, func() {
+	m.registerRuntimeTicker("branch_projector_lease_renewal", projectorRenewInterval)
+	m.startWorker("branch_projector", projectorBatchSize, func(context.Context) error {
 		m.runBranchProjectorLoop()
+		return nil
 	})
 }
 

@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -741,6 +743,83 @@ func TestClaimsIntakeDoesNotExecuteIssuerOwnedExpectedValidationToolsForOtherAge
 	}
 	if len(exec.calls) != 0 {
 		t.Fatalf("executor calls = %+v", exec.calls)
+	}
+}
+
+func TestClaimsIntakeRegistersClaimWorkForSessionCancellation(t *testing.T) {
+	sessionID := "sess-intake-cancel"
+	agentID := "librarian"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "board-intake-cancel", SessionID: sessionID, TaskID: "task"})
+	if err := board.PostAction(context.Background(), claims.Action{Type: claims.ActionTypeTask, AgentID: "architect"}, []claims.Claim{{
+		ID:          "claim-intake-cancel",
+		Title:       "cancel me",
+		Description: "claim-scoped agent intake work should be cancellable",
+		ActionType:  claims.ActionTypeTask,
+		Relations: []claims.Relation{
+			{Related: agentID, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+		},
+		Validations: []*claims.Validation{{ID: "claim-intake-cancel-receipt", Type: claims.ValidationTypeReceipt, Required: true, Description: "receipt", QualityBar: "received"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scope := concurrency.NewGoroutineScope(ctx, agentID, nil)
+	defer func() {
+		_ = scope.Shutdown(100*time.Millisecond, time.Second)
+	}()
+	bus := guide.NewChannelBus(guide.DefaultChannelBusConfig())
+	defer func() {
+		_ = bus.Close()
+	}()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	inbox := WireClaimsIntake(ClaimsIntakeConfig{
+		AgentID:   agentID,
+		SessionID: sessionID,
+		Role:      claims.RoleObserver,
+		Bus:       bus,
+		Board:     board,
+		Scope:     scope,
+		ProcessEntry: func(ctx context.Context, _ *claims.GraphEntryPoint) error {
+			close(started)
+			<-ctx.Done()
+			close(done)
+			return nil
+		},
+	})
+	if inbox == nil {
+		t.Fatal("WireClaimsIntake returned nil")
+	}
+	defer func() {
+		claims.DefaultSessionInboxRegistry().Remove(sessionID, agentID)
+		_ = inbox.Close()
+	}()
+
+	inbox.Ingest(claims.NewCanonicalDelta(
+		claims.DeltaActionClaimPosted,
+		sessionID,
+		board.BoardID(),
+		2,
+		time.Now(),
+		claims.DegradedAgentRef("architect", "test"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-intake-cancel"}},
+		&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef(agentID, "test")}, Relationship: claims.RelationshipSubject},
+		map[string]any{"claim": map[string]any{"id": "claim-intake-cancel", "action": string(claims.ActionTypeTask), "lifecycle_status": string(claims.ClaimLifecyclePosted)}},
+	))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("claim intake work did not start")
+	}
+	if got := claims.DefaultSessionInboxRegistry().CancelClaimWorkInSession(context.Background(), sessionID, "claim-intake-cancel", "test cancellation"); got != 1 {
+		t.Fatalf("cancelled contexts = %d, want 1", got)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("claim intake work did not observe cancellation")
 	}
 }
 

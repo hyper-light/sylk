@@ -441,8 +441,9 @@ func resolveRetrievalCooldownPenalty(p float64) float64 {
 
 func (m *MemoryForest) startMaintenance() {
 	m.bootstrapMaintenanceState()
-	m.startWorker("maintenance", m.replayBatchSize+m.substrateLimit+m.trainingMaxExamples, func() {
+	m.startWorker("maintenance", m.replayBatchSize+m.substrateLimit+m.trainingMaxExamples, func(context.Context) error {
 		m.maintenanceLoop()
+		return nil
 	})
 }
 
@@ -823,6 +824,7 @@ func (m *MemoryForest) wakeMaintenanceLoop() {
 	select {
 	case m.maintenanceWake <- struct{}{}:
 	default:
+		m.recordRuntimeQueueOverflow("maintenance_wake", "maintenance wake already pending")
 	}
 }
 

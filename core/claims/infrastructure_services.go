@@ -351,22 +351,95 @@ func InfrastructureSubsystemForParticipantID(participantID string) string {
 
 func (s *InfrastructureService) HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if err := validateInfrastructureService(s); err != nil {
-		return ServiceClaimResult{}, err
+		return infrastructureServiceFailureResult(nil, ExpectedToolCall{Tool: "infrastructure_service"}, req, err)
 	}
 	if req.Claim == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid)
+		return s.infrastructureFailureResult(ExpectedToolCall{Tool: string(s.kind)}, req, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid))
 	}
 	handlers := s.handlers()
 	call, err := infrastructureServiceCall(req.Claim, handlers)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return s.infrastructureFailureResult(ExpectedToolCall{Tool: string(s.kind)}, req, err)
 	}
-	return handlers[strings.TrimSpace(call.Tool)](ctxOrBackground(ctx), call, req)
+	handler, ok := handlers[strings.TrimSpace(call.Tool)]
+	if !ok || handler == nil {
+		return s.infrastructureFailureResult(call, req, fmt.Errorf("%w: unhandled infrastructure tool %q", ErrInfrastructureServiceInvalid, call.Tool))
+	}
+	return handler(ctxOrBackground(ctx), call, req)
+}
+
+func (s *InfrastructureService) ServiceTools() []string {
+	if s == nil {
+		return nil
+	}
+	handlers := s.handlers()
+	tools := make([]string, 0, len(handlers))
+	for tool := range handlers {
+		tools = append(tools, tool)
+	}
+	sort.Strings(tools)
+	return tools
+}
+
+func (s *InfrastructureService) infrastructureFailureResult(call ExpectedToolCall, req ServiceClaimRequest, cause error) (ServiceClaimResult, error) {
+	return infrastructureServiceFailureResult(s, call, req, cause)
+}
+
+func infrastructureServiceFailureResult(s *InfrastructureService, call ExpectedToolCall, req ServiceClaimRequest, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	if s == nil {
+		return infrastructureServiceErrorResult("infrastructure service failed", cause, "infrastructure_service_failure", call.Tool)
+	}
+	kind := string(s.kind)
+	switch s.kind {
+	case InfrastructureServiceKindDAG:
+		data := failDAGOperation(DAGOperationArtifactData{Operation: firstNonEmpty(call.Tool, kind), PipelineID: claimIDForInfrastructure(req.Claim)}, cause.Error())
+		artifact, err := dagOperationArtifact(data)
+		return serviceClaimResultWithArtifact("dag "+data.Operation+" failed", artifact, err, "dag_operation_failure_artifact_error", data.PipelineID)
+	case InfrastructureServiceKindVFS:
+		data := failVFSOperation(VFSOperationArtifactData{Operation: firstNonEmpty(call.Tool, kind), Scope: firstNonEmpty(s.vfsScope, "workspace")}, cause.Error())
+		artifact, err := vfsOperationArtifact(data)
+		return serviceClaimResultWithArtifact("vfs "+data.Operation+" failed", artifact, err, "vfs_operation_failure_artifact_error", data.MountRef)
+	case InfrastructureServiceKindTool:
+		data := failToolRuntimeExecution(ToolRuntimeExecutionArtifactData{ToolName: firstNonEmpty(stringArg(call.Arguments, "tool_name"), stringArg(call.Arguments, "tool"), call.Tool, kind)}, cause.Error())
+		artifact, err := toolRuntimeExecutionArtifact(data)
+		return serviceClaimResultWithArtifact("tool runtime "+data.ToolName+" failed", artifact, err, "tool_runtime_failure_artifact_error", data.ToolName)
+	case InfrastructureServiceKindKnowledge:
+		data := failKnowledgeOperation(KnowledgeOperationArtifactData{Operation: firstNonEmpty(call.Tool, kind)}, cause.Error())
+		artifact, err := knowledgeOperationArtifact(data)
+		return serviceClaimResultWithArtifact("knowledge "+data.Operation+" failed", artifact, err, "knowledge_operation_failure_artifact_error", data.Operation)
+	case InfrastructureServiceKindMemory:
+		data := failMemoryContinuity(MemoryContinuityArtifactData{Operation: firstNonEmpty(call.Tool, kind), Topic: reqSessionID(req)}, cause.Error())
+		artifacts, err := memoryContinuityArtifacts(data)
+		return serviceClaimResultWithArtifacts("memory "+data.Operation+" failed", artifacts, err, "memory_continuity_failure_artifact_error", data.Topic)
+	case InfrastructureServiceKindDocument:
+		data := failDocumentOperation(DocumentOperationArtifactData{Operation: firstNonEmpty(call.Tool, kind), DocumentID: stringArg(call.Arguments, "document_id")}, cause.Error())
+		artifact, err := documentOperationArtifact(data)
+		return serviceClaimResultWithArtifact("document "+data.Operation+" failed", artifact, err, "document_operation_failure_artifact_error", data.DocumentID)
+	case InfrastructureServiceKindGuardian:
+		data := failGuardianDecision(GuardianDecisionArtifactData{Operation: firstNonEmpty(call.Tool, kind)}, cause.Error())
+		artifact, err := guardianDecisionArtifact(data)
+		return serviceClaimResultWithArtifact("guardian "+data.Operation+" failed", artifact, err, "guardian_decision_failure_artifact_error", data.Operation)
+	case InfrastructureServiceKindProvider:
+		data := failProviderGatewayCall(ProviderGatewayCallArtifactData{Operation: firstNonEmpty(call.Tool, kind), Model: stringArg(call.Arguments, "model")}, cause.Error())
+		artifacts, err := providerGatewayCallArtifacts(data)
+		return serviceClaimResultWithArtifacts("provider "+data.Operation+" failed", artifacts, err, "provider_gateway_failure_artifact_error", data.ProviderRequestID)
+	case InfrastructureServiceKindExternal:
+		data := failExternalAdapterEvent(ExternalAdapterEventArtifactData{Operation: firstNonEmpty(call.Tool, kind), Source: normalizedExternalSource(ParticipantRef{}, call.Arguments)}, cause.Error())
+		artifact, err := externalAdapterEventArtifact(data)
+		return serviceClaimResultWithArtifact("external "+data.Operation+" failed", artifact, err, "external_adapter_failure_artifact_error", data.IdempotencyKey)
+	default:
+		return infrastructureServiceErrorResult("infrastructure service failed", cause, "infrastructure_service_failure", firstNonEmpty(kind, call.Tool, "infrastructure"))
+	}
+}
+
+func infrastructureServiceErrorResult(summary string, cause error, fallbackName, reference string) (ServiceClaimResult, error) {
+	return serviceClaimResultWithArtifact(summary, nil, infrastructureServiceCause(cause), fallbackName, reference)
 }
 
 func (s *InfrastructureService) ShutdownService(ctx context.Context, req ServiceShutdownRequest) (ServiceClaimResult, error) {
 	if err := validateInfrastructureService(s); err != nil {
-		return ServiceClaimResult{}, err
+		return infrastructureServiceErrorResult("infrastructure shutdown failed", err, "infrastructure_shutdown_failure", req.SessionID)
 	}
 	if s.kind != InfrastructureServiceKindVFS {
 		return ServiceClaimResult{}, nil
@@ -376,7 +449,7 @@ func (s *InfrastructureService) ShutdownService(ctx context.Context, req Service
 	for _, record := range records {
 		artifact, err := vfsOperationArtifact(record)
 		if err != nil {
-			return ServiceClaimResult{}, err
+			return infrastructureServiceErrorResult("vfs shutdown failed", err, "vfs_shutdown_artifact_error", record.MountRef)
 		}
 		artifacts = append(artifacts, artifact)
 	}
@@ -554,10 +627,7 @@ func (s *InfrastructureService) handleDAG(ctx context.Context, call ExpectedTool
 	}
 	s.mu.Unlock()
 	artifact, err := dagOperationArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "dag " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("dag "+data.Operation+" "+data.Status, artifact, err, "dag_operation_artifact_error", data.PipelineID)
 }
 
 func (s *InfrastructureService) handleVFS(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -577,10 +647,7 @@ func (s *InfrastructureService) handleVFS(ctx context.Context, call ExpectedTool
 	}
 	s.mu.Unlock()
 	artifact, err := vfsOperationArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "vfs " + data.Scope + " " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("vfs "+data.Scope+" "+data.Operation+" "+data.Status, artifact, err, "vfs_operation_artifact_error", data.MountRef)
 }
 
 func (s *InfrastructureService) handleToolRuntime(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -600,10 +667,7 @@ func (s *InfrastructureService) handleToolRuntime(ctx context.Context, call Expe
 	}
 	s.mu.Unlock()
 	artifact, err := toolRuntimeExecutionArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "tool runtime " + data.ToolName + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("tool runtime "+data.ToolName+" "+data.Status, artifact, err, "tool_runtime_execution_artifact_error", data.ToolName)
 }
 
 func (s *InfrastructureService) handleKnowledge(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -623,10 +687,7 @@ func (s *InfrastructureService) handleKnowledge(ctx context.Context, call Expect
 	}
 	s.mu.Unlock()
 	artifact, err := knowledgeOperationArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "knowledge " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("knowledge "+data.Operation+" "+data.Status, artifact, err, "knowledge_operation_artifact_error", data.Operation)
 }
 
 func (s *InfrastructureService) handleMemory(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -646,10 +707,7 @@ func (s *InfrastructureService) handleMemory(ctx context.Context, call ExpectedT
 	}
 	s.mu.Unlock()
 	artifacts, err := memoryContinuityArtifacts(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "memory " + data.Operation + " " + data.Status, Artifacts: artifacts}, nil
+	return serviceClaimResultWithArtifacts("memory "+data.Operation+" "+data.Status, artifacts, err, "memory_continuity_artifact_error", data.Topic)
 }
 
 func (s *InfrastructureService) handleDocument(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -669,10 +727,7 @@ func (s *InfrastructureService) handleDocument(ctx context.Context, call Expecte
 	}
 	s.mu.Unlock()
 	artifact, err := documentOperationArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "document " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("document "+data.Operation+" "+data.Status, artifact, err, "document_operation_artifact_error", data.DocumentID)
 }
 
 func (s *InfrastructureService) handleGuardian(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -692,10 +747,7 @@ func (s *InfrastructureService) handleGuardian(ctx context.Context, call Expecte
 	}
 	s.mu.Unlock()
 	artifact, err := guardianDecisionArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "guardian " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("guardian "+data.Operation+" "+data.Status, artifact, err, "guardian_decision_artifact_error", data.Operation)
 }
 
 func (s *InfrastructureService) handleProvider(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -715,10 +767,7 @@ func (s *InfrastructureService) handleProvider(ctx context.Context, call Expecte
 	}
 	s.mu.Unlock()
 	artifacts, err := providerGatewayCallArtifacts(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "provider " + data.Operation + " " + data.Status, Artifacts: artifacts}, nil
+	return serviceClaimResultWithArtifacts("provider "+data.Operation+" "+data.Status, artifacts, err, "provider_gateway_call_artifact_error", data.ProviderRequestID)
 }
 
 func (s *InfrastructureService) handleExternal(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -738,10 +787,7 @@ func (s *InfrastructureService) handleExternal(ctx context.Context, call Expecte
 	}
 	s.mu.Unlock()
 	artifact, err := externalAdapterEventArtifact(data)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "external " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("external "+data.Operation+" "+data.Status, artifact, err, "external_adapter_event_artifact_error", data.IdempotencyKey)
 }
 
 func normalizeDAGOperation(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (DAGOperationArtifactData, error) {

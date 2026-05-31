@@ -1,6 +1,7 @@
 package claims
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -314,6 +315,12 @@ type InboxConfig struct {
 	// BusSubscriptionQueueCap wins for existing tests and small local
 	// harnesses; otherwise this config provides the queue cap.
 	Operations ClaimsOperationsConfig
+
+	// CancelRegistry tracks claim-scoped execution contexts owned by
+	// this inbox. When nil, the inbox creates a private registry so
+	// session-level cancellation can still stop work dispatched through
+	// this inbox.
+	CancelRegistry *ClaimCancelRegistry
 }
 
 // ClaimsInbox is the per-replica event-driven intake surface.
@@ -361,6 +368,8 @@ type ClaimsInbox struct {
 	// onResolved is called when a delta matches. Runs on the bus
 	// subscriber's goroutine.
 	onResolved func(entry *GraphEntryPoint)
+
+	cancelRegistry *ClaimCancelRegistry
 
 	// queueCap is the bus per-sub queue cap, used to size the dedup
 	// LRU once the actual pattern count is known at Start.
@@ -427,6 +436,7 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 		subscriber:       subscribeOrNoop(cfg.Subscriber),
 		board:            cfg.Board,
 		onResolved:       cfg.OnResolved,
+		cancelRegistry:   firstNonNilClaimCancelRegistry(cfg.CancelRegistry),
 		seen:             newDedupLRU(queueCap),
 		expectations:     make(map[string]*Expectation),
 		orphans:          make(map[string][]orphanedInboxDelta),
@@ -435,6 +445,30 @@ func NewClaimsInbox(cfg InboxConfig) (*ClaimsInbox, error) {
 		orphanLimit:      orphanLimit,
 		orphanClaimLimit: inboxOrphanClaimLimit(orphanLimit),
 	}, nil
+}
+
+func (i *ClaimsInbox) ClaimContext(ctx context.Context, claimID string) (context.Context, ClaimCancelRegistration) {
+	if i == nil || i.cancelRegistry == nil {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return ctx, ClaimCancelRegistration{}
+	}
+	return i.cancelRegistry.Context(ctx, claimID)
+}
+
+func (i *ClaimsInbox) CancelClaimWork(_ context.Context, claimID string, _ string) (bool, error) {
+	if i == nil || i.cancelRegistry == nil {
+		return false, nil
+	}
+	return i.cancelRegistry.CancelClaim(claimID) > 0, nil
+}
+
+func (i *ClaimsInbox) ActiveClaimIDs() []string {
+	if i == nil || i.cancelRegistry == nil {
+		return nil
+	}
+	return i.cancelRegistry.ActiveClaimIDs()
 }
 
 // ────────────────────────────────────────────────────────────────────

@@ -88,6 +88,7 @@ type ClaimsIntakeConfig struct {
 	ExpectedToolAllowlist map[string]bool
 	ExpectedToolApprovals map[string]bool
 	ExpectedToolRemediate claims.ValidationExpectedToolRemediationPoster
+	CancelRegistry        *claims.ClaimCancelRegistry
 }
 
 func shouldSuppressForwardedPromptEntry(role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {
@@ -173,8 +174,11 @@ func dispatchExpectedValidationTools(cfg ClaimsIntakeConfig, entry *claims.Graph
 		return false
 	}
 	run := func(ctx context.Context) error {
+		claimID := entry.Node.Claim.ID
+		runCtx, reg := claimIntakeContext(ctx, cfg, claimID)
+		defer reg.Done()
 		for _, validationID := range validationIDs {
-			result, err := claims.ExecuteValidationExpectedTools(ctx, cfg.Board, entry.Node.Claim.ID, validationID, claims.ExpectedToolExecutionOptions{
+			result, err := claims.ExecuteValidationExpectedTools(runCtx, cfg.Board, claimID, validationID, claims.ExpectedToolExecutionOptions{
 				AgentID:           cfg.AgentID,
 				Executor:          executor,
 				Policy:            cfg.ExpectedToolPolicy,
@@ -759,6 +763,9 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	}
 
 	subscriber := &EventBusDeltaSubscriber{bus: cfg.Bus}
+	if cfg.CancelRegistry == nil {
+		cfg.CancelRegistry = claims.NewClaimCancelRegistry()
+	}
 
 	slog.Info("claims_intake_wiring",
 		"agent_id", cfg.AgentID,
@@ -770,11 +777,12 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	)
 
 	inbox, err := claims.NewClaimsInbox(claims.InboxConfig{
-		AgentID:    cfg.AgentID,
-		SessionID:  cfg.SessionID,
-		Role:       role,
-		Subscriber: subscriber,
-		Board:      cfg.Board,
+		AgentID:        cfg.AgentID,
+		SessionID:      cfg.SessionID,
+		Role:           role,
+		Subscriber:     subscriber,
+		Board:          cfg.Board,
+		CancelRegistry: cfg.CancelRegistry,
 		OnResolved: func(entry *claims.GraphEntryPoint) {
 			if entry == nil {
 				return
@@ -815,7 +823,9 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			)
 			if cfg.Scope != nil && cfg.ProcessEntry != nil {
 				if err := cfg.Scope.Go("process_claim", 0, func(ctx context.Context) error {
-					return cfg.ProcessEntry(stampClaimsIntakeContext(ctx, cfg, entry), entry)
+					runCtx, reg := claimIntakeContext(ctx, cfg, entryClaimID(entry))
+					defer reg.Done()
+					return cfg.ProcessEntry(stampClaimsIntakeContext(runCtx, cfg, entry), entry)
 				}); err != nil {
 					slog.Error("claims_intake_dispatch_failed",
 						"agent_id", cfg.AgentID,
@@ -825,7 +835,9 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				return
 			}
 			if cfg.ProcessEntry != nil {
-				ctx := stampClaimsIntakeContext(context.Background(), cfg, entry)
+				runCtx, reg := claimIntakeContext(context.Background(), cfg, entryClaimID(entry))
+				defer reg.Done()
+				ctx := stampClaimsIntakeContext(runCtx, cfg, entry)
 				if err := cfg.ProcessEntry(ctx, entry); err != nil {
 					slog.Error("claims_intake_process_failed",
 						"agent_id", cfg.AgentID,
@@ -850,6 +862,73 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	// avoid stale entries surviving a restart.
 	claims.DefaultSessionInboxRegistry().Register(cfg.SessionID, cfg.AgentID, inbox)
 	return inbox
+}
+
+func claimIntakeContext(ctx context.Context, cfg ClaimsIntakeConfig, claimID string) (context.Context, claims.ClaimCancelRegistration) {
+	if cfg.CancelRegistry == nil || strings.TrimSpace(claimID) == "" {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return ctx, claims.ClaimCancelRegistration{}
+	}
+	return cfg.CancelRegistry.Context(ctx, claimID)
+}
+
+func entryClaimID(entry *claims.GraphEntryPoint) string {
+	if entry == nil {
+		return ""
+	}
+	if entry.Node.Claim != nil && strings.TrimSpace(entry.Node.Claim.ID) != "" {
+		return strings.TrimSpace(entry.Node.Claim.ID)
+	}
+	if entry.Expectation != nil && strings.TrimSpace(entry.Expectation.ClaimID) != "" {
+		return strings.TrimSpace(entry.Expectation.ClaimID)
+	}
+	switch delta := entry.Delta.(type) {
+	case claims.InboxDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.InboxDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.TestamentDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.TestamentDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.ValidationDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.ValidationDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.ClaimStatusDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.ClaimStatusDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.ClaimContextDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.ClaimContextDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.TestamentContextDelta:
+		return strings.TrimSpace(delta.ClaimID)
+	case *claims.TestamentContextDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID)
+		}
+	case claims.CanonicalDelta:
+		return strings.TrimSpace(delta.ClaimID())
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			return strings.TrimSpace(delta.ClaimID())
+		}
+	}
+	return ""
 }
 
 func acknowledgeLifecycleReceipt(cfg ClaimsIntakeConfig, role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {

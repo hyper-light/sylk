@@ -135,6 +135,30 @@ func (r *SessionInboxRegistry) SnapshotStats() SessionInboxRegistrySnapshot {
 	return out
 }
 
+func (r *SessionInboxRegistry) CancelClaimWork(ctx context.Context, claimID string, reason string) (bool, error) {
+	return r.CancelClaimWorkInSession(ctx, "", claimID, reason) > 0, nil
+}
+
+func (r *SessionInboxRegistry) CancelClaimWorkInSession(ctx context.Context, sessionID, claimID string, reason string) int {
+	if r == nil || strings.TrimSpace(claimID) == "" {
+		return 0
+	}
+	count := 0
+	for _, entry := range r.Snapshot() {
+		if strings.TrimSpace(sessionID) != "" && entry.SessionID != strings.TrimSpace(sessionID) {
+			continue
+		}
+		if entry.Inbox == nil {
+			continue
+		}
+		ok, _ := entry.Inbox.CancelClaimWork(ctx, claimID, reason)
+		if ok {
+			count++
+		}
+	}
+	return count
+}
+
 // Remove unregisters the inbox for (sessionID, agentID). Safe to call
 // during inbox shutdown.
 func (r *SessionInboxRegistry) Remove(sessionID, agentID string) {

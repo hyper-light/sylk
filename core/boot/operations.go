@@ -1739,10 +1739,7 @@ func (h bootReadinessServiceHandler) HandleServiceClaim(_ context.Context, req c
 		Reference:  artifact.Reference,
 		Metadata:   artifact.Metadata,
 	})
-	if err != nil {
-		return claims.ServiceClaimResult{}, err
-	}
-	return claims.ServiceClaimResult{Summary: "service readiness " + participantID, Artifacts: []*claims.Artifact{artifact}}, nil
+	return bootServiceClaimResultWithArtifact("service readiness "+participantID, artifact, err, participantID)
 }
 
 func claimIDForReadiness(claim *claims.Claim) string {

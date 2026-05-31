@@ -275,16 +275,19 @@ type IdentityAllocationArtifactData struct {
 	UID             string              `json:"uid"`
 	Category        ParticipantCategory `json:"category"`
 	RouteKey        string              `json:"route_key"`
+	Operation       string              `json:"operation,omitempty"`
 	ParticipantType string              `json:"participant_type,omitempty"`
 	Scope           map[string]string   `json:"scope,omitempty"`
 	Generation      int                 `json:"generation,omitempty"`
 	ParentUID       string              `json:"parent_uid,omitempty"`
+	FailureReason   string              `json:"failure_reason,omitempty"`
 }
 
 type IdentityLineageArtifactData struct {
-	UID      string   `json:"uid"`
-	Lineage  []string `json:"lineage,omitempty"`
-	Terminal bool     `json:"terminal"`
+	UID           string   `json:"uid"`
+	Lineage       []string `json:"lineage,omitempty"`
+	Terminal      bool     `json:"terminal"`
+	FailureReason string   `json:"failure_reason,omitempty"`
 }
 
 type ActivationRecordArtifactData struct {

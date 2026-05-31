@@ -33,8 +33,10 @@ func (m *MemoryForest) startTrainingExamplesPruner() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorTrainingExamplesPrunerName, trainingExamplesPruneBatchSize, func() {
+	m.registerRuntimeTicker("training_examples_pruner_interval", m.trainingExamplesPruneInterval)
+	m.startWorker(projectorTrainingExamplesPrunerName, trainingExamplesPruneBatchSize, func(context.Context) error {
 		m.runTrainingExamplesPrunerLoop()
+		return nil
 	})
 }
 

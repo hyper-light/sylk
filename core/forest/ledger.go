@@ -97,7 +97,13 @@ func (m *MemoryForest) AppendCanonicalDelta(ctx context.Context, delta claims.Ca
 	}
 	if result.Inserted {
 		if err := projectCanonicalDeltaEvidenceTx(ctx, tx, delta, result.ID, result.Seq, payloadHash); err != nil {
-			return LedgerAppendResult{}, err
+			if !errors.Is(err, errEvidenceProjectionRejected) {
+				return LedgerAppendResult{}, err
+			}
+			if commitErr := tx.Commit(); commitErr != nil {
+				return LedgerAppendResult{}, fmt.Errorf("commit rejected canonical delta ledger tx: %w", commitErr)
+			}
+			return result, err
 		}
 	}
 	if err := tx.Commit(); err != nil {

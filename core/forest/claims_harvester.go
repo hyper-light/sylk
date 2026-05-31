@@ -65,8 +65,33 @@ func ledgerRecordFromFabricCandidate(candidate activitystore.ForestCandidate) Le
 		Payload: map[string]any{
 			"activity": a,
 			"reason":   candidate.Reason,
+			"state":    string(a.State),
 		},
+		Refs: fabricCandidateRefs(a),
 	}
+}
+
+func fabricCandidateRefs(a activity.AgentActivity) []claims.DeltaRef {
+	refs := make([]claims.DeltaRef, 0, len(a.Evidence)+4)
+	if a.SourceTable != "" && a.SourceID != "" {
+		refs = append(refs, claims.DeltaRef{Role: "source", Type: a.SourceTable, ID: a.SourceID})
+	}
+	if a.Caused != nil && *a.Caused != "" {
+		refs = append(refs, claims.DeltaRef{Role: "caused_by", Type: "activity", ID: string(*a.Caused)})
+	}
+	if a.Resolves != nil && *a.Resolves != "" {
+		refs = append(refs, claims.DeltaRef{Role: "resolves", Type: "activity", ID: string(*a.Resolves)})
+	}
+	if a.Subject.TargetArtifact != "" {
+		refs = append(refs, claims.DeltaRef{Role: "target", Type: claims.RelatedTypeArtifact, ID: a.Subject.TargetArtifact})
+	}
+	for _, evidence := range a.Evidence {
+		if evidence.Kind == "" || evidence.Ref == "" {
+			continue
+		}
+		refs = append(refs, claims.DeltaRef{Role: "evidence", Type: string(evidence.Kind), ID: evidence.Ref})
+	}
+	return refs
 }
 
 // Ensure ClaimsHarvester.Harvest satisfies the HarvestFunc signature.

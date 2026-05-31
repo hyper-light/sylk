@@ -3,6 +3,8 @@ package forest
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,6 +31,33 @@ func TestPhase123SchemaMetaAndAudit(t *testing.T) {
 	}
 	if prohibitedSQLiteObjectSQL(`CREATE TABLE ok (id TEXT PRIMARY KEY)`) {
 		t.Fatal("ordinary table prohibited")
+	}
+	var appliedAt int64
+	if err := db.QueryRow(`SELECT applied_at FROM forest_schema_meta WHERE meta_key = 'active'`).Scan(&appliedAt); err != nil {
+		t.Fatalf("schema meta applied_at: %v", err)
+	}
+	if err := ensurePhase123Schema(db); err != nil {
+		t.Fatalf("rerun phase schema: %v", err)
+	}
+	var appliedAgain int64
+	if err := db.QueryRow(`SELECT applied_at FROM forest_schema_meta WHERE meta_key = 'active'`).Scan(&appliedAgain); err != nil {
+		t.Fatalf("schema meta applied_again: %v", err)
+	}
+	if appliedAt != appliedAgain {
+		t.Fatalf("applied_at changed on idempotent migration: %d -> %d", appliedAt, appliedAgain)
+	}
+}
+
+func TestPhase123SchemaRejectsUnsupportedProjection(t *testing.T) {
+	db := openRawForestTestDB(t)
+	if err := ensureSchema(db); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE forest_schema_meta SET projection_version = 'legacy_branch_active' WHERE meta_key = 'active'`); err != nil {
+		t.Fatalf("seed unsupported projection: %v", err)
+	}
+	if err := ensurePhase123Schema(db); err == nil {
+		t.Fatal("unsupported projection version accepted")
 	}
 }
 
@@ -188,6 +217,90 @@ func TestAppendCanonicalDeltaProjectsArtifactEvidence(t *testing.T) {
 	}
 }
 
+func TestAppendCanonicalDeltaDerivesInlineArtifactHashAndQueriesEvidence(t *testing.T) {
+	forest, _ := newTestForest(t)
+	defer forest.Close()
+
+	delta := canonicalDeltaForForestTest(claims.DeltaActionArtifactGenerated, 31)
+	delta.Refs = []claims.DeltaRef{
+		{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-31"},
+		{Role: "artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-inline"},
+	}
+	delta.Context = map[string]any{
+		"claim": map[string]any{"id": "claim-31", "action": "task"},
+		"artifact": map[string]any{
+			"id":        "artifact-inline",
+			"kind":      "markdown",
+			"data_type": "text/markdown",
+			"content":   "# plan\n\nship it",
+		},
+	}
+	delta.Key = claims.BuildCanonicalDeltaKeyForSequence(delta.Action, delta.SessionID, delta.BoardID, delta.Sequence, delta.Refs, delta.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err != nil {
+		t.Fatalf("append inline artifact: %v", err)
+	}
+	records, err := forest.QueryArtifactEvidence(context.Background(), ArtifactEvidenceFilter{ClaimID: "claim-31"})
+	if err != nil {
+		t.Fatalf("query artifact evidence: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("artifact evidence records = %d, want 1", len(records))
+	}
+	if records[0].ContentHash == "" || !strings.HasPrefix(records[0].ContentHash, "sha256:") {
+		t.Fatalf("content hash = %q", records[0].ContentHash)
+	}
+	if len(records[0].Edges) == 0 {
+		t.Fatalf("artifact edges missing: %+v", records[0])
+	}
+}
+
+func TestAppendCanonicalDeltaRejectsArtifactSequenceRegression(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+
+	first := canonicalDeltaForForestTest(claims.DeltaActionArtifactGenerated, 40)
+	first.Refs = []claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-regress"}, {Role: "artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-regress"}}
+	first.Context = map[string]any{"artifact": map[string]any{"id": "artifact-regress", "kind": "log", "content_hash": "sha256:first"}}
+	first.Key = claims.BuildCanonicalDeltaKeyForSequence(first.Action, first.SessionID, first.BoardID, first.Sequence, first.Refs, first.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), first); err != nil {
+		t.Fatalf("append first artifact: %v", err)
+	}
+	second := first
+	second.Sequence = 39
+	second.DeltaID = "delta-regression"
+	second.Key = claims.BuildCanonicalDeltaKeyForSequence(second.Action, second.SessionID, second.BoardID, second.Sequence, second.Refs, second.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), second); err == nil {
+		t.Fatal("sequence regression accepted")
+	}
+	var sequence int64
+	if err := db.QueryRow(`SELECT last_sequence FROM forest_artifacts WHERE artifact_id = 'artifact-regress'`).Scan(&sequence); err != nil {
+		t.Fatalf("load artifact sequence: %v", err)
+	}
+	if sequence != 40 {
+		t.Fatalf("artifact sequence = %d, want 40", sequence)
+	}
+}
+
+func TestAppendCanonicalDeltaRejectsArtifactMissingContentIdentity(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+
+	delta := canonicalDeltaForForestTest(claims.DeltaActionArtifactGenerated, 45)
+	delta.Refs = []claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-no-content"}, {Role: "artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-no-content"}}
+	delta.Context = map[string]any{"artifact": map[string]any{"id": "artifact-no-content", "kind": "log"}}
+	delta.Key = claims.BuildCanonicalDeltaKeyForSequence(delta.Action, delta.SessionID, delta.BoardID, delta.Sequence, delta.Refs, delta.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err == nil {
+		t.Fatal("artifact without content identity accepted")
+	}
+	var errorKind string
+	if err := db.QueryRow(`SELECT error_kind FROM forest_evidence_errors WHERE entity_id = ?`, "artifact-no-content").Scan(&errorKind); err != nil {
+		t.Fatalf("load evidence error: %v", err)
+	}
+	if errorKind != "missing_content_identity" {
+		t.Fatalf("error kind = %q", errorKind)
+	}
+}
+
 func TestAppendCanonicalDeltaProjectsValidationEvidence(t *testing.T) {
 	forest, db := newTestForest(t)
 	defer forest.Close()
@@ -248,6 +361,102 @@ func TestAppendCanonicalDeltaProjectsValidationEvidence(t *testing.T) {
 	}
 }
 
+func TestKnownDeltaActionsAreAuditedOrProjected(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+
+	for idx, action := range claims.KnownDeltaActions() {
+		delta := canonicalDeltaForForestTest(action, uint64(idx+1))
+		if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err != nil {
+			t.Fatalf("append action %q: %v", action, err)
+		}
+	}
+	var audited int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_delta_projection_audit`).Scan(&audited); err != nil {
+		t.Fatalf("count projection audit: %v", err)
+	}
+	if audited != len(claims.KnownDeltaActions()) {
+		t.Fatalf("audited actions = %d, want %d", audited, len(claims.KnownDeltaActions()))
+	}
+	var unknown int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_delta_projection_audit WHERE classification = 'unknown_observed_delta'`).Scan(&unknown); err != nil {
+		t.Fatalf("count unknown audit: %v", err)
+	}
+	if unknown != 0 {
+		t.Fatalf("known action classified unknown count = %d", unknown)
+	}
+}
+
+func TestFutureCanonicalDeltaActionIsAuditedWithoutProjection(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+
+	delta := canonicalDeltaForForestTest(claims.DeltaAction("skill.generated_future"), 90)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err != nil {
+		t.Fatalf("append future action: %v", err)
+	}
+	var classification string
+	if err := db.QueryRow(`SELECT classification FROM forest_delta_projection_audit WHERE action = ?`, string(delta.Action)).Scan(&classification); err != nil {
+		t.Fatalf("load future action audit: %v", err)
+	}
+	if classification != "unknown_observed_delta" {
+		t.Fatalf("classification = %q", classification)
+	}
+}
+
+func TestValidationFailureCreatesResultAndRemediationEvidence(t *testing.T) {
+	forest, _ := newTestForest(t)
+	defer forest.Close()
+
+	artifact := canonicalDeltaForForestTest(claims.DeltaActionArtifactGenerated, 101)
+	artifact.Refs = []claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-fail"}, {Role: "artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-fail"}}
+	artifact.Context = map[string]any{"artifact": map[string]any{"id": "artifact-fail", "kind": "patch", "content_hash": "sha256:patch"}}
+	artifact.Key = claims.BuildCanonicalDeltaKeyForSequence(artifact.Action, artifact.SessionID, artifact.BoardID, artifact.Sequence, artifact.Refs, artifact.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), artifact); err != nil {
+		t.Fatalf("append artifact: %v", err)
+	}
+	validation := canonicalDeltaForForestTest(claims.DeltaActionValidationValidationFailed, 102)
+	validation.Refs = []claims.DeltaRef{
+		{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-fail"},
+		{Role: "validation", Type: claims.RelatedTypeValidation, ID: "validation-fail"},
+		{Role: "artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-fail"},
+		{Role: "result_artifact", Type: claims.RelatedTypeArtifact, ID: "artifact-result-fail"},
+		{Role: "remediation_claim", Type: claims.RelatedTypeClaim, ID: "claim-remediate"},
+	}
+	validation.Context = map[string]any{
+		"claim": map[string]any{"id": "claim-fail", "action": "task"},
+		"validation": map[string]any{
+			"id":                 "validation-fail",
+			"type":               "programmatic",
+			"status":             string(claims.ValidationStatusValidationFailed),
+			"required":           true,
+			"target_artifact_id": "artifact-fail",
+			"result_artifact_id": "artifact-result-fail",
+		},
+	}
+	validation.Key = claims.BuildCanonicalDeltaKeyForSequence(validation.Action, validation.SessionID, validation.BoardID, validation.Sequence, validation.Refs, validation.Delivery)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), validation); err != nil {
+		t.Fatalf("append validation failure: %v", err)
+	}
+	validations, err := forest.QueryValidationEvidence(context.Background(), ValidationEvidenceFilter{ValidationID: "validation-fail"})
+	if err != nil {
+		t.Fatalf("query validation evidence: %v", err)
+	}
+	if len(validations) != 1 || validations[0].ResultArtifactID != "artifact-result-fail" {
+		t.Fatalf("validation evidence = %+v", validations)
+	}
+	artifacts, err := forest.QueryArtifactEvidence(context.Background(), ArtifactEvidenceFilter{ArtifactID: "artifact-result-fail"})
+	if err != nil {
+		t.Fatalf("query result artifact: %v", err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("result artifacts = %d, want 1", len(artifacts))
+	}
+	if !hasArtifactEdge(artifacts[0].Edges, artifactEdgeRemediates, claims.RelatedTypeClaim, "claim-remediate") {
+		t.Fatalf("remediation edge missing: %+v", artifacts[0].Edges)
+	}
+}
+
 func TestAppendCanonicalDeltaRecordsValidationEvidenceErrorForMissingTargetArtifact(t *testing.T) {
 	forest, db := newTestForest(t)
 	defer forest.Close()
@@ -274,8 +483,8 @@ func TestAppendCanonicalDeltaRecordsValidationEvidenceErrorForMissingTargetArtif
 			},
 		},
 	)
-	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err != nil {
-		t.Fatalf("append validation without target: %v", err)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err == nil {
+		t.Fatal("append validation without target succeeded")
 	}
 	var errorKind string
 	if err := db.QueryRow(`
@@ -287,6 +496,13 @@ func TestAppendCanonicalDeltaRecordsValidationEvidenceErrorForMissingTargetArtif
 	}
 	if errorKind != "missing_target_artifact" {
 		t.Fatalf("error kind = %q", errorKind)
+	}
+	var validations int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_validations WHERE validation_id = ?`, "validation-missing-target").Scan(&validations); err != nil {
+		t.Fatalf("count rejected validation rows: %v", err)
+	}
+	if validations != 0 {
+		t.Fatalf("rejected validation rows = %d, want 0", validations)
 	}
 }
 
@@ -300,18 +516,22 @@ func TestDeltaIngestorUsesMockerySubscriberAndDedupes(t *testing.T) {
 		t.Fatalf("seed nodes: %v", err)
 	}
 	subscription, _ := claims.NoopDeltaBus{}.SubscribeDelta("unused", nil)
-	var handler claims.DeltaHandler
+	var handlers []claims.DeltaHandler
+	patterns := canonicalDeltaIngestPatterns("session-1")
 	subscriber := claimsmocks.NewDeltaSubscriber(t)
 	subscriber.EXPECT().
-		SubscribeDelta(claims.CanonicalSessionPattern("session-1"), mock.Anything).
-		Run(func(_ string, h claims.DeltaHandler) { handler = h }).
+		SubscribeDelta(mock.Anything, mock.Anything).
+		Run(func(_ string, h claims.DeltaHandler) { handlers = append(handlers, h) }).
 		Return(subscription, nil).
-		Once()
+		Times(len(patterns))
 	forest, err := New(Config{DB: db, SynchronousProjection: true, ClaimsDeltaSubscriber: subscriber, ClaimsDeltaSessionFilter: "session-1", DeltaIngestQueueCapacity: 4})
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}
 	defer forest.Close()
+	if len(handlers) != len(patterns) {
+		t.Fatalf("handlers = %d, want %d", len(handlers), len(patterns))
+	}
 	delta := claims.NewCanonicalDelta(
 		claims.DeltaActionArtifactGenerated,
 		"session-1", "board-1", 10, time.Unix(23, 0),
@@ -320,8 +540,8 @@ func TestDeltaIngestorUsesMockerySubscriberAndDedupes(t *testing.T) {
 		nil,
 		map[string]any{"artifact": map[string]any{"id": "artifact-1", "kind": "diagnostic", "status": string(claims.ArtifactStatusGenerated), "content_hash": "sha256:def"}},
 	)
-	handler(delta)
-	handler(delta)
+	handlers[0](delta)
+	handlers[0](delta)
 	waitForForestCondition(t, time.Second, func() (bool, error) {
 		var count int
 		err := db.QueryRow(`SELECT COUNT(*) FROM forest_ledger WHERE source_key = ?`, delta.DeltaKey()).Scan(&count)
@@ -331,4 +551,163 @@ func TestDeltaIngestorUsesMockerySubscriberAndDedupes(t *testing.T) {
 	if snap.Received != 2 || snap.Enqueued != 2 || snap.Ingested == 0 {
 		t.Fatalf("ingestor snapshot = %+v", snap)
 	}
+}
+
+func TestDeltaIngestorAuditsLegacyDelta(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+	ingestor := &DeltaIngestor{forest: forest}
+	legacy := claims.InboxDelta{SessionID: "session-legacy", Sequence: 7, ClaimID: "claim-legacy", AgentID: "architect"}
+	ingestor.handleDelta(legacy)
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_ledger WHERE event_kind = 'claims_delta_legacy_ignored'`).Scan(&count); err != nil {
+		t.Fatalf("count legacy audit: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("legacy audit rows = %d, want 1", count)
+	}
+}
+
+func TestDeltaIngestorOverflowRecordsLedgerAndRuntimeHealth(t *testing.T) {
+	forest, db := newTestForest(t)
+	defer forest.Close()
+	ingestor := &DeltaIngestor{
+		forest: forest,
+		queue:  make(chan claims.CanonicalDelta, 1),
+	}
+	forest.deltaIngestor = ingestor
+	forest.registerRuntimeQueue("claims_delta_ingestor", cap(ingestor.queue))
+	delta := canonicalDeltaForForestTest(claims.DeltaActionClaimGenerated, 77)
+	ingestor.handleDelta(delta)
+	ingestor.handleDelta(delta)
+	var overflowRows int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_ledger WHERE event_kind = 'claims_delta_ingest_overflow'`).Scan(&overflowRows); err != nil {
+		t.Fatalf("count overflow ledger: %v", err)
+	}
+	if overflowRows != 1 {
+		t.Fatalf("overflow rows = %d, want 1", overflowRows)
+	}
+	snap := forest.RuntimeSnapshot()
+	if !runtimeQueueOverflowed(snap, "claims_delta_ingestor") {
+		t.Fatalf("runtime queue overflow not visible: %+v", snap.Queues)
+	}
+}
+
+func TestMigrateForestEventsToLedgerFixture(t *testing.T) {
+	db := openRawForestTestDB(t)
+	if err := ensureSchema(db); err != nil {
+		t.Fatalf("ensure schema: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO forest_events
+			(id, session_id, task_id, agent_id, agent_type, event_type, family, scope,
+			 root_id, branch_id, confidence, salience, timestamp, title, summary, payload)
+		VALUES
+			('legacy-event-1', 'session-legacy', '', 'agent-1', 'engineer', 'observation',
+			 'evidence', 'episodic', 'root-1', 'branch-1', 0.8, 0.7, 123, 'legacy', 'legacy summary', '{}')
+	`); err != nil {
+		t.Fatalf("seed forest_events: %v", err)
+	}
+	result, err := MigrateForestEventsToLedger(context.Background(), db)
+	if err != nil {
+		t.Fatalf("migrate forest_events: %v", err)
+	}
+	if result.Scanned != 1 || result.Inserted != 1 {
+		t.Fatalf("migration result = %+v", result)
+	}
+	result, err = MigrateForestEventsToLedger(context.Background(), db)
+	if err != nil {
+		t.Fatalf("rerun forest_events migration: %v", err)
+	}
+	if result.Scanned != 1 || result.Inserted != 0 {
+		t.Fatalf("second migration result = %+v", result)
+	}
+}
+
+func openRawForestTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite3", "file:"+stableID("raw-forest", t.Name())+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("busy_timeout: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE nodes (id TEXT PRIMARY KEY, domain INTEGER NOT NULL, node_type INTEGER NOT NULL, name TEXT NOT NULL)`); err != nil {
+		t.Fatalf("seed nodes: %v", err)
+	}
+	return db
+}
+
+func canonicalDeltaForForestTest(action claims.DeltaAction, sequence uint64) claims.CanonicalDelta {
+	refs := []claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: fmt.Sprintf("claim-%d", sequence)}}
+	context := map[string]any{"claim": map[string]any{"id": fmt.Sprintf("claim-%d", sequence), "action": "task"}}
+	if _, ok := claims.DeltaActionTestamentLifecycleStatus(action); ok {
+		refs = append(refs, claims.DeltaRef{Role: "testament", Type: claims.RelatedTypeTestament, ID: fmt.Sprintf("testament-%d", sequence)})
+		context["testament"] = map[string]any{"id": fmt.Sprintf("testament-%d", sequence)}
+	}
+	if _, ok := claims.DeltaActionArtifactLifecycleStatus(action); ok {
+		refs = append(refs, claims.DeltaRef{Role: "artifact", Type: claims.RelatedTypeArtifact, ID: fmt.Sprintf("artifact-%d", sequence)})
+		context["artifact"] = map[string]any{"id": fmt.Sprintf("artifact-%d", sequence), "kind": "test", "content_hash": fmt.Sprintf("sha256:%d", sequence)}
+	}
+	if _, ok := claims.DeltaActionValidationLifecycleStatus(action); ok || action == claims.DeltaActionValidationEvaluated {
+		refs = append(refs,
+			claims.DeltaRef{Role: "validation", Type: claims.RelatedTypeValidation, ID: fmt.Sprintf("validation-%d", sequence)},
+			claims.DeltaRef{Role: "artifact", Type: claims.RelatedTypeArtifact, ID: fmt.Sprintf("artifact-target-%d", sequence)},
+		)
+		context["validation"] = map[string]any{
+			"id":                 fmt.Sprintf("validation-%d", sequence),
+			"type":               "programmatic",
+			"status":             validationStatusForAction(action),
+			"target_artifact_id": fmt.Sprintf("artifact-target-%d", sequence),
+			"required":           true,
+		}
+	}
+	var delivery *claims.DeltaDelivery
+	if claims.DeltaActionRequiresDelivery(action) {
+		delivery = &claims.DeltaDelivery{
+			To:           []claims.AgentRef{claims.DegradedAgentRef("architect", "test")},
+			Relationship: claims.RelationshipSubject,
+		}
+	}
+	return claims.NewCanonicalDelta(
+		action,
+		"session-actions",
+		"board-actions",
+		sequence,
+		time.Unix(int64(sequence), 0),
+		claims.DegradedAgentRef("engineer", "test"),
+		refs,
+		delivery,
+		context,
+	)
+}
+
+func validationStatusForAction(action claims.DeltaAction) string {
+	if status, ok := claims.DeltaActionValidationLifecycleStatus(action); ok {
+		return string(status)
+	}
+	if action == claims.DeltaActionValidationEvaluated {
+		return string(claims.ValidationStatusValidated)
+	}
+	return ""
+}
+
+func hasArtifactEdge(edges []ArtifactEvidenceEdge, kind, targetType, targetID string) bool {
+	for _, edge := range edges {
+		if edge.Kind == kind && edge.TargetType == targetType && edge.TargetID == targetID {
+			return true
+		}
+	}
+	return false
+}
+
+func runtimeQueueOverflowed(snapshot RuntimeSnapshot, name string) bool {
+	for _, queue := range snapshot.Queues {
+		if queue.Name == name && queue.Overflows > 0 {
+			return true
+		}
+	}
+	return false
 }

@@ -37,8 +37,10 @@ func (m *MemoryForest) startSubstrateStatePruner() {
 	if m == nil {
 		return
 	}
-	m.startWorker(projectorSubstrateStatePrunerName, substrateStatePruneBatchSize, func() {
+	m.registerRuntimeTicker("substrate_state_pruner_interval", m.substrateStatePruneInterval)
+	m.startWorker(projectorSubstrateStatePrunerName, substrateStatePruneBatchSize, func(context.Context) error {
 		m.runSubstrateStatePrunerLoop()
+		return nil
 	})
 }
 

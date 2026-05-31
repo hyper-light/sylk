@@ -2,7 +2,6 @@ package boot
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -35,9 +34,13 @@ func TestBootSequencerServiceHappyNegativeAndCapacityPaths(t *testing.T) {
 		t.Fatalf("capacity data = %+v, want bounded capacity failure", capacityData)
 	}
 
-	_, err = service.HandleServiceClaim(context.Background(), claims.ServiceClaimRequest{Claim: bootServiceClaim("unknown", nil)})
-	if !errors.Is(err, ErrBootSequencerServiceInvalid) {
-		t.Fatalf("unknown tool error = %v, want ErrBootSequencerServiceInvalid", err)
+	unknownResult, err := service.HandleServiceClaim(context.Background(), claims.ServiceClaimRequest{Claim: bootServiceClaim("unknown", nil)})
+	if err != nil {
+		t.Fatalf("HandleServiceClaim unknown: %v", err)
+	}
+	unknownData := bootPhaseArtifactData(t, unknownResult.Artifacts[0])
+	if unknownData.Status != claims.InfrastructureStatusFailed || unknownData.FailureReason == "" {
+		t.Fatalf("unknown tool data = %+v, want failure artifact", unknownData)
 	}
 }
 

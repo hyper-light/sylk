@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -47,16 +48,20 @@ func NewIdentityRegistryService(cfg IdentityRegistryServiceConfig) *IdentityRegi
 
 func (s *IdentityRegistryService) HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if err := validateIdentityRegistryService(s); err != nil {
-		return ServiceClaimResult{}, err
+		return identityAllocationFailureResult(ExpectedToolCall{Tool: "identity_registry"}, err)
 	}
 	if req.Claim == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: claim is required", ErrIdentityRegistryServiceInvalid)
+		return identityAllocationFailureResult(ExpectedToolCall{Tool: "identity_registry"}, fmt.Errorf("%w: claim is required", ErrIdentityRegistryServiceInvalid))
 	}
 	call, err := identityRegistryCall(req.Claim)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return identityAllocationFailureResult(ExpectedToolCall{Tool: "identity_registry"}, err)
 	}
 	return s.handleIdentityRegistryCall(ctx, call)
+}
+
+func (s *IdentityRegistryService) ServiceTools() []string {
+	return []string{IdentityRegistryToolAllocate, IdentityRegistryToolLineage, IdentityRegistryToolLookup}
 }
 
 func (s *IdentityRegistryService) allocate(ctx context.Context, input IdentityAllocationArtifactData) (IdentityAllocationArtifactData, error) {
@@ -122,49 +127,40 @@ func (s *IdentityRegistryService) handleIdentityRegistryCall(ctx context.Context
 	case IdentityRegistryToolLineage:
 		return s.handleLineage(ctx, call)
 	default:
-		return ServiceClaimResult{}, fmt.Errorf("%w: unknown identity operation %q", ErrIdentityRegistryServiceInvalid, call.Tool)
+		return identityAllocationFailureResult(call, fmt.Errorf("%w: unknown identity operation %q", ErrIdentityRegistryServiceInvalid, call.Tool))
 	}
 }
 
 func (s *IdentityRegistryService) handleAllocate(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	input, err := identityAllocationFromArgs(call.Arguments)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return identityAllocationFailureResult(call, err)
 	}
 	record, err := s.allocate(ctx, input)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return identityAllocationFailureResult(call, err)
 	}
 	artifact, err := identityAllocationArtifact(record)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "identity allocated " + record.UID, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("identity allocated "+record.UID, artifact, err, "identity_allocation_artifact_error", record.UID)
 }
 
 func (s *IdentityRegistryService) handleLookup(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	uid := stringArg(call.Arguments, "uid")
 	record, ok := s.Lookup(ctx, uid)
 	if !ok {
-		return ServiceClaimResult{}, fmt.Errorf("%w: %s", ErrIdentityRegistryNotFound, uid)
+		return identityAllocationFailureResult(call, fmt.Errorf("%w: %s", ErrIdentityRegistryNotFound, uid))
 	}
 	artifact, err := identityAllocationArtifact(record)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "identity found " + record.UID, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("identity found "+record.UID, artifact, err, "identity_lookup_artifact_error", record.UID)
 }
 
 func (s *IdentityRegistryService) handleLineage(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	lineage, err := s.lineage(ctx, stringArg(call.Arguments, "uid"))
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return identityLineageFailureResult(call, err)
 	}
 	artifact, err := identityLineageArtifact(lineage)
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "identity lineage " + lineage.UID, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("identity lineage "+lineage.UID, artifact, err, "identity_lineage_artifact_error", lineage.UID)
 }
 
 func identityRegistryCall(claim *Claim) (ExpectedToolCall, error) {
@@ -260,18 +256,30 @@ func identityLineageLocked(records map[string]IdentityAllocationArtifactData, ui
 }
 
 func identityAllocationArtifact(data IdentityAllocationArtifactData) (*Artifact, error) {
-	artifact := &Artifact{ArtifactName: "identity_allocation", Kind: ArtifactKindAgentID, Reference: data.UID}
-	return artifact, SetArtifactData(artifact, data)
+	artifact := &Artifact{ArtifactName: "identity_allocation", Kind: identityAllocationArtifactKind(data), Reference: firstNonEmpty(data.UID, data.RouteKey, data.Operation)}
+	if err := SetArtifactData(artifact, data); err != nil {
+		return nil, err
+	}
+	appendInfrastructureArtifactFailure(artifact, data.FailureReason)
+	return artifact, nil
 }
 
 func identityLineageArtifact(data IdentityLineageArtifactData) (*Artifact, error) {
-	artifact := &Artifact{ArtifactName: "identity_lineage", Kind: ArtifactKindAgentID, Reference: data.UID}
-	return artifact, SetArtifactData(artifact, data)
+	artifact := &Artifact{ArtifactName: "identity_lineage", Kind: identityLineageArtifactKind(data), Reference: data.UID}
+	if err := SetArtifactData(artifact, data); err != nil {
+		return nil, err
+	}
+	appendInfrastructureArtifactFailure(artifact, data.FailureReason)
+	return artifact, nil
 }
 
 func activationRecordArtifact(data ActivationRecordArtifactData) (*Artifact, error) {
 	artifact := &Artifact{ArtifactName: "activation_record", Kind: activationRecordArtifactKind(data), Reference: data.ParticipantID}
-	return artifact, SetArtifactData(artifact, data)
+	if err := SetArtifactData(artifact, data); err != nil {
+		return nil, err
+	}
+	appendInfrastructureArtifactFailure(artifact, data.FailureReason)
+	return artifact, nil
 }
 
 func activationRecordArtifacts(data ActivationRecordArtifactData) ([]*Artifact, error) {
@@ -302,6 +310,79 @@ func activationRecordArtifactKind(data ActivationRecordArtifactData) string {
 	default:
 		return ArtifactKindActivationRecord
 	}
+}
+
+func identityAllocationFailureResult(call ExpectedToolCall, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	data, _ := identityAllocationFromArgs(call.Arguments)
+	data.Operation = firstNonEmpty(data.Operation, call.Tool, "identity_registry")
+	data.RouteKey = firstNonEmpty(data.RouteKey, stringArg(call.Arguments, "route_key"), data.Operation)
+	data.UID = firstNonEmpty(strings.TrimSpace(data.UID), stringArg(call.Arguments, "uid"), data.RouteKey)
+	data.FailureReason = cause.Error()
+	artifact, err := identityAllocationArtifact(data)
+	return serviceClaimResultWithArtifact("identity "+data.Operation+" failed", artifact, err, "identity_allocation_failure_artifact_error", data.UID)
+}
+
+func identityLineageFailureResult(call ExpectedToolCall, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	data := IdentityLineageArtifactData{UID: firstNonEmpty(stringArg(call.Arguments, "uid"), call.ID, call.Tool), Terminal: false, FailureReason: cause.Error()}
+	artifact, err := identityLineageArtifact(data)
+	return serviceClaimResultWithArtifact("identity lineage failed", artifact, err, "identity_lineage_failure_artifact_error", data.UID)
+}
+
+func identityAllocationArtifactKind(data IdentityAllocationArtifactData) string {
+	if strings.TrimSpace(data.FailureReason) != "" {
+		return ArtifactKindErrorDiagnostic
+	}
+	return ArtifactKindAgentID
+}
+
+func identityLineageArtifactKind(data IdentityLineageArtifactData) string {
+	if strings.TrimSpace(data.FailureReason) != "" {
+		return ArtifactKindErrorDiagnostic
+	}
+	return ArtifactKindAgentID
+}
+
+func appendInfrastructureArtifactFailure(artifact *Artifact, reason string) {
+	reason = strings.TrimSpace(reason)
+	if artifact == nil || reason == "" {
+		return
+	}
+	artifact.Errors = append(artifact.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: reason, OccurredAt: time.Now().UTC()})
+}
+
+func serviceClaimResultWithArtifact(summary string, artifact *Artifact, err error, fallbackName, reference string) (ServiceClaimResult, error) {
+	if err == nil && artifact != nil {
+		return ServiceClaimResult{Summary: summary, Artifacts: []*Artifact{artifact}}, nil
+	}
+	if err == nil {
+		err = fmt.Errorf("%w: artifact is nil", ErrInfrastructureServiceInvalid)
+	}
+	fallback := &Artifact{ArtifactName: fallbackName, Kind: ArtifactKindErrorDiagnostic, Reference: firstNonEmpty(reference, fallbackName)}
+	fallback.Errors = append(fallback.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: err.Error(), OccurredAt: time.Now().UTC()})
+	setErr := SetArtifactData(fallback, PresentationEvidenceArtifactData{Kind: ArtifactKindErrorDiagnostic, Reference: fallback.Reference, Title: fallbackName, Metadata: map[string]any{"failure_reason": err.Error()}})
+	if setErr != nil {
+		fallback.Errors = append(fallback.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: setErr.Error(), OccurredAt: time.Now().UTC()})
+	}
+	return ServiceClaimResult{Summary: firstNonEmpty(summary, fallbackName) + " artifact_error", Artifacts: []*Artifact{fallback}}, nil
+}
+
+func serviceClaimResultWithArtifacts(summary string, artifacts []*Artifact, err error, fallbackName, reference string) (ServiceClaimResult, error) {
+	if err != nil {
+		return serviceClaimResultWithArtifact(summary, nil, err, fallbackName, reference)
+	}
+	if len(artifacts) == 0 {
+		return serviceClaimResultWithArtifact(summary, nil, fmt.Errorf("%w: artifacts are empty", ErrInfrastructureServiceInvalid), fallbackName, reference)
+	}
+	return ServiceClaimResult{Summary: summary, Artifacts: artifacts}, nil
+}
+
+func infrastructureServiceCause(cause error) error {
+	if cause != nil {
+		return cause
+	}
+	return ErrInfrastructureServiceInvalid
 }
 
 func cloneIdentityAllocation(in IdentityAllocationArtifactData) IdentityAllocationArtifactData {

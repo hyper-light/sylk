@@ -104,14 +104,14 @@ func newSystemParticipantService(cfg SystemParticipantServiceConfig) *SystemPart
 
 func (s *SystemParticipantService) HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if s == nil || s.maxRecords <= 0 || s.seen == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: system participant service is not initialized", ErrInfrastructureServiceInvalid)
+		return systemParticipantFailureResult(systemParticipantGeneric, ExpectedToolCall{Tool: GenericSystemEvidenceToolRecord}, fmt.Errorf("%w: system participant service is not initialized", ErrInfrastructureServiceInvalid))
 	}
 	if req.Claim == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid)
+		return systemParticipantFailureResult(s.kind, ExpectedToolCall{Tool: systemParticipantFallbackTool(s.kind)}, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid))
 	}
 	call, err := systemParticipantCall(req.Claim, systemParticipantTools(s.kind))
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return systemParticipantFailureResult(s.kind, ExpectedToolCall{Tool: systemParticipantFallbackTool(s.kind)}, err)
 	}
 	switch s.kind {
 	case systemParticipantSession:
@@ -121,21 +121,28 @@ func (s *SystemParticipantService) HandleServiceClaim(ctx context.Context, req S
 	case systemParticipantBus:
 		return s.handleBusTransport(ctxOrBackground(ctx), call)
 	default:
-		return ServiceClaimResult{}, fmt.Errorf("%w: unknown system participant kind %q", ErrInfrastructureServiceInvalid, s.kind)
+		return systemParticipantFailureResult(s.kind, call, fmt.Errorf("%w: unknown system participant kind %q", ErrInfrastructureServiceInvalid, s.kind))
 	}
+}
+
+func (s *SystemParticipantService) ServiceTools() []string {
+	if s == nil {
+		return nil
+	}
+	return systemParticipantTools(s.kind)
 }
 
 func (s *GenericSystemEvidenceService) HandleServiceClaim(_ context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if req.Claim == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid)
+		return genericSystemEvidenceFailureResult(ExpectedToolCall{Tool: GenericSystemEvidenceToolRecord}, fmt.Errorf("%w: claim is required", ErrInfrastructureServiceInvalid))
 	}
 	call, err := systemParticipantCall(req.Claim, systemParticipantTools(systemParticipantGeneric))
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return genericSystemEvidenceFailureResult(ExpectedToolCall{Tool: GenericSystemEvidenceToolRecord}, err)
 	}
 	var args genericSystemEvidenceArgs
 	if err := decodeArgs(call.Arguments, &args); err != nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: %v", ErrInfrastructureServiceInvalid, err)
+		return genericSystemEvidenceFailureResult(call, fmt.Errorf("%w: %v", ErrInfrastructureServiceInvalid, err))
 	}
 	kind := firstNonEmpty(args.ArtifactKind, ArtifactKindReadiness)
 	reference := firstNonEmpty(args.Reference, args.Operation, "system evidence")
@@ -149,9 +156,58 @@ func (s *GenericSystemEvidenceService) HandleServiceClaim(_ context.Context, req
 		"status":    args.Status,
 	})
 	if err := SetArtifactData(artifact, PresentationEvidenceArtifactData{Kind: kind, Reference: reference, Title: artifact.ArtifactName, Metadata: metadata}); err != nil {
-		return ServiceClaimResult{}, err
+		return genericSystemEvidenceFailureResult(call, err)
 	}
 	return ServiceClaimResult{Summary: "system evidence " + reference, Artifacts: []*Artifact{artifact}}, nil
+}
+
+func (s *GenericSystemEvidenceService) ServiceTools() []string {
+	return systemParticipantTools(systemParticipantGeneric)
+}
+
+func systemParticipantFailureResult(kind string, call ExpectedToolCall, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	switch strings.TrimSpace(kind) {
+	case systemParticipantSession:
+		data := failSessionLifecycleData(call, cause)
+		artifact, err := sessionLifecycleArtifact(data, systemArtifactName(call, "session_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "session "+data.Operation), systemArtifactKindOverride(call))
+		return serviceClaimResultWithArtifact("session "+data.Operation+" failed", artifact, err, "session_lifecycle_failure_artifact_error", data.SessionID)
+	case systemParticipantFabric:
+		data := failFabricSubscriptionData(call, cause)
+		artifact, err := fabricSubscriptionArtifact(data, systemArtifactName(call, "fabric_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "fabric "+data.Operation), systemArtifactKindOverride(call))
+		return serviceClaimResultWithArtifact("fabric "+data.Operation+" failed", artifact, err, "fabric_subscription_failure_artifact_error", data.Topic)
+	case systemParticipantBus:
+		data := failBusTransportData(call, cause)
+		artifact, err := busTransportArtifact(data, systemArtifactName(call, "bus_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "bus "+data.Operation), systemArtifactKindOverride(call))
+		return serviceClaimResultWithArtifact("bus "+data.Operation+" failed", artifact, err, "bus_transport_failure_artifact_error", data.Topic)
+	default:
+		return genericSystemEvidenceFailureResult(call, cause)
+	}
+}
+
+func genericSystemEvidenceFailureResult(call ExpectedToolCall, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	reference := firstNonEmpty(systemArtifactReference(call, ""), call.Tool, GenericSystemEvidenceToolRecord)
+	artifact := &Artifact{ArtifactName: firstNonEmpty(systemArtifactName(call, ""), "system_evidence_failure"), Kind: ArtifactKindErrorDiagnostic, Reference: reference}
+	artifact.Errors = append(artifact.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: cause.Error(), OccurredAt: time.Now().UTC()})
+	err := SetArtifactData(artifact, PresentationEvidenceArtifactData{
+		Kind:      ArtifactKindErrorDiagnostic,
+		Reference: reference,
+		Title:     artifact.ArtifactName,
+		Metadata: map[string]any{
+			"failure_reason": cause.Error(),
+			"operation":      firstNonEmpty(stringArg(call.Arguments, "operation"), call.Tool),
+		},
+	})
+	return serviceClaimResultWithArtifact("system evidence "+reference+" failed", artifact, err, "system_evidence_failure_artifact_error", reference)
+}
+
+func systemParticipantFallbackTool(kind string) string {
+	tools := systemParticipantTools(kind)
+	if len(tools) == 0 {
+		return GenericSystemEvidenceToolRecord
+	}
+	return tools[0]
 }
 
 func (s *SystemParticipantService) handleSessionLifecycle(ctx context.Context, call ExpectedToolCall, req ServiceClaimRequest) (ServiceClaimResult, error) {
@@ -165,10 +221,7 @@ func (s *SystemParticipantService) handleSessionLifecycle(ctx context.Context, c
 		data.Active = false
 	}
 	artifact, err := sessionLifecycleArtifact(data, systemArtifactName(call, "session_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "session "+data.Operation), systemArtifactKindOverride(call))
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "session " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("session "+data.Operation+" "+data.Status, artifact, err, "session_lifecycle_artifact_error", data.SessionID)
 }
 
 func (s *SystemParticipantService) handleFabricSubscription(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
@@ -182,10 +235,7 @@ func (s *SystemParticipantService) handleFabricSubscription(ctx context.Context,
 		data.Attached = false
 	}
 	artifact, err := fabricSubscriptionArtifact(data, systemArtifactName(call, "fabric_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "fabric "+data.Operation), systemArtifactKindOverride(call))
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "fabric " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("fabric "+data.Operation+" "+data.Status, artifact, err, "fabric_subscription_artifact_error", data.Topic)
 }
 
 func (s *SystemParticipantService) handleBusTransport(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
@@ -198,10 +248,7 @@ func (s *SystemParticipantService) handleBusTransport(ctx context.Context, call 
 		data.Status = InfrastructureStatusFailed
 	}
 	artifact, err := busTransportArtifact(data, systemArtifactName(call, "bus_"+sanitizeSystemEvidenceSegment(data.Operation)), systemArtifactReference(call, "bus "+data.Operation), systemArtifactKindOverride(call))
-	if err != nil {
-		return ServiceClaimResult{}, err
-	}
-	return ServiceClaimResult{Summary: "bus " + data.Operation + " " + data.Status, Artifacts: []*Artifact{artifact}}, nil
+	return serviceClaimResultWithArtifact("bus "+data.Operation+" "+data.Status, artifact, err, "bus_transport_artifact_error", data.Topic)
 }
 
 func (s *SystemParticipantService) record(key string) bool {
@@ -341,6 +388,9 @@ func systemParticipantArtifact[T any](artifactName, kind, reference, failure str
 		kind = ArtifactKindErrorDiagnostic
 	}
 	artifact := &Artifact{ArtifactName: artifactName, Kind: kind, Reference: reference}
+	if strings.TrimSpace(failure) != "" {
+		artifact.Errors = append(artifact.Errors, &ArtifactError{Category: ArtifactErrorCategoryInternal, Description: strings.TrimSpace(failure), OccurredAt: time.Now().UTC()})
+	}
 	return artifact, SetArtifactData(artifact, data)
 }
 

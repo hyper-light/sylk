@@ -11,23 +11,11 @@ const (
 	forestSchemaVersionPhase123     = 3
 	forestSchemaReplacesVersion     = 1
 	forestSchemaMigrationPhase123   = "memory_forest_phase_1_2_3"
-	forestProjectionVersionPhase123 = "ledger_v1_evidence_v1_branch_compat"
+	forestProjectionVersionPhase123 = "ledger_v1_evidence_v1"
 )
 
 func ensurePhase123Schema(db *sql.DB) error {
-	if err := ensureNoProhibitedSQLiteObjects(db); err != nil {
-		return err
-	}
-	if err := ensureForestSchemaMeta(db); err != nil {
-		return err
-	}
-	if err := ensureForestLedgerSchema(db); err != nil {
-		return err
-	}
-	if err := ensureForestEvidenceSchema(db); err != nil {
-		return err
-	}
-	return ensureNoProhibitedSQLiteObjects(db)
+	return runForestSchemaMigrations(db)
 }
 
 func ensureForestSchemaMeta(db *sql.DB) error {
@@ -44,21 +32,40 @@ func ensureForestSchemaMeta(db *sql.DB) error {
 	`); err != nil {
 		return fmt.Errorf("create forest_schema_meta: %w", err)
 	}
-	now := time.Now().UTC().Unix()
 	if _, err := db.Exec(`
 		INSERT INTO forest_schema_meta
 			(meta_key, schema_version, replaces_version, projection_version, migration_id, code_version, applied_at)
 		VALUES
 			('active', ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(meta_key) DO UPDATE SET
-			schema_version = excluded.schema_version,
-			replaces_version = excluded.replaces_version,
-			projection_version = excluded.projection_version,
-			migration_id = excluded.migration_id,
-			code_version = excluded.code_version,
-			applied_at = excluded.applied_at
-	`, forestSchemaVersionPhase123, forestSchemaReplacesVersion, forestProjectionVersionPhase123, forestSchemaMigrationPhase123, expectedSchemaHash(), now); err != nil {
+		ON CONFLICT(meta_key) DO NOTHING
+	`, forestSchemaVersionPhase123, forestSchemaReplacesVersion, forestProjectionVersionPhase123, forestSchemaMigrationPhase123, expectedSchemaHash(), time.Now().UTC().Unix()); err != nil {
 		return fmt.Errorf("record forest_schema_meta: %w", err)
+	}
+	return verifyForestSchemaMeta(db)
+}
+
+func verifyForestSchemaMeta(db *sql.DB) error {
+	row := db.QueryRow(`
+		SELECT schema_version, replaces_version, projection_version, migration_id
+		FROM forest_schema_meta
+		WHERE meta_key = 'active'
+	`)
+	var schemaVersion, replacesVersion int
+	var projectionVersion, migrationID string
+	if err := row.Scan(&schemaVersion, &replacesVersion, &projectionVersion, &migrationID); err != nil {
+		return fmt.Errorf("verify forest_schema_meta: %w", err)
+	}
+	if schemaVersion != forestSchemaVersionPhase123 {
+		return fmt.Errorf("unsupported forest schema version %d", schemaVersion)
+	}
+	if replacesVersion != forestSchemaReplacesVersion {
+		return fmt.Errorf("unsupported forest replaces_version %d", replacesVersion)
+	}
+	if projectionVersion != forestProjectionVersionPhase123 {
+		return fmt.Errorf("unsupported forest projection version %q", projectionVersion)
+	}
+	if migrationID != forestSchemaMigrationPhase123 {
+		return fmt.Errorf("unsupported forest migration id %q", migrationID)
 	}
 	return nil
 }
@@ -214,6 +221,24 @@ func ensureForestEvidenceSchema(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_forest_validation_patterns_lookup
 			ON forest_validation_patterns(claim_action, artifact_kind, validation_type)`,
+		`CREATE TABLE IF NOT EXISTS forest_validation_pattern_observations (
+			validation_id TEXT PRIMARY KEY,
+			pattern_key TEXT NOT NULL,
+			status TEXT NOT NULL,
+			recorded_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_validation_pattern_observations_pattern
+			ON forest_validation_pattern_observations(pattern_key, recorded_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS forest_delta_projection_audit (
+			ledger_id TEXT PRIMARY KEY,
+			action TEXT NOT NULL,
+			classification TEXT NOT NULL,
+			reason TEXT NOT NULL,
+			side_effect TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_forest_delta_projection_audit_action
+			ON forest_delta_projection_audit(action, classification)`,
 		`CREATE TABLE IF NOT EXISTS forest_evidence_errors (
 			id TEXT PRIMARY KEY,
 			ledger_id TEXT NOT NULL,

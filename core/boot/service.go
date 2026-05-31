@@ -50,11 +50,14 @@ func NewBootSequencerService(cfg BootSequencerServiceConfig) *BootSequencerServi
 
 func (s *BootSequencerService) HandleServiceClaim(ctx context.Context, req claims.ServiceClaimRequest) (claims.ServiceClaimResult, error) {
 	if s == nil {
-		return claims.ServiceClaimResult{}, ErrBootSequencerServiceInvalid
+		return bootPhaseFailureResult(
+			"boot phase failed",
+			bootPhaseFailureData(claims.ExpectedToolCall{Tool: BootToolPhase}, bootProcessUIDFromRequest(req), ErrBootSequencerServiceInvalid),
+		)
 	}
 	call, err := bootSequencerClaimCall(req.Claim)
 	if err != nil {
-		return claims.ServiceClaimResult{}, err
+		return s.recordPhase(ctx, bootPhaseFailureData(claims.ExpectedToolCall{Tool: BootToolPhase}, s.processUID, err), nil)
 	}
 	data, err := s.bootPhaseDataFromCall(ctx, call, req)
 	if err != nil {
@@ -63,15 +66,19 @@ func (s *BootSequencerService) HandleServiceClaim(ctx context.Context, req claim
 	return s.recordPhase(ctx, data, nil)
 }
 
+func (s *BootSequencerService) ServiceTools() []string {
+	return []string{BootToolAllocate, BootToolCommit, BootToolDetect, BootToolFinalize, BootToolIngest, BootToolPhase, BootToolSetup}
+}
+
 func (s *BootSequencerService) recordPhase(ctx context.Context, data claims.BootPhaseArtifactData, extra []*claims.Artifact) (claims.ServiceClaimResult, error) {
 	if s == nil {
-		return claims.ServiceClaimResult{}, ErrBootSequencerServiceInvalid
+		return bootPhaseFailureResult("boot phase failed", bootPhaseFailureData(claims.ExpectedToolCall{Tool: BootToolPhase}, data.ProcessUID, ErrBootSequencerServiceInvalid))
 	}
 	data = s.normalizeBootPhaseData(ctx, data)
 	data = s.recordBootPhaseData(data)
 	artifact, err := claims.NewBootPhaseArtifact(data)
 	if err != nil {
-		return claims.ServiceClaimResult{}, err
+		return bootServiceClaimResultWithArtifact("boot "+data.Phase+" "+data.Status, nil, err, data.Phase)
 	}
 	artifacts := make([]*claims.Artifact, 0, 1+len(extra))
 	artifacts = append(artifacts, artifact)
@@ -80,6 +87,27 @@ func (s *BootSequencerService) recordPhase(ctx context.Context, data claims.Boot
 		Summary:   "boot " + data.Phase + " " + data.Status,
 		Artifacts: artifacts,
 	}, nil
+}
+
+func bootServiceClaimResultWithArtifact(summary string, artifact *claims.Artifact, err error, reference string) (claims.ServiceClaimResult, error) {
+	if err == nil {
+		return claims.ServiceClaimResult{Summary: summary, Artifacts: []*claims.Artifact{artifact}}, nil
+	}
+	fallback := &claims.Artifact{ArtifactName: "boot_phase_artifact_error", Kind: claims.ArtifactKindErrorDiagnostic, Reference: firstBootServiceString(reference, "boot_phase")}
+	fallback.Errors = append(fallback.Errors, &claims.ArtifactError{Category: claims.ArtifactErrorCategoryInternal, Description: err.Error(), OccurredAt: time.Now().UTC()})
+	if setErr := claims.SetArtifactData(fallback, claims.PresentationEvidenceArtifactData{Kind: claims.ArtifactKindErrorDiagnostic, Reference: fallback.Reference, Title: fallback.ArtifactName, Metadata: map[string]any{"failure_reason": err.Error()}}); setErr != nil {
+		fallback.Errors = append(fallback.Errors, &claims.ArtifactError{Category: claims.ArtifactErrorCategoryInternal, Description: setErr.Error(), OccurredAt: time.Now().UTC()})
+	}
+	return claims.ServiceClaimResult{Summary: firstBootServiceString(summary, "boot phase") + " artifact_error", Artifacts: []*claims.Artifact{fallback}}, nil
+}
+
+func bootPhaseFailureResult(summary string, data claims.BootPhaseArtifactData) (claims.ServiceClaimResult, error) {
+	data.Phase = firstBootServiceString(data.Phase, BootToolPhase)
+	data.PhaseOrder = firstBootServiceInt(data.PhaseOrder, bootPhaseOrder(data.Phase))
+	data.Status = firstBootServiceString(data.Status, claims.InfrastructureStatusFailed)
+	data.Ready = false
+	artifact, err := claims.NewBootPhaseArtifact(data)
+	return bootServiceClaimResultWithArtifact(summary, artifact, err, data.Phase)
 }
 
 func (s *BootSequencerService) bootPhaseDataFromCall(ctx context.Context, call claims.ExpectedToolCall, req claims.ServiceClaimRequest) (claims.BootPhaseArtifactData, error) {

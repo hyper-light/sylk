@@ -41,16 +41,20 @@ func NewActivationControllerService(cfg ActivationControllerServiceConfig) *Acti
 
 func (s *ActivationControllerService) HandleServiceClaim(ctx context.Context, req ServiceClaimRequest) (ServiceClaimResult, error) {
 	if err := validateActivationControllerService(s); err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(ExpectedToolCall{Tool: "activation_controller"}, err)
 	}
 	if req.Claim == nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: claim is required", ErrActivationControllerServiceInvalid)
+		return activationRecordFailureResult(ExpectedToolCall{Tool: "activation_controller"}, fmt.Errorf("%w: claim is required", ErrActivationControllerServiceInvalid))
 	}
 	call, err := activationControllerCall(req.Claim)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(ExpectedToolCall{Tool: "activation_controller"}, err)
 	}
 	return s.handleActivationControllerCall(ctx, call)
+}
+
+func (s *ActivationControllerService) ServiceTools() []string {
+	return []string{ActivationControllerToolActivate, ActivationControllerToolDeactivate, ActivationControllerToolQueryTier}
 }
 
 func (s *ActivationControllerService) activate(ctx context.Context, input ActivationRecordArtifactData) (ActivationRecordArtifactData, error) {
@@ -131,18 +135,18 @@ func (s *ActivationControllerService) handleActivationControllerCall(ctx context
 	case ActivationControllerToolQueryTier:
 		return s.handleQueryTier(ctx, call)
 	default:
-		return ServiceClaimResult{}, fmt.Errorf("%w: unknown activation operation %q", ErrActivationControllerServiceInvalid, call.Tool)
+		return activationRecordFailureResult(call, fmt.Errorf("%w: unknown activation operation %q", ErrActivationControllerServiceInvalid, call.Tool))
 	}
 }
 
 func (s *ActivationControllerService) handleActivate(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	input, err := activationRecordFromArgs(call.Arguments)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(call, err)
 	}
 	record, err := s.activate(ctx, input)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(call, err)
 	}
 	return activationRecordResult(record, "activation ready ")
 }
@@ -150,13 +154,13 @@ func (s *ActivationControllerService) handleActivate(ctx context.Context, call E
 func (s *ActivationControllerService) handleDeactivate(ctx context.Context, call ExpectedToolCall) (ServiceClaimResult, error) {
 	record, err := activationRecordFromArgs(call.Arguments)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(call, err)
 	}
 	record.ParticipantID = firstNonEmpty(record.ParticipantID, stringArg(call.Arguments, "participant_id"))
 	record.FailureReason = firstNonEmpty(record.FailureReason, stringArg(call.Arguments, "failure_reason"), stringArg(call.Arguments, "reason"))
 	record, err = s.deactivateRecord(ctx, record)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(call, err)
 	}
 	return activationRecordResult(record, "activation deactivated ")
 }
@@ -169,12 +173,12 @@ func (s *ActivationControllerService) handleQueryTier(ctx context.Context, call 
 	}
 	record, err := activationRecordFromArgs(call.Arguments)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return activationRecordFailureResult(call, err)
 	}
 	record.Operation = firstNonEmpty(record.Operation, "query_tier")
 	record, err = normalizeActivationRecord(record, false)
 	if err != nil {
-		return ServiceClaimResult{}, fmt.Errorf("%w: %s", ErrActivationControllerServiceInvalid, stringArg(call.Arguments, "participant_id"))
+		return activationRecordFailureResult(call, fmt.Errorf("%w: %s", ErrActivationControllerServiceInvalid, stringArg(call.Arguments, "participant_id")))
 	}
 	return activationRecordResult(record, "activation queried ")
 }
@@ -223,9 +227,33 @@ func normalizeActivationRecord(in ActivationRecordArtifactData, activating bool)
 func activationRecordResult(record ActivationRecordArtifactData, prefix string) (ServiceClaimResult, error) {
 	artifacts, err := activationRecordArtifacts(record)
 	if err != nil {
-		return ServiceClaimResult{}, err
+		return serviceClaimResultWithArtifact(prefix+record.ParticipantID, nil, err, "activation_record_artifact_error", record.ParticipantID)
 	}
 	return ServiceClaimResult{Summary: prefix + record.ParticipantID, Artifacts: artifacts}, nil
+}
+
+func activationRecordFailureResult(call ExpectedToolCall, cause error) (ServiceClaimResult, error) {
+	cause = infrastructureServiceCause(cause)
+	record, _ := activationRecordFromArgs(call.Arguments)
+	record.Operation = firstNonEmpty(record.Operation, activationOperationForTool(call.Tool), call.Tool, "activation_controller")
+	record.ParticipantID = firstNonEmpty(record.ParticipantID, stringArg(call.Arguments, "participant_id"), call.ID, record.Operation)
+	record.Ready = false
+	record.ReplicaCount = 0
+	record.FailureReason = cause.Error()
+	return activationRecordResult(record, "activation failed ")
+}
+
+func activationOperationForTool(tool string) string {
+	switch strings.TrimSpace(tool) {
+	case ActivationControllerToolActivate:
+		return "activate"
+	case ActivationControllerToolDeactivate:
+		return "deactivate"
+	case ActivationControllerToolQueryTier:
+		return "query_tier"
+	default:
+		return ""
+	}
 }
 
 func validateActivationControllerService(s *ActivationControllerService) error {

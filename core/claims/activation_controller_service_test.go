@@ -92,6 +92,34 @@ func TestActivationControllerServiceHandlerProducesTypedArtifacts(t *testing.T) 
 	}
 }
 
+func TestActivationControllerServiceHandlerFailuresBecomeArtifacts(t *testing.T) {
+	service := NewActivationControllerService(ActivationControllerServiceConfig{MaxRecords: 1})
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{name: "activate missing participant", tool: ActivationControllerToolActivate, args: map[string]any{"replica_count": 1}},
+		{name: "activate missing replica", tool: ActivationControllerToolActivate, args: map[string]any{"participant_id": "guide"}},
+		{name: "query missing participant", tool: ActivationControllerToolQueryTier, args: map[string]any{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{Tool: tt.tool, Arguments: tt.args}}}})
+			if err != nil {
+				t.Fatalf("HandleServiceClaim: %v", err)
+			}
+			if len(result.Artifacts) != 1 || result.Artifacts[0].Kind != ArtifactKindActivationFailure {
+				t.Fatalf("artifacts = %+v, want one activation failure artifact", result.Artifacts)
+			}
+			data, err := ArtifactData[ActivationRecordArtifactData](result.Artifacts[0])
+			if err != nil || data.FailureReason == "" || data.Ready {
+				t.Fatalf("activation failure data = %+v err=%v, want typed failure", data, err)
+			}
+		})
+	}
+}
+
 func TestActivationControllerServiceTransitionAndQueryArtifacts(t *testing.T) {
 	service := NewActivationControllerService(ActivationControllerServiceConfig{})
 	if _, err := service.HandleServiceClaim(context.Background(), ServiceClaimRequest{Claim: &Claim{ExpectedToolCalls: []ExpectedToolCall{{
