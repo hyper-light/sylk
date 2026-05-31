@@ -142,7 +142,7 @@ func TestAltMIndexesChatHistoryIntoForest(t *testing.T) {
 	// after toggling memory mode sees every just-ingested chat event.
 	// The async projector path is correct production behavior but
 	// races the test's expectations within a single tick.
-	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true})
+	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true, DisableBackgroundWorkers: true})
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestAltMIndexesInterAgentConsultKnowledgeIntoForest(t *testing.T) {
 	// after toggling memory mode sees every just-ingested chat event.
 	// The async projector path is correct production behavior but
 	// races the test's expectations within a single tick.
-	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true})
+	forestSvc, err := forest.New(forest.Config{DB: db, SynchronousProjection: true, DisableBackgroundWorkers: true})
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
 	}

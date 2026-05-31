@@ -47,6 +47,14 @@ type Config struct {
 	// to avoid lock-contention with shared-memory SQLite.
 	SynchronousProjection bool
 
+	// DisableBackgroundWorkers prevents maintenance/projector workers
+	// from starting. This is narrower than SynchronousProjection:
+	// several tests need inline branch projection while still exercising
+	// event-driven replay/training/substrate maintenance. UI snapshot
+	// tests use this when they only need deterministic read-your-writes
+	// ingestion and immediate snapshot queries.
+	DisableBackgroundWorkers bool
+
 	// ── Issue #3 — selection-bias correction ──
 
 	// CounterfactualLabelWeight is the magnitude applied to training
@@ -556,15 +564,17 @@ func New(cfg Config) (*MemoryForest, error) {
 		}
 	}
 
-	if !service.synchronousProjection {
-		// Async-only goroutines: maintenance scheduler, branch
-		// projector, retrieval-candidates projector, audit drainer,
+	if !cfg.DisableBackgroundWorkers {
+		service.startMaintenance()
+	}
+	if !service.synchronousProjection && !cfg.DisableBackgroundWorkers {
+		// Async-only goroutines: branch projector,
+		// retrieval-candidates projector, audit drainer,
 		// implicit-negative sweeper, AntiPattern promoter, and
 		// storage pruners. Tests using SynchronousProjection=true
-		// write branch projections inline and skip background
-		// schedulers to avoid shared-cache lock contention with
-		// same-tick assertions.
-		service.startMaintenance()
+		// write branch projections inline but still rely on the
+		// maintenance worker for replay, substrate, and training
+		// schedules.
 		service.startBranchProjector()
 		service.startRetrievalCandidatesProjector()
 		service.startRetrievalAuditDrainer()

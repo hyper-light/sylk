@@ -31,7 +31,7 @@ func newTestForestWithConfig(t testing.TB, cfg Config) (*MemoryForest, *sql.DB) 
 	}
 
 	schema := `
-		CREATE TABLE nodes (
+		CREATE TABLE IF NOT EXISTS nodes (
 			id TEXT PRIMARY KEY,
 			domain INTEGER NOT NULL,
 			node_type INTEGER NOT NULL,
