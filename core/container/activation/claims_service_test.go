@@ -25,6 +25,39 @@ func TestInvokeActivationServiceClaimPostsTypedActivationRecord(t *testing.T) {
 	assertActivationServiceRecord(t, board, "guide", true, "")
 }
 
+func TestInvokeActivationServiceClaimUsesResolvableActivationControllerIdentity(t *testing.T) {
+	sessionID := "activation-session"
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:          "activation-service-identity-board",
+		SessionID:        sessionID,
+		TaskID:           "task",
+		AgentRefResolver: activationControllerTestResolver(t, sessionID),
+	})
+	record := claims.ActivationRecordArtifactData{
+		ParticipantID:   "guide",
+		ParticipantType: "agent",
+		Operation:       "activate",
+		Tier:            "hot",
+		ReplicaCount:    1,
+		Ready:           true,
+		Duration:        time.Millisecond,
+	}
+	if err := invokeActivationServiceClaim(context.Background(), board, claims.ActivationControllerToolActivate, record); err != nil {
+		t.Fatalf("invokeActivationServiceClaim with resolver: %v", err)
+	}
+	projection := board.Projection()
+	if len(projection.Claims) != 1 {
+		t.Fatalf("claims = %d, want 1", len(projection.Claims))
+	}
+	claim := projection.Claims[0]
+	if got := claims.IssuerAgentID(claim.Relations); got != activationControllerParticipantID {
+		t.Fatalf("issuer = %q, want %q", got, activationControllerParticipantID)
+	}
+	if got := claims.SubjectAgentID(claim.Relations); got != activationControllerParticipantID {
+		t.Fatalf("subject = %q, want %q", got, activationControllerParticipantID)
+	}
+}
+
 func TestInvokeActivationServiceClaimRecordsFailedActivationWithoutReplica(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{BoardID: "activation-service-failed-board", SessionID: "activation-session", TaskID: "task"})
 	record := claims.ActivationRecordArtifactData{
@@ -75,8 +108,8 @@ func TestInvokeActivationServiceClaimPostsTransitionAndQueryRecords(t *testing.T
 		t.Fatalf("claims = %d, want 2", len(projection.Claims))
 	}
 	for _, claim := range projection.Claims {
-		if claim.ActionType != claims.ActionTypeTask || claim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
-			t.Fatalf("claim = %+v, want satisfied task activation service claim", claim)
+		if claim.ActionType != claims.ActionTypeActivation || claim.LifecycleStatus != claims.ClaimLifecycleSatisfied {
+			t.Fatalf("claim = %+v, want satisfied activation service claim", claim)
 		}
 	}
 }
@@ -90,6 +123,9 @@ func assertActivationServiceRecord(t *testing.T, board *claims.ClaimsBoard, part
 	if projection.Claims[0].LifecycleStatus != claims.ClaimLifecycleSatisfied {
 		t.Fatalf("claim lifecycle = %s, want satisfied", projection.Claims[0].LifecycleStatus)
 	}
+	if projection.Claims[0].ActionType != claims.ActionTypeActivation {
+		t.Fatalf("claim action type = %s, want activation", projection.Claims[0].ActionType)
+	}
 	testaments := board.TestamentsByClaim(projection.Claims[0].ID)
 	if len(testaments) != 1 {
 		t.Fatalf("testaments = %d, want 1", len(testaments))
@@ -101,4 +137,26 @@ func assertActivationServiceRecord(t *testing.T, board *claims.ClaimsBoard, part
 	if data.ParticipantID != participantID || data.Ready != ready || data.FailureReason != reason {
 		t.Fatalf("activation record = %+v, want participant=%s ready=%t reason=%q", data, participantID, ready, reason)
 	}
+}
+
+func activationControllerTestResolver(t *testing.T, sessionID string) claims.AgentRefResolver {
+	t.Helper()
+	scope := map[string]string{"session_id": sessionID}
+	uid, err := claims.DeriveParticipantUID(claims.ParticipantCategoryService, activationControllerParticipantID, scope)
+	if err != nil {
+		t.Fatalf("DeriveParticipantUID: %v", err)
+	}
+	return claims.AgentRefResolverFunc(func(_ context.Context, gotSessionID, agentID string) (claims.AgentRef, bool) {
+		if gotSessionID != sessionID || agentID != activationControllerParticipantID {
+			return claims.AgentRef{}, false
+		}
+		return claims.AgentRef{
+			UID:        uid,
+			Type:       activationControllerParticipantID,
+			Name:       "activation_controller",
+			Category:   string(claims.ParticipantCategoryService),
+			Generation: claims.InitialParticipantGeneration,
+			Labels:     scope,
+		}.Normalized(), true
+	})
 }

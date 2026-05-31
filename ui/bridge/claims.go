@@ -1354,6 +1354,21 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 		)
 		return
 	}
+	if claimHiddenFromUserSurfaces(c) {
+		meta := hiddenSystemClaimMeta(sessionID, c, issuer, subject, ownerForResolver, issuerRef, subjectRef, ownerRef)
+		meta = mergeExistingParticipantMetadata(meta, existing)
+		b.claimMeta[c.ID] = meta
+		b.mu.Unlock()
+		b.debug("claim_created_hidden_system",
+			"session_id", sessionID,
+			"claim_id", c.ID,
+			"issuer", issuer,
+			"subject", subject,
+			"title", strings.TrimSpace(c.Title),
+			"action_type", string(c.ActionType),
+		)
+		return
+	}
 	outcome := b.resolver.onClaimCreated(c.ID, ownerForResolver, subject, causedBy, handoffFrom)
 	cycleID := b.resolver.CycleForClaim(c.ID)
 	cycleOwner := ownerForResolver
@@ -1504,6 +1519,15 @@ func (b *ClaimsBridge) handleTestamentSubmitted(sessionID string, t *claims.Test
 	}
 	claimID := claims.ClaimIDFromRelations(t.Relations)
 	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
+	if b.hiddenSystemClaimKnown(claimID) {
+		b.debug("testament_drop_hidden_system_claim",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"testament_id", t.ID,
+			"agent_id", t.AgentID,
+		)
+		return
+	}
 	if m := b.claimPresentationMsgForTestament(sessionID, claimID, t); m != nil {
 		b.enqueue(*m)
 	}
@@ -1755,6 +1779,16 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 
 	b.mu.Lock()
+	if meta := b.claimMeta[claimID]; meta.UIState == claimUIStateHiddenSystem {
+		b.mu.Unlock()
+		b.debug("artifact_drop_hidden_system_claim",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"artifact_id", artifact.ID,
+			"kind", artifact.Kind,
+		)
+		return
+	}
 	if sessionID == "" || sessionID != b.activeSession {
 		b.observePresentationMetricLocked(claimsVisibilityStaleSessionDropped, claimsVisibilityMetricSurface, claimsVisibilityMetricFormat, "artifact_sink_session_mismatch")
 		b.mu.Unlock()
@@ -1857,6 +1891,9 @@ func (b *ClaimsBridge) ensureClaimRegisteredFromProjection(sessionID, claimID st
 		sessionID = activeSession
 	}
 	if board == nil || activeSession == "" || sessionID != activeSession || b.claimRegistered(claimID) {
+		return
+	}
+	if b.hiddenSystemClaimKnown(claimID) {
 		return
 	}
 	if c := findClaim(board.Projection(), claimID); c != nil {
@@ -2828,7 +2865,107 @@ func claimUIStreamCorrelation(c *claims.Claim) string {
 const (
 	claimTagGuideClassification = "ui:guide_classification"
 	claimTagAgentPanelOnly      = "ui_surface:agent_panel"
+	claimUIStateHiddenSystem    = "hidden_system"
 )
+
+func hiddenSystemClaimMeta(sessionID string, c *claims.Claim, issuer, subject, owner string, issuerRef, subjectRef, ownerRef participantDisplayRef) claimMeta {
+	return claimMeta{
+		ClaimID:                   strings.TrimSpace(c.ID),
+		SessionID:                 strings.TrimSpace(sessionID),
+		OwnerAgentID:              strings.TrimSpace(owner),
+		OwnerAgentType:            agentTypeFromID(owner),
+		OwnerParticipantUID:       firstNonBlank(ownerRef.UID, owner),
+		OwnerParticipantCategory:  ownerRef.Category,
+		OwnerParticipantRoute:     firstNonBlank(ownerRef.Route, owner),
+		TargetAgentID:             strings.TrimSpace(subject),
+		TargetAgentType:           agentTypeFromID(subject),
+		TargetParticipantUID:      firstNonBlank(subjectRef.UID, subject),
+		TargetParticipantCategory: subjectRef.Category,
+		TargetParticipantRoute:    firstNonBlank(subjectRef.Route, subject),
+		IssuerAgentID:             strings.TrimSpace(issuer),
+		IssuerParticipantUID:      firstNonBlank(issuerRef.UID, issuer),
+		IssuerParticipantCategory: issuerRef.Category,
+		IssuerParticipantRoute:    firstNonBlank(issuerRef.Route, issuer),
+		ActionType:                string(c.ActionType),
+		Title:                     strings.TrimSpace(c.Title),
+		StreamCorrelationID:       claimUIStreamCorrelation(c),
+		SuppressChat:              true,
+		UIState:                   claimUIStateHiddenSystem,
+	}
+}
+
+func (b *ClaimsBridge) hiddenSystemClaimKnown(claimID string) bool {
+	claimID = strings.TrimSpace(claimID)
+	if b == nil || claimID == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.claimMeta[claimID].UIState == claimUIStateHiddenSystem
+}
+
+func claimHiddenFromUserSurfaces(c *claims.Claim) bool {
+	if c == nil {
+		return false
+	}
+	return claims.IsSystemInternalAction(c.ActionType) || claimTargetsActivationService(c)
+}
+
+func claimTargetsActivationService(c *claims.Claim) bool {
+	if hasActivationParticipant(claims.IssuerAgentID(c.Relations)) {
+		return true
+	}
+	if hasActivationParticipant(claims.SubjectAgentID(c.Relations)) {
+		return true
+	}
+	return claimHasActivationControllerTool(c)
+}
+
+func hasActivationParticipant(id string) bool {
+	switch strings.TrimSpace(id) {
+	case "system:activation", "sys:activation_controller":
+		return true
+	default:
+		return false
+	}
+}
+
+func claimHasActivationControllerTool(c *claims.Claim) bool {
+	for _, call := range c.ExpectedToolCalls {
+		if isActivationControllerTool(call.Tool) {
+			return true
+		}
+	}
+	for _, validation := range c.Validations {
+		if validationHasActivationControllerTool(validation) {
+			return true
+		}
+	}
+	return false
+}
+
+func validationHasActivationControllerTool(validation *claims.Validation) bool {
+	if validation == nil {
+		return false
+	}
+	for _, call := range validation.ExpectedToolCalls {
+		if isActivationControllerTool(call.Tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func isActivationControllerTool(tool string) bool {
+	switch strings.TrimSpace(tool) {
+	case claims.ActivationControllerToolActivate,
+		claims.ActivationControllerToolDeactivate,
+		claims.ActivationControllerToolQueryTier:
+		return true
+	default:
+		return false
+	}
+}
 
 func claimSuppressChat(c *claims.Claim) bool {
 	if c == nil {

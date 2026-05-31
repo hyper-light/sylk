@@ -86,7 +86,7 @@ func init() {
 }
 
 func runTUI(_ *cobra.Command, _ []string) error {
-	startupTrace("run_tui_enter", "debug_log", diagnostics.StartupTracePath())
+	startupTrace("run_tui_enter", "debug_log", diagnostics.StartupTracePath(), "activation_debug_log", diagnostics.ActivationTracePath())
 	restoreStdLog := installTUIStdLogSink()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
@@ -119,7 +119,7 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	projectRoot := resolveProjectRoot()
 	startupTrace("project_root_resolved", "project_root", projectRoot, "mock_mode", tuiMock)
 
-	deps, cleanup, err := bootstrapDeps(ctx, tuiMock, projectRoot)
+	deps, cleanup, err := runBootstrapWithBootUI(ctx, tuiMock, projectRoot, stop)
 	if err != nil {
 		startupTrace("bootstrap_failed", "error", err.Error())
 		stop()
@@ -417,6 +417,7 @@ type bootstrapPhase1 struct {
 	ctx         context.Context
 	projectRoot string
 	start       time.Time
+	progress    *bootstrapProgressReporter
 
 	bootIdentity    boot.ProcessIdentity
 	phase0Board     *claims.ClaimsBoard
@@ -906,51 +907,66 @@ func (h *hydrateOnceCell) result() *providers.HydratedGoogleAuth {
 //	Phase 3: Wiring (sequential, depends on Phase 2 results)
 //	Phase 4: Post-wiring (Architect pre-activation, handoff, session)
 func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.Deps, func() error, error) {
+	return bootstrapDepsWithProgress(ctx, mockMode, projectRoot, nil)
+}
+
+func bootstrapDepsWithProgress(ctx context.Context, mockMode bool, projectRoot string, progress *bootstrapProgressReporter) (ui.Deps, func() error, error) {
 	_ = mockMode
 	start := time.Now()
 	startupTrace("bootstrap_deps_start", "project_root", projectRoot)
 	loadBootstrapDotenv(projectRoot)
 
+	progress.ReportStage("infrastructure", 0)
 	startupTrace("bootstrap_phase1_start")
-	phase1, err := buildBootstrapPhase1(ctx, projectRoot, start)
+	phase1, err := buildBootstrapPhase1(ctx, projectRoot, start, progress)
 	if err != nil {
+		progress.ReportError("infrastructure", err)
 		startupTrace("bootstrap_phase1_error", "error", err.Error())
 		if phase1 != nil {
 			cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		}
 		return ui.Deps{}, nil, err
 	}
+	progress.ReportStage("system participants", 1)
 	startupTrace("bootstrap_phase1_done", "elapsed_ms", time.Since(start).Milliseconds(), "session_id", phaseDefaultSessionID(phase1))
 	startupTrace("bootstrap_phase2_start")
 	phase2, err := runBootstrapPhase2(phase1)
 	if err != nil {
+		progress.ReportError("system participants", err)
 		startupTrace("bootstrap_phase2_error", "error", err.Error())
 		return ui.Deps{}, nil, err
 	}
+	progress.ReportStage("agent wiring", 2)
 	startupTrace("bootstrap_phase2_done", "elapsed_ms", time.Since(start).Milliseconds())
 	startupTrace("bootstrap_phase3_start")
 	phase3, err := wireBootstrapPhase3(phase1, phase2)
 	if err != nil {
+		progress.ReportError("agent wiring", err)
 		startupTrace("bootstrap_phase3_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	progress.ReportStage("services", 3)
 	startupTrace("bootstrap_phase3_done", "elapsed_ms", time.Since(start).Milliseconds())
 	startupTrace("bootstrap_phase4_start")
 	phase4, err := startBootstrapPhase4(phase1, phase2, phase3)
 	if err != nil {
+		progress.ReportError("services", err)
 		startupTrace("bootstrap_phase4_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	progress.ReportStage("surfaces", 4)
 	startupTrace("bootstrap_phase4_done", "elapsed_ms", time.Since(start).Milliseconds())
 	startupTrace("bootstrap_build_deps_start")
 	deps, err := buildBootstrapDeps(phase1, phase2, phase3, phase4)
 	if err != nil {
+		progress.ReportError("surfaces", err)
 		startupTrace("bootstrap_build_deps_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	progress.ReportStage("complete", 5)
 	startupTrace("bootstrap_build_deps_done", "elapsed_ms", time.Since(start).Milliseconds())
 	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
 	return deps, buildBootstrapCleanup(phase1, phase3, phase4), nil
@@ -1105,11 +1121,12 @@ func loadBootstrapDotenv(projectRoot string) {
 	}
 }
 
-func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Time) (*bootstrapPhase1, error) {
+func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Time, progress *bootstrapProgressReporter) (*bootstrapPhase1, error) {
 	phase1 := &bootstrapPhase1{
 		ctx:         ctx,
 		projectRoot: projectRoot,
 		start:       start,
+		progress:    progress,
 	}
 
 	phase1.scope = concurrency.NewGoroutineScope(ctx, "tui", nil)
@@ -1204,6 +1221,7 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.bootDeltaUnsub = startBootstrapClaimsDeltaTrace(defaultSession.ClaimsBoard())
 	result, err := phase1.bootOps.CommitPhase1(ctx, bootstrapPhase1Status(phase1))
 	traceBootPhaseCommit("claims_operations_phase1_commit", result, err, phase1.bootOps)
+	reportBootstrapClaimsHealth(phase1)
 	if err != nil {
 		return phase1, fmt.Errorf("claims operations phase 1: %w", err)
 	}
@@ -1575,6 +1593,7 @@ func runBootstrapPhase2(phase1 *bootstrapPhase1) (bootstrapPhase2, error) {
 			Context:      map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase2_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return phase2, fmt.Errorf("claims operations phase 2: %w", err)
 		}
@@ -1742,6 +1761,7 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase3_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return bootstrapPhase3{}, fmt.Errorf("claims operations phase 3: %w", err)
 		}
@@ -2400,6 +2420,7 @@ func startBootstrapPhase4(
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase4_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return nil, fmt.Errorf("claims operations phase 4: %w", err)
 		}
@@ -2408,6 +2429,7 @@ func startBootstrapPhase4(
 			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase5_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return nil, fmt.Errorf("claims operations phase 5: %w", err)
 		}
@@ -2530,12 +2552,14 @@ func startBootstrapPhase4(
 			Logger:      phase4.bootLogger,
 			OnProgress: func(phase string, current, total int64) {
 				startupTrace("knowledge_boot_pipeline_progress", "phase", phase, "current", current, "total", total)
+				phase1.progress.ReportKnowledgeProgress(phase, current, total)
 				phase1.knowledgeStore.NotifyProgress(phase, current, total)
 			},
 			Scope: phase1.scope,
 		})
 		if err != nil {
 			startupTrace("knowledge_boot_pipeline_error", "error", err.Error())
+			phase1.progress.ReportError("knowledge boot", err)
 			slog.Warn("knowledge boot failed (non-critical)", "error", err)
 			startLibrarianKnowledgeSync(phase1, phase4, true)
 			return nil
@@ -2781,6 +2805,7 @@ func buildBootstrapDeps(
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase6_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return ui.Deps{}, fmt.Errorf("claims operations phase 6: %w", err)
 		}
@@ -2788,6 +2813,7 @@ func buildBootstrapDeps(
 			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
 		})
 		traceBootPhaseCommit("claims_operations_phase7_commit", result, err, phase1.bootOps)
+		reportBootstrapClaimsHealth(phase1)
 		if err != nil {
 			return ui.Deps{}, fmt.Errorf("claims operations phase 7: %w", err)
 		}

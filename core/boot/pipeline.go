@@ -158,6 +158,7 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	// Phase 1: Setup
 	setupClaimID := postBootPhaseClaim(board, "setup", 1)
 	setupStart := time.Now()
+	p.reportProgress("setup", 0, 6)
 	sd, gm, canonIdx, commitWAL, err := p.setupSylkDir(projectRoot)
 	if err != nil {
 		submitBootPhaseError(board, "setup", setupClaimID, err)
@@ -186,6 +187,7 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	if skip {
 		result.BackgroundHasher = completedHasher()
 		result.Duration = time.Since(start)
+		p.reportProgress("done", 6, 6)
 		p.logBootEvent(agentlog.EventBootSkipped, "info", &agentlog.BootPhasePayload{
 			Phase: "skipped",
 			DurNs: result.Duration.Nanoseconds(),

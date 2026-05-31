@@ -87,3 +87,65 @@ func TestInvokeServiceClaimWithMockeryHandlerCompletesLifecycle(t *testing.T) {
 		t.Fatalf("testament artifacts = %d, want %d", got, want)
 	}
 }
+
+func TestInvokeServiceClaimSystemInternalServiceIssuerOmitsQualityBar(t *testing.T) {
+	sessionID := "service-invoke-system-session"
+	participant, err := claims.NewParticipantRegistration(
+		claims.ParticipantCategoryService,
+		"sys:test_service",
+		map[string]string{"session_id": sessionID},
+		1,
+		1,
+		time.Second,
+		claims.HandlerDeterminismSideEffect,
+		[]claims.ActionType{claims.ActionTypeActivation},
+	)
+	if err != nil {
+		t.Fatalf("NewParticipantRegistration: %v", err)
+	}
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:          "service-invoke-system-board",
+		SessionID:        sessionID,
+		TaskID:           "task",
+		AgentRefResolver: serviceInvokeResolver(participant),
+	})
+	handler := claimsmocks.NewServiceHandler(t)
+	handler.EXPECT().
+		HandleServiceClaim(mock.Anything, mock.MatchedBy(func(req claims.ServiceClaimRequest) bool {
+			return req.Claim != nil && req.Claim.LifecycleStatus == claims.ClaimLifecycleProgressed
+		})).
+		Return(claims.ServiceClaimResult{Summary: "system service completed"}, nil).
+		Once()
+
+	result, err := claims.InvokeServiceClaim(context.Background(), claims.ServiceInvocationOptions{
+		Board:        board,
+		Handler:      handler,
+		Participant:  participant,
+		IssuerID:     participant.RouteKey,
+		SubjectID:    participant.RouteKey,
+		Title:        "Invoke system service",
+		Description:  "Exercise system-internal service claim invocation.",
+		ActionType:   claims.ActionTypeActivation,
+		ExpectedCall: claims.ExpectedToolCall{ID: "call-system", Tool: "system_tool"},
+	})
+	if err != nil {
+		t.Fatalf("InvokeServiceClaim: %v", err)
+	}
+	claim, ok := board.CloneClaim(result.ClaimID)
+	if !ok {
+		t.Fatalf("claim %q not found", result.ClaimID)
+	}
+	if len(claim.Validations) != 1 || claim.Validations[0].QualityBar != "" {
+		t.Fatalf("validation quality bar = %+v, want empty quality bar for system-internal service issuer", claim.Validations)
+	}
+}
+
+func serviceInvokeResolver(participant claims.ParticipantRegistration) claims.AgentRefResolver {
+	ref := participant.AgentRef()
+	return claims.AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
+		if sessionID != participant.ScopeKeys["session_id"] || agentID != participant.RouteKey {
+			return claims.AgentRef{}, false
+		}
+		return ref, true
+	})
+}

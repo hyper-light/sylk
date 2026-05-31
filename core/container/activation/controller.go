@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,29 +13,12 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/container"
 	"github.com/adalundhe/sylk/core/container/pod"
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/handoff"
-	"github.com/adalundhe/sylk/core/logging"
-)
-
-var (
-	activationDebugLog     *slog.Logger
-	activationDebugLogOnce sync.Once
 )
 
 func activationFileLog() *slog.Logger {
-	activationDebugLogOnce.Do(func() {
-		home, _ := os.UserHomeDir()
-		dir := filepath.Join(home, ".sylk", "logs")
-		_ = os.MkdirAll(dir, 0755)
-		f, err := os.OpenFile(filepath.Join(dir, "ui_events.log"),
-			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if err != nil {
-			activationDebugLog = slog.Default()
-			return
-		}
-		activationDebugLog = slog.New(slog.NewTextHandler(f, logging.HandlerOptions(slog.LevelInfo)))
-	})
-	return activationDebugLog
+	return diagnostics.ActivationTrace()
 }
 
 var (

@@ -13,8 +13,8 @@ import (
 	"github.com/google/uuid"
 )
 
-const activationClaimsAgent = "system:activation"
 const activationControllerParticipantID = "sys:activation_controller"
+const activationClaimsAgent = activationControllerParticipantID
 
 // ────────────────────────────────────────────────────────────────────
 // Activation claims (async, best-effort, session board)
@@ -26,9 +26,17 @@ const activationControllerParticipantID = "sys:activation_controller"
 func (ac *ActivationController) postActivationSuccess(agentType string, c *container.Container, duration time.Duration) {
 	board := ac.loadBoard()
 	if board == nil {
+		activationFileLog().Info("DEBUG: activation_claim_success_no_board", "agent_type", agentType, "duration_ms", duration.Milliseconds())
 		return
 	}
 	record := ac.activationRecord(agentType, c, nil, duration)
+	activationFileLog().Info("DEBUG: activation_claim_success_schedule",
+		"agent_type", agentType,
+		"session_id", activationBoardSessionID(board),
+		"operation", record.Operation,
+		"tier", record.Tier,
+		"ready", record.Ready,
+		"duration_ms", duration.Milliseconds())
 	ac.runAsync("activation_claim_"+agentType, func(ctx context.Context) error {
 		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolActivate, record)
 	})
@@ -39,9 +47,18 @@ func (ac *ActivationController) postActivationSuccess(agentType string, c *conta
 func (ac *ActivationController) postActivationError(agentType string, err error, duration time.Duration) {
 	board := ac.loadBoard()
 	if board == nil {
+		activationFileLog().Info("DEBUG: activation_claim_error_no_board", "agent_type", agentType, "duration_ms", duration.Milliseconds(), "error", err)
 		return
 	}
 	record := ac.activationRecord(agentType, nil, err, duration)
+	activationFileLog().Info("DEBUG: activation_claim_error_schedule",
+		"agent_type", agentType,
+		"session_id", activationBoardSessionID(board),
+		"operation", record.Operation,
+		"tier", record.Tier,
+		"ready", record.Ready,
+		"duration_ms", duration.Milliseconds(),
+		"error", err)
 	ac.runAsync("activation_error_"+agentType, func(ctx context.Context) error {
 		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolActivate, record)
 	})
@@ -70,6 +87,15 @@ func (ac *ActivationController) postActivationTransition(agentType string, previ
 		record.Ready = false
 		record.ReplicaCount = 0
 	}
+	activationFileLog().Info("DEBUG: activation_claim_transition_schedule",
+		"agent_type", agentType,
+		"session_id", activationBoardSessionID(board),
+		"previous_tier", record.PreviousTier,
+		"target_tier", record.TargetTier,
+		"final_tier", record.Tier,
+		"ready", record.Ready,
+		"duration_ms", duration.Milliseconds(),
+		"error", transitionErr)
 	ac.runAsync("activation_transition_"+agentType, func(ctx context.Context) error {
 		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolDeactivate, record)
 	})
@@ -91,6 +117,11 @@ func (ac *ActivationController) postActivationQuery(agentType string, tier Activ
 	if record.Ready {
 		record.ReplicaCount = 1
 	}
+	activationFileLog().Info("DEBUG: activation_claim_query_schedule",
+		"agent_type", agentType,
+		"session_id", activationBoardSessionID(board),
+		"tier", record.Tier,
+		"ready", record.Ready)
 	ac.runAsync("activation_query_"+agentType, func(ctx context.Context) error {
 		return invokeActivationServiceClaim(ctx, board, claims.ActivationControllerToolQueryTier, record)
 	})
@@ -137,7 +168,14 @@ func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard
 	if err != nil {
 		return err
 	}
-	_, err = claims.InvokeServiceClaim(ctx, claims.ServiceInvocationOptions{
+	start := time.Now()
+	activationFileLog().Info("DEBUG: activation_service_claim_start",
+		"session_id", activationBoardSessionID(board),
+		"tool", tool,
+		"participant_id", record.ParticipantID,
+		"operation", record.Operation,
+		"action_type", claims.ActionTypeActivation)
+	result, err := claims.InvokeServiceClaim(ctx, claims.ServiceInvocationOptions{
 		Board:        board,
 		Handler:      claims.NewActivationControllerService(claims.ActivationControllerServiceConfig{MaxRecords: activationControllerRecordCapacity()}),
 		Participant:  participant,
@@ -145,10 +183,19 @@ func invokeActivationServiceClaim(ctx context.Context, board *claims.ClaimsBoard
 		SubjectID:    activationControllerParticipantID,
 		Title:        fmt.Sprintf("Activation controller %s %s", record.Operation, record.ParticipantID),
 		Description:  fmt.Sprintf("Run activation controller operation %s for agent type %s.", record.Operation, record.ParticipantID),
-		ActionType:   claims.ActionTypeTask,
+		ActionType:   claims.ActionTypeActivation,
 		ExpectedCall: claims.ExpectedToolCall{Tool: tool, Arguments: activationServiceArguments(record)},
 		Reason:       "activation controller service claim generated",
 	})
+	activationFileLog().Info("DEBUG: activation_service_claim_done",
+		"session_id", activationBoardSessionID(board),
+		"tool", tool,
+		"participant_id", record.ParticipantID,
+		"operation", record.Operation,
+		"claim_id", result.ClaimID,
+		"testament_id", result.TestamentID,
+		"elapsed_ms", time.Since(start).Milliseconds(),
+		"error", err)
 	return err
 }
 
@@ -161,7 +208,7 @@ func activationControllerParticipant(board *claims.ClaimsBoard) (claims.Particip
 		len(activationControllerTools()),
 		activationControllerTimeout(),
 		claims.HandlerDeterminismSideEffect,
-		[]claims.ActionType{claims.ActionTypeTask},
+		[]claims.ActionType{claims.ActionTypeActivation},
 	)
 }
 
@@ -338,12 +385,24 @@ func (ac *ActivationController) loadBoard() *claims.ClaimsBoard {
 // runAsync dispatches fn via scope.Go. Falls back to synchronous on nil scope.
 func (ac *ActivationController) runAsync(desc string, fn func(context.Context) error) {
 	if ac.scope == nil {
+		start := time.Now()
+		activationFileLog().Info("DEBUG: activation_async_sync_start", "desc", desc)
 		if err := fn(context.Background()); err != nil {
+			activationFileLog().Info("DEBUG: activation_async_sync_error", "desc", desc, "elapsed_ms", time.Since(start).Milliseconds(), "error", err)
 			slog.Warn("activation_claims_sync_error", "desc", desc, "error", err.Error())
+			return
 		}
+		activationFileLog().Info("DEBUG: activation_async_sync_done", "desc", desc, "elapsed_ms", time.Since(start).Milliseconds())
 		return
 	}
-	if err := ac.scope.Go(desc, 5*time.Second, fn); err != nil {
+	if err := ac.scope.Go(desc, activationControllerTimeout(), func(ctx context.Context) error {
+		start := time.Now()
+		activationFileLog().Info("DEBUG: activation_async_start", "desc", desc)
+		err := fn(ctx)
+		activationFileLog().Info("DEBUG: activation_async_done", "desc", desc, "elapsed_ms", time.Since(start).Milliseconds(), "error", err)
+		return err
+	}); err != nil {
+		activationFileLog().Info("DEBUG: activation_async_dispatch_failed", "desc", desc, "error", err)
 		slog.Warn("activation_claims_dispatch_failed", "desc", desc, "error", err.Error())
 	}
 }

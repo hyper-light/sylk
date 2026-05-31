@@ -2369,6 +2369,60 @@ func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.
 	}
 }
 
+func TestBridgeIntegration_ActivationServiceClaimsHiddenFromUserSurfaces(t *testing.T) {
+	tests := []struct {
+		name       string
+		actionType claims.ActionType
+		issuer     string
+	}{
+		{name: "canonical activation", actionType: claims.ActionTypeActivation, issuer: "sys:activation_controller"},
+		{name: "legacy task misclassification", actionType: claims.ActionTypeTask, issuer: "system:activation"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			br, board, prog, cleanup := setupBridgeOnSession(t, "ses-activation-hidden-"+strings.ReplaceAll(tc.name, " ", "-"))
+			defer cleanup()
+
+			if err := board.PostAction(context.Background(),
+				claims.Action{AgentID: tc.issuer, Type: tc.actionType},
+				[]claims.Claim{{
+					Title:      "Activation controller activate inspector",
+					ActionType: tc.actionType,
+					Relations: []claims.Relation{
+						{Related: tc.issuer, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+						{Related: "sys:activation_controller", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+					},
+					ExpectedToolCalls: []claims.ExpectedToolCall{{
+						Tool:     claims.ActivationControllerToolActivate,
+						Required: true,
+					}},
+					Validations: []*claims.Validation{{Description: "activation receipt", QualityBar: "recorded", Type: claims.ValidationTypeReceipt, Required: true}},
+				}},
+			); err != nil {
+				t.Fatalf("PostAction: %v", err)
+			}
+			claimID := board.Projection().Claims[0].ID
+			drainBridge(t, prog, "activation service claim")
+
+			br.OnArtifactAdded(claimID, tc.issuer, board.SessionID(), &claims.Artifact{
+				ID:        "activation-tool-started-" + strings.ReplaceAll(tc.name, " ", "-"),
+				AgentID:   tc.issuer,
+				Kind:      "tool_started",
+				Reference: claims.ActivationControllerToolActivate,
+				Created:   time.Now().UTC(),
+			})
+			drainBridge(t, prog, "activation service artifact")
+
+			for _, message := range prog.Snapshot() {
+				switch message.(type) {
+				case msg.ClaimsAgentStatusMsg, msg.ClaimContextMsg, msg.TestamentContextMsg, msg.ClaimArtifactAddedMsg, msg.ClaimResponseTextMsg, msg.ClaimPeerInteractionMsg:
+					t.Fatalf("activation service claim emitted user-facing message: %#v", message)
+				}
+			}
+		})
+	}
+}
+
 // TestBridgeIntegration_ClaimContextSuppressedAfterTerminal verifies the
 // claim Context is sealed when the claim reaches a terminal status —
 // late narration arriving after acceptance/rejection must be dropped

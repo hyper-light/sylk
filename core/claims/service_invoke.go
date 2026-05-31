@@ -89,7 +89,7 @@ func generateServiceInvocationClaim(ctx context.Context, opts ServiceInvocationO
 			Type:        ValidationTypeReceipt,
 			Required:    true,
 			Description: "service testament received",
-			QualityBar:  "service.claim.completed",
+			QualityBar:  serviceInvocationValidationQualityBar(opts),
 			Status:      ValidationStatusPending,
 		}},
 	}
@@ -101,6 +101,16 @@ func generateServiceInvocationClaim(ctx context.Context, opts ServiceInvocationO
 		return "", err
 	}
 	return generated.Claims[0].ID, postGeneratedServiceInvocationClaim(ctx, opts, generated.Claims[0].ID)
+}
+
+func serviceInvocationValidationQualityBar(opts ServiceInvocationOptions) string {
+	if IsSystemInternalAction(opts.ActionType) {
+		return ""
+	}
+	if opts.Participant.Category != ParticipantCategoryAgent && strings.TrimSpace(opts.IssuerID) == strings.TrimSpace(opts.Participant.RouteKey) {
+		return ""
+	}
+	return "service.claim.completed"
 }
 
 func prepareServiceInvocationClaim(ctx context.Context, opts ServiceInvocationOptions, claimID string) (*Claim, error) {
