@@ -427,6 +427,7 @@ func nodeProjectionOpsForLedgerRecord(record forestLedgerProjectionRecord) (fore
 	subject := record.Subject()
 	kind := forestNodeKindForRecord(record)
 	grade := evidenceGradeForRecord(record)
+	family := treeFamilyForProjectionRecord(record, kind)
 	node := ForestNode{
 		Kind:            kind,
 		SourceKind:      record.SourceKind,
@@ -450,6 +451,7 @@ func nodeProjectionOpsForLedgerRecord(record forestLedgerProjectionRecord) (fore
 		PayloadHash:     record.PayloadHash,
 		Metadata: map[string]any{
 			"event_kind": record.EventKind,
+			"family":     string(family),
 			"ledger_id":  record.ID,
 			"board_id":   record.BoardID,
 		},
@@ -481,6 +483,24 @@ func nodeProjectionOpsForLedgerRecord(record forestLedgerProjectionRecord) (fore
 		ops.Edges = append(ops.Edges, edgeForRecord(record, node.ID, target.ID, edgeKindForRef(record, ref), grade, recordSalience(record)))
 	}
 	return dedupeNodeProjectionOps(ops)
+}
+
+func treeFamilyForProjectionRecord(record forestLedgerProjectionRecord, kind ForestNodeKind) TreeFamily {
+	payload := payloadMap(record.PayloadJSON)
+	family := canonicalizeFamily(TreeFamily(nestedPayloadString(payload, "family")))
+	if defaultFamily(family) {
+		return family
+	}
+	return treeFamilyForNodeKind(kind)
+}
+
+func defaultFamily(family TreeFamily) bool {
+	for _, candidate := range defaultFamilies() {
+		if family == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func dedupeNodeProjectionOps(ops forestNodeProjectionOps) (forestNodeProjectionOps, error) {
@@ -692,7 +712,7 @@ func evidenceGradeForRecord(record forestLedgerProjectionRecord) EvidenceGrade {
 
 func nodeTitleForRecord(record forestLedgerProjectionRecord, kind ForestNodeKind) string {
 	payload := payloadMap(record.PayloadJSON)
-	for _, path := range [][]string{{"claim", "title"}, {"artifact", "name"}, {"validation", "type"}, {"transition", "status"}} {
+	for _, path := range [][]string{{"title"}, {"summary"}, {"claim", "title"}, {"artifact", "name"}, {"validation", "type"}, {"transition", "status"}} {
 		if value := nestedPayloadString(payload, path...); value != "" {
 			return value
 		}
@@ -702,7 +722,7 @@ func nodeTitleForRecord(record forestLedgerProjectionRecord, kind ForestNodeKind
 
 func nodeSummaryForRecord(record forestLedgerProjectionRecord) string {
 	payload := payloadMap(record.PayloadJSON)
-	for _, path := range [][]string{{"claim", "description"}, {"artifact", "summary"}, {"validation", "reason"}, {"transition", "reason"}} {
+	for _, path := range [][]string{{"summary"}, {"title"}, {"claim", "description"}, {"artifact", "summary"}, {"validation", "reason"}, {"transition", "reason"}} {
 		if value := nestedPayloadString(payload, path...); value != "" {
 			return value
 		}

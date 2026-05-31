@@ -134,7 +134,7 @@ func (m *MemoryForest) loadViewNodesAsBranches(ctx context.Context, sessionID st
 	query := `
 		SELECT node_id, node_kind, source_partition, subject_id, session_id, task_id,
 		       title, summary, confidence, salience, utility, evidence_grade,
-		       first_seen_at, last_seen_at, source_seq
+		       first_seen_at, last_seen_at, source_seq, metadata
 		FROM forest_nodes
 		WHERE 1 = 1
 	`
@@ -155,14 +155,15 @@ func (m *MemoryForest) loadViewNodesAsBranches(ctx context.Context, sessionID st
 		var (
 			id, kind, partition, subjectID, nodeSessionID, taskID string
 			title, summary, grade                                 string
+			metadata                                              string
 			confidence, salience, utility                         float64
 			firstSeen, lastSeen, seq                              int64
 		)
 		if err := rows.Scan(&id, &kind, &partition, &subjectID, &nodeSessionID, &taskID, &title, &summary,
-			&confidence, &salience, &utility, &grade, &firstSeen, &lastSeen, &seq); err != nil {
+			&confidence, &salience, &utility, &grade, &firstSeen, &lastSeen, &seq, &metadata); err != nil {
 			return nil, fmt.Errorf("scan memory view node: %w", err)
 		}
-		family := treeFamilyForNodeKind(ForestNodeKind(kind))
+		family := treeFamilyForViewNode(ForestNodeKind(kind), metadata)
 		state := BranchStateActive
 		if EvidenceGrade(grade) == EvidenceGradeFailed || EvidenceGrade(grade) == EvidenceGradeContradicted {
 			state = BranchStateContradicted
@@ -202,6 +203,14 @@ func treeFamilyForNodeKind(kind ForestNodeKind) TreeFamily {
 	default:
 		return TreeFamilyEvidence
 	}
+}
+
+func treeFamilyForViewNode(kind ForestNodeKind, metadata string) TreeFamily {
+	family := canonicalizeFamily(TreeFamily(nestedPayloadString(payloadMap(metadata), "family")))
+	if defaultFamily(family) {
+		return family
+	}
+	return treeFamilyForNodeKind(kind)
 }
 
 func (m *MemoryForest) loadViewBranchesWithScope(ctx context.Context, sessionID string, semanticOnly bool) ([]*Branch, error) {
