@@ -1,6 +1,7 @@
 package context
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -607,6 +608,10 @@ func TestTruncate_DataIntegrityAfterReopen(t *testing.T) {
 func TestTruncate_PerformanceLargeFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "obs.wal")
+	const (
+		observationsCount = 1000
+		truncateBefore    = 500
+	)
 
 	log, err := NewObservationLog(context.Background(), ObservationLogConfig{
 		Path: path,
@@ -616,31 +621,50 @@ func TestTruncate_PerformanceLargeFile(t *testing.T) {
 	}
 	defer log.Close()
 
-	// Record 1000 observations
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < observationsCount; i++ {
 		log.Record(context.Background(), &EpisodeObservation{
 			TaskCompleted: true,
 			FollowUpCount: i,
 			PrefetchedIDs: []string{"a", "b", "c"},
 		})
 	}
+	sizeBefore, err := log.Size()
+	if err != nil {
+		t.Fatalf("failed to stat log before truncate: %v", err)
+	}
+	dataBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read log before truncate: %v", err)
+	}
+	linesBefore := bytes.Count(dataBefore, []byte{'\n'})
 
-	// Truncate should be fast (append-only, no rewrite)
-	start := time.Now()
-	if err := log.Truncate(500); err != nil {
+	if err := log.Truncate(truncateBefore); err != nil {
 		t.Fatalf("failed to truncate: %v", err)
 	}
-	elapsed := time.Since(start)
-
-	// Truncate should be < 10ms since it's just appending a marker
-	if elapsed > 10*time.Millisecond {
-		t.Errorf("truncate took %v, expected < 10ms for append-only operation", elapsed)
+	sizeAfter, err := log.Size()
+	if err != nil {
+		t.Fatalf("failed to stat log after truncate: %v", err)
+	}
+	dataAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read log after truncate: %v", err)
+	}
+	linesAfter := bytes.Count(dataAfter, []byte{'\n'})
+	if sizeAfter <= sizeBefore {
+		t.Fatalf("truncate rewrote or shrank WAL: before=%d after=%d", sizeBefore, sizeAfter)
+	}
+	if linesAfter != linesBefore+1 {
+		t.Fatalf("truncate appended %d WAL records, want 1", linesAfter-linesBefore)
+	}
+	appended := bytes.TrimSpace(dataAfter[sizeBefore:])
+	if !IsTruncateMarker(appended) {
+		t.Fatalf("truncate appended non-marker record: %s", string(appended))
 	}
 
-	// Verify correct observations are returned
 	observations, _ := log.GetObservations()
-	if len(observations) != 501 {
-		t.Errorf("expected 501 observations (500-1000), got %d", len(observations))
+	expectedRemaining := observationsCount - truncateBefore + 1
+	if len(observations) != expectedRemaining {
+		t.Errorf("expected %d observations (%d-%d), got %d", expectedRemaining, truncateBefore, observationsCount, len(observations))
 	}
 }
 
