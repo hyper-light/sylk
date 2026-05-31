@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	forestSchemaVersionPhase123     = forestSchemaVersionPhase789
+	forestSchemaVersionPhase123     = forestSchemaVersionPhase101112
 	forestSchemaReplacesVersion     = 1
-	forestSchemaMigrationPhase123   = forestSchemaMigrationPhase789
-	forestProjectionVersionPhase123 = forestProjectionVersionPhase789
+	forestSchemaMigrationPhase123   = forestSchemaMigrationPhase101112
+	forestProjectionVersionPhase123 = forestProjectionVersionPhase101112
 )
 
 func ensurePhase123Schema(db *sql.DB) error {

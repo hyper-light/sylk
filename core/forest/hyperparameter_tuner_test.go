@@ -283,10 +283,9 @@ func TestHyperParameterTuner_OverridePriority(t *testing.T) {
 		t.Errorf("override provenance: got %q want %q",
 			hp.Provenance["exploration_rate"], SourceConfig)
 	}
-	// Construct a proposed snapshot and feed enough observations to
-	// trigger promotion. Even with strong evidence, exploration_rate
-	// stays at the override because promoteProposed preserves
-	// SourceConfig fields by source-stamp.
+	// Feed adaptation observations after the override. The policy
+	// engine may reject retrieval-only evidence, but regardless of
+	// trial outcome exploration_rate stays at the operator override.
 	for i := 0; i < int(2*minSamplesForAdaptDecision); i++ {
 		obs := AdaptationObservation{CalibrationError: 0.6, RegretFrac: 0.3, SampleCount: 1, ObservedAt: time.Now()}
 		tuner.ObserveAndAdapt(ctx, obs, false)
@@ -348,17 +347,29 @@ func TestHyperParameterTuner_RuntimePromotion(t *testing.T) {
 	for i := 0; i < int(4*minSamplesForAdaptDecision); i++ {
 		// Active continues to be bad.
 		tuner.ObserveAndAdapt(ctx, AdaptationObservation{
-			CalibrationError: 0.30 + rng.NormFloat64()*0.02,
-			RegretFrac:       0.20 + rng.NormFloat64()*0.02,
-			SampleCount:      1,
-			ObservedAt:       time.Now(),
+			CalibrationError:   0.30 + rng.NormFloat64()*0.02,
+			RegretFrac:         0.20 + rng.NormFloat64()*0.02,
+			SampleCount:        1,
+			Correctness:        0.45,
+			Safety:             0.70,
+			Cost:               0.50,
+			Ecology:            0.45,
+			ValidationPassRate: 0.50,
+			EvidenceRefs:       []string{fmt.Sprintf("validation:champion:%d", i)},
+			ObservedAt:         time.Now(),
 		}, false)
 		// Proposed is clearly better.
 		tuner.ObserveAndAdapt(ctx, AdaptationObservation{
-			CalibrationError: 0.05 + math.Abs(rng.NormFloat64())*0.01,
-			RegretFrac:       0.04 + math.Abs(rng.NormFloat64())*0.01,
-			SampleCount:      1,
-			ObservedAt:       time.Now(),
+			CalibrationError:   0.05 + math.Abs(rng.NormFloat64())*0.01,
+			RegretFrac:         0.04 + math.Abs(rng.NormFloat64())*0.01,
+			SampleCount:        1,
+			Correctness:        0.95,
+			Safety:             0.95,
+			Cost:               0.90,
+			Ecology:            0.92,
+			ValidationPassRate: 0.98,
+			EvidenceRefs:       []string{fmt.Sprintf("validation:challenger:%d", i)},
+			ObservedAt:         time.Now(),
 		}, true)
 	}
 

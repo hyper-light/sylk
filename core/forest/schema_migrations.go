@@ -18,6 +18,7 @@ func runForestSchemaMigrations(db *sql.DB) error {
 		{id: "phase123_evidence", fn: ensureForestEvidenceSchema},
 		{id: "phase456_graph_cluster_ecology", fn: ensureForestPhase456Schema},
 		{id: "phase789_immunity_retrieval_fabric", fn: ensureForestPhase789Schema},
+		{id: "phase101112_policy_memetic_foundry", fn: ensureForestPhase101112Schema},
 		{id: "phase123_post_extension_audit", fn: ensureNoProhibitedSQLiteObjects},
 	}
 	for _, migration := range migrations {

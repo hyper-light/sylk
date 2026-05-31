@@ -41,6 +41,7 @@ var (
 	// tester variant's system prompt. Pipeline tester and global
 	// tester both compose this in.
 	TesterFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+	TesterClaimsNative    = prompts.MustLoad("shared", "claims_native")
 
 	// Language, framework, and tooling selection guidance — shared
 	// across pipeline and global tester variants. Sits next to fabric
@@ -61,6 +62,7 @@ var (
 func PipelineTesterSystemPrompt() string {
 	return PipelineSystemPrompt + "\n\n" +
 		TesterFabricAwareness + "\n\n" +
+		TesterClaimsNative + "\n\n" +
 		TesterLanguageToolingPreference + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
@@ -91,6 +93,7 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 	base := joinPromptSections(
 		TesterTaskSystem,
 		TesterFabricAwareness, // promoted ahead of workflow
+		TesterClaimsNative,
 		TesterLanguageToolingPreference,
 		DiagnosisMethodology,
 		TestPlanningStrategy,
@@ -110,6 +113,7 @@ func PipelineTesterSystemPromptForWorkerAndContract(workerType string, contract 
 func GlobalTesterSystemPrompt() string {
 	return GlobalSystemPrompt + "\n\n" +
 		TesterFabricAwareness + "\n\n" +
+		TesterClaimsNative + "\n\n" +
 		TesterLanguageToolingPreference + "\n\n" +
 		DiagnosisMethodology + "\n\n" +
 		TestPlanningStrategy + "\n\n" +
@@ -132,6 +136,7 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 	return joinPromptSections(
 		TesterGlobalTaskSystem,
 		TesterFabricAwareness, // promoted ahead of workflow
+		TesterClaimsNative,
 		TesterLanguageToolingPreference,
 		DiagnosisMethodology,
 		TestPlanningStrategy,
@@ -150,7 +155,7 @@ func GlobalTesterSystemPromptForContract(contract *agentshared.GlobalExecutionCo
 // inheriting structured task obligations.
 func TesterConversationSystemPrompt() string {
 	return strings.TrimSpace(agentshared.AppendWorkspaceViewContext(
-		TesterConversationPrompt,
+		joinPromptSections(TesterConversationPrompt, TesterClaimsNative),
 		agentshared.WorkspacePromptOptions{DefaultView: versioning.WorkspaceViewGlobal},
 	))
 }

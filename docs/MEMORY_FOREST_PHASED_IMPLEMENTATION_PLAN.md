@@ -1016,13 +1016,13 @@ Implementation guide:
   `core/context/skills/forest_role_skills.go`.
 - Remove branch/family input parameters from public skills.
 - Add operations:
-  - `forest.retrieve_evidence`
-  - `forest.suggest_validations`
-  - `forest.propose_claim`
-  - `forest.review_contradiction`
-  - `forest.review_bridge`
-  - `forest.review_skill_candidate`
-  - `forest.record_outcome`
+  - `forest_retrieve_evidence`
+  - `forest_suggest_validations`
+  - `forest_propose_claim`
+  - `forest_review_contradiction`
+  - `forest_review_bridge`
+  - `forest_review_skill_candidate`
+  - `forest_record_outcome`
 - Each mutating operation creates a claim proposal artifact or ledger record,
   not direct trusted infrastructure mutation.
 

@@ -3,6 +3,7 @@ package shared
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -581,27 +582,60 @@ func TestClaimsIntakeExpectedConsultTestamentWithoutResolutionIDIsConsumed(t *te
 	}
 }
 
-func TestClaimsIntakeSuppressesGuideUserPromptForActionAgents(t *testing.T) {
-	entry := guideUserPromptEntry()
-	if !shouldSuppressForwardedPromptEntry(claims.RoleSubject, entry) {
-		t.Fatal("expected guide user prompt claim to be suppressed for action agent")
+func TestComposeClaimsEntryPromptIncludesClaimNativeExpectedTools(t *testing.T) {
+	entry := &claims.GraphEntryPoint{
+		Delta: claims.InboxDelta{AgentID: "librarian", ClaimID: "claim-1"},
+		Node: claims.GraphNode{
+			Claim: &claims.Claim{
+				ID:              "claim-1",
+				Title:           "Inspect workspace",
+				Description:     "List the top-level project files.",
+				ActionType:      claims.ActionTypeConsultation,
+				LifecycleStatus: claims.ClaimLifecyclePosted,
+				Relations: []claims.Relation{
+					{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+					{Related: "librarian", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				},
+				ExpectedToolCalls: []claims.ExpectedToolCall{{
+					ID:                "etc-claim",
+					Tool:              "workspace_read",
+					Required:          true,
+					Purpose:           "list root files",
+					ProducesArtifacts: []string{"workspace_observation"},
+					Arguments:         map[string]any{"op": "glob", "path": "."},
+				}},
+				Validations: []*claims.Validation{{
+					ID:          "validation-1",
+					Description: "response received",
+					QualityBar:  "testament includes workspace observation",
+					Type:        claims.ValidationTypeReceipt,
+					Status:      claims.ValidationStatusPending,
+					ExpectedToolCalls: []claims.ExpectedToolCall{{
+						ID:       "etc-validation",
+						Tool:     "query_board",
+						Required: true,
+						Arguments: map[string]any{
+							"op":       "testaments",
+							"claim_id": "claim-1",
+						},
+					}},
+				}},
+			},
+		},
 	}
-	if !shouldSuppressForwardedPromptEntry(claims.RoleSubject|claims.RoleAuditor, entry) {
-		t.Fatal("expected guide user prompt claim to be suppressed for auditor action agent")
-	}
-}
-
-func TestClaimsIntakeDoesNotSuppressGuideUserPromptForObserver(t *testing.T) {
-	if shouldSuppressForwardedPromptEntry(claims.RoleObserver, guideUserPromptEntry()) {
-		t.Fatal("observer inbox must still receive guide user prompt claims for rendering")
-	}
-}
-
-func TestClaimsIntakeDoesNotSuppressNonPromptClaims(t *testing.T) {
-	entry := guideUserPromptEntry()
-	entry.Node.Claim.ActionType = claims.ActionTypeConsultation
-	if shouldSuppressForwardedPromptEntry(claims.RoleSubject, entry) {
-		t.Fatal("consultation claim should not be suppressed")
+	prompt := ComposeClaimsEntryPrompt(entry)
+	for _, want := range []string{
+		"Expected subject tool calls",
+		"`workspace_read` id=`etc-claim` required - list root files",
+		"produces=workspace_observation",
+		"Expected validation tool calls",
+		"`query_board` id=`etc-validation` required",
+		"Process this event as first-class claims work",
+		"Errors are artifacts for testaments",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
 
@@ -820,25 +854,5 @@ func TestClaimsIntakeRegistersClaimWorkForSessionCancellation(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("claim intake work did not observe cancellation")
-	}
-}
-
-func guideUserPromptEntry() *claims.GraphEntryPoint {
-	return &claims.GraphEntryPoint{
-		Delta: claims.InboxDelta{
-			AgentID: "architect",
-			ClaimID: "claim-guide-prompt",
-		},
-		Node: claims.GraphNode{
-			Claim: &claims.Claim{
-				ID:         "claim-guide-prompt",
-				ActionType: claims.ActionTypePrompt,
-				Tags:       []string{"guide_classification", "user_prompt"},
-				Relations: []claims.Relation{
-					{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
-					{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
-				},
-			},
-		},
 	}
 }

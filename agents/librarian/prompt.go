@@ -12,6 +12,7 @@ var (
 	PatternDetectionPrompt    = prompts.MustLoad("librarian", "patterns")
 	QueryClassificationPrompt = prompts.MustLoad("librarian", "query_classification")
 	librarianFabricAwareness  = prompts.MustLoad("shared", "fabric_awareness")
+	librarianClaimsNative     = prompts.MustLoad("shared", "claims_native")
 	librarianFabricAdvisory   = prompts.MustLoad("shared", "fabric_knowledge_advisory")
 
 	// DefaultSystemPrompt composes the librarian's base persona with the
@@ -20,6 +21,7 @@ var (
 	DefaultSystemPrompt = strings.Join([]string{
 		librarianBaseSystem,
 		librarianFabricAwareness,
+		librarianClaimsNative,
 		librarianFabricAdvisory,
 	}, "\n\n---\n\n")
 )

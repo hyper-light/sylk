@@ -17,6 +17,7 @@ var (
 	// inspector audit-clause extension. Pipeline inspector and global
 	// inspector both compose both in.
 	InspectorFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+	InspectorClaimsNative    = prompts.MustLoad("shared", "claims_native")
 	InspectorFabricAudit     = prompts.MustLoad("shared", "fabric_inspector_audit")
 )
 
@@ -49,6 +50,7 @@ const promptSeparator = "\n\n---\n\n"
 func PipelineInspectorSystemPrompt() string {
 	return pipelineSystem + promptSeparator +
 		InspectorFabricAwareness + promptSeparator +
+		InspectorClaimsNative + promptSeparator +
 		InspectorFabricAudit + promptSeparator +
 		pipelineProtocol + promptSeparator +
 		InspectorSkillsPolicy + promptSeparator +
@@ -66,6 +68,7 @@ func PipelineInspectorSystemPromptForContract(contract *agentshared.TaskExecutio
 	parts := []string{
 		pipelineSystem,
 		InspectorFabricAwareness, // promote ahead of workflow
+		InspectorClaimsNative,
 		InspectorFabricAudit,
 	}
 	if contract == nil || !contract.PreImplementation {
@@ -117,6 +120,7 @@ func PipelineCorrectionPrompt() string {
 func GlobalInspectorSystemPrompt() string {
 	return globalSystem + promptSeparator +
 		InspectorFabricAwareness + promptSeparator +
+		InspectorClaimsNative + promptSeparator +
 		InspectorFabricAudit + promptSeparator +
 		globalProtocol + promptSeparator +
 		globalAudit + promptSeparator +
@@ -138,6 +142,7 @@ func GlobalInspectorSystemPromptForContract(contract *agentshared.GlobalExecutio
 	return joinNonEmpty([]string{
 		globalSystem,
 		InspectorFabricAwareness,
+		InspectorClaimsNative,
 		InspectorFabricAudit,
 		globalProtocol,
 		globalAudit,
@@ -159,6 +164,7 @@ func GlobalConversationPrompt() string {
 func GlobalInspectorConversationSystemPrompt() string {
 	return joinNonEmpty([]string{
 		globalSystem,
+		InspectorClaimsNative,
 		InspectorGuardrails,
 		globalConversation,
 		agentshared.BuildWorkspaceViewContext(agentshared.WorkspacePromptOptions{

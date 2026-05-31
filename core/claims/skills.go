@@ -47,7 +47,7 @@ func QueryClaimsBoardSkill(bp BoardProvider) *skills.Skill {
 // Each op returns ONLY the requested slice — no full board copy.
 func QueryBoardSkill(bp BoardProvider, defaultAgentID string) *skills.Skill {
 	return skills.NewSkill("query_board").
-		Description("Query the claims board. Use op to select what you need.\n\n"+
+		Description("Query the claims board. Use this at claim intake to inspect delivered claims, expected tool calls, linked testaments, artifacts, and pending validations before acting. Use op to select what you need.\n\n"+
 			"Ops:\n"+
 			"- summary: Board status counts (phase, accepted/total, pending, etc.) — fastest\n"+
 			"- my_claims: Claims where you are the subject (your directed work)\n"+
@@ -182,12 +182,12 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 		inboxFn = ip[0]
 	}
 	return skills.NewSkill("post_action").
-		Description("Issue an action (set of claims) against one or more target agents. Each claim names its target via the `subject` field — this is the agent who must respond with a testament. Covers task, challenge, consultation, corrective, and archival actions. Returns the committed action_id and claim_ids. The issuer's inbox automatically watches for testament responses from the subject agents.").
+		Description("Issue an action (set of claims) against one or more target agents. Each claim names its target via the `subject` field — this is the agent who must respond with a testament. Use `expected_tool_calls` on the claim for work the subject should attempt, and on validations for tools the evaluator should run. Covers task, challenge, consultation, corrective, archival, prompt, and handoff actions. Returns the committed action_id and claim_ids. The issuer's inbox automatically watches for testament responses from the subject agents.").
 		Domain("claims").
 		Keywords("action", "claim", "issue", "challenge", "consult").
 		Priority(97).
-		StringParam("action_type", "Type: task, challenge, consultation, corrective, archival, prompt", true).
-		StringParam("claims_json", `JSON array of claim objects. Each claim: {"title": str, "description": str, "subject": "<agent_id>", "scope": [{"kind": "file"|"scope"|..., "key": str}], "validations": [{"description": str, "quality_bar": str, "type": "test"|"inspection"|"integration"|"contract"|"design"|"regression"|"receipt"}]}. validations MUST be an array of objects — never a string. Example: [{"title":"Add login","description":"...","subject":"engineer","scope":[{"kind":"file","key":"auth.go"}],"validations":[{"description":"unit tests pass","quality_bar":"100% pass","type":"test"}]}]`, true).
+		StringParam("action_type", "Type: task, challenge, consultation, corrective, archival, prompt, handoff", true).
+		StringParam("claims_json", `JSON array of claim objects. Each claim: {"title": str, "description": str, "subject": "<agent_id>", "scope": [{"kind": "file"|"scope"|..., "key": str}], "expected_tool_calls": [{"tool": str, "arguments": {...}, "purpose": str, "required": bool, "produces_artifacts": [str]}], "validations": [{"description": str, "quality_bar": str, "type": "test"|"inspection"|"integration"|"contract"|"design"|"regression"|"receipt", "expected_tool_calls": [{"tool": str, "arguments": {...}, "purpose": str, "required": bool}]}]}. validations MUST be an array of objects — never a string. Example: [{"title":"Inspect repo","description":"Check current structure","subject":"librarian","scope":[{"kind":"workspace","key":"root"}],"expected_tool_calls":[{"tool":"workspace_read","arguments":{"op":"glob","path":"."},"purpose":"list top-level files","required":true,"produces_artifacts":["workspace_observation"]}],"validations":[{"description":"response received","quality_bar":"testament links workspace observation","type":"receipt"}]}]`, true).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			board, err := bp()
 			if err != nil {
@@ -210,7 +210,7 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 					"post_action", "action_type",
 				)
 			}
-			const claimsShapeHint = `non-empty JSON array of claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"validations":[{"description":"...","quality_bar":"...","type":"test"}]}]`
+			const claimsShapeHint = `non-empty JSON array of claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"expected_tool_calls":[{"tool":"workspace_read","arguments":{"op":"glob","path":"."},"purpose":"inspect workspace","required":true}],"validations":[{"description":"...","quality_bar":"...","type":"test","expected_tool_calls":[{"tool":"run_tests","arguments":{"target":"./..."},"required":true}]}]}]`
 			if err := requireRawJSONParam("post_action", "claims_json", params.ClaimsJSON, claimsShapeHint); err != nil {
 				return nil, err
 			}
@@ -234,19 +234,21 @@ func PostActionSkill(bp BoardProvider, ip ...InboxProvider) *skills.Skill {
 			postedClaims := make([]Claim, 0, len(claimInputs))
 			for _, ci := range claimInputs {
 				c := Claim{
-					Title:       ci.Title,
-					Description: ci.Description,
-					Scope:       ci.Scope,
+					Title:             ci.Title,
+					Description:       ci.Description,
+					Scope:             ci.Scope,
+					ExpectedToolCalls: ci.ExpectedToolCalls,
 					Relations: []Relation{
 						{Related: ci.Subject, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
 					},
 				}
 				for _, vi := range ci.Validations {
 					c.Validations = append(c.Validations, &Validation{
-						Description: vi.Description,
-						QualityBar:  vi.QualityBar,
-						Type:        ValidationType(vi.Type),
-						Required:    true,
+						Description:       vi.Description,
+						QualityBar:        vi.QualityBar,
+						Type:              ValidationType(vi.Type),
+						Required:          true,
+						ExpectedToolCalls: vi.ExpectedToolCalls,
 					})
 				}
 				postedClaims = append(postedClaims, c)
@@ -413,7 +415,7 @@ func InspectClaimConflictsSkill(bp BoardProvider) *skills.Skill {
 
 func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("submit_testaments").
-		Description("Submit testaments responding to specific claims. Each testament's `claim_id` field names the claim being answered — this is how you respond to work directed at you. Carry artifacts as proof of completion or error details. When work FAILS, submit a testament with kind='error' artifacts — never silently drop errors. Error artifacts are structured reports the issuer evaluates, not system failures.").
+		Description("Submit testaments responding to specific claims. Each testament's `claim_id` field names the claim being answered — this is how you respond to work directed at you. Carry artifacts as proof of completion, refusal, impossibility, blocker, or error details. When work fails or an expected tool cannot run, submit a testament with error/error_trace/error_diagnostic artifacts — never silently drop errors. Error artifacts are structured evidence the issuer evaluates, not system failures.").
 		Domain("claims").
 		Keywords("testament", "submit", "proof", "artifacts", "done", "error").
 		Priority(96).
@@ -481,7 +483,7 @@ func SubmitTestamentsSkill(bp BoardProvider) *skills.Skill {
 
 func UpdateClaimProgressSkill(bp BoardProvider) *skills.Skill {
 	return skills.NewSkill("update_claim_progress").
-		Description("Record incremental progress on a claim. If work encounters an error, report it here — then submit a testament with error artifacts when done.").
+		Description("Record incremental progress on a claim you are processing. Use this for non-terminal state changes such as received, inspecting context, running expected tools, waiting on a subclaim, or blocked. If work encounters an error, report it here — then submit a testament with error artifacts when done.").
 		Domain("claims").
 		Keywords("progress", "update", "evidence", "work").
 		Priority(95).
@@ -585,7 +587,7 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 					"post_remediation_claims", "reason",
 				)
 			}
-			const replacementsShapeHint = `non-empty JSON array of replacement claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"validations":[{"description":"...","quality_bar":"...","type":"test"}]}]`
+			const replacementsShapeHint = `non-empty JSON array of replacement claim objects, e.g. [{"title":"...","description":"...","subject":"<agent_id>","scope":[{"kind":"file","key":"path"}],"expected_tool_calls":[{"tool":"workspace_read","arguments":{"op":"read","path":"src/app.go"},"required":true}],"validations":[{"description":"...","quality_bar":"...","type":"test","expected_tool_calls":[{"tool":"run_tests","arguments":{"target":"./..."},"required":true}]}]}]`
 			if err := requireRawJSONParam("post_remediation_claims", "replacements_json", params.ReplacementsJSON, replacementsShapeHint); err != nil {
 				return nil, err
 			}
@@ -608,19 +610,21 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 			var claims []Claim
 			for _, ci := range claimInputs {
 				c := Claim{
-					Title:       ci.Title,
-					Description: ci.Description,
-					Scope:       ci.Scope,
+					Title:             ci.Title,
+					Description:       ci.Description,
+					Scope:             ci.Scope,
+					ExpectedToolCalls: ci.ExpectedToolCalls,
 					Relations: []Relation{
 						{Related: ci.Subject, RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
 					},
 				}
 				for _, vi := range ci.Validations {
 					c.Validations = append(c.Validations, &Validation{
-						Description: vi.Description,
-						QualityBar:  vi.QualityBar,
-						Type:        ValidationType(vi.Type),
-						Required:    true,
+						Description:       vi.Description,
+						QualityBar:        vi.QualityBar,
+						Type:              ValidationType(vi.Type),
+						Required:          true,
+						ExpectedToolCalls: vi.ExpectedToolCalls,
 					})
 				}
 				claims = append(claims, c)
@@ -636,11 +640,12 @@ func PostRemediationClaimsSkill(bp BoardProvider) *skills.Skill {
 // ── Input types ─────────────────────────────────────────────────────
 
 type claimInput struct {
-	Title       string              `json:"title"`
-	Description string              `json:"description"`
-	Subject     string              `json:"subject"`
-	Scope       flexibleScope       `json:"scope,omitempty"`
-	Validations flexibleValidations `json:"validations,omitempty"`
+	Title             string              `json:"title"`
+	Description       string              `json:"description"`
+	Subject           string              `json:"subject"`
+	Scope             flexibleScope       `json:"scope,omitempty"`
+	ExpectedToolCalls []ExpectedToolCall  `json:"expected_tool_calls,omitempty"`
+	Validations       flexibleValidations `json:"validations,omitempty"`
 }
 
 // flexibleScope handles LLM variability in how scope is provided:
@@ -686,9 +691,10 @@ func (s *flexibleScope) UnmarshalJSON(data []byte) error {
 }
 
 type validationInput struct {
-	Description string `json:"description"`
-	QualityBar  string `json:"quality_bar"`
-	Type        string `json:"type"`
+	Description       string             `json:"description"`
+	QualityBar        string             `json:"quality_bar"`
+	Type              string             `json:"type"`
+	ExpectedToolCalls []ExpectedToolCall `json:"expected_tool_calls,omitempty"`
 }
 
 // flexibleValidations handles LLM variability in how validations are provided.

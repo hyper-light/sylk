@@ -14,6 +14,7 @@ var (
 	OrchestratorConversationPrompt     = prompts.MustLoad("orchestrator", "conversation")
 	OrchestratorSelfResponsePrompt     = prompts.MustLoad("orchestrator", "self_response")
 	OrchestratorFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
+	OrchestratorClaimsNative           = prompts.MustLoad("shared", "claims_native")
 
 	// DefaultSystemPrompt is the full system prompt for event
 	// processing (LLM loop).
@@ -25,6 +26,7 @@ var (
 	DefaultSystemPrompt = strings.Join(nonEmptyOrchestratorSections([]string{
 		OrchestratorSystemCorePrompt,
 		OrchestratorFabricAwareness,
+		OrchestratorClaimsNative,
 		OrchestratorSystemProtocolPrompt,
 		OrchestratorSystemGuardrailsPrompt,
 		OrchestratorSystemSkillsPrompt,
@@ -39,6 +41,7 @@ var (
 func OrchestratorConversationSystemPrompt() string {
 	return strings.Join(nonEmptyOrchestratorSections([]string{
 		OrchestratorSystemCorePrompt,
+		OrchestratorClaimsNative,
 		OrchestratorSystemGuardrailsPrompt,
 		OrchestratorConversationPrompt,
 		OrchestratorSelfResponsePrompt,

@@ -17,6 +17,7 @@ var (
 	EngineerSystemAuditPrompt      = prompts.MustLoad("engineer", "system_audit")
 	EngineerSystemCollabPrompt     = prompts.MustLoad("engineer", "system_collaboration")
 	EngineerFabricAwarenessPrompt  = prompts.MustLoad("shared", "fabric_awareness")
+	EngineerClaimsNativePrompt     = prompts.MustLoad("shared", "claims_native")
 
 	// EngineerLanguageToolingPreferencePrompt encodes the priority
 	// order — task spec → fabric → codebase — that engineer reads
@@ -33,6 +34,7 @@ var (
 	DefaultEngineerSystemPrompt = strings.Join([]string{
 		EngineerSystemCorePrompt,
 		EngineerFabricAwarenessPrompt,
+		EngineerClaimsNativePrompt,
 		EngineerLanguageToolingPreferencePrompt,
 		EngineerSystemProtocolPrompt,
 		EngineerSystemConsultPrompt,
@@ -57,6 +59,7 @@ func EngineerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 	return strings.Join([]string{
 		EngineerSystemCorePrompt,
 		EngineerFabricAwarenessPrompt, // promoted ahead of workflow
+		EngineerClaimsNativePrompt,
 		EngineerLanguageToolingPreferencePrompt,
 		EngineerSystemConsultPrompt,
 		EngineerSystemSkillsPrompt,

@@ -154,7 +154,7 @@ func TestEngineerSystemCollabPrompt_RoutesImplementationBackToInspector(t *testi
 		"`inspector -> tester -> engineer/designer -> inspector`",
 		"Do not hand off directly to `tester-pipeline` after implementation",
 		"Use `post_action(kind=task)` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.",
-		"Use `submit_testaments` only when you are answering an active challenge from Inspector, Tester, or Designer.",
+		"Use `submit_testaments` whenever you are the subject of a delivered claim and have completion, refusal, blocker, or error evidence to return.",
 		"Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.",
 		"Your first `post_action(kind=challenge)` call to Tester, Designer, or Inspector is allowed.",
 		"Re-challenge Inspector only after Inspector answered your previous challenge and you then changed pipeline VFS state yourself based on that answer.",

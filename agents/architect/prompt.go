@@ -16,13 +16,16 @@ var (
 	ArchitectSystemSkillsPrompt     = prompts.MustLoad("architect", "system_skills")
 	ArchitectConversationPrompt     = prompts.MustLoad("architect", "conversation")
 	ArchitectFabricAwareness        = prompts.MustLoad("shared", "fabric_awareness")
+	ArchitectClaimsNative           = prompts.MustLoad("shared", "claims_native")
 	// IMPORTANT ORDERING: ArchitectFabricAwareness comes RIGHT
-	// AFTER core identity, BEFORE protocol/skills. The screenshot
-	// review showed the LLM follows the workflow it reads first;
-	// fabric must be framing, not a footer.
+	// AFTER core identity, followed by the claims-native contract,
+	// BEFORE protocol/skills. The screenshot review showed the LLM
+	// follows the workflow it reads first; fabric and claims must be
+	// framing, not footers.
 	DefaultSystemPrompt = strings.Join([]string{
 		ArchitectSystemCorePrompt,
 		ArchitectFabricAwareness,
+		ArchitectClaimsNative,
 		ArchitectSystemProtocolPrompt,
 		ArchitectSystemConsultPrompt,
 		ArchitectSystemDelegationPrompt,
@@ -47,6 +50,7 @@ func plannerPromptModules(stage string) []string {
 		return []string{
 			ArchitectSystemCorePrompt,
 			ArchitectFabricAwareness,
+			ArchitectClaimsNative,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemGuardrailsPrompt,
@@ -56,6 +60,7 @@ func plannerPromptModules(stage string) []string {
 		return []string{
 			ArchitectSystemCorePrompt,
 			ArchitectFabricAwareness,
+			ArchitectClaimsNative,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemOutputPrompt,
@@ -65,6 +70,7 @@ func plannerPromptModules(stage string) []string {
 		return []string{
 			ArchitectSystemCorePrompt,
 			ArchitectFabricAwareness,
+			ArchitectClaimsNative,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemDelegationPrompt,
 			ArchitectSystemSkillsPrompt,
@@ -75,6 +81,7 @@ func plannerPromptModules(stage string) []string {
 		return []string{
 			ArchitectSystemCorePrompt,
 			ArchitectFabricAwareness, // promoted ahead of workflow
+			ArchitectClaimsNative,
 			ArchitectSystemProtocolPrompt,
 			ArchitectSystemConsultPrompt,
 			ArchitectSystemDelegationPrompt,

@@ -54,6 +54,37 @@ type AdaptationObservation struct {
 	// metrics were averaged over. Lower = noisier observation.
 	SampleCount int64
 
+	// Correctness, Safety, Cost, and Ecology are normalized
+	// claim-/artifact-aligned policy fitness signals. Runtime
+	// retrieval regret without these independent positive signals
+	// cannot promote a policy.
+	Correctness float64
+	Safety      float64
+	Cost        float64
+	Ecology     float64
+
+	// ValidationPassRate is the normalized validation harness pass
+	// rate for the work represented by this observation.
+	ValidationPassRate float64
+
+	// ArtifactQuality captures normalized artifact/testament quality
+	// when available. It is recorded for audit and fitness without
+	// replacing the mandatory correctness/safety/cost/ecology gates.
+	ArtifactQuality float64
+
+	// ContradictionDelta is positive when the candidate reduces
+	// contradiction pressure relative to the champion.
+	ContradictionDelta float64
+
+	// LatencyMicros records observed end-to-end cost. Latency alone
+	// never promotes a policy.
+	LatencyMicros int64
+
+	// EvidenceRefs identifies the ledger/evidence records that
+	// produced this observation so policy candidates can be traced
+	// back to concrete retrieval outcomes.
+	EvidenceRefs []string
+
 	// ObservedAt is when the metrics were collected.
 	ObservedAt time.Time
 }
@@ -64,6 +95,7 @@ type AdaptationObservation struct {
 type HyperParameterTuner struct {
 	store  *HyperParameterStore
 	fitter *HyperParameterFitter
+	policy *ForestPolicyEngine
 
 	logger *slog.Logger
 
@@ -104,6 +136,11 @@ type adaptationState struct {
 	// nil = no active trial.
 	proposed *HyperParameters
 
+	// policyCandidateID binds proposed to a persisted
+	// forest_policy_candidates row. A non-empty value is required
+	// before any trial can promote.
+	policyCandidateID string
+
 	// trialStart is when the current A/B trial began.
 	trialStart time.Time
 
@@ -121,7 +158,7 @@ type adaptationState struct {
 // Errors are returned for hard failures (e.g., schema migration
 // failed). Soft failures (e.g., persisted snapshot was invalid)
 // degrade gracefully to the next priority tier and log a warning.
-func NewHyperParameterTuner(ctx context.Context, db *sql.DB, logger *slog.Logger) (*HyperParameterTuner, error) {
+func NewHyperParameterTuner(ctx context.Context, db *sql.DB, logger *slog.Logger, sinks ...ClaimProposalSink) (*HyperParameterTuner, error) {
 	if db == nil {
 		return nil, fmt.Errorf("hyperparameter tuner: nil db")
 	}
@@ -132,6 +169,10 @@ func NewHyperParameterTuner(ctx context.Context, db *sql.DB, logger *slog.Logger
 	store := NewHyperParameterStore(db)
 	if err := store.EnsureSchema(ctx); err != nil {
 		return nil, err
+	}
+	var sink ClaimProposalSink
+	if len(sinks) > 0 {
+		sink = sinks[0]
 	}
 
 	t := &HyperParameterTuner{
@@ -150,6 +191,14 @@ func NewHyperParameterTuner(ctx context.Context, db *sql.DB, logger *slog.Logger
 	// First set is direct (no subscribers yet); subsequent
 	// changes flow through setActive so subscribers track.
 	t.active.Store(hp)
+	policy, err := NewForestPolicyEngine(ctx, db, store, logger, sink)
+	if err != nil {
+		return nil, fmt.Errorf("hyperparameter tuner policy engine: %w", err)
+	}
+	t.policy = policy
+	if err := t.policy.EnsureChampionPolicy(ctx, hp, []string{"forest:active_snapshot"}); err != nil {
+		return nil, fmt.Errorf("hyperparameter tuner champion policy: %w", err)
+	}
 	return t, nil
 }
 
@@ -340,6 +389,11 @@ func (t *HyperParameterTuner) SetOverride(ctx context.Context, fieldName string,
 	t.overrideMu.Unlock()
 
 	t.setActive(current)
+	if t.policy != nil {
+		if err := t.policy.EnsureChampionPolicy(ctx, current, []string{"forest:config_override:" + fieldName}); err != nil {
+			return fmt.Errorf("sync override policy: %w", err)
+		}
+	}
 	t.logger.Info("hyperparameter override applied",
 		"field", fieldName,
 		"value", value,
@@ -395,16 +449,24 @@ func (t *HyperParameterTuner) ObserveAndAdapt(ctx context.Context, obs Adaptatio
 	}
 
 	if t.adapt.proposed == nil {
-		// No trial — see if current performance warrants proposing one.
+		// No trial: policy candidates must be persisted through the
+		// policy engine. The legacy direct perturbation path is gone,
+		// so a missing policy engine simply disables adaptation rather
+		// than creating unverifiable runtime state.
 		if shouldPropose(t.adapt.recent) {
-			proposed := t.proposePerturbation(t.Get())
-			if proposed != nil {
-				t.adapt.proposed = proposed
+			candidate, err := t.policyCandidateFromRecentLocked(ctx)
+			if err != nil {
+				t.logger.Warn("forest policy candidate proposal failed", "err", err)
+				return
+			}
+			if candidate != nil {
+				t.adapt.proposed = candidate.HyperParameters.Clone()
+				t.adapt.policyCandidateID = candidate.ID
 				t.adapt.trialStart = time.Now().UTC()
 				t.adapt.proposedRecent = nil
-				t.logger.Info("hyperparameter A/B trial started",
+				t.logger.Info("forest policy A/B trial started",
 					"current_snapshot_id", t.Get().SnapshotID,
-					"proposed_snapshot_id", "pending",
+					"policy_candidate_id", candidate.ID,
 				)
 			}
 		}
@@ -421,14 +483,17 @@ func (t *HyperParameterTuner) ObserveAndAdapt(ctx context.Context, obs Adaptatio
 	proposedMean := meanCalibrationError(t.adapt.proposedRecent)
 
 	// Decision rule: promote proposed iff its mean is meaningfully
-	// lower (5% relative improvement) AND the difference is
-	// statistically significant via Welch's t-test at α=0.05.
-	relImprovement := (currentMean - proposedMean) / math.Max(currentMean, 1e-9)
-	if relImprovement >= 0.05 && welchSignificant(t.adapt.recent, t.adapt.proposedRecent, 0.05) {
-		t.promoteProposed(ctx)
+	// lower AND the difference is statistically significant, then
+	// delegate final activation to the policy engine. The policy
+	// engine can still reject the candidate if it lacks validation
+	// evidence or independent correctness/safety/cost/ecology
+	// support.
+	relImprovement := (currentMean - proposedMean) / math.Max(currentMean, 1/float64(policyCandidatePopulationLimit()*policyCandidatePopulationLimit()))
+	if relativeImprovementClearsGate(relImprovement) && welchSignificant(t.adapt.recent, t.adapt.proposedRecent, policyTrialAlpha()) {
+		t.promotePolicyCandidate(ctx)
 		return
 	}
-	if relImprovement <= -0.05 || time.Since(t.adapt.trialStart) > maxAdaptTrialDuration {
+	if relImprovement <= -policyRelativeImprovementThreshold() || time.Since(t.adapt.trialStart) > maxAdaptTrialDuration {
 		t.rejectProposed("relative improvement insufficient or trial timed out")
 	}
 }
@@ -446,9 +511,10 @@ func (t *HyperParameterTuner) SnapshotForTrial(seed uint32) (*HyperParameters, b
 	}
 	t.adapt.mu.Lock()
 	proposed := t.adapt.proposed
+	candidateID := t.adapt.policyCandidateID
 	t.adapt.mu.Unlock()
 
-	if proposed == nil {
+	if proposed == nil || candidateID == "" {
 		return t.Get(), false
 	}
 	// Deterministic 50/50 split keyed off the caller-supplied
@@ -460,91 +526,72 @@ func (t *HyperParameterTuner) SnapshotForTrial(seed uint32) (*HyperParameters, b
 	return t.Get(), false
 }
 
-// promoteProposed installs the current proposal as the new active
-// snapshot. Called with adapt.mu held.
-func (t *HyperParameterTuner) promoteProposed(ctx context.Context) {
-	proposed := t.adapt.proposed
-	if proposed == nil {
+func (t *HyperParameterTuner) policyCandidateFromRecentLocked(ctx context.Context) (*PolicyCandidate, error) {
+	if t.policy == nil {
+		return nil, nil
+	}
+	recent := append([]AdaptationObservation(nil), t.adapt.recent...)
+	return t.policy.ProposeCandidateFromObservations(ctx, t.Get(), recent)
+}
+
+// promotePolicyCandidate asks the policy engine to activate the
+// persisted candidate. Called with adapt.mu held.
+func (t *HyperParameterTuner) promotePolicyCandidate(ctx context.Context) {
+	if t.policy == nil || t.adapt.policyCandidateID == "" {
 		return
 	}
-	for field := range proposed.Provenance {
-		if proposed.Provenance[field] != SourceConfig {
-			proposed.Provenance[field] = SourceRuntimeAdapt
+	candidateID := t.adapt.policyCandidateID
+	champion := policyOutcomesFromObservations(candidateID, t.policy.activePolicyID(ctx), PolicyOutcomeArmChampion, t.adapt.recent)
+	challenger := policyOutcomesFromObservations(candidateID, candidateID, PolicyOutcomeArmChallenger, t.adapt.proposedRecent)
+	fitness := ComputePolicyFitness(champion, challenger)
+	promoted, err := t.policy.PromoteCandidate(ctx, candidateID, fitness)
+	if err != nil {
+		t.logger.Info("forest policy candidate rejected", "candidate_id", candidateID, "err", err)
+		t.resetPolicyTrialLocked()
+		return
+	}
+	for field := range promoted.Provenance {
+		if promoted.Provenance[field] != SourceConfig {
+			promoted.Provenance[field] = SourceRuntimeAdapt
 		}
 	}
-	proposed.SnapshotID = t.snapshotCounter.Add(1)
-	proposed.UpdatedAt = time.Now().UTC()
-	if err := proposed.Validate(); err != nil {
-		t.logger.Warn("proposed snapshot invalid; rejecting", "err", err)
-		t.rejectProposed("validation failed")
+	promoted.SnapshotID = t.snapshotCounter.Add(1)
+	promoted.UpdatedAt = time.Now().UTC()
+	if err := promoted.Validate(); err != nil {
+		t.logger.Warn("promoted policy snapshot invalid; rejecting", "err", err)
+		t.resetPolicyTrialLocked()
 		return
 	}
-	if err := t.store.Save(ctx, proposed); err != nil {
-		t.logger.Warn("promote: persist failed; in-memory swap proceeds", "err", err)
+	if err := t.store.Save(ctx, promoted); err != nil {
+		t.logger.Warn("promote policy: persist failed; in-memory swap proceeds", "err", err)
 	}
-	t.setActive(proposed)
-	t.logger.Info("hyperparameter snapshot promoted via runtime adaptation",
-		"snapshot_id", proposed.SnapshotID,
+	t.setActive(promoted)
+	t.logger.Info("forest policy promoted via runtime adaptation",
+		"snapshot_id", promoted.SnapshotID,
+		"policy_candidate_id", candidateID,
 		"trial_duration", time.Since(t.adapt.trialStart),
 	)
-	t.adapt.proposed = nil
-	t.adapt.recent = nil
-	t.adapt.proposedRecent = nil
+	t.resetPolicyTrialLocked()
 }
 
 // rejectProposed discards the current proposal and resets trial
 // state. Called with adapt.mu held.
 func (t *HyperParameterTuner) rejectProposed(reason string) {
-	t.logger.Info("hyperparameter A/B trial rejected", "reason", reason)
-	t.adapt.proposed = nil
-	t.adapt.proposedRecent = nil
-	t.adapt.trialStart = time.Time{}
+	if t.policy != nil && t.adapt.policyCandidateID != "" {
+		if err := t.policy.RejectCandidate(context.Background(), t.adapt.policyCandidateID, reason); err != nil {
+			t.logger.Debug("forest policy candidate rejection persist failed", "err", err)
+		}
+	}
+	t.logger.Info("forest policy A/B trial rejected", "reason", reason)
+	t.resetPolicyTrialLocked()
 }
 
-// proposePerturbation generates a candidate snapshot by perturbing
-// each fitted/runtime-adapted field by ±10% (continuous) or ±1
-// step (discrete). Direction is chosen to nudge against the
-// observed worst-case metric — for higher CalibrationError, we
-// nudge weights toward more conservative values; for higher
-// RegretFrac, we nudge ExplorationRate up.
-//
-// Returns nil if no perturbable fields are available (i.e., every
-// field is SourceConfig override).
-func (t *HyperParameterTuner) proposePerturbation(current *HyperParameters) *HyperParameters {
-	candidate := current.Clone()
-
-	avgRegret := 0.0
-	avgCal := 0.0
-	if len(t.adapt.recent) > 0 {
-		for _, o := range t.adapt.recent {
-			avgRegret += o.RegretFrac
-			avgCal += o.CalibrationError
-		}
-		avgRegret /= float64(len(t.adapt.recent))
-		avgCal /= float64(len(t.adapt.recent))
-	}
-
-	// Pick the most-actionable nudge given observed metric:
-	//   - high regret → bump exploration rate
-	//   - high calibration error → bump regularization
-	if avgRegret > 0.1 && current.Provenance["exploration_rate"] != SourceConfig {
-		candidate.ExplorationRate = clamp(candidate.ExplorationRate*1.10, 0.01, 0.30)
-	}
-	if avgCal > 0.15 && current.Provenance["base_score_l2_reg"] != SourceConfig {
-		candidate.BaseScoreL2Reg = clamp(candidate.BaseScoreL2Reg*1.10, 1e-5, 1.0)
-	}
-	if avgCal > 0.15 && current.Provenance["counterfactual_weight"] != SourceConfig {
-		// Reduce counterfactual influence when calibration is
-		// drifting — over-trusting weak labels is a common cause.
-		candidate.CounterfactualWeight = clamp(candidate.CounterfactualWeight*0.90, 0.05, 1.0)
-	}
-
-	// If we ended up with no actual change, return nil — no point
-	// running an A/B against an identical snapshot.
-	if hyperparameterValuesEqual(current, candidate) {
-		return nil
-	}
-	return candidate
+func (t *HyperParameterTuner) resetPolicyTrialLocked() {
+	t.adapt.proposed = nil
+	t.adapt.policyCandidateID = ""
+	t.adapt.recent = nil
+	t.adapt.proposedRecent = nil
+	t.adapt.trialStart = time.Time{}
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────
@@ -561,6 +608,49 @@ const minSamplesForAdaptDecision = 64
 // minSamplesForAdaptDecision after this long is in a workload
 // where adaptation isn't viable; reject and try again later.
 const maxAdaptTrialDuration = 6 * time.Hour
+
+func policyRelativeImprovementThreshold() float64 {
+	return 1 / float64(policyCandidatePopulationLimit())
+}
+
+func policyTrialAlpha() float64 {
+	return 1 / float64(policyCandidatePopulationLimit()*policyCandidatePopulationLimit())
+}
+
+func relativeImprovementClearsGate(relImprovement float64) bool {
+	return relImprovement >= policyRelativeImprovementThreshold()
+}
+
+func policyOutcomesFromObservations(candidateID, policyID, arm string, observations []AdaptationObservation) []PolicyOutcome {
+	outcomes := make([]PolicyOutcome, 0, len(observations))
+	for _, obs := range observations {
+		outcomes = append(outcomes, policyOutcomeFromObservation(candidateID, policyID, arm, obs))
+	}
+	return outcomes
+}
+
+func policyOutcomeFromObservation(candidateID, policyID, arm string, obs AdaptationObservation) PolicyOutcome {
+	return PolicyOutcome{
+		CandidateID:        candidateID,
+		PolicyID:           policyID,
+		Arm:                arm,
+		Correctness:        obs.Correctness,
+		Safety:             obs.Safety,
+		Cost:               obs.Cost,
+		Ecology:            obs.Ecology,
+		ValidationPassRate: obs.ValidationPassRate,
+		LatencyMicros:      obs.LatencyMicros,
+		ContradictionDelta: obs.ContradictionDelta,
+		SampleCount:        obs.SampleCount,
+		EvidenceRefs:       obs.EvidenceRefs,
+		ObservedAt:         obs.ObservedAt,
+		Metadata: map[string]any{
+			"calibration_error": obs.CalibrationError,
+			"regret_frac":       obs.RegretFrac,
+			"artifact_quality":  obs.ArtifactQuality,
+		},
+	}
+}
 
 // shouldPropose returns true when the active snapshot's recent
 // observations show consistently bad metrics — calibration error

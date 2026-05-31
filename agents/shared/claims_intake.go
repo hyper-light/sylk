@@ -91,33 +91,6 @@ type ClaimsIntakeConfig struct {
 	CancelRegistry        *claims.ClaimCancelRegistry
 }
 
-func shouldSuppressForwardedPromptEntry(role claims.ClaimsRole, entry *claims.GraphEntryPoint) bool {
-	if role.Has(claims.RoleObserver) || entry == nil || entry.Node.Claim == nil {
-		return false
-	}
-	claim := entry.Node.Claim
-	if claim.ActionType != claims.ActionTypePrompt {
-		return false
-	}
-	if claims.IssuerAgentID(claim.Relations) != "guide" {
-		return false
-	}
-	return claimHasTag(claim.Tags, "user_prompt")
-}
-
-func claimHasTag(tags []string, want string) bool {
-	want = strings.TrimSpace(want)
-	if want == "" {
-		return false
-	}
-	for _, tag := range tags {
-		if strings.TrimSpace(tag) == want {
-			return true
-		}
-	}
-	return false
-}
-
 func deliverExpectedPeerResultToContinuation(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) bool {
 	if cfg.ContinuationStore == nil || entry == nil || entry.Expectation == nil || entry.Delta == nil {
 		return false
@@ -892,35 +865,6 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				)
 				return
 			}
-			if shouldSuppressForwardedPromptEntry(role, entry) {
-				claimID := ""
-				if entry.Node.Claim != nil {
-					claimID = entry.Node.Claim.ID
-				}
-				slog.Info("claims_intake_suppressed_forwarded_prompt_entry",
-					"agent_id", cfg.AgentID,
-					"session_id", cfg.SessionID,
-					"role", role,
-					"claim_id", claimID,
-				)
-				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
-					append([]any{
-						"agent_id", cfg.AgentID,
-						"session_id", cfg.SessionID,
-						"role", role,
-						"reason", "suppressed_forwarded_prompt_entry",
-						"claim_id", claimID,
-					}, claims.DeltaDebugArgs(entry.Delta)...)...,
-				)
-				claims.TraceRouteFlowDelta("claims_route_flow_intake_on_resolved_stopped", entry.Delta,
-					"agent_id", cfg.AgentID,
-					"session_id", cfg.SessionID,
-					"role", role,
-					"reason", "suppressed_forwarded_prompt_entry",
-					"claim_id", claimID,
-				)
-				return
-			}
 			slog.Info("claims_intake_resolved",
 				"agent_id", cfg.AgentID,
 				"session_id", cfg.SessionID,
@@ -1358,6 +1302,9 @@ func ComposeClaimsEntryPrompt(entry *claims.GraphEntryPoint) string {
 			b.WriteString(c.Description + "\n\n")
 		}
 		b.WriteString("- **Status:** " + string(c.Status) + "\n")
+		if c.LifecycleStatus != "" {
+			b.WriteString("- **Lifecycle:** " + string(c.LifecycleStatus) + "\n")
+		}
 		b.WriteString("- **Action type:** " + string(c.ActionType) + "\n")
 		if issuer := claims.IssuerAgentID(c.Relations); issuer != "" {
 			b.WriteString("- **Issuer:** " + issuer + "\n")
@@ -1375,14 +1322,19 @@ func ComposeClaimsEntryPrompt(entry *claims.GraphEntryPoint) string {
 			}
 			b.WriteString("\n")
 		}
+		composeExpectedToolCalls(&b, "Expected subject tool calls", c.ExpectedToolCalls)
 		if len(c.Validations) > 0 {
 			b.WriteString("\n**Validations required:**\n")
 			for _, v := range c.Validations {
+				if v == nil {
+					continue
+				}
 				b.WriteString("- " + v.Description)
 				if v.QualityBar != "" {
 					b.WriteString(" (bar: " + v.QualityBar + ")")
 				}
-				b.WriteString("\n")
+				b.WriteString(" [id: `" + v.ID + "`, type: " + string(v.Type) + ", status: " + string(v.Status) + "]\n")
+				composeExpectedToolCalls(&b, "  Expected validation tool calls", v.ExpectedToolCalls)
 			}
 		}
 
@@ -1433,11 +1385,42 @@ func ComposeClaimsEntryPrompt(entry *claims.GraphEntryPoint) string {
 	}
 
 	b.WriteString("\n---\n\n")
-	b.WriteString("Process this event using your skills. Use `traverse` for more context, ")
-	b.WriteString("`post_action` to issue sub-claims, `submit_testaments` to respond, ")
-	b.WriteString("`evaluate_validation` to judge responses.\n")
+	b.WriteString("Process this event as first-class claims work. ")
+	b.WriteString("Use `query_board` or `traverse` for more graph context. ")
+	b.WriteString("If you are the subject of the claim, use `update_claim_progress`, perform the requested work and expected tool calls, then call `submit_testaments` with artifacts. ")
+	b.WriteString("If you are the issuer/evaluator receiving a testament, inspect the artifacts and call `evaluate_validation` for every pending validation you own. ")
+	b.WriteString("Use `post_action` only for explicit subclaims, consultations, challenges, handoffs, corrective work, or archival work. ")
+	b.WriteString("Errors are artifacts for testaments; do not drop them as prose-only failures.\n")
 
 	return b.String()
+}
+
+func composeExpectedToolCalls(b *strings.Builder, heading string, calls []claims.ExpectedToolCall) {
+	if b == nil || len(calls) == 0 {
+		return
+	}
+	b.WriteString("\n**" + heading + ":**\n")
+	for _, call := range calls {
+		b.WriteString("- `" + strings.TrimSpace(call.Tool) + "`")
+		if call.ID != "" {
+			b.WriteString(" id=`" + strings.TrimSpace(call.ID) + "`")
+		}
+		if call.Required {
+			b.WriteString(" required")
+		}
+		if purpose := strings.TrimSpace(call.Purpose); purpose != "" {
+			b.WriteString(" - " + purpose)
+		}
+		if len(call.ProducesArtifacts) > 0 {
+			b.WriteString(" produces=" + strings.Join(call.ProducesArtifacts, ","))
+		}
+		if len(call.Arguments) > 0 {
+			if raw, err := json.Marshal(call.Arguments); err == nil {
+				b.WriteString(" args=" + truncatePromptString(string(raw), 240))
+			}
+		}
+		b.WriteString("\n")
+	}
 }
 
 // composeValidationInstructions renders the parent claim's pending

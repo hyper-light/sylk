@@ -10,6 +10,7 @@ import (
 var (
 	archivalistBaseSystem            = prompts.MustLoad("archivalist", "system")
 	archivalistFabricAwareness       = prompts.MustLoad("shared", "fabric_awareness")
+	archivalistClaimsNative          = prompts.MustLoad("shared", "claims_native")
 	archivalistFabricAdvisory        = prompts.MustLoad("shared", "fabric_knowledge_advisory")
 	SummaryPromptTemplate            = prompts.MustLoad("archivalist", "summary")
 	MultiSourceSummaryPromptTemplate = prompts.MustLoad("archivalist", "multi_source_summary")
@@ -22,6 +23,7 @@ var (
 	DefaultSystemPrompt = strings.Join([]string{
 		archivalistBaseSystem,
 		archivalistFabricAwareness,
+		archivalistClaimsNative,
 		archivalistFabricAdvisory,
 	}, "\n\n---\n\n")
 )

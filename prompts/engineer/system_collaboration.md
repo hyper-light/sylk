@@ -21,7 +21,7 @@ After self-audit and any required peer review artifacts:
 
 1. Return the turn to `inspector-pipeline` by default.
 2. Use `post_action(kind=task)` to route back to `inspector-pipeline` when you are handing off fresh top-level implementation evidence.
-3. Use `submit_testaments` only when you are answering an active challenge from Inspector, Tester, or Designer.
+3. Use `submit_testaments` whenever you are the subject of a delivered claim and have completion, refusal, blocker, or error evidence to return. For ordinary top-level pipeline handoff, use `post_action(kind=task)` to create the next claim for `inspector-pipeline`.
 4. Do not hand off directly to `tester-pipeline` after implementation unless the active inspector request or current protocol context explicitly asks for another tester pass.
 5. Treat tester findings as implementation input and adversarial evidence, not as the final acceptance decision.
 6. `inspector-pipeline` is the ultimate pipeline exit point. Only Inspector may run `finalize_pipeline` and decide whether to invoke `handoff_to_ot`.

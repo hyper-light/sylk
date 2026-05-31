@@ -28,7 +28,8 @@ type Config struct {
 	MaxTraces    int
 	Booster      boosterConfig
 
-	ClaimProposalSink ClaimProposalSink
+	ClaimProposalSink   ClaimProposalSink
+	SkillArtifactWriter SkillArtifactWriter
 
 	ReplayDelay         time.Duration
 	SubstrateDebounce   time.Duration
@@ -290,15 +291,16 @@ type Config struct {
 
 // MemoryForest provides forest projection, retrieval, and learning services.
 type MemoryForest struct {
-	db            *sql.DB
-	contentStore  *ctxpkg.UniversalContentStore
-	searcher      *ctxpkg.TieredSearcher
-	logger        *slog.Logger
-	warmth        *WarmthStore
-	models        *learnedModelStore
-	booster       boosterConfig
-	proposalSink  ClaimProposalSink
-	neighborIndex NeighborIndex
+	db                  *sql.DB
+	contentStore        *ctxpkg.UniversalContentStore
+	searcher            *ctxpkg.TieredSearcher
+	logger              *slog.Logger
+	warmth              *WarmthStore
+	models              *learnedModelStore
+	booster             boosterConfig
+	proposalSink        ClaimProposalSink
+	skillArtifactWriter SkillArtifactWriter
+	neighborIndex       NeighborIndex
 
 	// tuner is the integrated hyperparameter system (see
 	// hyperparameters.go). Single source of truth for every
@@ -466,7 +468,7 @@ func New(cfg Config) (*MemoryForest, error) {
 	// snapshot, ensuring "Config explicitly set" and "workload-init
 	// fitted from my ledger" values flow into the field reads
 	// existing code uses.
-	tuner, err := NewHyperParameterTuner(runCtx, cfg.DB, logger)
+	tuner, err := NewHyperParameterTuner(runCtx, cfg.DB, logger, cfg.ClaimProposalSink)
 	if err != nil {
 		runCancel()
 		return nil, fmt.Errorf("forest: hyperparameter tuner init: %w", err)
@@ -488,6 +490,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		models:                           models,
 		booster:                          booster,
 		proposalSink:                     cfg.ClaimProposalSink,
+		skillArtifactWriter:              cfg.SkillArtifactWriter,
 		neighborIndex:                    cfg.NeighborIndex,
 		tuner:                            tuner,
 		runCtx:                           runCtx,

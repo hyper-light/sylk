@@ -19,6 +19,7 @@ var (
 	DesignerGuardrails     = prompts.MustLoad("designer", "system_guardrails")
 	DesignerCollaboration  = prompts.MustLoad("designer", "collaboration")
 	DesignerFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+	DesignerClaimsNative    = prompts.MustLoad("shared", "claims_native")
 
 	// DesignerLanguageToolingPreference encodes the priority order —
 	// task spec → fabric → codebase — that designer reads before
@@ -39,6 +40,8 @@ func DesignerSystemPrompt() string {
 	b.WriteString(DefaultSystemPrompt)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerFabricAwareness)
+	b.WriteString("\n\n")
+	b.WriteString(DesignerClaimsNative)
 	b.WriteString("\n\n")
 	b.WriteString(DesignerLanguageToolingPreference)
 	b.WriteString("\n\n")
@@ -61,6 +64,7 @@ func DesignerSystemPromptForContract(contract *shared.TaskExecutionContract) str
 	return joinPromptSections(
 		TaskSystemPrompt,
 		DesignerFabricAwareness, // promoted ahead of workflow
+		DesignerClaimsNative,
 		DesignerLanguageToolingPreference,
 		DesignerCollaboration,
 		DesignerGuardrails,

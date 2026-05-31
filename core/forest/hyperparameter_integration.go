@@ -46,7 +46,7 @@ import (
 // degrade gracefully — the tuner falls back to placeholders, and
 // the forest boots with an explicit warning logged.
 func (m *MemoryForest) initialiseTuner(ctx context.Context, cfg Config) error {
-	tuner, err := NewHyperParameterTuner(ctx, cfg.DB, m.logger)
+	tuner, err := NewHyperParameterTuner(ctx, cfg.DB, m.logger, cfg.ClaimProposalSink)
 	if err != nil {
 		return fmt.Errorf("forest: hyperparameter tuner init: %w", err)
 	}
@@ -288,6 +288,7 @@ func (m *MemoryForest) recordAdaptationObservationsForOutcome(ctx context.Contex
 			CalibrationError: calErr,
 			RegretFrac:       regret,
 			SampleCount:      1,
+			EvidenceRefs:     []string{"forest_retrieval_event:" + eventID},
 			ObservedAt:       now,
 		}, proposedInt != 0)
 	}

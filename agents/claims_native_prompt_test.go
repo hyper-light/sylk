@@ -16,7 +16,7 @@ import (
 	testerprompts "github.com/adalundhe/sylk/agents/tester/shared"
 )
 
-func TestAgentPromptsIncludeCarryForwardContinuityContract(t *testing.T) {
+func TestAgentPromptsIncludeClaimsNativeOperatingContract(t *testing.T) {
 	prompts := map[string]string{
 		"academic":                     academic.DefaultSystemPrompt,
 		"architect/default":            architect.DefaultSystemPrompt,
@@ -26,28 +26,31 @@ func TestAgentPromptsIncludeCarryForwardContinuityContract(t *testing.T) {
 		"archivalist":                  archivalist.DefaultSystemPrompt,
 		"designer/default":             designer.DesignerSystemPrompt(),
 		"designer/task":                designer.DesignerSystemPromptForContract(nil),
-		"engineer":                     engineer.DefaultEngineerSystemPrompt,
+		"engineer/default":             engineer.DefaultEngineerSystemPrompt,
+		"engineer/task":                engineer.EngineerSystemPromptForContract(nil),
 		"guide":                        guide.GuideSystemPrompt,
 		"inspector/global":             inspectorprompts.GlobalInspectorSystemPrompt(),
 		"inspector/pipeline":           inspectorprompts.PipelineInspectorSystemPrompt(),
 		"librarian":                    librarian.DefaultSystemPrompt,
-		"orchestrator":                 orchestrator.DefaultSystemPrompt,
+		"orchestrator/default":         orchestrator.DefaultSystemPrompt,
+		"orchestrator/conversation":    orchestrator.OrchestratorConversationSystemPrompt(),
 		"tester/global":                testerprompts.GlobalTesterSystemPrompt(),
 		"tester/pipeline":              testerprompts.PipelineTesterSystemPrompt(),
+		"tester/conversation":          testerprompts.TesterConversationSystemPrompt(),
 	}
 	for name, prompt := range prompts {
 		compact := strings.Join(strings.Fields(prompt), " ")
-		for _, want := range []string{"recall_forward", "carry_forward"} {
+		for _, want := range []string{
+			"Claims, Testaments, And Artifacts Operating Contract",
+			"Claims are first-class work inputs",
+			"expected_tool_calls",
+			"Errors are artifacts for testaments",
+			"submit_testaments",
+			"evaluate_validation",
+		} {
 			if !strings.Contains(compact, want) {
 				t.Fatalf("%s prompt missing %q", name, want)
 			}
-		}
-		if !strings.Contains(compact, "testaments and artifacts") &&
-			!strings.Contains(compact, "testaments/artifacts") {
-			t.Fatalf("%s prompt does not distinguish carried testaments/artifacts:\n%s", name, compact)
-		}
-		if strings.Contains(compact, "carry claims as evidence") {
-			t.Fatalf("%s prompt tells the agent to carry claims as evidence:\n%s", name, compact)
 		}
 	}
 }

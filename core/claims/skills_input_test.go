@@ -204,6 +204,44 @@ func TestClaimInput_AcceptsAllLenientShapesTogether(t *testing.T) {
 	}
 }
 
+func TestClaimInput_AcceptsExpectedToolCallsOnClaimAndValidation(t *testing.T) {
+	raw := []byte(`{
+		"title": "Inspect workspace",
+		"description": "Check project shape",
+		"subject": "librarian",
+		"expected_tool_calls": [{
+			"tool": "workspace_read",
+			"arguments": {"op": "glob", "path": "."},
+			"purpose": "list top-level files",
+			"required": true,
+			"produces_artifacts": ["workspace_observation"]
+		}],
+		"validations": [{
+			"description": "Verify the observation",
+			"quality_bar": "artifact contains root listing",
+			"type": "inspection",
+			"expected_tool_calls": [{
+				"tool": "workspace_read",
+				"arguments": {"op": "read", "path": "go.mod"},
+				"required": true
+			}]
+		}]
+	}`)
+	var ci claimInput
+	if err := json.Unmarshal(raw, &ci); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(ci.ExpectedToolCalls) != 1 || ci.ExpectedToolCalls[0].Tool != "workspace_read" {
+		t.Fatalf("claim expected tool calls = %+v", ci.ExpectedToolCalls)
+	}
+	if len(ci.Validations) != 1 || len(ci.Validations[0].ExpectedToolCalls) != 1 {
+		t.Fatalf("validation expected tool calls = %+v", ci.Validations)
+	}
+	if ci.Validations[0].ExpectedToolCalls[0].Arguments["op"] != "read" {
+		t.Fatalf("validation expected tool args = %#v", ci.Validations[0].ExpectedToolCalls[0].Arguments)
+	}
+}
+
 func TestTestamentInput_AcceptsAllLenientShapesTogether(t *testing.T) {
 	raw := []byte(`{
 		"claim_id": "clm_123",

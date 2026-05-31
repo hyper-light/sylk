@@ -5,6 +5,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/versioning"
+	"github.com/adalundhe/sylk/prompts"
 )
 
 // =============================================================================
@@ -104,9 +105,11 @@ Use the Memory Forest when governance decisions should be grounded in precedent 
 - **guardian_forest_consult(purpose=evaluate_scope_risk, query=…)**: recall prior conflicts, constraints, and risky scope expansions before approving or escalating
 - **guardian_forest_consult(purpose=get_approval_precedents, query=…)**: recall prior approved or rejected outcomes relevant to the current safety or approval decision`
 
+var guardianClaimsNative = prompts.MustLoad("shared", "claims_native")
+
 // buildSystemPrompt assembles the system prompt for a given intent.
 func (g *Guardian) buildSystemPrompt(intent GuardianIntent) string {
-	modules := []string{guardianCoreIdentity, guardianSafetyDomain}
+	modules := []string{guardianCoreIdentity, guardianClaimsNative, guardianSafetyDomain}
 
 	switch intent {
 	case IntentReport:

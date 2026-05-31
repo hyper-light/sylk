@@ -18,6 +18,7 @@ import (
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/handoff"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/prompts"
 	"github.com/google/uuid"
 )
 
@@ -61,6 +62,8 @@ const (
 	scribeMaxWorkstreams = 64
 	scribeWorkstreamTTL  = 15 * time.Minute
 )
+
+var scribeClaimsNative = prompts.MustLoad("shared", "claims_native")
 
 // Scribe is a per-agent summarization sidecar that maintains running
 // commentary on a parent agent's work and forwards it to the Archivalist
@@ -594,6 +597,8 @@ func scribeSystemPrompt(parentAgentType string, forestEnabled bool) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are a Scribe, a silent observer maintaining high-signal notes on a %s agent's work. Your output must be stored in the Archivalist for long-term memory.\n\n", parentAgentType)
 	b.WriteString(focus)
+	b.WriteString("\n\n")
+	b.WriteString(scribeClaimsNative)
 	b.WriteString("\n\n")
 	b.WriteString("You operate through tools, not free-text completion.\n")
 	if forestEnabled {
