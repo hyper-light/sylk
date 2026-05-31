@@ -95,6 +95,20 @@ func TestBootstrapBootModelViewCoversFullViewport(t *testing.T) {
 	}
 }
 
+func TestBootstrapBootModelViewUsesTerminalSurfaceBackground(t *testing.T) {
+	model := newBootstrapBootModel(context.Background(), nil, nil)
+	model.width = 96
+	model.height = 24
+	model.health = boot.BootHealth{Phases: []boot.BootPhaseHealth{
+		{Phase: boot.BootPhaseDurableSubstrate, Outcome: string(claims.ClaimLifecycleSatisfied)},
+	}}
+
+	view := model.View()
+	if strings.Contains(view, "\x1b[48;2;") {
+		t.Fatalf("View() paints explicit truecolor backgrounds; boot surface should inherit the main TUI terminal background")
+	}
+}
+
 func TestFitBootstrapTextBoundsOutputWidth(t *testing.T) {
 	got := fitBootstrapText("abcdefghijklmnopqrstuvwxyz", 8)
 	if len([]rune(got)) != 8 {

@@ -2,11 +2,40 @@ package knowledgeruntime
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 )
+
+func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotCreateMissingBleve(t *testing.T) {
+	projectRoot := t.TempDir()
+	sd := sylkdir.New(projectRoot)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("init sylkdir: %v", err)
+	}
+	gm := sylkdir.NewGlobalMetaFromSylkDir(sd)
+	if err := gm.Load(); err != nil {
+		t.Fatalf("load global meta: %v", err)
+	}
+
+	backend := NewCommittedKnowledgeBackend(projectRoot, nil)
+	defer backend.Close()
+
+	err := backend.RefreshExistingFromDisk(context.Background())
+	if !errors.Is(err, sylkdir.ErrBleveHeadUnavailable) {
+		t.Fatalf("RefreshExistingFromDisk error = %v, want ErrBleveHeadUnavailable", err)
+	}
+	blevePath := filepath.Join(sylkdir.NewGlobalVersionBleveStore(sd, gm.GetHead()).HeadBlevePath(), "documents.bleve")
+	if _, statErr := os.Stat(blevePath); statErr == nil {
+		t.Fatalf("RefreshExistingFromDisk created missing Bleve index at %s", blevePath)
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("stat missing Bleve index: %v", statErr)
+	}
+}
 
 func TestCommittedKnowledgeBackend_UpsertTextDocument(t *testing.T) {
 	projectRoot := t.TempDir()

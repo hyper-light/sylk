@@ -437,11 +437,11 @@ func TestFindLastBreakPoint(t *testing.T) {
 		s        string
 		expected int
 	}{
-		{"hello world", 5},           // space at position 5
-		{"hello\nworld", 5},          // newline at position 5
-		{"no break points", 8},       // last space
-		{"word", -1},                 // no break points
-		{"hello world\ntest", 11},    // prefer newline over space
+		{"hello world", 5},        // space at position 5
+		{"hello\nworld", 5},       // newline at position 5
+		{"no break points", 8},    // last space
+		{"word", -1},              // no break points
+		{"hello world\ntest", 11}, // prefer newline over space
 	}
 
 	for _, tc := range tests {

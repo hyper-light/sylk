@@ -3,6 +3,7 @@ package sylkdir
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,10 @@ import (
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/blevesearch/bleve/v2"
 )
+
+// ErrBleveHeadUnavailable is returned by read-only HEAD open paths when the
+// committed HEAD Bleve index is missing or cannot be opened without recovery.
+var ErrBleveHeadUnavailable = errors.New("global version bleve store: head bleve unavailable")
 
 // GlobalVersionBleveStore manages per-version Bleve indices for the global knowledge graph.
 // Each version has its own Bleve index at knowledge/versions/<version>/bleve/documents.bleve.
@@ -70,6 +75,43 @@ func (gvbs *GlobalVersionBleveStore) OpenHead() error {
 	}
 
 	return gvbs.openOrRebuildLocked()
+}
+
+// OpenExistingHead opens the HEAD version's Bleve index only if it already
+// exists and can be opened as-is. It never rebuilds, creates, deletes, or
+// otherwise mutates the Bleve directory, so startup readers can use it without
+// turning a missing/corrupt derived index into boot-time write work.
+func (gvbs *GlobalVersionBleveStore) OpenExistingHead() error {
+	gvbs.mu.Lock()
+	defer gvbs.mu.Unlock()
+
+	if gvbs.store != nil && gvbs.store.Manager() != nil {
+		return nil
+	}
+
+	return gvbs.openExistingLocked()
+}
+
+// openExistingLocked opens an existing HEAD Bleve without repair.
+// Must be called with gvbs.mu held.
+func (gvbs *GlobalVersionBleveStore) openExistingLocked() error {
+	blevePath := gvbs.BlevePath(gvbs.head)
+	bleveDBPath := filepath.Join(blevePath, "documents.bleve")
+
+	if _, err := os.Stat(bleveDBPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrBleveHeadUnavailable
+		}
+		return fmt.Errorf("%w: stat %s: %v", ErrBleveHeadUnavailable, bleveDBPath, err)
+	}
+
+	store := NewBleveStoreAtPath(blevePath)
+	if err := store.Open(); err != nil {
+		_ = store.Close()
+		return fmt.Errorf("%w: open %s: %v", ErrBleveHeadUnavailable, blevePath, err)
+	}
+	gvbs.store = store
+	return nil
 }
 
 // openOrRebuildLocked opens or rebuilds the HEAD Bleve.
@@ -175,7 +217,6 @@ func (gvbs *GlobalVersionBleveStore) SnapshotBleve(parent, target SemanticVersio
 	gvbs.head = target
 	return gvbs.rebuildLocked()
 }
-
 
 // SnapshotOrPromote prepares the target version's Bleve using the best available source.
 // On incremental boot, copies the parent global Bleve (contains all prior docs).
@@ -306,4 +347,3 @@ func (gvbs *GlobalVersionBleveStore) RawIndex() bleve.Index {
 	}
 	return gvbs.store.Manager().RawIndex()
 }
-

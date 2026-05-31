@@ -207,6 +207,7 @@ func (s *KnowledgeSyncService) loop(ctx context.Context) {
 func (s *KnowledgeSyncService) runSync(ctx context.Context) error {
 	result, err := s.cfg.RunBoot(ctx)
 	if err != nil {
+		s.cfg.Store.NotifyProgressDone()
 		return err
 	}
 

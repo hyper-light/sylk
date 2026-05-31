@@ -253,7 +253,7 @@ func TestRegisterSkillsForAgent_Engineer(t *testing.T) {
 	if registry.Get("retrieve_context") == nil {
 		t.Error("engineer should receive universal skills")
 	}
-	if registry.Get("forest.retrieve_evidence") == nil {
+	if registry.Get("forest_retrieve_evidence") == nil {
 		t.Error("engineer should receive forest evidence skill")
 	}
 	if registry.Get("engineer_forest_consult") == nil {
@@ -277,7 +277,7 @@ func TestRegisterSkillsForAgent_Guardian(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest.review_bridge") == nil {
+	if registry.Get("forest_review_bridge") == nil {
 		t.Error("guardian should receive bridge review skill")
 	}
 	if registry.Get("guardian_forest_consult") == nil {
@@ -298,7 +298,7 @@ func TestRegisterSkillsForAgent_Scribe(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest.retrieve_evidence") == nil {
+	if registry.Get("forest_retrieve_evidence") == nil {
 		t.Error("scribe agents should receive forest evidence skill")
 	}
 	if registry.Get("scribe_forest_consult") == nil {
@@ -319,7 +319,7 @@ func TestRegisterSkillsForAgent_Architect(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest.suggest_validations") == nil {
+	if registry.Get("forest_suggest_validations") == nil {
 		t.Error("architect should receive validation suggestion skill")
 	}
 	if registry.Get("architect_forest_consult") == nil {
@@ -341,7 +341,7 @@ func TestRegisterSkillsForAgent_Inspector(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest.review_contradiction") == nil {
+	if registry.Get("forest_review_contradiction") == nil {
 		t.Error("inspector should receive contradiction review skill")
 	}
 	if registry.Get("inspector_forest_consult") == nil {
@@ -366,7 +366,7 @@ func TestRegisterSkillsForAgent_Tester(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest.suggest_validations") == nil {
+	if registry.Get("forest_suggest_validations") == nil {
 		t.Error("tester should receive validation suggestion skill")
 	}
 	if registry.Get("tester_forest_consult") == nil {
@@ -569,7 +569,7 @@ func TestIsAdaptiveRetrievalSkill(t *testing.T) {
 		expected bool
 	}{
 		{"retrieve_context", true},
-		{"forest.retrieve_evidence", true},
+		{"forest_retrieve_evidence", true},
 		{"librarian_search_codebase", true},
 		{"archivalist_search_sessions", true},
 		{"academic_search_research", true},

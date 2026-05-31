@@ -1176,6 +1176,15 @@ func acknowledgeClaimPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDelta)
 	if claimID == "" {
 		return true
 	}
+	if !delta.DeliveredTo(cfg.AgentID) {
+		claims.TraceRouteFlowDelta("claims_route_flow_intake_claim_receipt_ack_skipped", delta,
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", claimID,
+			"reason", "not_delivered_to_agent",
+		)
+		return false
+	}
 	claims.TraceRouteFlowDelta("claims_route_flow_intake_claim_receipt_ack_start", delta,
 		"agent_id", cfg.AgentID,
 		"session_id", cfg.SessionID,
@@ -1212,6 +1221,16 @@ func acknowledgeTestamentPosted(cfg ClaimsIntakeConfig, delta claims.CanonicalDe
 	testamentID := strings.TrimSpace(delta.TestamentID())
 	if testamentID == "" {
 		return true
+	}
+	if !delta.DeliveredTo(cfg.AgentID) {
+		claims.TraceRouteFlowDelta("claims_route_flow_intake_testament_receipt_ack_skipped", delta,
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"claim_id", strings.TrimSpace(delta.ClaimID()),
+			"testament_id", testamentID,
+			"reason", "not_delivered_to_agent",
+		)
+		return false
 	}
 	claims.TraceRouteFlowDelta("claims_route_flow_intake_testament_receipt_ack_start", delta,
 		"agent_id", cfg.AgentID,

@@ -154,7 +154,7 @@ func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
 }
 
 func NewForestRetrieveEvidenceSkill(deps *RetrievalDependencies) *skills.Skill {
-	return skills.NewSkill("forest.retrieve_evidence").
+	return skills.NewSkill("forest_retrieve_evidence").
 		Description("Retrieve evidence-backed ForestPackets with node, cluster, artifact, validation, cursor, risk, and counter-evidence refs.").
 		Domain(RetrievalDomain).
 		Keywords("forest", "evidence", "cursor", "validation", "artifact").
@@ -172,7 +172,7 @@ func NewForestRetrieveEvidenceSkill(deps *RetrievalDependencies) *skills.Skill {
 }
 
 func NewForestSuggestValidationsSkill(deps *RetrievalDependencies) *skills.Skill {
-	return skills.NewSkill("forest.suggest_validations").
+	return skills.NewSkill("forest_suggest_validations").
 		Description("Suggest validation needs from ForestPackets, quarantine state, and missing validation evidence.").
 		Domain(RetrievalDomain).
 		Keywords("forest", "validation", "suggest", "evidence").
@@ -192,7 +192,7 @@ func NewForestSuggestValidationsSkill(deps *RetrievalDependencies) *skills.Skill
 }
 
 func NewForestProposeClaimSkill(deps *RetrievalDependencies) *skills.Skill {
-	return skills.NewSkill("forest.propose_claim").
+	return skills.NewSkill("forest_propose_claim").
 		Description("Create a proposal-only forest claim artifact with evidence refs; cannot install skills or alter permissions.").
 		Domain(RetrievalDomain).
 		Keywords("forest", "claim", "proposal", "remediation").

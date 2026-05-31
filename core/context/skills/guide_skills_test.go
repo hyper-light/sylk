@@ -428,12 +428,12 @@ func TestExplainConcept_WithExplainer(t *testing.T) {
 	deps := &GuideDependencies{
 		ConceptExplainer: &mockConceptExplainer{
 			explanation: &ConceptExplanation{
-				Concept:     "dependency injection",
-				Explanation: "DI is a design pattern...",
-				KeyPoints:   []string{"Decouples components", "Improves testability"},
-				CodeExamples: []string{"func New(dep Dep) *Service {}"},
+				Concept:       "dependency injection",
+				Explanation:   "DI is a design pattern...",
+				KeyPoints:     []string{"Decouples components", "Improves testability"},
+				CodeExamples:  []string{"func New(dep Dep) *Service {}"},
 				RelatedTopics: []string{"inversion of control"},
-				TokenCount:  150,
+				TokenCount:    150,
 			},
 		},
 	}

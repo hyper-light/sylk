@@ -202,6 +202,12 @@ func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
 	}
 }
 
+// NotifyProgressDone forwards a terminal progress event to clear any visible
+// pipeline progress when boot exits through a degraded or no-op path.
+func (ks *KnowledgeStore) NotifyProgressDone() {
+	ks.NotifyProgress("done", 1, 1)
+}
+
 // PromotePartial atomically sets the bleve searcher on the coordinator and
 // transitions to ReadinessPartial. The caller builds the searcher and adapter
 // (in cmd/tui.go) to avoid import cycles.

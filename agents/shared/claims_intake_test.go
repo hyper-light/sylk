@@ -84,7 +84,7 @@ func TestClaimsIntakeAcknowledgesClaimPostedBeforeProcessing(t *testing.T) {
 	}
 }
 
-func TestClaimsIntakeReceiptFailureStopsProcessing(t *testing.T) {
+func TestClaimsIntakeSkipsReceiptForUndeliveredClaim(t *testing.T) {
 	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
 		BoardID:   "board-intake-receipt-failed",
 		SessionID: "sess-intake-receipt-failed",
@@ -119,8 +119,8 @@ func TestClaimsIntakeReceiptFailureStopsProcessing(t *testing.T) {
 	if !ok {
 		t.Fatalf("claim %q not found", claimID)
 	}
-	if stored.LifecycleStatus != claims.ClaimLifecycleReceiptFailed {
-		t.Fatalf("lifecycle = %q, want %q", stored.LifecycleStatus, claims.ClaimLifecycleReceiptFailed)
+	if stored.LifecycleStatus != claims.ClaimLifecyclePosted {
+		t.Fatalf("lifecycle = %q, want %q", stored.LifecycleStatus, claims.ClaimLifecyclePosted)
 	}
 }
 

@@ -10,13 +10,13 @@ import (
 // genericForestSkillNames lists the ForestPacket-native query and governance
 // surface for every agent's visible catalog.
 var genericForestSkillNames = []string{
-	"forest.retrieve_evidence",
-	"forest.suggest_validations",
-	"forest.propose_claim",
-	"forest.review_contradiction",
-	"forest.review_bridge",
-	"forest.review_skill_candidate",
-	"forest.record_outcome",
+	"forest_retrieve_evidence",
+	"forest_suggest_validations",
+	"forest_propose_claim",
+	"forest_review_contradiction",
+	"forest_review_bridge",
+	"forest_review_skill_candidate",
+	"forest_record_outcome",
 }
 
 // forestMutatingSkillNames lists the write-side forest skill.
@@ -24,8 +24,8 @@ var genericForestSkillNames = []string{
 // deserve their own catalog entry rather than hiding inside the
 // read verb's op enum.
 var forestMutatingSkillNames = []string{
-	"forest.propose_claim",
-	"forest.record_outcome",
+	"forest_propose_claim",
+	"forest_record_outcome",
 }
 
 // NormalizeAdaptiveAgentType maps runtime agent identifiers to the role family
@@ -57,10 +57,10 @@ func registerGenericForestSkills(registry *skills.Registry, deps *RetrievalDepen
 		NewForestRetrieveEvidenceSkill(deps),
 		NewForestSuggestValidationsSkill(deps),
 		NewForestProposeClaimSkill(deps),
-		NewForestReviewSkill("forest.review_contradiction", "Review contradiction evidence and quarantine state for a claim, artifact, or cluster.", deps),
-		NewForestReviewSkill("forest.review_bridge", "Review bridge-node risk and cross-cluster evidence before a context crossing.", deps),
-		NewForestReviewSkill("forest.review_skill_candidate", "Review skill-candidate evidence, validation needs, and quarantine state.", deps),
-		NewForestRecordOutcomeNamedSkill("forest.record_outcome", deps),
+		NewForestReviewSkill("forest_review_contradiction", "Review contradiction evidence and quarantine state for a claim, artifact, or cluster.", deps),
+		NewForestReviewSkill("forest_review_bridge", "Review bridge-node risk and cross-cluster evidence before a context crossing.", deps),
+		NewForestReviewSkill("forest_review_skill_candidate", "Review skill-candidate evidence, validation needs, and quarantine state.", deps),
+		NewForestRecordOutcomeNamedSkill("forest_record_outcome", deps),
 	} {
 		if err := registry.Register(skill); err != nil {
 			return fmt.Errorf("failed to register %s: %w", skill.Name, err)

@@ -501,6 +501,8 @@ type bootstrapPhase4 struct {
 	modelStore             *agentpkg.AgentModelStore
 	modelSwapper           modelSwapperFunc
 	knowledgeSync          *librarian.KnowledgeSyncService
+	knowledgeSyncInitial   atomic.Bool
+	knowledgeSyncStartOnce sync.Once
 	phase4Done             chan struct{}
 	knowledgeBootStart     chan struct{}
 	knowledgeBootStartOnce sync.Once
@@ -517,6 +519,21 @@ func (p *bootstrapPhase4) StartKnowledgeBoot() {
 		startupTrace("knowledge_boot_release_close_start")
 		close(p.knowledgeBootStart)
 		startupTrace("knowledge_boot_release_close_done")
+	})
+}
+
+func (p *bootstrapPhase4) RequestKnowledgeSyncInitialRun() {
+	if p != nil {
+		p.knowledgeSyncInitial.Store(true)
+	}
+}
+
+func (p *bootstrapPhase4) StartKnowledgeSyncAfterBoot(phase1 *bootstrapPhase1) {
+	if p == nil {
+		return
+	}
+	p.knowledgeSyncStartOnce.Do(func() {
+		startLibrarianKnowledgeSync(phase1, p, p.knowledgeSyncInitial.Load())
 	})
 }
 
@@ -794,8 +811,10 @@ type bleveStoreCloser struct {
 
 func (c *bleveStoreCloser) Close() error { return c.store.CloseAll() }
 
-// buildBleveSearcher opens Bleve at the HEAD version and returns a ready-to-use
-// BleveSearcher plus a Closer for cleanup. Called inside the boot goroutine.
+// buildBleveSearcher opens an existing Bleve index at the HEAD version and
+// returns a ready-to-use BleveSearcher plus a Closer for cleanup. It never
+// rebuilds the index; startup callers must not turn read availability checks
+// into boot-time write work.
 func buildBleveSearcher(projectRoot string) (*query.BleveSearcher, io.Closer, error) {
 	sd := sylkdir.New(projectRoot)
 	meta := sylkdir.NewGlobalMetaFromSylkDir(sd)
@@ -805,8 +824,8 @@ func buildBleveSearcher(projectRoot string) (*query.BleveSearcher, io.Closer, er
 	head := meta.GetHead()
 
 	bleveStore := sylkdir.NewGlobalVersionBleveStore(sd, head)
-	if err := bleveStore.OpenHead(); err != nil {
-		return nil, nil, fmt.Errorf("open head bleve: %w", err)
+	if err := bleveStore.OpenExistingHead(); err != nil {
+		return nil, nil, fmt.Errorf("open existing head bleve: %w", err)
 	}
 
 	adapter := &globalBleveAdapter{store: bleveStore}
@@ -1993,6 +2012,7 @@ func startLibrarianKnowledgeSync(phase1 *bootstrapPhase1, phase4 *bootstrapPhase
 	gitRes := phase1.gitSubsRef.Load()
 	if gitRes == nil || gitRes.watcher == nil {
 		slog.Warn("librarian knowledge sync unavailable", "reason", "git watcher unavailable")
+		finishKnowledgeProgress(phase1, "librarian_sync_watcher_unavailable")
 		return
 	}
 	syncSvc, err := librarian.NewKnowledgeSyncService(librarian.KnowledgeSyncConfig{
@@ -2006,13 +2026,23 @@ func startLibrarianKnowledgeSync(phase1 *bootstrapPhase1, phase4 *bootstrapPhase
 	})
 	if err != nil {
 		slog.Warn("librarian knowledge sync setup failed", "error", err)
+		finishKnowledgeProgress(phase1, "librarian_sync_setup_failed")
 		return
 	}
 	if err := syncSvc.Start(); err != nil {
 		slog.Warn("librarian knowledge sync start failed", "error", err)
+		finishKnowledgeProgress(phase1, "librarian_sync_start_failed")
 		return
 	}
 	phase4.knowledgeSync = syncSvc
+}
+
+func finishKnowledgeProgress(phase1 *bootstrapPhase1, reason string) {
+	if phase1 == nil || phase1.knowledgeStore == nil {
+		return
+	}
+	startupTrace("knowledge_boot_progress_done", "reason", reason)
+	phase1.knowledgeStore.NotifyProgressDone()
 }
 
 func schedulePhase4Activation(
@@ -2453,6 +2483,7 @@ func startBootstrapPhase4(
 			return
 		}
 		slog.Info("bootstrap phase 4 background complete", "elapsed", time.Since(phase4Start))
+		phase4.StartKnowledgeSyncAfterBoot(phase1)
 		close(phase4.phase4Done)
 	}
 
@@ -2540,67 +2571,39 @@ func startBootstrapPhase4(
 		return nil
 	})
 	// Knowledge boot emits user-visible progress through KnowledgeStore.
-	// Keep these phase-4 workers registered for shutdown accounting, but
-	// release them only after the TUI has attached its progress observer.
+	// Startup only opens already-materialized committed state. Mutating
+	// rebuild/sync work is started by phase4Finish after every boot process
+	// in this phase has completed, so .sylk's writer lock never gates the TUI.
 	schedulePhase4Task(phase1.scope, "phase4-knowledge-boot", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
 		if !phase4.waitForKnowledgeBootStart(bgCtx) {
 			return nil
 		}
-		startupTrace("knowledge_boot_pipeline_start")
-		result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
-			ProjectRoot: phase1.projectRoot,
-			Logger:      phase4.bootLogger,
-			OnProgress: func(phase string, current, total int64) {
-				startupTrace("knowledge_boot_pipeline_progress", "phase", phase, "current", current, "total", total)
-				phase1.progress.ReportKnowledgeProgress(phase, current, total)
-				phase1.knowledgeStore.NotifyProgress(phase, current, total)
-			},
-			Scope: phase1.scope,
-		})
-		if err != nil {
-			startupTrace("knowledge_boot_pipeline_error", "error", err.Error())
-			phase1.progress.ReportError("knowledge boot", err)
-			slog.Warn("knowledge boot failed (non-critical)", "error", err)
-			startLibrarianKnowledgeSync(phase1, phase4, true)
-			return nil
-		}
-		startupTrace("knowledge_boot_pipeline_done",
-			"files_processed", result.FilesProcessed,
-			"docs_created", result.DocsCreated,
-			"vectors_created", result.VectorsCreated,
-			"background_indexer", result.BackgroundIndexer != nil,
-		)
+		startupTrace("knowledge_boot_readonly_start")
+		phase1.progress.ReportKnowledgeProgress("setup", 0, 1)
+		phase1.knowledgeStore.NotifyProgress("setup", 0, 1)
 		backend := phase1.knowledgeBackend
 		if backend == nil {
 			startupTrace("knowledge_boot_backend_missing")
 			slog.Warn("knowledge backend unavailable (non-critical)")
-			startLibrarianKnowledgeSync(phase1, phase4, false)
+			finishKnowledgeProgress(phase1, "backend_missing")
 			return nil
 		}
-		var refreshErr error
-		if bgIdx := result.BackgroundIndexer; bgIdx != nil && bgIdx.BleveStore() != nil {
-			refreshErr = backend.RefreshWithBleveStore(bgCtx, bgIdx.BleveStore())
-		} else {
-			refreshErr = backend.RefreshFromDisk(bgCtx)
-		}
-		if refreshErr != nil {
+		if refreshErr := backend.RefreshExistingFromDisk(bgCtx); refreshErr != nil {
 			startupTrace("knowledge_boot_backend_refresh_error", "error", refreshErr.Error())
 			slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
-			startLibrarianKnowledgeSync(phase1, phase4, true)
+			finishKnowledgeProgress(phase1, "backend_refresh_error")
+			if bgCtx.Err() == nil {
+				phase4.RequestKnowledgeSyncInitialRun()
+			}
 			return nil
 		}
 		startupTrace("knowledge_boot_promote_partial_start")
-		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), result.BackgroundIndexer, backend)
+		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), nil, backend)
 		startupTrace("knowledge_boot_promote_partial_done")
-		startLibrarianKnowledgeSync(phase1, phase4, false)
+		phase1.knowledgeStore.PromoteFull()
+		finishKnowledgeProgress(phase1, "readonly_ready")
+		startupTrace("knowledge_boot_readonly_done")
 		return nil
-	})
-	schedulePhase4Task(phase1.scope, "phase4-bleve-ready", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
-		if !phase4.waitForKnowledgeBootStart(bgCtx) {
-			return nil
-		}
-		startupTrace("knowledge_boot_bleve_ready_wait_start")
-		return waitForBootBleveReady(bgCtx, phase1.knowledgeStore)
 	})
 
 	return phase4, nil

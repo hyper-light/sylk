@@ -209,6 +209,32 @@ func TestKnowledgeStore_SetProgressObserverDoesNotReplaySynchronously(t *testing
 	}
 }
 
+func TestKnowledgeStore_NotifyProgressDoneEmitsTerminalProgress(t *testing.T) {
+	ks := NewKnowledgeStore(nil, nil)
+	defer ks.Close()
+
+	notified := make(chan struct {
+		phase        string
+		currentTotal [2]int64
+	}, 1)
+	ks.SetProgressObserver(func(phase string, current, total int64) {
+		notified <- struct {
+			phase        string
+			currentTotal [2]int64
+		}{phase: phase, currentTotal: [2]int64{current, total}}
+	})
+	ks.NotifyProgressDone()
+
+	select {
+	case event := <-notified:
+		if event.phase != "done" || event.currentTotal != [2]int64{1, 1} {
+			t.Fatalf("progress done event = %+v, want done 1/1", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for progress done event")
+	}
+}
+
 func TestKnowledgeStore_NotifiesProgressOutsideMutex(t *testing.T) {
 	ks := NewKnowledgeStore(nil, nil)
 	defer ks.Close()

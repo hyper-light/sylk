@@ -2,6 +2,9 @@ package sylkdir
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/adalundhe/sylk/core/search"
@@ -26,6 +29,66 @@ func TestGlobalVersionBleveStoreOpenClose(t *testing.T) {
 
 	if err := gvbs.CloseAll(); err != nil {
 		t.Fatalf("CloseAll: %v", err)
+	}
+}
+
+func TestGlobalVersionBleveStoreOpenExistingHeadOpensExistingIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	gm := NewGlobalMetaFromSylkDir(sd)
+	if err := gm.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	head := gm.GetHead()
+
+	writer := NewGlobalVersionBleveStore(sd, head)
+	if err := writer.OpenHead(); err != nil {
+		t.Fatalf("OpenHead: %v", err)
+	}
+	if err := writer.CloseAll(); err != nil {
+		t.Fatalf("CloseAll writer: %v", err)
+	}
+
+	reader := NewGlobalVersionBleveStore(sd, head)
+	if err := reader.OpenExistingHead(); err != nil {
+		t.Fatalf("OpenExistingHead: %v", err)
+	}
+	defer reader.CloseAll()
+	if _, err := reader.DocumentCount(); err != nil {
+		t.Fatalf("DocumentCount: %v", err)
+	}
+}
+
+func TestGlobalVersionBleveStoreOpenExistingHeadDoesNotCreateMissingIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	gm := NewGlobalMetaFromSylkDir(sd)
+	if err := gm.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	gvbs := NewGlobalVersionBleveStore(sd, gm.GetHead())
+	bleveDBPath := filepath.Join(gvbs.HeadBlevePath(), "documents.bleve")
+	if _, err := os.Stat(bleveDBPath); err == nil {
+		t.Fatalf("test setup unexpectedly created %s", bleveDBPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat missing index: %v", err)
+	}
+
+	err := gvbs.OpenExistingHead()
+	if !errors.Is(err, ErrBleveHeadUnavailable) {
+		t.Fatalf("OpenExistingHead error = %v, want ErrBleveHeadUnavailable", err)
+	}
+	if _, err := os.Stat(bleveDBPath); err == nil {
+		t.Fatalf("OpenExistingHead created missing index at %s", bleveDBPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat missing index after open: %v", err)
 	}
 }
 

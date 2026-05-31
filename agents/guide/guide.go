@@ -1123,6 +1123,22 @@ func (g *Guide) resolveClassification(ctx context.Context, request *RouteRequest
 }
 
 func (g *Guide) completeGuideClassificationAndStamp(ctx context.Context, request *RouteRequest, h *guideClassificationClaim, result *RouteResult, targetAgentID string, classifyErr error) string {
+	if g != nil && h != nil && classifyErr == nil && shouldOpenGuideClassificationClaim(request) && g.scope != nil {
+		resultCopy := cloneRouteResultForGuideClassification(result)
+		targetCopy := strings.TrimSpace(targetAgentID)
+		dispatchErr := g.scope.Go("guide_classification_complete", 10*time.Second, func(gctx context.Context) error {
+			g.completeGuideClassificationClaim(gctx, h, resultCopy, targetCopy, nil)
+			return nil
+		})
+		if dispatchErr == nil {
+			return ""
+		}
+		slog.Warn("guide_classification_complete_dispatch_failed",
+			"session", h.sessionID,
+			"claim_id", h.claimID,
+			"error", dispatchErr.Error(),
+		)
+	}
 	testamentID := g.completeGuideClassificationClaim(ctx, h, result, targetAgentID, classifyErr)
 	if request != nil && strings.TrimSpace(testamentID) != "" {
 		request.Metadata = mergeForwardMetadata(request.Metadata, map[string]any{
@@ -1130,6 +1146,14 @@ func (g *Guide) completeGuideClassificationAndStamp(ctx context.Context, request
 		})
 	}
 	return testamentID
+}
+
+func cloneRouteResultForGuideClassification(result *RouteResult) *RouteResult {
+	if result == nil {
+		return nil
+	}
+	clone := *result
+	return &clone
 }
 
 func (g *Guide) replayGuideClassificationFromTestament(request *RouteRequest, h *guideClassificationClaim) (*RouteResult, string, string, bool) {
@@ -2773,10 +2797,12 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 
 	targetAgent := ""
 	intent := ""
+	domain := ""
 	confidence := 0.0
 	if classification != nil {
 		targetAgent = string(classification.TargetAgent)
 		intent = string(classification.Intent)
+		domain = string(classification.Domain)
 		confidence = classification.Confidence
 	}
 
@@ -2799,6 +2825,10 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 		Scope: []claims.ClaimScopeEntry{
 			{Kind: "session", Key: request.SessionID},
 			{Kind: "correlation", Key: request.CorrelationID},
+			{Kind: "route_intent", Key: intent},
+			{Kind: "route_domain", Key: domain},
+			{Kind: "source_agent", Key: request.SourceAgentID},
+			{Kind: "target_agent", Key: targetAgent},
 		},
 		Relations: []claims.Relation{
 			{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},

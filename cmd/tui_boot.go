@@ -299,8 +299,6 @@ func (m bootstrapBootModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 func (m bootstrapBootModel) View() string {
 	width := max(m.width, bootstrapMinBarWidth)
 	height := max(m.height, bootstrapMinViewportHeight)
-	bg := m.theme.Palette.Background
-	panelBg := m.theme.Palette.PopupBg
 	panelWidth := bootstrapPanelWidth(width)
 	frameWidth := bootstrapFrameInnerWidth(panelWidth)
 	contentWidth := bootstrapContentWidth(panelWidth)
@@ -317,15 +315,13 @@ func (m bootstrapBootModel) View() string {
 	rows = append(rows, m.footerRows(contentWidth)...)
 	content := lipgloss.NewStyle().
 		Width(contentWidth).
-		Background(panelBg).
 		Padding(bootstrapPanelPaddingY, bootstrapPanelPaddingX).
 		Render(strings.Join(rows, "\n"))
 	panel := uitheme.RenderGradientBorder(content, m.borderGrad, elapsed, frameWidth, lipgloss.Height(content), 0)
-	placed := lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, panel, lipgloss.WithWhitespaceBackground(bg))
+	placed := lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, panel)
 	return lipgloss.NewStyle().
 		Width(width).
 		Height(height).
-		Background(bg).
 		Render(placed)
 }
 

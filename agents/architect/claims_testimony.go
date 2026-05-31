@@ -8,10 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/agents/shared"
+	"github.com/adalundhe/sylk/core/agents/identity"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/providers"
+	"github.com/adalundhe/sylk/core/versioning"
+	"github.com/google/uuid"
 )
 
 // architectBoard resolves the claims board for the architect's session.
@@ -294,6 +298,10 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	ctx = claims.WithTestamentAccumulator(ctx, acc)
 	acc.Note("Processing claims entry: " + entry.Delta.DeltaKind())
 
+	if handled, err := a.processGuideRoutedWorkClaimEntry(ctx, entry, acc); handled {
+		return err
+	}
+
 	// Push: narrate entry into the claim. Surfaces an immediate
 	// "Acknowledging request" status on the architect's row in the
 	// UI before the LLM tool loop produces any output.
@@ -376,6 +384,220 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 			append([]any{"result_length", len(result)}, claims.DeltaDebugArgs(entry.Delta)...)...)...,
 	)
 	return nil
+}
+
+func (a *Architect) processGuideRoutedWorkClaimEntry(ctx context.Context, entry *claims.GraphEntryPoint, acc *claims.TestamentAccumulator) (bool, error) {
+	if !a.isGuideRoutedWorkClaimEntry(entry) {
+		return false, nil
+	}
+	fwd := a.forwardedRequestFromRoutedWorkClaim(entry.Node.Claim)
+	claims.RouteFlowDebugLog().Info("architect_route_flow_routed_work_claim_start",
+		append(a.claimsEntryRouteFlowArgs(entry),
+			"correlation_id", fwd.CorrelationID,
+			"intent", string(fwd.Intent),
+			"query", truncateArchitectString(fwd.Input, 120),
+		)...,
+	)
+	if a.requestSerializer != nil && !a.requestSerializer.Acquire(ctx) {
+		return true, nil
+	}
+	if a.requestSerializer != nil {
+		defer a.requestSerializer.Release()
+	}
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	reqCtx = versioning.WithSessionID(reqCtx, fwd.SessionID)
+	reqCtx = shared.WithForwardedTaskScope(reqCtx, fwd.Metadata)
+	reqCtx = withRouteHops(reqCtx, fwd.Hops)
+	reqCtx = withArchitectStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID)
+	reqCtx = shared.WithForwardedStreamContext(reqCtx, fwd.CorrelationID, fwd.SourceAgentID, fwd.ParentCorrelationID, fwd.Metadata)
+	reqCtx = shared.WithOwnedStreamIdentity(reqCtx, "architect", "Architect")
+	reqCtx, usageAcc := withArchitectUsageAccumulator(reqCtx)
+	reqCtx = withArchitectEarlyUsageEmitter(reqCtx, func(inputTokens int) {
+		a.publishPlanStreamEarlyUsage(reqCtx, inputTokens)
+	})
+	reqCtx = withStreamRetryResetEmitter(reqCtx, func() {
+		a.publishPlanStreamStart(reqCtx)
+	})
+	reqCtx = shared.WithGuardianCommandGate(reqCtx, shared.GuardianCommandGateConfig{
+		BusProvider:     func() guide.EventBus { return a.bus },
+		SourceAgentID:   func() string { return a.id },
+		SourceAgentType: "architect",
+		SourceAgentName: "Architect",
+	})
+	reqCtx = shared.WithProgressPublisher(reqCtx, &shared.ProgressPublisher{
+		Bus: a.bus, Channels: a.channels,
+		AgentID: a.id, CorrelationID: fwd.CorrelationID, SourceAgentID: fwd.SourceAgentID,
+	})
+	reqCtx = shared.WithToolCallEmitter(reqCtx, shared.NewToolCallEmitter(
+		a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID,
+	))
+	if a.steering != nil {
+		ledger := a.steering.Create(fwd.CorrelationID, a.id, fwd.SessionID, a.activityPub, nil)
+		defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)
+		reqCtx = shared.WithSteeringLedger(reqCtx, ledger)
+		reqCtx = shared.WithLogMeta(reqCtx, shared.LogMeta{
+			EventLogger: a.steering.EventLogger(),
+			CorrID:      fwd.CorrelationID,
+			AgentID:     a.id,
+			SessionID:   fwd.SessionID,
+		})
+		a.steering.RegisterCancel(fwd.CorrelationID, fwd.SessionID, cancel)
+	}
+	if a.factory != nil && a.identity != nil {
+		task, taskErr := a.factory.NewTask(identity.TaskOptions{
+			DisplayID:   fwd.CorrelationID,
+			Correlation: identity.CorrelationID(fwd.CorrelationID),
+		})
+		if taskErr != nil {
+			return true, fmt.Errorf("architect claim-native route: mint task: %w", taskErr)
+		}
+		reqCtx = identity.WithIdentity(reqCtx, a.identity)
+		reqCtx = identity.WithTask(reqCtx, task)
+	}
+	a.registerInFlight(fwd.CorrelationID, cancel)
+	defer a.clearInFlight(fwd.CorrelationID)
+
+	if entry.Node.Claim != nil {
+		shared.RecordAgentState(reqCtx, a.architectBoard(), entry.Node.Claim.ID,
+			"Planning request", shared.AgentStateReasoning, nil)
+	}
+	publishStreamLifecycle := guide.ShouldPublishForwardedStreamLifecycle(fwd)
+	if publishStreamLifecycle {
+		a.publishPlanStreamStart(reqCtx)
+	}
+	result, err := a.processForwardedRequest(reqCtx, fwd)
+	if err != nil {
+		if publishStreamLifecycle {
+			a.publishPlanStreamError(reqCtx, err)
+		}
+		if acc != nil {
+			acc.Record("error", err.Error())
+		}
+		claims.RouteFlowDebugLog().Info("architect_route_flow_routed_work_claim_failed",
+			append(a.claimsEntryRouteFlowArgs(entry), "error", err.Error())...,
+		)
+		return true, err
+	}
+	if publishStreamLifecycle {
+		a.publishPlanStreamComplete(reqCtx, extractUserResponse(result), usageAcc.Total(), a.responseDirectiveForResult(reqCtx, result))
+	}
+	if acc != nil {
+		acc.Record("routed_work_result_type", fmt.Sprintf("%T", result))
+	}
+	claims.RouteFlowDebugLog().Info("architect_route_flow_routed_work_claim_done",
+		append(a.claimsEntryRouteFlowArgs(entry), "correlation_id", fwd.CorrelationID)...,
+	)
+	return true, nil
+}
+
+func (a *Architect) isGuideRoutedWorkClaimEntry(entry *claims.GraphEntryPoint) bool {
+	if entry == nil || entry.Node.Claim == nil {
+		return false
+	}
+	delta, ok := architectCanonicalDelta(entry)
+	if !ok || delta.Action != claims.DeltaActionClaimPosted {
+		return false
+	}
+	claim := entry.Node.Claim
+	if claim.ActionType != claims.ActionTypeTask || !architectClaimHasTag(claim.Tags, "routed_work") {
+		return false
+	}
+	if strings.TrimSpace(claims.IssuerAgentID(claim.Relations)) != "guide" {
+		return false
+	}
+	subject := strings.TrimSpace(claims.SubjectAgentID(claim.Relations))
+	return subject == a.id || subject == "architect"
+}
+
+func architectCanonicalDelta(entry *claims.GraphEntryPoint) (claims.CanonicalDelta, bool) {
+	if entry == nil || entry.Delta == nil {
+		return claims.CanonicalDelta{}, false
+	}
+	switch delta := entry.Delta.(type) {
+	case claims.CanonicalDelta:
+		return delta, true
+	case *claims.CanonicalDelta:
+		if delta != nil {
+			return *delta, true
+		}
+	}
+	return claims.CanonicalDelta{}, false
+}
+
+func (a *Architect) forwardedRequestFromRoutedWorkClaim(claim *claims.Claim) *guide.ForwardedRequest {
+	sessionID := firstNonEmptyArchitectString(architectClaimScopeValue(claim.Scope, "session"), a.config.SessionID)
+	correlationID := firstNonEmptyArchitectString(
+		architectClaimScopeValue(claim.Scope, "correlation"),
+		architectStreamCorrelationFromTags(claim.Tags),
+		"claim_"+strings.TrimSpace(claim.ID),
+		uuid.NewString(),
+	)
+	intent := guide.Intent(firstNonEmptyArchitectString(architectClaimScopeValue(claim.Scope, "route_intent"), string(guide.IntentPlan)))
+	domain := guide.Domain(firstNonEmptyArchitectString(architectClaimScopeValue(claim.Scope, "route_domain"), string(guide.DomainPlanning)))
+	sourceAgentID := firstNonEmptyArchitectString(architectClaimScopeValue(claim.Scope, "source_agent"), "tui")
+	metadata := map[string]any{
+		"parent_claim_id":      strings.TrimSpace(claim.ID),
+		"routed_work_claim_id": strings.TrimSpace(claim.ID),
+		"claim_native_routing": true,
+	}
+	return &guide.ForwardedRequest{
+		CorrelationID:        correlationID,
+		Input:                strings.TrimSpace(claim.Description),
+		Intent:               intent,
+		Domain:               domain,
+		SourceAgentID:        sourceAgentID,
+		SourceAgentName:      sourceAgentID,
+		SessionID:            sessionID,
+		TargetAgentID:        a.id,
+		FireAndForget:        false,
+		Confidence:           1,
+		ClassificationMethod: "claim_delta",
+		Metadata:             metadata,
+	}
+}
+
+func architectClaimScopeValue(scope []claims.ClaimScopeEntry, kind string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		return ""
+	}
+	for _, entry := range scope {
+		if strings.TrimSpace(entry.Kind) == kind {
+			return strings.TrimSpace(entry.Key)
+		}
+	}
+	return ""
+}
+
+func architectClaimHasTag(tags []string, want string) bool {
+	want = strings.TrimSpace(want)
+	for _, tag := range tags {
+		if strings.TrimSpace(tag) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func architectStreamCorrelationFromTags(tags []string) string {
+	const prefix = "stream_corr_id:"
+	for _, tag := range tags {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(tag), prefix); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstNonEmptyArchitectString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" && trimmed != "<nil>" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func (a *Architect) claimsEntryRouteFlowArgs(entry *claims.GraphEntryPoint) []any {

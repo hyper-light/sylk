@@ -398,7 +398,15 @@ func (b *CommittedKnowledgeBackend) SearchInContext(ctx context.Context, req *bl
 
 // RefreshFromDisk reloads committed-global state from the current HEAD.
 func (b *CommittedKnowledgeBackend) RefreshFromDisk(ctx context.Context) error {
-	return b.refresh(ctx, nil, false, false)
+	return b.refresh(ctx, nil, false, false, false)
+}
+
+// RefreshExistingFromDisk reloads committed-global state only from already
+// materialized read indices. It does not rebuild missing Bleve state; startup
+// callers use this so missing/corrupt derived indices are recovered by the
+// post-boot mutating sync pipeline instead of blocking the TUI.
+func (b *CommittedKnowledgeBackend) RefreshExistingFromDisk(ctx context.Context) error {
+	return b.refresh(ctx, nil, false, false, true)
 }
 
 // RefreshWithBleveStore reloads committed-global metadata while reusing an
@@ -407,13 +415,13 @@ func (b *CommittedKnowledgeBackend) RefreshWithBleveStore(ctx context.Context, s
 	if store == nil {
 		return fmt.Errorf("committed backend: bleve store is required")
 	}
-	return b.refresh(ctx, store, true, false)
+	return b.refresh(ctx, store, true, false, false)
 }
 
 // AdoptOwnedBleve refreshes state from disk and closes any previously-retired
 // external Bleve state that was kept alive while background indexing finished.
 func (b *CommittedKnowledgeBackend) AdoptOwnedBleve(ctx context.Context) error {
-	return b.refresh(ctx, nil, false, true)
+	return b.refresh(ctx, nil, false, true, false)
 }
 
 // Search executes a committed-global document search and enriches hits with
@@ -621,7 +629,7 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	if !refreshAttached {
 		attachedBleve = nil
 	}
-	if err := b.refreshLocked(ctx, attachedBleve, false, true); err != nil {
+	if err := b.refreshLocked(ctx, attachedBleve, false, true, false); err != nil {
 		return fmt.Errorf("committed ingest: refresh backend: %w", err)
 	}
 	transferredAttached = refreshAttached
@@ -755,14 +763,14 @@ func (b *CommittedKnowledgeBackend) unloadEmbedderIfIdle() {
 	b.logger.Info("embedder unloaded after idle ttl", "ttl", embedderIdleTTL)
 }
 
-func (b *CommittedKnowledgeBackend) refresh(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool) error {
+func (b *CommittedKnowledgeBackend) refresh(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool, existingOnly bool) error {
 	b.refreshMu.Lock()
 	defer b.refreshMu.Unlock()
-	return b.refreshLocked(ctx, attachedBleve, externalBleve, closeRetired)
+	return b.refreshLocked(ctx, attachedBleve, externalBleve, closeRetired, existingOnly)
 }
 
-func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool) error {
-	nextState, err := b.buildState(ctx, attachedBleve, externalBleve)
+func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool, existingOnly bool) error {
+	nextState, err := b.buildState(ctx, attachedBleve, externalBleve, existingOnly)
 	if err != nil {
 		return err
 	}
@@ -792,7 +800,7 @@ func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedB
 	return closeCommittedStates(toClose...)
 }
 
-func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool) (*committedKnowledgeState, error) {
+func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, existingOnly bool) (*committedKnowledgeState, error) {
 	sd := sylkdir.New(b.projectRoot)
 	gm := sylkdir.NewGlobalMetaFromSylkDir(sd)
 	if err := gm.Load(); err != nil {
@@ -819,7 +827,13 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 	bleveStore := attachedBleve
 	if bleveStore == nil {
 		bleveStore = sylkdir.NewGlobalVersionBleveStore(sd, head)
-		if err := bleveStore.OpenHead(); err != nil {
+		var err error
+		if existingOnly {
+			err = bleveStore.OpenExistingHead()
+		} else {
+			err = bleveStore.OpenHead()
+		}
+		if err != nil {
 			_ = nodeStore.Close()
 			_ = edgeStore.Close()
 			_ = docStore.Close()

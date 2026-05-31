@@ -228,7 +228,7 @@ func (s *SylkDir) Lock() error {
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		f.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return ErrLocked
 		}
 		return fmt.Errorf("sylkdir: failed to acquire lock: %w", err)
