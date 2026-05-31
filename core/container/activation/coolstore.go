@@ -23,6 +23,7 @@ type CoolStore struct {
 	mu       sync.Mutex
 	dir      string
 	entries  map[string]struct{} // tracks which agent types have files
+	order    []string            // LRU order: most recent at end
 	capacity int
 	logger   *slog.Logger
 }
@@ -39,9 +40,11 @@ func NewCoolStore(dir string, capacity int) (*CoolStore, error) {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, err
 	}
+	entryCap := max(capacity, 0)
 	return &CoolStore{
 		dir:      dir,
-		entries:  make(map[string]struct{}, capacity),
+		entries:  make(map[string]struct{}, entryCap),
+		order:    make([]string, 0, entryCap),
 		capacity: capacity,
 		logger:   slog.Default(),
 	}, nil
@@ -52,14 +55,18 @@ func (cs *CoolStore) SetLogger(logger *slog.Logger) {
 	cs.logger = logger
 }
 
-// Store serializes container state to disk. Returns ErrCoolStoreFull if
-// the store is at capacity and the agent type is not already present.
+// Store serializes container state to disk. When the bounded store is at
+// capacity, the least recently used cool entry is removed before writing the
+// new one. A zero-capacity store rejects writes instead of growing unbounded.
 func (cs *CoolStore) Store(agentType string, spec container.ContainerSpec, state *handoff.ArchivableState) error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	if _, exists := cs.entries[agentType]; !exists && len(cs.entries) >= cs.capacity {
+	if cs.capacity <= 0 {
 		return ErrCoolStoreFull
+	}
+	if _, exists := cs.entries[agentType]; !exists && len(cs.entries) >= cs.capacity {
+		cs.evictLRULocked()
 	}
 
 	entry := CoolEntry{Spec: spec, State: state}
@@ -74,6 +81,7 @@ func (cs *CoolStore) Store(agentType string, spec container.ContainerSpec, state
 	}
 
 	cs.entries[agentType] = struct{}{}
+	cs.moveToBackLocked(agentType)
 	return nil
 }
 
@@ -103,6 +111,7 @@ func (cs *CoolStore) Load(agentType string) (*CoolEntry, error) {
 		}
 		return nil, err
 	}
+	cs.moveToBackLocked(agentType)
 	return &entry, nil
 }
 
@@ -115,6 +124,7 @@ func (cs *CoolStore) Remove(agentType string) error {
 		return nil
 	}
 	delete(cs.entries, agentType)
+	cs.removeFromOrderLocked(agentType)
 	return os.Remove(cs.pathFor(agentType))
 }
 
@@ -135,4 +145,33 @@ func (cs *CoolStore) Len() int {
 
 func (cs *CoolStore) pathFor(agentType string) string {
 	return filepath.Join(cs.dir, agentType+".json")
+}
+
+func (cs *CoolStore) evictLRULocked() {
+	if len(cs.order) == 0 {
+		return
+	}
+	oldest := cs.order[0]
+	cs.order = cs.order[1:]
+	delete(cs.entries, oldest)
+	if err := os.Remove(cs.pathFor(oldest)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		cs.logger.Warn("failed to remove evicted cool store entry",
+			"agent_type", oldest,
+			"error", err,
+		)
+	}
+}
+
+func (cs *CoolStore) moveToBackLocked(agentType string) {
+	cs.removeFromOrderLocked(agentType)
+	cs.order = append(cs.order, agentType)
+}
+
+func (cs *CoolStore) removeFromOrderLocked(agentType string) {
+	for i, existing := range cs.order {
+		if existing == agentType {
+			cs.order = append(cs.order[:i], cs.order[i+1:]...)
+			return
+		}
+	}
 }

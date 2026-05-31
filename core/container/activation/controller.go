@@ -126,7 +126,9 @@ type ActivationController struct {
 // NewActivationController creates and initializes the controller.
 // Does not start the idle monitor — call Start() after construction.
 func NewActivationController(cfg ActivationControllerConfig) (*ActivationController, error) {
-	coolStore, err := NewCoolStore(cfg.StorageDir, cfg.CoolStoreCap)
+	warmPoolCap := activationCacheCapacity(cfg.WarmPoolCap, cfg.Policies)
+	coolStoreCap := activationCacheCapacity(cfg.CoolStoreCap, cfg.Policies)
+	coolStore, err := NewCoolStore(cfg.StorageDir, coolStoreCap)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +148,7 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 	ac := &ActivationController{
 		entries:       make(map[string]*ActivationEntry, len(cfg.Policies)),
 		gate:          NewActivationGate(),
-		warmPool:      NewWarmPool(cfg.WarmPoolCap),
+		warmPool:      NewWarmPool(warmPoolCap),
 		coolStore:     coolStore,
 		predictor:     NewActivationPredictor(cfg.Predictor),
 		runtime:       cfg.Runtime,
@@ -169,6 +171,13 @@ func NewActivationController(cfg ActivationControllerConfig) (*ActivationControl
 	}
 
 	return ac, nil
+}
+
+func activationCacheCapacity(configured int, policies []*ActivationPolicy) int {
+	if configured > 0 {
+		return configured
+	}
+	return len(policies)
 }
 
 // Start launches the idle monitor, pressure evaluator, and pre-warms

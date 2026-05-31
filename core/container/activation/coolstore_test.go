@@ -78,7 +78,7 @@ func TestCoolStore_Remove(t *testing.T) {
 	}
 }
 
-func TestCoolStore_CapacityEnforced(t *testing.T) {
+func TestCoolStore_CapacityEvictsLeastRecentlyUsed(t *testing.T) {
 	dir := t.TempDir()
 	cs, err := NewCoolStore(dir, 2)
 	if err != nil {
@@ -93,9 +93,44 @@ func TestCoolStore_CapacityEnforced(t *testing.T) {
 
 	spec.AgentType = "c"
 	spec.Name = "c"
-	err = cs.Store("c", spec, nil)
-	if err != ErrCoolStoreFull {
-		t.Fatalf("expected ErrCoolStoreFull, got %v", err)
+	if err := cs.Store("c", spec, nil); err != nil {
+		t.Fatalf("Store c: %v", err)
+	}
+	if cs.Contains("a") {
+		t.Fatal("expected oldest entry a to be evicted")
+	}
+	if !cs.Contains("b") || !cs.Contains("c") {
+		t.Fatal("expected b and c to remain after LRU eviction")
+	}
+	if _, err := cs.Load("a"); err != ErrCoolStoreNotFound {
+		t.Fatalf("Load evicted a error = %v, want ErrCoolStoreNotFound", err)
+	}
+}
+
+func TestCoolStore_LoadRefreshesLRU(t *testing.T) {
+	dir := t.TempDir()
+	cs, err := NewCoolStore(dir, 2)
+	if err != nil {
+		t.Fatalf("NewCoolStore: %v", err)
+	}
+
+	if err := cs.Store("a", container.ContainerSpec{Name: "a", AgentType: "a"}, nil); err != nil {
+		t.Fatalf("Store a: %v", err)
+	}
+	if err := cs.Store("b", container.ContainerSpec{Name: "b", AgentType: "b"}, nil); err != nil {
+		t.Fatalf("Store b: %v", err)
+	}
+	if _, err := cs.Load("a"); err != nil {
+		t.Fatalf("Load a: %v", err)
+	}
+	if err := cs.Store("c", container.ContainerSpec{Name: "c", AgentType: "c"}, nil); err != nil {
+		t.Fatalf("Store c: %v", err)
+	}
+	if !cs.Contains("a") || !cs.Contains("c") {
+		t.Fatal("expected recently loaded a and new c to remain")
+	}
+	if cs.Contains("b") {
+		t.Fatal("expected b to be evicted after a was loaded")
 	}
 }
 

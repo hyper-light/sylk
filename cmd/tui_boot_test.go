@@ -8,6 +8,7 @@ import (
 
 	"github.com/adalundhe/sylk/core/boot"
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestBootstrapProgressReporterStoresCompletionAndStopsAcceptingProgress(t *testing.T) {
@@ -72,6 +73,25 @@ func TestBootstrapBootModelViewUsesThemedFrameAndHidesPendingWarnings(t *testing
 	}
 	if strings.Contains(view, "phase claim missing") {
 		t.Fatalf("View() = %q, pending claim warnings should not be rendered in boot splash", view)
+	}
+}
+
+func TestBootstrapBootModelViewCoversFullViewport(t *testing.T) {
+	model := newBootstrapBootModel(context.Background(), nil, nil)
+	model.width = 96
+	model.height = 24
+	model.health = boot.BootHealth{Phases: []boot.BootPhaseHealth{
+		{Phase: boot.BootPhaseDurableSubstrate, Outcome: string(claims.ClaimLifecycleSatisfied)},
+	}}
+
+	lines := strings.Split(model.View(), "\n")
+	if len(lines) != model.height {
+		t.Fatalf("View height = %d, want %d", len(lines), model.height)
+	}
+	for i, line := range lines {
+		if got := ansi.StringWidth(line); got != model.width {
+			t.Fatalf("View line %d width = %d, want %d", i, got, model.width)
+		}
 	}
 }
 

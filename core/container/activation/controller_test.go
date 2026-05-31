@@ -431,6 +431,34 @@ func TestController_FullCycle_ColdHotWarmCoolCold(t *testing.T) {
 	assertTier(t, ac, "engineer", TierCold)
 }
 
+func TestController_DefaultCacheCapacityDerivedFromPolicies(t *testing.T) {
+	cfg := testControllerConfig(t)
+	cfg.WarmPoolCap = 0
+	cfg.CoolStoreCap = 0
+	ac, err := NewActivationController(cfg)
+	if err != nil {
+		t.Fatalf("NewActivationController: %v", err)
+	}
+
+	ctx := testCtx(t)
+	for _, agentType := range []string{"engineer", "architect", "tester"} {
+		if _, err := ac.EnsureActive(ctx, agentType); err != nil {
+			t.Fatalf("EnsureActive(%s): %v", agentType, err)
+		}
+		if err := ac.DemoteTo(ctx, agentType, TierWarm); err != nil {
+			t.Fatalf("DemoteTo(%s, warm): %v", agentType, err)
+		}
+		if err := ac.DemoteTo(ctx, agentType, TierCool); err != nil {
+			t.Fatalf("DemoteTo(%s, cool): %v", agentType, err)
+		}
+		assertTier(t, ac, agentType, TierCool)
+	}
+
+	if got, want := ac.coolStore.Len(), len(cfg.Policies); got != want {
+		t.Fatalf("cool store len = %d, want %d derived from policies", got, want)
+	}
+}
+
 func TestController_ConcurrentEnsureActive_SameType(t *testing.T) {
 	cfg := testControllerConfig(t)
 	rt := cfg.Runtime.(*mockRuntime)

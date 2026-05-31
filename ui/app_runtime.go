@@ -468,9 +468,10 @@ func (m *AppModel) handleSessionSwitched(switched msg.SessionSwitchedMsg) tea.Cm
 }
 
 // pipelinePhaseMap maps boot pipeline phase strings to UI IndexPhase constants.
-// Pipeline "done" is deliberately absent — it only means the synchronous
-// pipeline finished, not that background indexing is complete. The real
-// Done signal comes from bgWaiter.Ready().
+// Pipeline "done" is handled explicitly in startIndexProgressObserver: it
+// clears stale setup/load state if the lifecycle watcher has not produced a
+// terminal event yet. A later background-index waiter can still reopen the bar
+// with PhaseIndex progress.
 var pipelinePhaseMap = map[string]status.IndexPhase{
 	"setup":    status.PhaseLoad,
 	"allocate": status.PhaseLoad,
@@ -501,10 +502,15 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 	// snap the stage's bar segment to full.
 	ks.SetProgressObserver(func(phase string, current, total int64) {
 		diagnostics.LogStartup("index_progress_observer_event", "phase", phase, "current", current, "total", total)
+		if phase == "done" {
+			diagnostics.LogStartup("index_progress_observer_send_done", "phase", phase)
+			program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
+			return
+		}
 		uiPhase, ok := pipelinePhaseMap[phase]
 		if !ok {
 			diagnostics.LogStartup("index_progress_observer_unknown_phase", "phase", phase, "current", current, "total", total)
-			return // Skip unknown phases including "done"; real Done comes from bgWaiter.Ready().
+			return
 		}
 		diagnostics.LogStartup("index_progress_observer_send", "phase", phase, "ui_phase", int(uiPhase))
 		program.Send(msg.IndexProgressMsg{

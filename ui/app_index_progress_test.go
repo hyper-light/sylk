@@ -177,6 +177,22 @@ func TestStartIndexProgressObserver_SendsPipelineProgressAfterObserverAttached(t
 	}
 }
 
+func TestStartIndexProgressObserver_ClearsPipelineDoneWithoutLifecycleEvent(t *testing.T) {
+	ks := knowledge.NewKnowledgeStore(nil, nil)
+
+	scope := newIndexProgressScope(t)
+	app := &AppModel{deps: Deps{KnowledgeStore: ks, Scope: scope}}
+	program := newRecordingTeaProgram()
+
+	app.startIndexProgressObserver(program)
+	ks.NotifyProgress("done", 6, 6)
+
+	progress := program.waitForDoneIndexProgress(t)
+	if !progress.Done {
+		t.Fatalf("pipeline done progress = %#v, want Done=true", progress)
+	}
+}
+
 func TestStartIndexProgressObserver_TracksReplacementBackgroundWaitersAcrossSyncs(t *testing.T) {
 	ks := knowledge.NewKnowledgeStore(nil, nil)
 	waiter1 := newMockBackgroundWaiter(0, 8)
