@@ -218,6 +218,13 @@ func (b *ClaimsBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string
 	claims, err := b.claimsForLifecyclePostLocked(claimIDs)
 	if err != nil {
 		b.mu.Unlock()
+		RouteDebugLog().Info("claims_board_post_generated_claims_lookup_failed",
+			"board_id", b.BoardID(),
+			"session_id", b.SessionID(),
+			"claim_ids", claimIDs,
+			"actor_id", actorID,
+			"error", err.Error(),
+		)
 		return err
 	}
 	if err := b.validateClaimsPostableLocked(ctx, claims, actorID, opts); err != nil {
@@ -235,10 +242,23 @@ func (b *ClaimsBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string
 			}
 		}
 		b.notifySubscribers()
+		RouteDebugLog().Info("claims_board_post_generated_claims_validation_failed",
+			"board_id", b.BoardID(),
+			"session_id", b.SessionID(),
+			"claim_ids", claimIDs,
+			"actor_id", actorID,
+			"error", err.Error(),
+		)
 		return err
 	}
 	if allClaimsLifecyclePosted(claims) {
 		b.mu.Unlock()
+		RouteDebugLog().Info("claims_board_post_generated_claims_already_posted",
+			"board_id", b.BoardID(),
+			"session_id", b.SessionID(),
+			"claim_ids", claimIDs,
+			"actor_id", actorID,
+		)
 		return nil
 	}
 	prevSeq := b.seq.Load()
@@ -262,6 +282,16 @@ func (b *ClaimsBoard) PostGeneratedClaims(ctx context.Context, claimIDs []string
 		if action == nil {
 			continue
 		}
+		RouteDebugLog().Info("claims_board_post_generated_claims_emitting",
+			"board_id", b.BoardID(),
+			"session_id", b.SessionID(),
+			"claim_id", snapshots[i].ID,
+			"actor_id", actorID,
+			"subject_agent", SubjectAgentID(snapshots[i].Relations),
+			"action_type", snapshots[i].ActionType,
+			"canonical_direct", b.shouldEmitCanonicalDirect(),
+			"fabric_direct", b.shouldEmitFabricDirect(),
+		)
 		if b.shouldEmitFabricDirect() {
 			b.amplifier.EmitClaimIssued(ctx, snapshots[i])
 		}

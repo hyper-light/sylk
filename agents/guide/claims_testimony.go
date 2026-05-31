@@ -66,6 +66,13 @@ func postGuideGeneratedClaimIfNeeded(ctx context.Context, board *claims.ClaimsBo
 	if claimID == "" {
 		return fmt.Errorf("generated claim id is required")
 	}
+	claims.RouteDebugLog().Info("guide_post_generated_claim_if_needed",
+		"board_id", board.BoardID(),
+		"claim_id", claimID,
+		"actor_id", actorID,
+		"reason", reason,
+		"lifecycle_status", claim.LifecycleStatus,
+	)
 	switch claim.LifecycleStatus {
 	case "", claims.ClaimLifecycleGenerated:
 		return board.PostGeneratedClaim(ctx, claimID, actorID, claims.ClaimPostOptions{Reason: reason})

@@ -67,6 +67,12 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 	if delta == nil {
 		return fmt.Errorf("nil delta")
 	}
+	claims.RouteDebugLog().Info("claims_bus_publish_delta_start",
+		append([]any{
+			"topic", topic,
+			"subscriber_count", a.bus.TopicSubscriberCount(topic),
+		}, claims.DeltaDebugArgs(delta)...)...,
+	)
 	msg := &Message{
 		ID:            uuid.NewString(),
 		Type:          MessageTypeClaimsDelta,
@@ -81,8 +87,21 @@ func (a *ClaimsBusAdapter) PublishDelta(_ context.Context, topic string, delta c
 			"delta_kind", delta.DeltaKind(),
 			"err", err.Error(),
 		)
+		claims.RouteDebugLog().Info("claims_bus_publish_delta_failed",
+			append([]any{
+				"topic", topic,
+				"message_id", msg.ID,
+				"error", err.Error(),
+			}, claims.DeltaDebugArgs(delta)...)...,
+		)
 		return err
 	}
+	claims.RouteDebugLog().Info("claims_bus_publish_delta_done",
+		append([]any{
+			"topic", topic,
+			"message_id", msg.ID,
+		}, claims.DeltaDebugArgs(delta)...)...,
+	)
 	return nil
 }
 
@@ -103,18 +122,42 @@ func (a *ClaimsBusAdapter) SubscribeDelta(pattern string, handler claims.DeltaHa
 				"pattern", pattern,
 				"err", err.Error(),
 			)
+			claims.RouteDebugLog().Info("claims_bus_subscribe_decode_failed",
+				"pattern", pattern,
+				"message_id", messageIDForDebug(msg),
+				"message_type", messageTypeForDebug(msg),
+				"error", err.Error(),
+			)
 			return nil // never surface decode errors into bus retry
 		}
 		if delta == nil {
+			claims.RouteDebugLog().Info("claims_bus_subscribe_ignored_non_delta",
+				"pattern", pattern,
+				"message_id", messageIDForDebug(msg),
+				"message_type", messageTypeForDebug(msg),
+			)
 			return nil
 		}
+		claims.RouteDebugLog().Info("claims_bus_subscribe_delta_delivered",
+			append([]any{
+				"pattern", pattern,
+				"message_id", messageIDForDebug(msg),
+			}, claims.DeltaDebugArgs(delta)...)...,
+		)
 		handler(delta)
 		return nil
 	}
 	sub, err := a.bus.Subscribe(pattern, msgHandler)
 	if err != nil {
+		claims.RouteDebugLog().Info("claims_bus_subscribe_failed",
+			"pattern", pattern,
+			"error", err.Error(),
+		)
 		return nil, fmt.Errorf("subscribe %q: %w", pattern, err)
 	}
+	claims.RouteDebugLog().Info("claims_bus_subscribed",
+		"pattern", pattern,
+	)
 	return &claimsSubscriptionAdapter{inner: sub, pattern: pattern}, nil
 }
 
@@ -139,6 +182,20 @@ func ExtractClaimsDelta(msg *Message) (claims.Delta, error) {
 	default:
 		return nil, fmt.Errorf("claims_delta payload has unexpected type %T (id=%s)", payload, msg.ID)
 	}
+}
+
+func messageIDForDebug(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	return msg.ID
+}
+
+func messageTypeForDebug(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+	return string(msg.Type)
 }
 
 // ────────────────────────────────────────────────────────────────────

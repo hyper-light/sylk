@@ -719,6 +719,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"session_id", cfg.SessionID,
 			"bus_nil", cfg.Bus == nil,
 		)
+		claims.RouteDebugLog().Info("claims_intake_skipped_insufficient_config",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"bus_nil", cfg.Bus == nil,
+		)
 		return nil
 	}
 	role := cfg.Role
@@ -742,6 +747,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"session_id", cfg.SessionID,
 			"reason", "ProcessEntry will run without AgentIdentity on ctx; gateway.RequireIdentity will reject every LLM dispatch",
 		)
+		claims.RouteDebugLog().Info("claims_intake_missing_identity",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
+		)
 		return nil
 	}
 	// A missing scope means OnResolved would fall back to running
@@ -759,6 +769,11 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 			"session_id", cfg.SessionID,
 			"reason", "ProcessEntry needs a scope to dispatch async; without it accumulator flushes drop and OnResolved blocks the bus",
 		)
+		claims.RouteDebugLog().Info("claims_intake_missing_scope",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
+		)
 		return nil
 	}
 
@@ -775,6 +790,16 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 		"scope_present", cfg.Scope != nil,
 		"patterns", claims.InboxPatternsFor(role, cfg.SessionID, cfg.AgentID),
 	)
+	claims.RouteDebugLog().Info("claims_intake_wiring",
+		"agent_id", cfg.AgentID,
+		"session_id", cfg.SessionID,
+		"role", role,
+		"board_present", cfg.Board != nil,
+		"scope_present", cfg.Scope != nil,
+		"identity_present", cfg.Identity != nil,
+		"factory_present", cfg.Factory != nil,
+		"patterns", claims.InboxPatternsFor(role, cfg.SessionID, cfg.AgentID),
+	)
 
 	inbox, err := claims.NewClaimsInbox(claims.InboxConfig{
 		AgentID:        cfg.AgentID,
@@ -788,13 +813,34 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				return
 			}
 			if !acknowledgeLifecycleReceipt(cfg, role, entry) {
+				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
+					append([]any{
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"reason", "lifecycle_receipt_not_acknowledged",
+					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
 				return
 			}
 			expectedValidationToolsScheduled := dispatchExpectedValidationTools(cfg, entry)
 			if deliverExpectedPeerResultToContinuation(cfg, entry) {
+				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
+					append([]any{
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"reason", "delivered_to_continuation",
+					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
 				return
 			}
 			if expectedValidationToolsScheduled {
+				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
+					append([]any{
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"reason", "expected_validation_tools_scheduled",
+					}, claims.DeltaDebugArgs(entry.Delta)...)...,
+				)
 				return
 			}
 			if shouldSuppressForwardedPromptEntry(role, entry) {
@@ -807,6 +853,15 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 					"session_id", cfg.SessionID,
 					"role", role,
 					"claim_id", claimID,
+				)
+				claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
+					append([]any{
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"role", role,
+						"reason", "suppressed_forwarded_prompt_entry",
+						"claim_id", claimID,
+					}, claims.DeltaDebugArgs(entry.Delta)...)...,
 				)
 				return
 			}
@@ -821,6 +876,17 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				"identity_present", cfg.Identity != nil,
 				"factory_present", cfg.Factory != nil,
 			)
+			claims.RouteDebugLog().Info("claims_intake_resolved",
+				append([]any{
+					"agent_id", cfg.AgentID,
+					"session_id", cfg.SessionID,
+					"node_has_claim", entry.Node.Claim != nil,
+					"node_has_testament", entry.Node.Testament != nil,
+					"node_has_validation", entry.Node.Validation != nil,
+					"identity_present", cfg.Identity != nil,
+					"factory_present", cfg.Factory != nil,
+				}, claims.DeltaDebugArgs(entry.Delta)...)...,
+			)
 			if cfg.Scope != nil && cfg.ProcessEntry != nil {
 				if err := cfg.Scope.Go("process_claim", 0, func(ctx context.Context) error {
 					runCtx, reg := claimIntakeContext(ctx, cfg, entryClaimID(entry))
@@ -830,6 +896,13 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 					slog.Error("claims_intake_dispatch_failed",
 						"agent_id", cfg.AgentID,
 						"error", err.Error(),
+					)
+					claims.RouteDebugLog().Info("claims_intake_dispatch_failed",
+						append([]any{
+							"agent_id", cfg.AgentID,
+							"session_id", cfg.SessionID,
+							"error", err.Error(),
+						}, claims.DeltaDebugArgs(entry.Delta)...)...,
 					)
 				}
 				return
@@ -843,6 +916,13 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 						"agent_id", cfg.AgentID,
 						"error", err.Error(),
 					)
+					claims.RouteDebugLog().Info("claims_intake_process_failed",
+						append([]any{
+							"agent_id", cfg.AgentID,
+							"session_id", cfg.SessionID,
+							"error", err.Error(),
+						}, claims.DeltaDebugArgs(entry.Delta)...)...,
+					)
 				}
 			}
 		},
@@ -850,6 +930,12 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	if err != nil {
 		slog.Error("claims_intake_create_failed",
 			"agent_id", cfg.AgentID,
+			"error", err.Error(),
+		)
+		claims.RouteDebugLog().Info("claims_intake_create_failed",
+			"agent_id", cfg.AgentID,
+			"session_id", cfg.SessionID,
+			"role", role,
 			"error", err.Error(),
 		)
 		return nil

@@ -924,11 +924,31 @@ func (a *BoardAmplifier) dispatchSingle(ctx context.Context, topic string, delta
 	publisher := a.deltaBus
 	emit := func(runCtx context.Context) error {
 		start := time.Now()
+		RouteDebugLog().Info("claims_amplifier_publish_delta_start",
+			append([]any{
+				"topic", topic,
+				"canonical", false,
+			}, DeltaDebugArgs(delta)...)...,
+		)
 		if err := publisher.PublishDelta(runCtx, topic, delta); err != nil {
 			a.reportEmitError("delta_publish_failed", topic, err)
 			a.recordDeltaPublishFailure(runCtx, err)
+			RouteDebugLog().Info("claims_amplifier_publish_delta_failed",
+				append([]any{
+					"topic", topic,
+					"canonical", false,
+					"error", err.Error(),
+				}, DeltaDebugArgs(delta)...)...,
+			)
 		}
 		a.recordDeltaEmission(runCtx, delta, time.Since(start))
+		RouteDebugLog().Info("claims_amplifier_publish_delta_done",
+			append([]any{
+				"topic", topic,
+				"canonical", false,
+				"elapsed_ms", time.Since(start).Milliseconds(),
+			}, DeltaDebugArgs(delta)...)...,
+		)
 		return nil
 	}
 	a.runTracked(ctx, "claims_amplifier_delta", emit)
@@ -953,14 +973,34 @@ func (a *BoardAmplifier) publishCanonicalBatch(ctx context.Context, publisher De
 	var firstErr error
 	for _, d := range deltas {
 		start := time.Now()
+		RouteDebugLog().Info("claims_amplifier_publish_delta_start",
+			append([]any{
+				"topic", d.topic,
+				"canonical", true,
+			}, DeltaDebugArgs(d.delta)...)...,
+		)
 		if err := publisher.PublishDelta(ctx, d.topic, d.delta); err != nil {
 			a.reportEmitError("canonical_delta_publish_failed", d.topic, err)
 			a.recordDeltaPublishFailure(ctx, err)
+			RouteDebugLog().Info("claims_amplifier_publish_delta_failed",
+				append([]any{
+					"topic", d.topic,
+					"canonical", true,
+					"error", err.Error(),
+				}, DeltaDebugArgs(d.delta)...)...,
+			)
 			if firstErr == nil {
 				firstErr = err
 			}
 		}
 		a.recordDeltaEmission(ctx, d.delta, time.Since(start))
+		RouteDebugLog().Info("claims_amplifier_publish_delta_done",
+			append([]any{
+				"topic", d.topic,
+				"canonical", true,
+				"elapsed_ms", time.Since(start).Milliseconds(),
+			}, DeltaDebugArgs(d.delta)...)...,
+		)
 	}
 	return firstErr
 }

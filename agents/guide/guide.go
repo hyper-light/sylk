@@ -2256,22 +2256,61 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 		g.conversationWorkMetadata(request.SessionID),
 		mergeForwardMetadata(classification.PhaseMetadata, request.Metadata),
 	)
+	claims.RouteDebugLog().Info("guide_build_forwarded_request_start",
+		"session_id", request.SessionID,
+		"correlation_id", correlationID,
+		"source_agent", request.SourceAgentID,
+		"target_agent", classificationTargetAgentID("", classification),
+		"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
+	)
 
 	if board := g.sessionClaimsBoard(request.SessionID); board != nil {
 		metadata = mergeForwardMetadata(metadata, map[string]any{
 			"session_board_id": board.BoardID(),
 		})
+		claims.RouteDebugLog().Info("guide_session_board_resolved",
+			"session_id", request.SessionID,
+			"correlation_id", correlationID,
+			"board_id", board.BoardID(),
+			"claim_native_candidate", shouldPostRoutedWorkClaim(request, metadata),
+		)
 		if shouldPostRoutedWorkClaim(request, metadata) {
 			if err := g.ensureClaimNativeRoutedWorkTarget(ctx, classification); err != nil {
+				claims.RouteDebugLog().Info("guide_claim_native_target_failed",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"error", err.Error(),
+				)
 				return nil, err
 			}
 			routeClaimID, err := g.dispatchRoutedWorkClaim(board, request, classification)
 			if err != nil {
+				claims.RouteDebugLog().Info("guide_routed_work_claim_dispatch_failed",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"board_id", board.BoardID(),
+					"error", err.Error(),
+				)
 				return nil, err
 			}
 			if routeClaimID == "" {
+				claims.RouteDebugLog().Info("guide_routed_work_claim_dispatch_empty",
+					"session_id", request.SessionID,
+					"correlation_id", correlationID,
+					"target_agent", classificationTargetAgentID("", classification),
+					"board_id", board.BoardID(),
+				)
 				return nil, fmt.Errorf("claim-native routed work claim was not posted")
 			}
+			claims.RouteDebugLog().Info("guide_routed_work_claim_dispatched",
+				"session_id", request.SessionID,
+				"correlation_id", correlationID,
+				"target_agent", classificationTargetAgentID("", classification),
+				"board_id", board.BoardID(),
+				"claim_id", routeClaimID,
+			)
 			metadata = mergeForwardMetadata(metadata, map[string]any{
 				"parent_claim_id":      routeClaimID,
 				"routed_work_claim_id": routeClaimID,
@@ -2279,6 +2318,11 @@ func (g *Guide) buildForwardedRequest(ctx context.Context, request *RouteRequest
 			})
 		}
 	} else if shouldPostRoutedWorkClaim(request, metadata) {
+		claims.RouteDebugLog().Info("guide_session_board_missing",
+			"session_id", request.SessionID,
+			"correlation_id", correlationID,
+			"target_agent", classificationTargetAgentID("", classification),
+		)
 		return nil, fmt.Errorf("claim-native routing requires a session claims board")
 	}
 
@@ -2455,11 +2499,32 @@ const sourceAgentTUI = "tui"
 // synchronously. claim.generated is an audit fact only; claim.posted is
 // the event that wakes the target agent's inbox.
 func (g *Guide) dispatchRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, classification *RouteResult) (string, error) {
+	claims.RouteDebugLog().Info("guide_dispatch_routed_work_claim_start",
+		"session_id", request.SessionID,
+		"correlation_id", request.CorrelationID,
+		"board_present", board != nil,
+		"board_id", boardIDForRouteDebug(board),
+		"target_agent", classificationTargetAgentID("", classification),
+	)
 	claimID, err := postRoutedWorkClaim(board, request, classification)
 	if err != nil {
+		claims.RouteDebugLog().Info("guide_dispatch_routed_work_claim_failed",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+			"target_agent", classificationTargetAgentID("", classification),
+			"error", err.Error(),
+		)
 		recordPromptActionFailure(context.Background(), board, request.SessionID, err)
 		return "", err
 	}
+	claims.RouteDebugLog().Info("guide_dispatch_routed_work_claim_done",
+		"session_id", request.SessionID,
+		"correlation_id", request.CorrelationID,
+		"board_id", boardIDForRouteDebug(board),
+		"target_agent", classificationTargetAgentID("", classification),
+		"claim_id", claimID,
+	)
 	return claimID, nil
 }
 
@@ -2527,6 +2592,14 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 	if input == "" {
 		return "", nil
 	}
+	claims.RouteDebugLog().Info("guide_post_routed_work_claim_start",
+		"session_id", request.SessionID,
+		"correlation_id", request.CorrelationID,
+		"board_present", board != nil,
+		"board_id", boardIDForRouteDebug(board),
+		"input_len", len(input),
+		"input_preview", truncateLogStr(input, 120),
+	)
 
 	targetAgent := ""
 	intent := ""
@@ -2539,6 +2612,11 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 
 	targetAgent = strings.TrimSpace(targetAgent)
 	if targetAgent == "" {
+		claims.RouteDebugLog().Info("guide_post_routed_work_claim_no_target",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+		)
 		return "", fmt.Errorf("routed work claim target agent is required")
 	}
 
@@ -2592,19 +2670,69 @@ func postRoutedWorkClaim(board *claims.ClaimsBoard, request *RouteRequest, class
 		Reason:         "guide generated routed work claim",
 	})
 	if err != nil {
+		claims.RouteDebugLog().Info("guide_post_routed_work_claim_generate_failed",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+			"target_agent", targetAgent,
+			"error", err.Error(),
+		)
 		return "", err
 	}
 	if generated == nil || len(generated.Claims) == 0 {
+		claims.RouteDebugLog().Info("guide_post_routed_work_claim_generate_empty",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+			"target_agent", targetAgent,
+		)
 		return "", nil
 	}
 	claimID := strings.TrimSpace(generated.Claims[0].ID)
 	if claimID == "" {
+		claims.RouteDebugLog().Info("guide_post_routed_work_claim_generated_without_id",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+			"target_agent", targetAgent,
+		)
 		return "", nil
 	}
+	claims.RouteDebugLog().Info("guide_post_routed_work_claim_generated",
+		"session_id", request.SessionID,
+		"correlation_id", request.CorrelationID,
+		"board_id", boardIDForRouteDebug(board),
+		"target_agent", targetAgent,
+		"claim_id", claimID,
+		"lifecycle_status", generated.Claims[0].LifecycleStatus,
+		"validations", len(generated.Claims[0].Validations),
+	)
 	if err := postGuideGeneratedClaimIfNeeded(context.Background(), board, generated.Claims[0], "guide", "guide posted routed work claim"); err != nil {
+		claims.RouteDebugLog().Info("guide_post_routed_work_claim_post_failed",
+			"session_id", request.SessionID,
+			"correlation_id", request.CorrelationID,
+			"board_id", boardIDForRouteDebug(board),
+			"target_agent", targetAgent,
+			"claim_id", claimID,
+			"error", err.Error(),
+		)
 		return "", err
 	}
+	claims.RouteDebugLog().Info("guide_post_routed_work_claim_posted",
+		"session_id", request.SessionID,
+		"correlation_id", request.CorrelationID,
+		"board_id", boardIDForRouteDebug(board),
+		"target_agent", targetAgent,
+		"claim_id", claimID,
+	)
 	return claimID, nil
+}
+
+func boardIDForRouteDebug(board *claims.ClaimsBoard) string {
+	if board == nil {
+		return ""
+	}
+	return board.BoardID()
 }
 
 func routedWorkValidationID(kind string, request *RouteRequest) string {

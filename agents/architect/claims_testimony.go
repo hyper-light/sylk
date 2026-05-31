@@ -260,8 +260,24 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	if entry == nil {
 		return nil
 	}
+	claims.RouteDebugLog().Info("architect_process_claims_entry_start",
+		append([]any{
+			"agent_id", a.id,
+			"session_id", a.config.SessionID,
+			"node_has_claim", entry.Node.Claim != nil,
+			"node_has_testament", entry.Node.Testament != nil,
+			"node_has_validation", entry.Node.Validation != nil,
+		}, claims.DeltaDebugArgs(entry.Delta)...)...,
+	)
 	planner := a.ensurePlanner(ctx)
 	if planner == nil {
+		claims.RouteDebugLog().Info("architect_process_claims_entry_failed",
+			append([]any{
+				"agent_id", a.id,
+				"session_id", a.config.SessionID,
+				"reason", "planner_not_configured",
+			}, claims.DeltaDebugArgs(entry.Delta)...)...,
+		)
 		return fmt.Errorf("architect: LLM planner not configured")
 	}
 
@@ -310,14 +326,34 @@ func (a *Architect) processClaimsEntry(ctx context.Context, entry *claims.GraphE
 	if err != nil {
 		if shared.IsConsultYielded(err) {
 			slog.Info("architect_claims_entry_yielded", "delta_key", entry.Delta.DeltaKey())
+			claims.RouteDebugLog().Info("architect_process_claims_entry_yielded",
+				append([]any{
+					"agent_id", a.id,
+					"session_id", a.config.SessionID,
+				}, claims.DeltaDebugArgs(entry.Delta)...)...,
+			)
 			return nil
 		}
 		slog.Error("architect_claims_entry_failed", "error", err.Error(), "delta_key", entry.Delta.DeltaKey())
+		claims.RouteDebugLog().Info("architect_process_claims_entry_failed",
+			append([]any{
+				"agent_id", a.id,
+				"session_id", a.config.SessionID,
+				"error", err.Error(),
+			}, claims.DeltaDebugArgs(entry.Delta)...)...,
+		)
 		acc.Record("error", err.Error())
 		return err
 	}
 	acc.Record("result_length", fmt.Sprintf("%d", len(result)))
 	acc.Note("Claims entry processed successfully")
+	claims.RouteDebugLog().Info("architect_process_claims_entry_done",
+		append([]any{
+			"agent_id", a.id,
+			"session_id", a.config.SessionID,
+			"result_length", len(result),
+		}, claims.DeltaDebugArgs(entry.Delta)...)...,
+	)
 	return nil
 }
 

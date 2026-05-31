@@ -754,6 +754,15 @@ func (a *Architect) Start(bus guide.EventBus) error {
 
 	a.bus = bus
 	a.channels = guide.NewAgentChannels("architect", a.id)
+	claims.RouteDebugLog().Info("architect_start",
+		"agent_id", a.id,
+		"session_id", a.config.SessionID,
+		"identity_present", a.identity != nil,
+		"factory_present", a.factory != nil,
+		"scope_present", a.scope != nil,
+		"request_topic", a.channels.Requests,
+		"response_topic", a.channels.Responses,
+	)
 
 	// Subscribe to own request channel (architect.requests)
 	var err error
@@ -858,8 +867,23 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	}); inbox != nil {
 		if err := inbox.Start(nil); err != nil {
 			slog.Warn("architect_claims_inbox_start_failed", "error", err.Error())
+			claims.RouteDebugLog().Info("architect_claims_inbox_start_failed",
+				"agent_id", a.id,
+				"session_id", a.config.SessionID,
+				"error", err.Error(),
+			)
 		}
 		a.claimsInbox = inbox
+		claims.RouteDebugLog().Info("architect_claims_inbox_started",
+			"agent_id", a.id,
+			"session_id", a.config.SessionID,
+			"patterns", claims.InboxPatternsFor(claims.RoleSubject|claims.RoleRemediator, a.config.SessionID, a.id),
+		)
+	} else {
+		claims.RouteDebugLog().Info("architect_claims_inbox_not_wired",
+			"agent_id", a.id,
+			"session_id", a.config.SessionID,
+		)
 	}
 
 	if a.scope != nil {
