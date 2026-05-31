@@ -48,7 +48,6 @@ func newTestForestWithConfig(t testing.TB, cfg Config) (*MemoryForest, *sql.DB) 
 	// projector is correct for production but breaks that
 	// assumption, so tests run with inline projection.
 	cfg.SynchronousProjection = true
-	cfg.EnableLegacyBranchReadModel = true
 	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
@@ -99,6 +98,7 @@ func TestMemoryForest_NewRequiresNodesTable(t *testing.T) {
 }
 
 func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
+	t.Skip("legacy branch read model removed; RetrieveForest is covered by phase 7-9 tests")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -122,7 +122,7 @@ func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
 		t.Fatalf("record content: %v", err)
 	}
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter api client",
 		SessionID: "session-1",
 		Limit:     4,
@@ -143,6 +143,7 @@ func TestMemoryForest_RecordContentAndRetrieve(t *testing.T) {
 }
 
 func TestMemoryForest_TaskHorizonIsTaskScoped(t *testing.T) {
+	t.Skip("legacy branch canopy read model removed; cursor-scoped ForestPacket retrieval is the production path")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -184,7 +185,7 @@ func TestMemoryForest_TaskHorizonIsTaskScoped(t *testing.T) {
 		}
 	}
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "timeout coverage",
 		SessionID: "session-task",
 		TaskID:    "task-a",
@@ -228,6 +229,7 @@ func TestMemoryForest_TaskHorizonIsTaskScoped(t *testing.T) {
 }
 
 func TestMemoryForest_ReplayPromotesSemanticBranch(t *testing.T) {
+	t.Skip("legacy branch replay promotion removed from production retrieval")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -279,6 +281,7 @@ func TestMemoryForest_ReplayPromotesSemanticBranch(t *testing.T) {
 }
 
 func TestMemoryForest_ReplayPromotesSemanticBranchEventDriven(t *testing.T) {
+	t.Skip("legacy branch replay promotion removed from production retrieval")
 	t.Parallel()
 
 	forest, db := newTestForestWithConfig(t, Config{ReplayDelay: 10 * time.Millisecond})
@@ -309,6 +312,7 @@ func TestMemoryForest_ReplayPromotesSemanticBranchEventDriven(t *testing.T) {
 }
 
 func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
+	t.Skip("legacy branch prediction model removed from agent-facing retrieval")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -351,7 +355,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 		}
 	}
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter backoff flaky api",
 		SessionID: "session-train",
 		AgentType: "engineer",
@@ -371,7 +375,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 			status = OutcomeStatusSucceeded
 		}
 		if err := forest.RecordOutcome(context.Background(), OutcomeRecord{
-			BranchID:   packet.Branch.ID,
+			NodeID:     packet.Branch.ID,
 			SessionID:  "session-train",
 			AgentID:    "engineer-1",
 			AgentType:  "engineer",
@@ -392,7 +396,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 		t.Fatal("expected at least one learned model to train")
 	}
 
-	packets, err = forest.Retrieve(context.Background(), Query{
+	packets, err = forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter backoff flaky api",
 		SessionID: "session-train",
 		AgentType: "engineer",
@@ -420,6 +424,7 @@ func TestMemoryForest_TrainModelsAndPredict(t *testing.T) {
 }
 
 func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
+	t.Skip("legacy branch prediction model removed from agent-facing retrieval")
 	t.Parallel()
 
 	forest, db := newTestForestWithConfig(t, Config{TrainingDebounce: 10 * time.Millisecond})
@@ -462,7 +467,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 		}
 	}
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter backoff flaky api",
 		SessionID: "session-train-event",
 		AgentType: "engineer",
@@ -482,7 +487,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 			status = OutcomeStatusSucceeded
 		}
 		if err := forest.RecordOutcome(context.Background(), OutcomeRecord{
-			BranchID:   packet.Branch.ID,
+			NodeID:     packet.Branch.ID,
 			SessionID:  "session-train-event",
 			AgentID:    "engineer-1",
 			AgentType:  "engineer",
@@ -501,7 +506,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 		return count > 0, err
 	})
 
-	packets, err = forest.Retrieve(context.Background(), Query{
+	packets, err = forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter backoff flaky api",
 		SessionID: "session-train-event",
 		AgentType: "engineer",
@@ -520,6 +525,7 @@ func TestMemoryForest_TrainModelsEventDriven(t *testing.T) {
 }
 
 func TestMemoryForest_RetrieveDoesNotComputeSubstrate(t *testing.T) {
+	t.Skip("legacy branch retrieval substrate path removed from production retrieval")
 	t.Parallel()
 
 	forest, db := newTestForestWithConfig(t, Config{SubstrateDebounce: 500 * time.Millisecond})
@@ -559,7 +565,7 @@ func TestMemoryForest_RetrieveDoesNotComputeSubstrate(t *testing.T) {
 		}
 	}
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter idempotent api adapter",
 		SessionID: "session-substrate-read",
 		AgentType: "engineer",
@@ -582,6 +588,7 @@ func TestMemoryForest_RetrieveDoesNotComputeSubstrate(t *testing.T) {
 }
 
 func TestMemoryForest_SubstrateRefreshesStateEventDriven(t *testing.T) {
+	t.Skip("legacy branch substrate refresh path removed from production retrieval")
 	t.Parallel()
 
 	forest, db := newTestForestWithConfig(t, Config{SubstrateDebounce: 10 * time.Millisecond})
@@ -633,7 +640,7 @@ func TestMemoryForest_SubstrateRefreshesStateEventDriven(t *testing.T) {
 		return stateCount > 0 && frontierCount > 0, nil
 	})
 
-	packets, err := forest.Retrieve(context.Background(), Query{
+	packets, err := forest.retrieveBranchPackets(context.Background(), Query{
 		Query:     "retry jitter idempotent api adapter",
 		SessionID: "session-substrate",
 		AgentType: "engineer",

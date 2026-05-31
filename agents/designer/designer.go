@@ -840,6 +840,12 @@ func (d *Designer) handleDesign(ctx context.Context, fwd *guide.ForwardedRequest
 		MaxTokens: d.config.DesignerConfig.MaxTokens,
 	}
 	d.applyDesignRuntimeProfile(req)
+	ctx, _, _ = shared.ApplyForestPreload(ctx, req, d.config.Forest, shared.ForestPreloadInput{
+		AgentType: "designer",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+		AgentID:   d.id,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(req, fwd.ConversationHistory)

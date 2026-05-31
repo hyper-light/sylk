@@ -812,32 +812,6 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 		limit = 64
 	}
 	sessionID = normalizeForestSessionID(sessionID)
-	if !m.legacyBranchReadModel {
-		hasNodes, err := m.hasSubstrateNodes(ctx, sessionID)
-		if err != nil {
-			return SubstrateResult{}, err
-		}
-		if hasNodes {
-			return m.refreshSubstrateChannelState(ctx, sessionID, limit)
-		}
-		return SubstrateResult{}, nil
-	}
-	branchRows, err := m.countSubstrateBranches(ctx, sessionID)
-	if err != nil {
-		return SubstrateResult{}, err
-	}
-	if branchRows > 0 {
-		branches, err := m.queryBranches(ctx, sessionID, "", false, defaultFamilies(), limit)
-		if err != nil {
-			return SubstrateResult{}, err
-		}
-		canopyRoots, err := m.loadSessionCanopyRoots(ctx, sessionID)
-		if err != nil {
-			return SubstrateResult{}, err
-		}
-		_, refreshed, err := m.refreshSubstrateState(ctx, sessionID, branches, canopyRoots)
-		return refreshed, err
-	}
 	hasNodes, err := m.hasSubstrateNodes(ctx, sessionID)
 	if err != nil {
 		return SubstrateResult{}, err
@@ -845,16 +819,7 @@ func (m *MemoryForest) runSubstrateMaintenanceForSession(ctx context.Context, se
 	if hasNodes {
 		return m.refreshSubstrateChannelState(ctx, sessionID, limit)
 	}
-	branches, err := m.queryBranches(ctx, sessionID, "", false, defaultFamilies(), limit)
-	if err != nil {
-		return SubstrateResult{}, err
-	}
-	canopyRoots, err := m.loadSessionCanopyRoots(ctx, sessionID)
-	if err != nil {
-		return SubstrateResult{}, err
-	}
-	_, refreshed, err := m.refreshSubstrateState(ctx, sessionID, branches, canopyRoots)
-	return refreshed, err
+	return SubstrateResult{}, nil
 }
 
 func (m *MemoryForest) countSubstrateBranches(ctx context.Context, sessionID string) (int, error) {

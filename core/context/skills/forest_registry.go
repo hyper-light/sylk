@@ -7,10 +7,8 @@ import (
 	"github.com/adalundhe/sylk/core/skills"
 )
 
-// genericForestSkillNames lists the forest query surface for every
-// agent's visible catalog. The four read-side verbs collapsed into a
-// single `forest(op=resolve_intent|recall|recall_recent|predict_next)`
-// so the LLM sees one name and selects the op.
+// genericForestSkillNames lists the ForestPacket-native query and governance
+// surface for every agent's visible catalog.
 var genericForestSkillNames = []string{
 	"forest.retrieve_evidence",
 	"forest.suggest_validations",

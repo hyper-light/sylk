@@ -25,7 +25,7 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 					ActiveRoots:   []string{"root-1"},
 				}, nil
 			},
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.AgentType != AgentTypeEngineer {
 					t.Fatalf("retrieve agent_type = %q, want %q", query.AgentType, AgentTypeEngineer)
 				}
@@ -40,20 +40,14 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 				if !query.IncludeCounterEvidence {
 					t.Fatal("expected counter evidence enabled")
 				}
-				return []*forest.BranchPacket{
-					{
-						Branch: &forest.Branch{
-							ID:      "branch-1",
-							Family:  forest.TreeFamilyIntent,
-							Summary: "Reuse the existing retry worker path",
-						},
-						Conflicts: []forest.PacketConflict{{Summary: "Prior branch failed without timeout coverage"}},
-						NextActions: []forest.PacketAction{{
-							Label:       "add-tests",
-							Description: "Add timeout regression coverage before merging",
-						}},
-					},
-				}, nil
+				packet := testSkillForestPacket("node-1", forest.ForestNodeClaim, "Reuse the existing retry worker path")
+				packet.CounterEvidence = []forest.ForestEvidence{{
+					RefType: "node",
+					RefID:   "risk-node",
+					NodeID:  "risk-node",
+					Summary: "Prior node failed without timeout coverage",
+				}}
+				return []*forest.ForestPacket{packet}, nil
 			},
 		},
 	}
@@ -91,19 +85,11 @@ func TestRoleForestSkillDesignerPredictsAdjacentValue(t *testing.T) {
 					PrimaryIntent: "improve the dashboard UX without extra scope",
 				}, nil
 			},
-			predict: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.AgentType != AgentTypeDesigner {
 					t.Fatalf("predict agent_type = %q, want %q", query.AgentType, AgentTypeDesigner)
 				}
-				return []*forest.BranchPacket{
-					{
-						Branch: &forest.Branch{
-							ID:      "branch-2",
-							Family:  forest.TreeFamilyIntent,
-							Summary: "Expose the primary status earlier in the flow",
-						},
-					},
-				}, nil
+				return []*forest.ForestPacket{testSkillForestPacket("node-2", forest.ForestNodeClaim, "Expose the primary status earlier in the flow")}, nil
 			},
 		},
 	}
@@ -145,22 +131,14 @@ func TestRoleForestSkillUsesRealTaskHorizon(t *testing.T) {
 					PrimaryIntent: "choose the right task-scoped tests",
 				}, nil
 			},
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.Horizon != forest.CanopyHorizonTask {
 					t.Fatalf("retrieve horizon = %q, want %q", query.Horizon, forest.CanopyHorizonTask)
 				}
 				if query.TaskID != "task-123" {
 					t.Fatalf("retrieve task_id = %q, want task-123", query.TaskID)
 				}
-				return []*forest.BranchPacket{
-					{
-						Branch: &forest.Branch{
-							ID:      "branch-task",
-							Family:  forest.TreeFamilyConstraint,
-							Summary: "Prior task-scoped regressions centered on timeout handling",
-						},
-					},
-				}, nil
+				return []*forest.ForestPacket{testSkillForestPacket("node-task", forest.ForestNodeValidation, "Prior task-scoped regressions centered on timeout handling")}, nil
 			},
 		},
 	}
@@ -226,7 +204,7 @@ func TestRoleForestSkillDefaultsScopeFromContext(t *testing.T) {
 				}
 				return &forest.IntentResolution{PrimaryIntent: "ctx-driven retrieval"}, nil
 			},
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.SessionID != "sess-ctx" {
 					t.Fatalf("retrieve session_id = %q, want sess-ctx", query.SessionID)
 				}
@@ -236,7 +214,7 @@ func TestRoleForestSkillDefaultsScopeFromContext(t *testing.T) {
 				if query.Horizon != forest.CanopyHorizonTask {
 					t.Fatalf("retrieve horizon = %q, want %q", query.Horizon, forest.CanopyHorizonTask)
 				}
-				return []*forest.BranchPacket{}, nil
+				return []*forest.ForestPacket{}, nil
 			},
 		},
 	}

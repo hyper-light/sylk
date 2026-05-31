@@ -75,8 +75,9 @@ func buildForestCursor(input ForestCursorInput) (*ForestCursor, error) {
 		PolicyVersion:    forestProjectionVersionPhase789,
 		CreatedAt:        time.Now().UTC(),
 		Metadata: map[string]any{
-			"packet_count": len(input.Packets),
-			"budget":       budget,
+			"packet_count":     len(input.Packets),
+			"budget":           budget,
+			"bridge_crossings": cursorBridgeCrossings(packets, budget),
 		},
 	}
 	if len(packets) == 0 && cursor.NoCursorReason == "" {
@@ -147,6 +148,54 @@ func cursorBridgeRefs(packets []*ForestPacket, budget int) []string {
 		}
 	}
 	return compactStrings(ids, budget)
+}
+
+func cursorBridgeCrossings(packets []*ForestPacket, budget int) []map[string]string {
+	type crossing struct {
+		BridgeID        string
+		NodeID          string
+		SourceClusterID string
+		TargetClusterID string
+	}
+	seen := make(map[string]struct{})
+	crossings := make([]crossing, 0)
+	for _, packet := range packets {
+		for _, risk := range packet.BridgeRisks {
+			if risk.BridgeID == "" || risk.SourceClusterID == "" || risk.TargetClusterID == "" {
+				continue
+			}
+			item := crossing{
+				BridgeID:        risk.BridgeID,
+				NodeID:          firstNonEmptyString(risk.NodeID, packet.Node.ID),
+				SourceClusterID: risk.SourceClusterID,
+				TargetClusterID: risk.TargetClusterID,
+			}
+			key := strings.Join([]string{item.BridgeID, item.NodeID, item.SourceClusterID, item.TargetClusterID}, "\x00")
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			crossings = append(crossings, item)
+		}
+	}
+	sort.SliceStable(crossings, func(i, j int) bool {
+		left := strings.Join([]string{crossings[i].BridgeID, crossings[i].SourceClusterID, crossings[i].TargetClusterID, crossings[i].NodeID}, "\x00")
+		right := strings.Join([]string{crossings[j].BridgeID, crossings[j].SourceClusterID, crossings[j].TargetClusterID, crossings[j].NodeID}, "\x00")
+		return left < right
+	})
+	if len(crossings) > budget {
+		crossings = crossings[:budget]
+	}
+	out := make([]map[string]string, 0, len(crossings))
+	for _, item := range crossings {
+		out = append(out, map[string]string{
+			"bridge_id":         item.BridgeID,
+			"node_id":           item.NodeID,
+			"source_cluster_id": item.SourceClusterID,
+			"target_cluster_id": item.TargetClusterID,
+		})
+	}
+	return out
 }
 
 func cursorRiskFlags(packets []*ForestPacket, reason string, budget int) []string {

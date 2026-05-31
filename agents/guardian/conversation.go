@@ -96,6 +96,12 @@ func (g *Guardian) composeUserFacingResponse(ctx context.Context, req *guardianC
 		Tools:        tools,
 	}
 	g.applyConversationRuntimeProfile(llmReq, req.Intent, req.SessionID)
+	ctx, _, _ = shared.ApplyForestPreload(ctx, llmReq, g.config.Forest, shared.ForestPreloadInput{
+		AgentType: "guardian",
+		Query:     req.Input,
+		SessionID: req.SessionID,
+		AgentID:   g.id,
+	})
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	// User-facing turn — caller is synchronously waiting for guardian's

@@ -131,8 +131,7 @@ func (s *mockSub) IsActive() bool {
 type mockForest struct {
 	mu             sync.Mutex
 	resolveResult  *forest.IntentResolution
-	retrieveResult []*forest.BranchPacket
-	predictResult  []*forest.BranchPacket
+	retrieveResult []*forest.ForestPacket
 	outcomes       []forest.OutcomeRecord
 }
 
@@ -146,18 +145,10 @@ func (m *mockForest) ResolveIntent(_ context.Context, input forest.ResolveIntent
 	return &forest.IntentResolution{Query: input.Query}, nil
 }
 
-func (m *mockForest) Retrieve(_ context.Context, _ forest.Query) ([]*forest.BranchPacket, error) {
+func (m *mockForest) RetrieveForest(_ context.Context, _ forest.Query) ([]*forest.ForestPacket, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return cloneBranchPackets(m.retrieveResult), nil
-}
-
-func (m *mockForest) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
-	packets, err := m.Retrieve(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	return mockForestPacketsFromBranches(packets), nil
+	return cloneForestPackets(m.retrieveResult), nil
 }
 
 func (m *mockForest) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
@@ -171,12 +162,6 @@ func (m *mockForest) CreateForestCursor(_ context.Context, input forest.ForestCu
 	return cursor, nil
 }
 
-func (m *mockForest) PredictNextBranches(_ context.Context, _ forest.Query) ([]*forest.BranchPacket, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return cloneBranchPackets(m.predictResult), nil
-}
-
 func (m *mockForest) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
 	return nil
 }
@@ -186,62 +171,6 @@ func (m *mockForest) RecordOutcome(_ context.Context, record forest.OutcomeRecor
 	defer m.mu.Unlock()
 	m.outcomes = append(m.outcomes, record)
 	return nil
-}
-
-func mockForestPacketsFromBranches(packets []*forest.BranchPacket) []*forest.ForestPacket {
-	out := make([]*forest.ForestPacket, 0, len(packets))
-	for _, packet := range packets {
-		if packet == nil || packet.Branch == nil {
-			continue
-		}
-		out = append(out, &forest.ForestPacket{
-			Node: forest.ForestNode{
-				ID:            packet.Branch.ID,
-				Kind:          forest.ForestNodeClaim,
-				Title:         packet.Branch.Title,
-				Summary:       packet.Branch.Summary,
-				EvidenceGrade: forest.EvidenceGradeObserved,
-				Confidence:    packet.Branch.Confidence,
-			},
-			Evidence: []forest.ForestEvidence{{
-				RefType: "node",
-				RefID:   packet.Branch.ID,
-				NodeID:  packet.Branch.ID,
-				Grade:   forest.EvidenceGradeObserved,
-				Summary: packet.Branch.Summary,
-			}},
-			Score: 1,
-		})
-	}
-	return out
-}
-
-// MEM-01: MemoryForestService widened with family projections. Scribe
-// doesn't exercise these; minimal no-op stubs keep the stub a valid
-// interface implementation.
-func (m *mockForest) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
-	return nil, nil
-}
-func (m *mockForest) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
-	return nil, nil
 }
 
 func (m *mockForest) recordedOutcomes() []forest.OutcomeRecord {
@@ -412,8 +341,8 @@ func TestScribe_GenerateCommentary_UsesForestSkillAndRecordsOutcome(t *testing.T
 			Query:         "preserve handoff context",
 			PrimaryIntent: "preserve history",
 		},
-		retrieveResult: []*forest.BranchPacket{
-			newBranchPacket("branch-1"),
+		retrieveResult: []*forest.ForestPacket{
+			newForestPacket("node-1"),
 		},
 	}
 	provider := &mockProvider{
@@ -471,8 +400,8 @@ func TestScribe_GenerateCommentary_UsesForestSkillAndRecordsOutcome(t *testing.T
 	if len(outcomes) != 1 {
 		t.Fatalf("forest outcomes = %d, want 1", len(outcomes))
 	}
-	if outcomes[0].BranchID != "branch-1" {
-		t.Fatalf("outcome branch_id = %q, want branch-1", outcomes[0].BranchID)
+	if outcomes[0].NodeID != "node-1" {
+		t.Fatalf("outcome node_id = %q, want node-1", outcomes[0].NodeID)
 	}
 	if outcomes[0].Status != forest.OutcomeStatusSucceeded {
 		t.Fatalf("outcome status = %q, want %q", outcomes[0].Status, forest.OutcomeStatusSucceeded)
@@ -949,30 +878,44 @@ func cloneAnyMap(values map[string]any) map[string]any {
 	return cloned
 }
 
-func newBranchPacket(branchID string) *forest.BranchPacket {
-	return &forest.BranchPacket{
-		Branch: &forest.Branch{
-			ID:      branchID,
-			Title:   "Branch " + branchID,
-			Summary: "summary for " + branchID,
+func newForestPacket(nodeID string) *forest.ForestPacket {
+	summary := "summary for " + nodeID
+	return &forest.ForestPacket{
+		Node: forest.ForestNode{
+			ID:            nodeID,
+			Kind:          forest.ForestNodeClaim,
+			Title:         "Node " + nodeID,
+			Summary:       summary,
+			EvidenceGrade: forest.EvidenceGradeObserved,
+			Confidence:    1,
 		},
+		Evidence: []forest.ForestEvidence{{
+			RefType: "node",
+			RefID:   nodeID,
+			NodeID:  nodeID,
+			Grade:   forest.EvidenceGradeObserved,
+			Summary: summary,
+		}},
+		Score: 1,
 	}
 }
 
-func cloneBranchPackets(packets []*forest.BranchPacket) []*forest.BranchPacket {
+func cloneForestPackets(packets []*forest.ForestPacket) []*forest.ForestPacket {
 	if len(packets) == 0 {
 		return nil
 	}
-	cloned := make([]*forest.BranchPacket, 0, len(packets))
+	cloned := make([]*forest.ForestPacket, 0, len(packets))
 	for _, packet := range packets {
 		if packet == nil {
 			continue
 		}
 		next := *packet
-		if packet.Branch != nil {
-			branch := *packet.Branch
-			next.Branch = &branch
-		}
+		next.Evidence = append([]forest.ForestEvidence(nil), packet.Evidence...)
+		next.CounterEvidence = append([]forest.ForestEvidence(nil), packet.CounterEvidence...)
+		next.Validations = append([]forest.ValidationEvidenceRecord(nil), packet.Validations...)
+		next.Artifacts = append([]forest.ArtifactEvidenceRecord(nil), packet.Artifacts...)
+		next.Paths = append([]forest.ForestPath(nil), packet.Paths...)
+		next.ProposedClaims = append([]forest.ForestClaimProposalTemplate(nil), packet.ProposedClaims...)
 		cloned = append(cloned, &next)
 	}
 	return cloned

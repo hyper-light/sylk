@@ -12,7 +12,14 @@ import (
 	"github.com/google/uuid"
 )
 
-// Retrieve returns ranked branch packets for the supplied query.
+// Retrieve returns evidence-backed ForestPackets for the supplied query.
+func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*ForestPacket, error) {
+	return m.RetrieveForest(ctx, query)
+}
+
+// retrieveBranchPackets is the private branch-scoring pipeline retained for
+// internal branch-table maintenance diagnostics. Agent-facing retrieval is
+// ForestPacket-only.
 //
 // Emits a retrieval audit event after returning to the caller — the
 // audit captures the full ranked candidate set (not just top-K) so
@@ -27,7 +34,7 @@ import (
 // The pinned snapshot id and proposed-arm flag are stamped onto the
 // audit row so outcome-driven adaptation can attribute the
 // observation back to the correct A/B arm.
-func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPacket, error) {
+func (m *MemoryForest) retrieveBranchPackets(ctx context.Context, query Query) ([]*BranchPacket, error) {
 	start := time.Now()
 	auditQuery := query
 	hp, isProposed := m.pinHyperparameterSnapshotForRetrieve()
@@ -37,10 +44,9 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*BranchPack
 	return packets, err
 }
 
-// RetrieveForest is the phase-4 primary retrieval path. It returns node,
+// RetrieveForest is the phase-8 primary retrieval path. It returns node,
 // cluster, graph, artifact, validation, and ecology signals without reading
-// forest_branches. Retrieve remains as a compatibility adapter for legacy
-// callers until the public API moves fully to ForestPacket.
+// forest_branches.
 func (m *MemoryForest) RetrieveForest(ctx context.Context, query Query) ([]*ForestPacket, error) {
 	normalized, err := normalizeQuery(query)
 	if err != nil {
@@ -726,7 +732,7 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 		return nil, err
 	}
 
-	packets, err := m.Retrieve(ctx, Query{
+	packets, err := m.RetrieveForest(ctx, Query{
 		Query:     query.Query,
 		SessionID: query.SessionID,
 		TaskID:    query.TaskID,
@@ -751,31 +757,26 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 		ActiveRoots: canopy.RootIDs,
 	}
 	for _, packet := range packets {
-		switch packet.Branch.Family {
+		if packet == nil {
+			continue
+		}
+		switch treeFamilyForNodeKind(packet.Node.Kind) {
 		case TreeFamilyIntent:
-			resolution.IntentBranches = append(resolution.IntentBranches, *packet)
+			resolution.IntentNodes = append(resolution.IntentNodes, packet)
 			if resolution.PrimaryIntent == "" {
-				resolution.PrimaryIntent = packet.Branch.Summary
+				resolution.PrimaryIntent = firstNonEmptyString(packet.Node.Summary, packet.Node.Title)
 			}
 		case TreeFamilyConstraint:
-			// Issue #11 Phase 3: Preference is now Constraint with
-			// severity=soft. Route soft-severity constraints into the
-			// Preferences slot for the operator-facing IntentResolution
-			// surface; hard-severity into Constraints.
-			if packet.Branch.ConstraintSeverity == ConstraintSeveritySoft {
-				resolution.Preferences = append(resolution.Preferences, *packet)
-			} else {
-				resolution.Constraints = append(resolution.Constraints, *packet)
-			}
+			resolution.Constraints = append(resolution.Constraints, packet)
 		case TreeFamilyOutcome:
-			resolution.OutcomeHints = append(resolution.OutcomeHints, *packet)
+			resolution.OutcomeHints = append(resolution.OutcomeHints, packet)
 		}
 	}
 	return resolution, nil
 }
 
-// PredictNextBranches retrieves low-risk adjacent-value branches.
-func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]*BranchPacket, error) {
+// PredictNextBranches retrieves low-risk adjacent-value ForestPackets.
+func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]*ForestPacket, error) {
 	var err error
 	query, err = normalizeQuery(query)
 	if err != nil {
@@ -789,7 +790,7 @@ func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]
 		TreeFamilyOutcome,
 	}
 	query.IncludeCounterEvidence = true
-	return m.Retrieve(ctx, query)
+	return m.RetrieveForest(ctx, query)
 }
 
 func normalizeQuery(query Query) (Query, error) {

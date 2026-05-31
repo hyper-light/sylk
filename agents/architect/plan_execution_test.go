@@ -57,8 +57,7 @@ type captureConversationPlanner struct {
 
 type captureArchitectForest struct {
 	resolveIntent func(context.Context, forest.ResolveIntentInput) (*forest.IntentResolution, error)
-	retrieve      func(context.Context, forest.Query) ([]*forest.BranchPacket, error)
-	predict       func(context.Context, forest.Query) ([]*forest.BranchPacket, error)
+	retrieve      func(context.Context, forest.Query) ([]*forest.ForestPacket, error)
 	recordOutcome func(context.Context, forest.OutcomeRecord) error
 }
 
@@ -69,19 +68,11 @@ func (m *captureArchitectForest) ResolveIntent(ctx context.Context, input forest
 	return &forest.IntentResolution{}, nil
 }
 
-func (m *captureArchitectForest) Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+func (m *captureArchitectForest) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 	if m.retrieve != nil {
 		return m.retrieve(ctx, query)
 	}
 	return nil, nil
-}
-
-func (m *captureArchitectForest) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
-	packets, err := m.Retrieve(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	return captureForestPacketsFromBranches(packets), nil
 }
 
 func (m *captureArchitectForest) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
@@ -95,13 +86,6 @@ func (m *captureArchitectForest) CreateForestCursor(_ context.Context, input for
 	return cursor, nil
 }
 
-func (m *captureArchitectForest) PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
-	if m.predict != nil {
-		return m.predict(ctx, query)
-	}
-	return nil, nil
-}
-
 func (m *captureArchitectForest) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
 	return nil
 }
@@ -111,62 +95,6 @@ func (m *captureArchitectForest) RecordOutcome(ctx context.Context, record fores
 		return m.recordOutcome(ctx, record)
 	}
 	return nil
-}
-
-func captureForestPacketsFromBranches(packets []*forest.BranchPacket) []*forest.ForestPacket {
-	out := make([]*forest.ForestPacket, 0, len(packets))
-	for _, packet := range packets {
-		if packet == nil || packet.Branch == nil {
-			continue
-		}
-		out = append(out, &forest.ForestPacket{
-			Node: forest.ForestNode{
-				ID:            packet.Branch.ID,
-				Kind:          forest.ForestNodeClaim,
-				Title:         packet.Branch.Title,
-				Summary:       packet.Branch.Summary,
-				EvidenceGrade: forest.EvidenceGradeObserved,
-				Confidence:    packet.Branch.Confidence,
-			},
-			Evidence: []forest.ForestEvidence{{
-				RefType: "node",
-				RefID:   packet.Branch.ID,
-				NodeID:  packet.Branch.ID,
-				Grade:   forest.EvidenceGradeObserved,
-				Summary: packet.Branch.Summary,
-			}},
-			Score: 1,
-		})
-	}
-	return out
-}
-
-// MEM-01: family projection stubs. This capture double doesn't assert
-// on projection calls; no-op implementations keep the interface
-// contract without changing test semantics.
-func (m *captureArchitectForest) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
-	return nil, nil
-}
-func (m *captureArchitectForest) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
-	return nil, nil
 }
 
 func (p *captureConversationPlanner) AnalyzeRequirements(context.Context, string, map[string]any) (*Requirements, error) {
@@ -1198,16 +1126,16 @@ func TestHandleConversation_RecoversRecentContextForTerseResume(t *testing.T) {
 	planner := &captureConversationPlanner{response: "planner resumed from recovered context"}
 	a.config.EnableLLM = true
 	a.config.Forest = &captureArchitectForest{
-		retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+		retrieve: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 			if query.SessionID != "sess-recall" {
 				t.Fatalf("retrieve session_id = %q, want sess-recall", query.SessionID)
 			}
 			if query.Query != "" {
 				t.Fatalf("retrieve query = %q, want empty for terse follow-up", query.Query)
 			}
-			return []*forest.BranchPacket{
-				{Branch: &forest.Branch{ID: "intent-1", Family: forest.TreeFamilyIntent, Summary: "Create the Python CLI package with argparse"}},
-				{Branch: &forest.Branch{ID: "decision-1", Family: forest.TreeFamilyDecision, Summary: "Use pyproject.toml and __main__.py"}},
+			return []*forest.ForestPacket{
+				newArchitectForestPacket("intent-1", forest.ForestNodeClaim, "Create the Python CLI package with argparse"),
+				newArchitectForestPacket("decision-1", forest.ForestNodeClaim, "Use pyproject.toml and __main__.py"),
 			}, nil
 		},
 	}
@@ -1230,6 +1158,26 @@ func TestHandleConversation_RecoversRecentContextForTerseResume(t *testing.T) {
 	}
 	if len(planner.lastRequest.RecentContextFocus) == 0 {
 		t.Fatal("expected recent_context_focus to be populated")
+	}
+}
+
+func newArchitectForestPacket(nodeID string, kind forest.ForestNodeKind, summary string) *forest.ForestPacket {
+	return &forest.ForestPacket{
+		Node: forest.ForestNode{
+			ID:            nodeID,
+			Kind:          kind,
+			Summary:       summary,
+			EvidenceGrade: forest.EvidenceGradeObserved,
+			Confidence:    1,
+		},
+		Evidence: []forest.ForestEvidence{{
+			RefType: "node",
+			RefID:   nodeID,
+			NodeID:  nodeID,
+			Grade:   forest.EvidenceGradeObserved,
+			Summary: summary,
+		}},
+		Score: 1,
 	}
 }
 

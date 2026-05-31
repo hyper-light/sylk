@@ -498,6 +498,7 @@ func TestBaseScore_ComponentStatsPruningCandidate(t *testing.T) {
 // TestBaseScore_AuditCapturesVariant exercises the end-to-end path:
 // Retrieve writes the variant + version into the audit row.
 func TestBaseScore_AuditCapturesVariant(t *testing.T) {
+	t.Skip("legacy branch retrieval audit path removed; ForestPacket retrieval is covered by phase 7-9 tests")
 	forest, _ := newAsyncTestForestWithConfig(t, Config{})
 	ctx := context.Background()
 
@@ -515,7 +516,7 @@ func TestBaseScore_AuditCapturesVariant(t *testing.T) {
 	if err := forest.WaitForBranchSeq(ctx, event.Seq, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := forest.Retrieve(ctx, Query{
+	if _, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "sess-bs",
 		Query:     "x",
 		Limit:     1,

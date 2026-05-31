@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/adalundhe/sylk/core/activity"
@@ -22,6 +21,7 @@ type ForestRoleInput struct {
 	TaskID                 string `json:"task_id,omitempty"`
 	AgentID                string `json:"agent_id,omitempty"`
 	IntentID               string `json:"intent_id,omitempty"`
+	CursorID               string `json:"cursor_id,omitempty"`
 	Horizon                string `json:"horizon,omitempty"`
 	Limit                  int    `json:"limit,omitempty"`
 	IncludeCounterEvidence *bool  `json:"include_counter_evidence,omitempty"`
@@ -63,7 +63,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "architect_forest_get_plan_precedents",
 		Domain:           AgentTypeArchitect,
-		Description:      "Recall prior plan branches, constraints, evidence, and outcomes relevant to the current architectural direction.",
+		Description:      "Recall prior plan nodes, constraints, evidence, and outcomes relevant to the current architectural direction.",
 		Keywords:         []string{"architect", "plan", "precedent", "constraint", "outcome"},
 		QueryDescription: "Architectural plan, decomposition, or design direction to ground in precedent",
 		Families: []forest.TreeFamily{
@@ -74,7 +74,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 		},
 		DefaultLimit:           6,
 		IncludeCounterEvidence: true,
-		Usage:                  "Use before finalizing a plan, major decomposition, or architectural trade-off so the architect sees prior successful and failed branches.",
+		Usage:                  "Use before finalizing a plan, major decomposition, or architectural trade-off so the architect sees prior successful and failed plan paths.",
 		BestPractices: []string{
 			"Prefer this when the plan could repeat a past failure or when the repo already has strong implementation precedent.",
 		},
@@ -82,12 +82,12 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "architect_forest_compare_plan_branches",
 		Domain:           AgentTypeArchitect,
-		Description:      "Predict low-risk adjacent plan branches that could improve the current architecture or decomposition.",
-		Keywords:         []string{"architect", "compare", "plan", "branch", "adjacent"},
-		QueryDescription: "Current architectural problem or decomposition to compare against adjacent branches",
+		Description:      "Predict low-risk adjacent plan paths that could improve the current architecture or decomposition.",
+		Keywords:         []string{"architect", "compare", "plan", "path", "adjacent"},
+		QueryDescription: "Current architectural problem or decomposition to compare against adjacent packet paths",
 		DefaultLimit:     5,
 		Predict:          true,
-		Usage:            "Use when the architect wants to check whether a nearby branch would better satisfy likely user intent without surprising scope expansion.",
+		Usage:            "Use when the architect wants to check whether a nearby path would better satisfy likely user intent without surprising scope expansion.",
 	},
 	{
 		Name:             "academic_forest_get_authority_bundle",
@@ -106,7 +106,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "academic_forest_check_contradictions",
 		Domain:           AgentTypeAcademic,
-		Description:      "Retrieve contradiction-heavy branches and constraints so academic work does not overstate weak or conflicting evidence.",
+		Description:      "Retrieve contradiction-heavy nodes and constraints so academic work does not overstate weak or conflicting evidence.",
 		Keywords:         []string{"academic", "contradiction", "counterevidence", "constraint"},
 		QueryDescription: "Claim or proposal that needs contradiction and counterevidence review",
 		Families: []forest.TreeFamily{
@@ -120,7 +120,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "librarian_forest_get_code_precedents",
 		Domain:           AgentTypeLibrarian,
-		Description:      "Retrieve code-facing precedents, implementation branches, and capability evidence for the current repo task.",
+		Description:      "Retrieve code-facing precedents, implementation nodes, and capability evidence for the current repo task.",
 		Keywords:         []string{"librarian", "code", "precedent", "implementation", "pattern"},
 		QueryDescription: "Code problem, implementation pattern, or touched-file concern to ground in repo precedent",
 		Families: []forest.TreeFamily{
@@ -161,7 +161,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "archivalist_forest_get_failure_precedents",
 		Domain:           AgentTypeArchivalist,
-		Description:      "Retrieve past failed or mixed branches so current work avoids repeating historical mistakes.",
+		Description:      "Retrieve past failed or mixed paths so current work avoids repeating historical mistakes.",
 		Keywords:         []string{"archivalist", "failure", "precedent", "history", "conflict"},
 		QueryDescription: "Failure mode, repeated issue, or risky area to compare against prior outcomes",
 		Families: []forest.TreeFamily{
@@ -175,7 +175,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "guide_forest_get_user_intent_history",
 		Domain:           AgentTypeGuide,
-		Description:      "Resolve the user’s active intent using prior intent, preference, and outcome branches instead of only the literal current prompt.",
+		Description:      "Resolve the user's active intent using prior intent, preference, and outcome nodes instead of only the literal current prompt.",
 		Keywords:         []string{"guide", "intent", "history", "preference", "outcome"},
 		QueryDescription: "User request or confusion point that needs longitudinal intent context",
 		Families: []forest.TreeFamily{
@@ -189,9 +189,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "guide_forest_get_teaching_precedents",
 		Domain:           AgentTypeGuide,
-		Description:      "Retrieve evidence and successful explanation branches that can improve onboarding or guidance quality.",
+		Description:      "Retrieve evidence and successful explanation nodes that can improve onboarding or guidance quality.",
 		Keywords:         []string{"guide", "teaching", "example", "onboarding", "precedent"},
-		QueryDescription: "Concept, tutorial need, or explanation path that should use prior successful teaching branches",
+		QueryDescription: "Concept, tutorial need, or explanation path that should use prior successful teaching nodes",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyEvidence,
 			forest.TreeFamilyIntent,
@@ -203,7 +203,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "orchestrator_forest_get_coordination_precedents",
 		Domain:           AgentTypeOrchestrator,
-		Description:      "Recall prior coordination branches, outcomes, and capability precedents for the current multi-agent situation.",
+		Description:      "Recall prior coordination paths, outcomes, and capability precedents for the current multi-agent situation.",
 		Keywords:         []string{"orchestrator", "coordination", "precedent", "handoff", "workflow"},
 		QueryDescription: "Coordination problem, workflow state, or multi-agent objective to ground in precedent",
 		Families: []forest.TreeFamily{
@@ -217,7 +217,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "orchestrator_forest_predict_handoff_path",
 		Domain:           AgentTypeOrchestrator,
-		Description:      "Predict low-risk adjacent branches that could improve coordination or handoff sequencing.",
+		Description:      "Predict low-risk adjacent paths that could improve coordination or handoff sequencing.",
 		Keywords:         []string{"orchestrator", "predict", "handoff", "sequence", "adjacent"},
 		QueryDescription: "Workflow or coordination problem that may have a better next handoff path",
 		DefaultLimit:     5,
@@ -226,9 +226,9 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "engineer_forest_select_implementation_branch",
 		Domain:           AgentTypeEngineer,
-		Description:      "Retrieve the strongest implementation branches, constraints, and capability evidence for the current coding task.",
-		Keywords:         []string{"engineer", "implementation", "branch", "constraint", "capability"},
-		QueryDescription: "Implementation task or coding problem to ground in branch precedent",
+		Description:      "Retrieve the strongest implementation nodes, constraints, and capability evidence for the current coding task.",
+		Keywords:         []string{"engineer", "implementation", "node", "constraint", "capability"},
+		QueryDescription: "Implementation task or coding problem to ground in forest precedent",
 		Families: []forest.TreeFamily{
 			forest.TreeFamilyIntent,
 			forest.TreeFamilyEvidence,
@@ -242,7 +242,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "engineer_forest_get_failure_precedents",
 		Domain:           AgentTypeEngineer,
-		Description:      "Retrieve prior failures, constraints, and conflict-heavy branches that could invalidate the current implementation path.",
+		Description:      "Retrieve prior failures, constraints, and conflict-heavy nodes that could invalidate the current implementation path.",
 		Keywords:         []string{"engineer", "failure", "regression", "constraint", "conflict"},
 		QueryDescription: "Implementation area that may have hidden regression or failure precedent",
 		Families: []forest.TreeFamily{
@@ -270,7 +270,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "designer_forest_discover_adjacent_value",
 		Domain:           AgentTypeDesigner,
-		Description:      "Predict low-risk adjacent design branches that could improve the work beyond literal compliance.",
+		Description:      "Predict low-risk adjacent design paths that could improve the work beyond literal compliance.",
 		Keywords:         []string{"designer", "adjacent", "value", "opportunity", "predict"},
 		QueryDescription: "Design task or UX problem to explore for safe adjacent value",
 		DefaultLimit:     5,
@@ -294,7 +294,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "guardian_forest_get_approval_precedents",
 		Domain:           AgentTypeGuardian,
-		Description:      "Recall prior approved or rejected branches relevant to the current governance decision.",
+		Description:      "Recall prior approved or rejected outcomes relevant to the current governance decision.",
 		Keywords:         []string{"guardian", "approval", "precedent", "governance", "decision"},
 		QueryDescription: "Governance or approval decision that should be checked against precedent",
 		Families: []forest.TreeFamily{
@@ -323,7 +323,7 @@ var forestRoleSkillSpecs = []forestRoleSkillSpec{
 	{
 		Name:             "scribe_forest_prepare_handoff_context",
 		Domain:           AgentTypeScribe,
-		Description:      "Retrieve the branch context most important to preserve for future handoff and replay.",
+		Description:      "Retrieve the forest context most important to preserve for future handoff and replay.",
 		Keywords:         []string{"scribe", "handoff", "replay", "context", "preserve"},
 		QueryDescription: "Workstream or handoff target that needs compact high-signal forest context",
 		Families: []forest.TreeFamily{
@@ -538,8 +538,8 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 		}
 	}
 	description := fmt.Sprintf(
-		"Memory Forest consultation for the %s role. Run a retrieval or prediction query against the per-role tree families, selected by the purpose enum. Collapses the historical per-purpose %s_forest_* skills into one primitive.\n\nPurposes:\n%s",
-		role, role, purposeLines.String(),
+		"Memory Forest consultation for the %s role. Run a packet retrieval query against role-scoped forest node families, selected by the purpose enum.\n\nPurposes:\n%s",
+		role, purposeLines.String(),
 	)
 	b := skills.NewSkill(name).
 		Description(description).
@@ -559,7 +559,8 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		IntParam("limit", "Maximum number of branch packets to return", false).
+		StringParam("cursor_id", "Optional forest cursor id from a prior turn or preload", false).
+		IntParam("limit", "Maximum number of forest packets to return", false).
 		BoolParam("include_counter_evidence", "Whether to include contradictory evidence in the returned packets (retrieval purposes only; ignored for predict purposes)", false)
 
 	usageParts := make([]string, 0, len(specs))
@@ -589,6 +590,7 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 			TaskID                 string `json:"task_id,omitempty"`
 			AgentID                string `json:"agent_id,omitempty"`
 			IntentID               string `json:"intent_id,omitempty"`
+			CursorID               string `json:"cursor_id,omitempty"`
 			Horizon                string `json:"horizon,omitempty"`
 			Limit                  int    `json:"limit,omitempty"`
 			IncludeCounterEvidence *bool  `json:"include_counter_evidence,omitempty"`
@@ -637,50 +639,24 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 			Horizon:   query.Horizon,
 		}
 
-		var (
-			intent   *forest.IntentResolution
-			packets  []*forest.ForestPacket
-			cursor   *forest.ForestCursor
-			firstErr error
-			mu       sync.Mutex
-			wg       sync.WaitGroup
-		)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			resolution, resolveErr := deps.Forest.ResolveIntent(ctx, intentInput)
-			mu.Lock()
-			defer mu.Unlock()
-			if resolveErr != nil && firstErr == nil {
-				firstErr = resolveErr
-				return
-			}
-			intent = resolution
-		}()
-		go func() {
-			defer wg.Done()
-			retrieved, packetsErr := deps.Forest.RetrieveForest(ctx, query)
-			if packetsErr == nil {
-				cursor, packetsErr = deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
-					SessionID: query.SessionID,
-					TaskID:    query.TaskID,
-					AgentID:   query.AgentID,
-					Packets:   retrieved,
-					Limit:     query.Limit,
-				})
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if packetsErr != nil && firstErr == nil {
-				firstErr = packetsErr
-				return
-			}
-			packets = retrieved
-		}()
-		wg.Wait()
-		if firstErr != nil {
-			return nil, firstErr
+		intent, err := deps.Forest.ResolveIntent(ctx, intentInput)
+		if err != nil {
+			return nil, err
+		}
+		packets, err := deps.Forest.RetrieveForest(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		cursor, err := deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
+			SessionID: query.SessionID,
+			TaskID:    query.TaskID,
+			AgentID:   query.AgentID,
+			TurnID:    strings.TrimSpace(params.CursorID),
+			Packets:   packets,
+			Limit:     query.Limit,
+		})
+		if err != nil {
+			return nil, err
 		}
 		projection, err := forest.BuildRoleForestProjection(spec.Domain, packets, cursor, query.Limit)
 		if err != nil {
@@ -691,7 +667,7 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 		// activities within this call stack can declare causation
 		// back to this consult. The forest bridge joins the
 		// resulting outcomes to the consult record during harvest.
-		consultID := emitForestConsultActivity(ctx, spec, purpose, query, intent, packets)
+		consultID := emitForestConsultActivity(ctx, spec, purpose, query, intent, packets, cursor)
 
 		return &ForestRoleOutput{
 			Role:              spec.Domain,
@@ -725,7 +701,8 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		IntParam("limit", "Maximum number of branch packets to return", false)
+		StringParam("cursor_id", "Optional forest cursor id from a prior turn or preload", false).
+		IntParam("limit", "Maximum number of forest packets to return", false)
 	if !spec.Predict {
 		b = b.BoolParam("include_counter_evidence", "Whether to include contradictory evidence in the returned packets", false)
 	}
@@ -777,50 +754,24 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 			Horizon:   query.Horizon,
 		}
 
-		var (
-			intent   *forest.IntentResolution
-			packets  []*forest.ForestPacket
-			cursor   *forest.ForestCursor
-			firstErr error
-			mu       sync.Mutex
-			wg       sync.WaitGroup
-		)
-
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			resolution, resolveErr := deps.Forest.ResolveIntent(ctx, intentInput)
-			mu.Lock()
-			defer mu.Unlock()
-			if resolveErr != nil && firstErr == nil {
-				firstErr = resolveErr
-				return
-			}
-			intent = resolution
-		}()
-		go func() {
-			defer wg.Done()
-			retrieved, packetsErr := deps.Forest.RetrieveForest(ctx, query)
-			if packetsErr == nil {
-				cursor, packetsErr = deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
-					SessionID: query.SessionID,
-					TaskID:    query.TaskID,
-					AgentID:   query.AgentID,
-					Packets:   retrieved,
-					Limit:     query.Limit,
-				})
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			if packetsErr != nil && firstErr == nil {
-				firstErr = packetsErr
-				return
-			}
-			packets = retrieved
-		}()
-		wg.Wait()
-		if firstErr != nil {
-			return nil, firstErr
+		intent, err := deps.Forest.ResolveIntent(ctx, intentInput)
+		if err != nil {
+			return nil, err
+		}
+		packets, err := deps.Forest.RetrieveForest(ctx, query)
+		if err != nil {
+			return nil, err
+		}
+		cursor, err := deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
+			SessionID: query.SessionID,
+			TaskID:    query.TaskID,
+			AgentID:   query.AgentID,
+			TurnID:    strings.TrimSpace(params.CursorID),
+			Packets:   packets,
+			Limit:     query.Limit,
+		})
+		if err != nil {
+			return nil, err
 		}
 		projection, err := forest.BuildRoleForestProjection(spec.Domain, packets, cursor, query.Limit)
 		if err != nil {
@@ -831,7 +782,7 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 		// See the collapsed-skill handler above for rationale.
 		// The single-purpose per-role skill uses the spec's default
 		// purpose string since the handler params don't carry one.
-		consultID := emitForestConsultActivity(ctx, spec, defaultPurposeForSpec(spec), query, intent, packets)
+		consultID := emitForestConsultActivity(ctx, spec, defaultPurposeForSpec(spec), query, intent, packets, cursor)
 
 		return &ForestRoleOutput{
 			Role:              spec.Domain,
@@ -862,7 +813,7 @@ func defaultPurposeForSpec(spec forestRoleSkillSpec) string {
 }
 
 // emitForestConsultActivity records the fact of a forest consult
-// into the fabric. Payload captures purpose, query, branch IDs, and
+// into the fabric. Payload captures purpose, query, node IDs, cursor, and
 // intent confidence so the forest bridge's consume/resolve harvest
 // can join subsequent outcomes back to the consult that shaped
 // them. Returns the emitted activity ID so the handler can include
@@ -874,6 +825,7 @@ func emitForestConsultActivity(
 	query forest.Query,
 	intent *forest.IntentResolution,
 	packets []*forest.ForestPacket,
+	cursor *forest.ForestCursor,
 ) string {
 	actorID := strings.TrimSpace(query.AgentID)
 	if actorID == "" {
@@ -893,12 +845,17 @@ func emitForestConsultActivity(
 	}
 
 	payload := map[string]any{
-		"purpose":    purpose,
-		"query":      query.Query,
-		"horizon":    query.Horizon,
-		"limit":      query.Limit,
-		"branch_ids": nodeIDs,
-		"node_ids":   nodeIDs,
+		"purpose":  purpose,
+		"query":    query.Query,
+		"horizon":  query.Horizon,
+		"limit":    query.Limit,
+		"node_ids": nodeIDs,
+	}
+	if cursor != nil {
+		payload["cursor_id"] = cursor.ID
+		payload["active_cluster_ids"] = cursor.ActiveClusterIDs
+		payload["bridge_refs"] = cursor.BridgeRefs
+		payload["risk_flags"] = cursor.RiskFlags
 	}
 	if intent != nil {
 		if intent.PrimaryIntent != "" {
@@ -995,11 +952,11 @@ func buildRoleForestFocus(intent *forest.IntentResolution, packets []*forest.For
 
 	if intent != nil {
 		add("Primary intent: " + intent.PrimaryIntent)
-		if len(intent.Constraints) > 0 && intent.Constraints[0].Branch != nil {
-			add("Constraint: " + intent.Constraints[0].Branch.Summary)
+		if len(intent.Constraints) > 0 && intent.Constraints[0] != nil {
+			add("Constraint: " + firstNonEmpty(intent.Constraints[0].Node.Summary, intent.Constraints[0].Node.Title))
 		}
-		if len(intent.Preferences) > 0 && intent.Preferences[0].Branch != nil {
-			add("Preference: " + intent.Preferences[0].Branch.Summary)
+		if len(intent.Preferences) > 0 && intent.Preferences[0] != nil {
+			add("Preference: " + firstNonEmpty(intent.Preferences[0].Node.Summary, intent.Preferences[0].Node.Title))
 		}
 	}
 	if len(packets) > 0 {

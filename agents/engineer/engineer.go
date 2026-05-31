@@ -1019,6 +1019,13 @@ func (e *Engineer) Handle(ctx context.Context, req *EngineerRequest) (_ *Enginee
 		MaxTokens:    e.config.EngineerConfig.MaxTokens,
 	}
 	e.applyLLMRuntimeProfile(llmReq, "implementation")
+	ctx, _, _ = shared.ApplyForestPreload(ctx, llmReq, e.config.Forest, shared.ForestPreloadInput{
+		AgentType: "engineer",
+		Query:     req.Prompt,
+		SessionID: req.SessionID,
+		TaskID:    req.TaskID,
+		AgentID:   e.id,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	shared.PrependHistoryMessages(llmReq, req.ConversationHistory)

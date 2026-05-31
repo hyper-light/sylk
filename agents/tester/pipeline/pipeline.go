@@ -688,6 +688,17 @@ func (pt *PipelineTester) Handle(ctx context.Context, fwd *guide.ForwardedReques
 		Tools:     tools,
 	}
 	pt.applyLLMRuntimeProfile(req, "validation")
+	taskID := ""
+	if task != nil {
+		taskID = task.TaskID
+	}
+	ctx, _, _ = agentshared.ApplyForestPreload(ctx, req, pt.config.Forest, agentshared.ForestPreloadInput{
+		AgentType: "tester",
+		Query:     userMessage,
+		SessionID: fwd.SessionID,
+		TaskID:    taskID,
+		AgentID:   pt.id,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)

@@ -629,7 +629,9 @@ type LearnedPrediction struct {
 	Signals        []FeatureSignal `json:"signals,omitempty"`
 }
 
-// BranchPacket is the agent-facing retrieval unit.
+// BranchPacket is the pre-emergent branch scoring unit retained for
+// internal branch-table diagnostics and historical migration tests.
+// Agents receive ForestPacket values.
 //
 // MEM-05: every packet carries three first-class dimensions the Architect
 // and other consumers must interpret:
@@ -780,18 +782,19 @@ type ResolveIntentInput struct {
 
 // IntentResolution returns the active intent frontier for the caller.
 type IntentResolution struct {
-	Query          string         `json:"query"`
-	PrimaryIntent  string         `json:"primary_intent,omitempty"`
-	ActiveRoots    []string       `json:"active_roots"`
-	Constraints    []BranchPacket `json:"constraints,omitempty"`
-	Preferences    []BranchPacket `json:"preferences,omitempty"`
-	IntentBranches []BranchPacket `json:"intent_branches,omitempty"`
-	OutcomeHints   []BranchPacket `json:"outcome_hints,omitempty"`
+	Query         string          `json:"query"`
+	PrimaryIntent string          `json:"primary_intent,omitempty"`
+	ActiveRoots   []string        `json:"active_roots"`
+	Constraints   []*ForestPacket `json:"constraints,omitempty"`
+	Preferences   []*ForestPacket `json:"preferences,omitempty"`
+	IntentNodes   []*ForestPacket `json:"intent_nodes,omitempty"`
+	OutcomeHints  []*ForestPacket `json:"outcome_hints,omitempty"`
 }
 
 // OutcomeRecord appends an outcome event to the forest.
 type OutcomeRecord struct {
-	BranchID       string        `json:"branch_id"`
+	NodeID         string        `json:"node_id"`
+	CursorID       string        `json:"cursor_id,omitempty"`
 	SessionID      string        `json:"session_id,omitempty"`
 	TaskID         string        `json:"task_id,omitempty"`
 	AgentID        string        `json:"agent_id,omitempty"`

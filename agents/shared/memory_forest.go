@@ -18,12 +18,8 @@ import (
 
 // MemoryForestService captures the forest methods agents use directly.
 //
-// MEM-01/MEM-02: the Project* methods expose family-typed views so
-// agents can pull the slice of the forest they actually need before
-// they hit the LLM, rather than having the LLM call generic Retrieve
-// and cross-filter during its tool loop. ProjectionInput mirrors
-// ResolveIntentInput; see core/forest/projections.go for the bucket
-// partitioning rules each method applies.
+// Phase 9: agent-facing memory is ForestPacket and ForestCursor native.
+// Branch projections are not part of the agent contract.
 type MemoryForestService interface {
 	ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
 	RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
@@ -45,26 +41,27 @@ const (
 	forestTrackerMaxAge     = 15 * time.Minute
 )
 
-// MemoryForestTracker keeps the most recent branch IDs surfaced through forest
+// MemoryForestTracker keeps the most recent node IDs surfaced through forest
 // skills so later terminal steps can feed outcomes back into the forest.
 type MemoryForestTracker struct {
 	mu      sync.RWMutex
-	entries map[string]trackedForestBranches
+	entries map[string]trackedForestNodes
 }
 
-type trackedForestBranches struct {
-	BranchIDs []string
+type trackedForestNodes struct {
+	NodeIDs   []string
+	CursorID  string
 	UpdatedAt time.Time
 }
 
 func NewMemoryForestTracker() *MemoryForestTracker {
 	return &MemoryForestTracker{
-		entries: make(map[string]trackedForestBranches),
+		entries: make(map[string]trackedForestNodes),
 	}
 }
 
 // RegisterMemoryForestSkills installs forest-backed skills for the given role
-// and wraps them so surfaced branch IDs are tracked for later outcome writes.
+// and wraps them so surfaced node IDs are tracked for later outcome writes.
 func RegisterMemoryForestSkills(
 	registry *coreskills.Registry,
 	agentType string,
@@ -406,8 +403,8 @@ func (t *MemoryForestTracker) ObserveResult(ctx context.Context, result any, ses
 	if t == nil {
 		return
 	}
-	branchIDs := extractTrackedForestBranchIDs(result)
-	if len(branchIDs) == 0 {
+	nodeIDs, cursorID := extractTrackedForestNodeIDs(result)
+	if len(nodeIDs) == 0 {
 		return
 	}
 	key := forestTrackerKey(ctx, sessionFallback)
@@ -416,29 +413,31 @@ func (t *MemoryForestTracker) ObserveResult(ctx context.Context, result any, ses
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.entries[key] = trackedForestBranches{
-		BranchIDs: branchIDs,
+	t.entries[key] = trackedForestNodes{
+		NodeIDs:   nodeIDs,
+		CursorID:  cursorID,
 		UpdatedAt: time.Now(),
 	}
 	t.pruneLocked(time.Now())
 }
 
-func (t *MemoryForestTracker) Snapshot(ctx context.Context, sessionFallback string) []string {
+func (t *MemoryForestTracker) Snapshot(ctx context.Context, sessionFallback string) ([]string, string) {
 	if t == nil {
-		return nil
+		return nil, ""
 	}
 	key := forestTrackerKey(ctx, sessionFallback)
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if entry, ok := t.entries[key]; ok {
 		if forestTrackerEntryExpired(entry, time.Now()) {
-			return nil
+			return nil, ""
 		}
-		return append([]string(nil), entry.BranchIDs...)
+		return append([]string(nil), entry.NodeIDs...), entry.CursorID
 	}
 	var (
 		bestTime time.Time
 		bestIDs  []string
+		cursorID string
 	)
 	sessionID := forestTrackerSessionID(ctx, sessionFallback)
 	for entryKey, entry := range t.entries {
@@ -450,10 +449,11 @@ func (t *MemoryForestTracker) Snapshot(ctx context.Context, sessionFallback stri
 		}
 		if entry.UpdatedAt.After(bestTime) {
 			bestTime = entry.UpdatedAt
-			bestIDs = entry.BranchIDs
+			bestIDs = entry.NodeIDs
+			cursorID = entry.CursorID
 		}
 	}
-	return append([]string(nil), bestIDs...)
+	return append([]string(nil), bestIDs...), cursorID
 }
 
 func (t *MemoryForestTracker) RecordOutcome(
@@ -468,8 +468,8 @@ func (t *MemoryForestTracker) RecordOutcome(
 	if t == nil || forestSvc == nil {
 		return nil
 	}
-	branchIDs := t.Snapshot(ctx, sessionFallback)
-	if len(branchIDs) == 0 {
+	nodeIDs, cursorID := t.Snapshot(ctx, sessionFallback)
+	if len(nodeIDs) == 0 {
 		return nil
 	}
 	summary = strings.TrimSpace(summary)
@@ -477,9 +477,10 @@ func (t *MemoryForestTracker) RecordOutcome(
 		summary = fmt.Sprintf("%s outcome recorded by %s", status, strings.TrimSpace(agentType))
 	}
 	sessionID := forestTrackerSessionID(ctx, sessionFallback)
-	for _, branchID := range branchIDs {
+	for _, nodeID := range nodeIDs {
 		if err := forestSvc.RecordOutcome(ctx, forest.OutcomeRecord{
-			BranchID:   branchID,
+			NodeID:     nodeID,
+			CursorID:   cursorID,
 			SessionID:  sessionID,
 			AgentID:    strings.TrimSpace(agentID),
 			AgentType:  strings.TrimSpace(agentType),
@@ -536,7 +537,7 @@ func (t *MemoryForestTracker) pruneLocked(now time.Time) {
 	}
 }
 
-func forestTrackerEntryExpired(entry trackedForestBranches, now time.Time) bool {
+func forestTrackerEntryExpired(entry trackedForestNodes, now time.Time) bool {
 	if entry.UpdatedAt.IsZero() {
 		return false
 	}
@@ -570,66 +571,47 @@ func forestTrackerSessionID(ctx context.Context, sessionFallback string) string 
 	return strings.TrimSpace(sessionFallback)
 }
 
-func extractTrackedForestBranchIDs(result any) []string {
+func extractTrackedForestNodeIDs(result any) ([]string, string) {
 	switch value := result.(type) {
 	case *contextskills.ForestRoleOutput:
-		return branchIDsFromForestRoleOutput(value)
+		return nodeIDsFromForestRoleOutput(value)
 	case contextskills.ForestRoleOutput:
-		return branchIDsFromForestRoleOutput(&value)
+		return nodeIDsFromForestRoleOutput(&value)
 	case *contextskills.ForestRecallOutput:
-		return dedupeBranchIDs(branchIDsFromForestPackets(value.Packets))
+		return dedupeNodeIDs(nodeIDsFromForestPackets(value.Packets)), cursorIDFromForestCursor(value.Cursor)
 	case contextskills.ForestRecallOutput:
-		return dedupeBranchIDs(branchIDsFromForestPackets(value.Packets))
+		return dedupeNodeIDs(nodeIDsFromForestPackets(value.Packets)), cursorIDFromForestCursor(value.Cursor)
 	case *forest.IntentResolution:
-		return dedupeBranchIDs(branchIDsFromIntentResolution(value))
+		return dedupeNodeIDs(nodeIDsFromIntentResolution(value)), ""
 	case forest.IntentResolution:
-		return dedupeBranchIDs(branchIDsFromIntentResolution(&value))
+		return dedupeNodeIDs(nodeIDsFromIntentResolution(&value)), ""
 	default:
-		return nil
+		return nil, ""
 	}
 }
 
-func branchIDsFromForestRoleOutput(output *contextskills.ForestRoleOutput) []string {
+func nodeIDsFromForestRoleOutput(output *contextskills.ForestRoleOutput) ([]string, string) {
 	if output == nil {
-		return nil
+		return nil, ""
 	}
-	ids := branchIDsFromForestPackets(output.Packets)
-	ids = append(ids, branchIDsFromIntentResolution(output.Intent)...)
-	return dedupeBranchIDs(ids)
+	ids := nodeIDsFromForestPackets(output.Packets)
+	ids = append(ids, nodeIDsFromIntentResolution(output.Intent)...)
+	return dedupeNodeIDs(ids), cursorIDFromForestCursor(output.Cursor)
 }
 
-func branchIDsFromIntentResolution(resolution *forest.IntentResolution) []string {
+func nodeIDsFromIntentResolution(resolution *forest.IntentResolution) []string {
 	if resolution == nil {
 		return nil
 	}
 	var ids []string
-	for _, packet := range resolution.Constraints {
-		ids = append(ids, branchIDFromPacket(packet))
-	}
-	for _, packet := range resolution.Preferences {
-		ids = append(ids, branchIDFromPacket(packet))
-	}
-	for _, packet := range resolution.IntentBranches {
-		ids = append(ids, branchIDFromPacket(packet))
-	}
-	for _, packet := range resolution.OutcomeHints {
-		ids = append(ids, branchIDFromPacket(packet))
-	}
-	return dedupeBranchIDs(ids)
+	ids = append(ids, nodeIDsFromForestPackets(resolution.Constraints)...)
+	ids = append(ids, nodeIDsFromForestPackets(resolution.Preferences)...)
+	ids = append(ids, nodeIDsFromForestPackets(resolution.IntentNodes)...)
+	ids = append(ids, nodeIDsFromForestPackets(resolution.OutcomeHints)...)
+	return dedupeNodeIDs(ids)
 }
 
-func branchIDsFromPackets(packets []*forest.BranchPacket) []string {
-	ids := make([]string, 0, len(packets))
-	for _, packet := range packets {
-		if packet == nil {
-			continue
-		}
-		ids = append(ids, branchIDFromPacket(*packet))
-	}
-	return dedupeBranchIDs(ids)
-}
-
-func branchIDsFromForestPackets(packets []*forest.ForestPacket) []string {
+func nodeIDsFromForestPackets(packets []*forest.ForestPacket) []string {
 	ids := make([]string, 0, len(packets))
 	for _, packet := range packets {
 		if packet == nil {
@@ -637,17 +619,17 @@ func branchIDsFromForestPackets(packets []*forest.ForestPacket) []string {
 		}
 		ids = append(ids, packet.Node.ID)
 	}
-	return dedupeBranchIDs(ids)
+	return dedupeNodeIDs(ids)
 }
 
-func branchIDFromPacket(packet forest.BranchPacket) string {
-	if packet.Branch == nil {
+func cursorIDFromForestCursor(cursor *forest.ForestCursor) string {
+	if cursor == nil {
 		return ""
 	}
-	return packet.Branch.ID
+	return strings.TrimSpace(cursor.ID)
 }
 
-func dedupeBranchIDs(ids []string) []string {
+func dedupeNodeIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	result := make([]string, 0, len(ids))
 	for _, id := range ids {

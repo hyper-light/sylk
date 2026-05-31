@@ -12,9 +12,7 @@ import (
 
 type mockForestService struct {
 	resolveIntent  func(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
-	retrieve       func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	retrieveForest func(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
-	predict        func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	createCursor   func(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
 	proposeClaim   func(ctx context.Context, proposal forest.ForestClaimProposal) error
 	recordOutcome  func(ctx context.Context, record forest.OutcomeRecord) error
@@ -27,31 +25,11 @@ func (m *mockForestService) ResolveIntent(ctx context.Context, input forest.Reso
 	return &forest.IntentResolution{}, nil
 }
 
-func (m *mockForestService) Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
-	if m.retrieve != nil {
-		return m.retrieve(ctx, query)
-	}
-	return nil, nil
-}
-
 func (m *mockForestService) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 	if m.retrieveForest != nil {
 		return m.retrieveForest(ctx, query)
 	}
-	var packets []*forest.BranchPacket
-	var err error
-	switch {
-	case m.retrieve != nil:
-		packets, err = m.retrieve(ctx, query)
-	case m.predict != nil:
-		packets, err = m.predict(ctx, query)
-	default:
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return forestPacketsFromBranchPackets(packets), nil
+	return nil, nil
 }
 
 func (m *mockForestService) CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
@@ -75,63 +53,11 @@ func (m *mockForestService) ProposeForestClaim(ctx context.Context, proposal for
 	return nil
 }
 
-func (m *mockForestService) PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
-	if m.predict != nil {
-		return m.predict(ctx, query)
-	}
-	return nil, nil
-}
-
 func (m *mockForestService) RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error {
 	if m.recordOutcome != nil {
 		return m.recordOutcome(ctx, record)
 	}
 	return nil
-}
-
-func forestPacketsFromBranchPackets(packets []*forest.BranchPacket) []*forest.ForestPacket {
-	out := make([]*forest.ForestPacket, 0, len(packets))
-	for _, packet := range packets {
-		if packet == nil || packet.Branch == nil {
-			continue
-		}
-		nodeID := packet.Branch.ID
-		summary := packet.Branch.Summary
-		out = append(out, &forest.ForestPacket{
-			Node: forest.ForestNode{
-				ID:            nodeID,
-				Kind:          testNodeKindForFamily(packet.Branch.Family),
-				Title:         packet.Branch.Title,
-				Summary:       summary,
-				EvidenceGrade: forest.EvidenceGradeObserved,
-				Confidence:    packet.Branch.Confidence,
-			},
-			Evidence: []forest.ForestEvidence{{
-				RefType: "node",
-				RefID:   nodeID,
-				NodeID:  nodeID,
-				Grade:   forest.EvidenceGradeObserved,
-				Summary: summary,
-			}},
-			Score: 1,
-		})
-	}
-	return out
-}
-
-func testNodeKindForFamily(family forest.TreeFamily) forest.ForestNodeKind {
-	switch family {
-	case forest.TreeFamilyConstraint:
-		return forest.ForestNodeKind("Constraint")
-	case forest.TreeFamilyEvidence:
-		return forest.ForestNodeKind("Evidence")
-	case forest.TreeFamilyOutcome:
-		return forest.ForestNodeKind("Outcome")
-	case forest.TreeFamilyAntiPattern:
-		return forest.ForestNodeKind("AntiPattern")
-	default:
-		return forest.ForestNodeKind("Intent")
-	}
 }
 
 func TestForestResolveIntentSkill(t *testing.T) {
@@ -167,10 +93,8 @@ func TestForestRecallSkill(t *testing.T) {
 
 	deps := &RetrievalDependencies{
 		Forest: &mockForestService{
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
-				return []*forest.BranchPacket{
-					{Branch: &forest.Branch{ID: "branch-1", Family: forest.TreeFamilyIntent, Summary: query.Query}},
-				}, nil
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
+				return []*forest.ForestPacket{testSkillForestPacket("node-1", forest.ForestNodeClaim, query.Query)}, nil
 			},
 		},
 	}
@@ -193,7 +117,7 @@ func TestForestRecallSkillDefaultsScopeFromContext(t *testing.T) {
 
 	deps := &RetrievalDependencies{
 		Forest: &mockForestService{
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.SessionID != "sess-ctx" {
 					t.Fatalf("retrieve session_id = %q, want sess-ctx", query.SessionID)
 				}
@@ -203,7 +127,7 @@ func TestForestRecallSkillDefaultsScopeFromContext(t *testing.T) {
 				if query.Horizon != forest.CanopyHorizonTask {
 					t.Fatalf("retrieve horizon = %q, want %q", query.Horizon, forest.CanopyHorizonTask)
 				}
-				return []*forest.BranchPacket{}, nil
+				return []*forest.ForestPacket{}, nil
 			},
 		},
 	}
@@ -227,7 +151,7 @@ func TestRecallRecentSkillRecoversSummaryAndFocus(t *testing.T) {
 				}
 				return &forest.IntentResolution{PrimaryIntent: "Create the Python hello CLI package"}, nil
 			},
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.SessionID != "sess-ctx" {
 					t.Fatalf("retrieve session_id = %q, want sess-ctx", query.SessionID)
 				}
@@ -237,9 +161,9 @@ func TestRecallRecentSkillRecoversSummaryAndFocus(t *testing.T) {
 				if !query.IncludeCounterEvidence {
 					t.Fatal("expected include_counter_evidence to default true")
 				}
-				return []*forest.BranchPacket{
-					{Branch: &forest.Branch{ID: "decision-1", Family: forest.TreeFamilyIntent, Summary: "Use argparse from the stdlib"}},
-					{Branch: &forest.Branch{ID: "outcome-1", Family: forest.TreeFamilyOutcome, Summary: "Preserve python -m hello entrypoint"}},
+				return []*forest.ForestPacket{
+					testSkillForestPacket("intent-1", forest.ForestNodeClaim, "Use argparse from the stdlib"),
+					testSkillForestPacket("outcome-1", forest.ForestNodeOutcome, "Preserve python -m hello entrypoint"),
 				}, nil
 			},
 		},
@@ -270,13 +194,11 @@ func TestRecallRecentSkillAllowsEmptyQuery(t *testing.T) {
 
 	deps := &RetrievalDependencies{
 		Forest: &mockForestService{
-			retrieve: func(_ context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
 				if query.Query != "" {
 					t.Fatalf("retrieve query = %q, want empty", query.Query)
 				}
-				return []*forest.BranchPacket{
-					{Branch: &forest.Branch{ID: "intent-1", Family: forest.TreeFamilyIntent, Summary: "Continue the earlier architectural plan"}},
-				}, nil
+				return []*forest.ForestPacket{testSkillForestPacket("intent-1", forest.ForestNodeClaim, "Continue the earlier architectural plan")}, nil
 			},
 		},
 	}
@@ -301,7 +223,7 @@ func TestForestRecordOutcomeSkill(t *testing.T) {
 	deps := &RetrievalDependencies{
 		Forest: &mockForestService{
 			recordOutcome: func(_ context.Context, record forest.OutcomeRecord) error {
-				recorded = record.BranchID == "branch-1" && record.Status == forest.OutcomeStatusSucceeded
+				recorded = record.NodeID == "node-1" && record.Status == forest.OutcomeStatusSucceeded
 				return nil
 			},
 		},
@@ -309,9 +231,9 @@ func TestForestRecordOutcomeSkill(t *testing.T) {
 
 	skill := NewForestRecordOutcomeSkill(deps)
 	input, _ := json.Marshal(ForestOutcomeInput{
-		BranchID: "branch-1",
-		Status:   "succeeded",
-		Summary:  "tests passed",
+		NodeID:  "node-1",
+		Status:  "succeeded",
+		Summary: "tests passed",
 	})
 	result, err := skill.Handler(context.Background(), input)
 	if err != nil {
@@ -438,4 +360,25 @@ func mustJSON(t testing.TB, value any) json.RawMessage {
 		t.Fatalf("marshal json: %v", err)
 	}
 	return data
+}
+
+func testSkillForestPacket(id string, kind forest.ForestNodeKind, summary string) *forest.ForestPacket {
+	return &forest.ForestPacket{
+		Node: forest.ForestNode{
+			ID:            id,
+			Kind:          kind,
+			Title:         summary,
+			Summary:       summary,
+			EvidenceGrade: forest.EvidenceGradeObserved,
+			Confidence:    1,
+		},
+		Evidence: []forest.ForestEvidence{{
+			RefType: "node",
+			RefID:   id,
+			NodeID:  id,
+			Grade:   forest.EvidenceGradeObserved,
+			Summary: summary,
+		}},
+		Score: 1,
+	}
 }

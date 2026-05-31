@@ -33,7 +33,7 @@ func (l *Librarian) processViaLLM(ctx context.Context, fwd *guide.ForwardedReque
 	// MEM-01: preload family-typed forest projections into the system
 	// prompt before the tool loop starts. Best-effort: a preload error
 	// degrades silently; memory is assist, not gate.
-	l.injectForestPreload(ctx, llmReq, fwd)
+	ctx = l.injectForestPreload(ctx, llmReq, fwd)
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
@@ -116,23 +116,19 @@ func (l *Librarian) buildLLMRequestWithBundle(fwd *guide.ForwardedRequest, bundl
 // injectForestPreload pulls librarian-lane projections and prepends
 // the rendered block to the existing system prompt. See
 // agents/shared/forest_preload.go for the family selection rationale.
-func (l *Librarian) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) {
+func (l *Librarian) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) context.Context {
 	if req == nil || fwd == nil || l.config.Forest == nil {
-		return
+		return ctx
 	}
-	preload, err := shared.PreloadFor(ctx, l.config.Forest, shared.ForestPreloadInput{
+	ctx, _, err := shared.ApplyForestPreload(ctx, req, l.config.Forest, shared.ForestPreloadInput{
 		AgentType: "librarian",
 		Query:     fwd.Input,
 		SessionID: fwd.SessionID,
 	})
-	if err != nil || preload == nil {
-		return
+	if err != nil {
+		return ctx
 	}
-	rendered := preload.Render()
-	if rendered == "" {
-		return
-	}
-	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
+	return ctx
 }
 
 // processViaIntentDispatch is the legacy path that routes by intent without LLM.

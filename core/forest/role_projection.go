@@ -13,6 +13,7 @@ type ForestRoleProjection struct {
 	EvidenceRefs       []string        `json:"evidence_refs,omitempty"`
 	RiskFlags          []string        `json:"risk_flags,omitempty"`
 	ValidationNeeds    []string        `json:"validation_needs,omitempty"`
+	RoleFocus          []string        `json:"role_focus,omitempty"`
 	NoProjectionReason string          `json:"no_projection_reason,omitempty"`
 	Budget             int             `json:"budget"`
 	Text               string          `json:"text"`
@@ -37,6 +38,7 @@ func BuildRoleForestProjection(role string, packets []*ForestPacket, cursor *For
 		EvidenceRefs:    projectionEvidenceRefs(packets, budget),
 		RiskFlags:       projectionRiskFlags(packets, cursor, budget),
 		ValidationNeeds: projectionValidationNeeds(packets, budget),
+		RoleFocus:       projectionRoleFocus(role, packets, budget),
 		Budget:          budget,
 	}
 	if len(packets) == 0 {
@@ -126,6 +128,7 @@ func (p *ForestRoleProjection) render() string {
 	writeProjectionList(&b, "evidence_refs", p.EvidenceRefs)
 	writeProjectionList(&b, "risk_flags", p.RiskFlags)
 	writeProjectionList(&b, "validation_needs", p.ValidationNeeds)
+	writeProjectionList(&b, "role_focus", p.RoleFocus)
 	for _, packet := range sortedProjectionPackets(p.Packets) {
 		fmt.Fprintf(&b, "\n- node=%s kind=%s score=%.3f", packet.Node.ID, packet.Node.Kind, packet.Score)
 		if packet.Node.Title != "" {
@@ -136,6 +139,72 @@ func (p *ForestRoleProjection) render() string {
 		}
 	}
 	return b.String()
+}
+
+func projectionRoleFocus(role string, packets []*ForestPacket, budget int) []string {
+	var focus []string
+	for _, packet := range sortedProjectionPackets(packets) {
+		item := rolePacketFocus(role, packet)
+		if item == "" {
+			continue
+		}
+		focus = append(focus, item)
+	}
+	return compactStrings(focus, budget)
+}
+
+func rolePacketFocus(role string, packet *ForestPacket) string {
+	if packet == nil {
+		return ""
+	}
+	switch role {
+	case "guardian":
+		return riskFocus(packet)
+	case "tester", "inspector":
+		return validationFocus(packet)
+	case "scribe", "archivalist":
+		return preservationFocus(packet)
+	case "orchestrator":
+		return bridgeFocus(packet)
+	default:
+		return evidenceFocus(packet)
+	}
+}
+
+func evidenceFocus(packet *ForestPacket) string {
+	return packetFocus("evidence", packet)
+}
+
+func validationFocus(packet *ForestPacket) string {
+	if packet.ValidationNeed > 0 {
+		return packetFocus("validate", packet)
+	}
+	return evidenceFocus(packet)
+}
+
+func riskFocus(packet *ForestPacket) string {
+	if packet.Quarantine.Quarantined {
+		return packetFocus("quarantine", packet)
+	}
+	if len(packet.CounterEvidence) > 0 || len(packet.BridgeRisks) > 0 {
+		return packetFocus("review", packet)
+	}
+	return evidenceFocus(packet)
+}
+
+func preservationFocus(packet *ForestPacket) string {
+	return packetFocus("preserve", packet)
+}
+
+func bridgeFocus(packet *ForestPacket) string {
+	if len(packet.BridgeRisks) > 0 {
+		return packetFocus("bridge", packet)
+	}
+	return evidenceFocus(packet)
+}
+
+func packetFocus(prefix string, packet *ForestPacket) string {
+	return prefix + ":" + packet.Node.ID + ":" + string(packet.Node.Kind)
 }
 
 func writeProjectionList(b *strings.Builder, label string, values []string) {

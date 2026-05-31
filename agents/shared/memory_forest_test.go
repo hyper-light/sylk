@@ -17,19 +17,11 @@ func (s *testMemoryForestService) ResolveIntent(context.Context, forest.ResolveI
 	return nil, nil
 }
 
-func (s *testMemoryForestService) Retrieve(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
-	return nil, nil
-}
-
 func (s *testMemoryForestService) RetrieveForest(context.Context, forest.Query) ([]*forest.ForestPacket, error) {
 	return nil, nil
 }
 
 func (s *testMemoryForestService) CreateForestCursor(context.Context, forest.ForestCursorInput) (*forest.ForestCursor, error) {
-	return nil, nil
-}
-
-func (s *testMemoryForestService) PredictNextBranches(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
 	return nil, nil
 }
 
@@ -42,52 +34,24 @@ func (s *testMemoryForestService) RecordOutcome(_ context.Context, record forest
 	return nil
 }
 
-// Project* stubs — MEM-01 widened MemoryForestService with family
-// projections; preserve zero-behavior here since this stub only
-// exercises RecordOutcome paths.
-func (s *testMemoryForestService) ProjectIntent(context.Context, forest.ProjectionInput) (*forest.IntentProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectConstraints(context.Context, forest.ProjectionInput) (*forest.ConstraintProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectEvidence(context.Context, forest.ProjectionInput) (*forest.EvidenceProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectDecisions(context.Context, forest.ProjectionInput) (*forest.DecisionProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectOutcomes(context.Context, forest.ProjectionInput) (*forest.OutcomeProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectPreferences(context.Context, forest.ProjectionInput) (*forest.PreferenceProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectCapabilities(context.Context, forest.ProjectionInput) (*forest.CapabilityProjection, error) {
-	return nil, nil
-}
-func (s *testMemoryForestService) ProjectOpportunities(context.Context, forest.ProjectionInput) (*forest.OpportunityProjection, error) {
-	return nil, nil
-}
-
 func TestMemoryForestTrackerPrunesStaleAndExcessEntries(t *testing.T) {
 	tracker := NewMemoryForestTracker()
 	now := time.Now()
 	for i := 0; i < forestTrackerMaxEntries+8; i++ {
-		tracker.entries[fmt.Sprintf("stale|sess|%d", i)] = trackedForestBranches{
-			BranchIDs: []string{fmt.Sprintf("branch-%d", i)},
+		tracker.entries[fmt.Sprintf("stale|sess|%d", i)] = trackedForestNodes{
+			NodeIDs:   []string{fmt.Sprintf("node-%d", i)},
 			UpdatedAt: now.Add(-forestTrackerMaxAge - time.Minute),
 		}
 	}
 	for i := 0; i < forestTrackerMaxEntries+8; i++ {
-		tracker.entries[fmt.Sprintf("fresh|sess|%d", i)] = trackedForestBranches{
-			BranchIDs: []string{fmt.Sprintf("branch-fresh-%d", i)},
+		tracker.entries[fmt.Sprintf("fresh|sess|%d", i)] = trackedForestNodes{
+			NodeIDs:   []string{fmt.Sprintf("node-fresh-%d", i)},
 			UpdatedAt: now.Add(-time.Duration(i) * time.Second),
 		}
 	}
 
 	tracker.ObserveResult(context.Background(), forest.IntentResolution{
-		IntentBranches: []forest.BranchPacket{{Branch: &forest.Branch{ID: "branch-new"}}},
+		IntentNodes: []*forest.ForestPacket{testForestPacket("node-new")},
 	}, "sess")
 
 	if got := len(tracker.entries); got > forestTrackerMaxEntries {
@@ -108,7 +72,7 @@ func TestMemoryForestTrackerRecordOutcomeClearsTrackedEntry(t *testing.T) {
 		SessionID: "sess-1",
 	})
 	tracker.ObserveResult(ctx, forest.IntentResolution{
-		IntentBranches: []forest.BranchPacket{{Branch: &forest.Branch{ID: "branch-123"}}},
+		IntentNodes: []*forest.ForestPacket{testForestPacket("node-123")},
 	}, "")
 
 	svc := &testMemoryForestService{}
@@ -118,7 +82,18 @@ func TestMemoryForestTrackerRecordOutcomeClearsTrackedEntry(t *testing.T) {
 	if len(svc.outcomes) != 1 {
 		t.Fatalf("recorded outcomes = %d, want 1", len(svc.outcomes))
 	}
-	if got := tracker.Snapshot(ctx, ""); len(got) != 0 {
+	if got, _ := tracker.Snapshot(ctx, ""); len(got) != 0 {
 		t.Fatalf("tracker snapshot after record = %#v, want cleared entry", got)
+	}
+}
+
+func testForestPacket(id string) *forest.ForestPacket {
+	return &forest.ForestPacket{
+		Node: forest.ForestNode{ID: id, Kind: forest.ForestNodeClaim},
+		Evidence: []forest.ForestEvidence{{
+			RefType: "node",
+			RefID:   id,
+			NodeID:  id,
+		}},
 	}
 }

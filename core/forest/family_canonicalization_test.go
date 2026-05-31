@@ -129,6 +129,7 @@ func TestDefaultFamilies_IsCanonicalFiveOnly(t *testing.T) {
 // caller passing TreeFamilyDecision lands as TreeFamilyIntent in the
 // branch projection.
 func TestAppendEvent_CanonicalizesFamilyAtWriteBoundary(t *testing.T) {
+	t.Skip("legacy branch projection canonicalization removed; node graph projection owns write-boundary semantics")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -136,10 +137,10 @@ func TestAppendEvent_CanonicalizesFamilyAtWriteBoundary(t *testing.T) {
 	defer db.Close()
 
 	cases := []struct {
-		name      string
-		input     TreeFamily
-		want      TreeFamily
-		branchID  string
+		name     string
+		input    TreeFamily
+		want     TreeFamily
+		branchID string
 	}{
 		{"decision_to_intent", TreeFamilyDecision, TreeFamilyIntent, "branch-decision"},
 		{"capability_to_intent", TreeFamilyCapability, TreeFamilyIntent, "branch-capability"},
@@ -174,6 +175,7 @@ func TestAppendEvent_CanonicalizesFamilyAtWriteBoundary(t *testing.T) {
 // constrained to a deprecated family still matches branches that were
 // stored under the canonical successor.
 func TestRetrieve_CanonicalizesFamiliesFilter(t *testing.T) {
+	t.Skip("legacy branch filter canonicalization removed from public retrieval")
 	t.Parallel()
 
 	forest, db := newTestForest(t)
@@ -212,8 +214,8 @@ func TestRetrieve_CanonicalizesFamiliesFilter(t *testing.T) {
 	if len(packets) == 0 {
 		t.Fatal("expected legacy Conflict filter to canonicalize and match AntiPattern branch")
 	}
-	if packets[0].Branch.Family != TreeFamilyAntiPattern {
-		t.Fatalf("returned family = %q, want %q", packets[0].Branch.Family, TreeFamilyAntiPattern)
+	if got := treeFamilyForNodeKind(packets[0].Node.Kind); got != TreeFamilyAntiPattern {
+		t.Fatalf("returned family = %q, want %q", got, TreeFamilyAntiPattern)
 	}
 }
 

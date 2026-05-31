@@ -724,7 +724,6 @@ func (a *Architect) Close() error {
 	}
 	if a.ownsControlStore && a.controlStore != nil {
 		_ = a.controlStore.Close()
-		a.controlStore = nil
 		a.ownsControlStore = false
 	}
 	if a.logWAL == nil {

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/forest"
+	"github.com/adalundhe/sylk/core/providers"
 )
 
 // MEM-01: pre-LLM forest preload.
@@ -85,6 +87,53 @@ func PreloadFor(
 		return nil, fmt.Errorf("preload role projection: %w", err)
 	}
 	return &ForestPreload{Projection: projection, Cursor: cursor, Packets: packets}, nil
+}
+
+// ApplyForestPreload injects the rendered role projection into an LLM request
+// and propagates the cursor through request metadata and fabric baggage. It is
+// best-effort by design: callers should continue when the forest is absent.
+func ApplyForestPreload(
+	ctx context.Context,
+	req *providers.Request,
+	svc MemoryForestService,
+	input ForestPreloadInput,
+) (context.Context, *ForestPreload, error) {
+	if req == nil {
+		return ctx, nil, nil
+	}
+	preload, err := PreloadFor(ctx, svc, input)
+	if err != nil || preload == nil {
+		return ctx, preload, err
+	}
+	rendered := preload.Render()
+	if rendered != "" {
+		req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
+	}
+	if preload.Cursor != nil {
+		req.Metadata = forestPreloadMetadata(req.Metadata, preload.Cursor)
+		ctx = activity.WithBaggage(ctx, "forest_cursor_id", preload.Cursor.ID)
+		ctx = activity.WithBaggage(ctx, "forest_active_nodes", strings.Join(preload.Cursor.ActiveNodeIDs, ","))
+		ctx = activity.WithBaggage(ctx, "forest_active_clusters", strings.Join(preload.Cursor.ActiveClusterIDs, ","))
+	}
+	return ctx, preload, nil
+}
+
+func forestPreloadMetadata(metadata map[string]any, cursor *forest.ForestCursor) map[string]any {
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	if cursor == nil {
+		metadata["forest_no_cursor_reason"] = "no_cursor"
+		return metadata
+	}
+	metadata["forest_cursor_id"] = cursor.ID
+	metadata["forest_active_node_ids"] = append([]string(nil), cursor.ActiveNodeIDs...)
+	metadata["forest_active_cluster_ids"] = append([]string(nil), cursor.ActiveClusterIDs...)
+	metadata["forest_risk_flags"] = append([]string(nil), cursor.RiskFlags...)
+	if cursor.NoCursorReason != "" {
+		metadata["forest_no_cursor_reason"] = cursor.NoCursorReason
+	}
+	return metadata
 }
 
 func forestPreloadRoleSupported(role string) bool {

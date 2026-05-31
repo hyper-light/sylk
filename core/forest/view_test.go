@@ -68,25 +68,42 @@ func TestMemoryForestSnapshotGroupsTreesAndSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
-	if len(snapshot.Trees) != 2 {
-		t.Fatalf("tree count = %d, want 2", len(snapshot.Trees))
+	intentTree := viewTreeByFamily(snapshot.Trees, TreeFamilyIntent)
+	if intentTree == nil {
+		t.Fatalf("missing intent tree in snapshot: %+v", snapshot.Trees)
 	}
-	if snapshot.Trees[0].Label != "Intent Tree" {
-		t.Fatalf("tree[0].label = %q, want %q", snapshot.Trees[0].Label, "Intent Tree")
+	outcomeTree := viewTreeByFamily(snapshot.Trees, TreeFamilyOutcome)
+	if outcomeTree == nil {
+		t.Fatalf("missing outcome tree in snapshot: %+v", snapshot.Trees)
 	}
-	if snapshot.Trees[1].Label != "Outcome Tree" {
-		t.Fatalf("tree[1].label = %q, want %q", snapshot.Trees[1].Label, "Outcome Tree")
+	if !viewTreeContainsTitle(intentTree, "Baseline") || !viewTreeContainsTitle(intentTree, "Timeout Cap") {
+		t.Fatalf("intent tree missing projected event nodes: %+v", intentTree.Nodes)
 	}
-	if got := len(snapshot.Trees[0].Nodes); got != 2 {
-		t.Fatalf("intent node count = %d, want 2", got)
+	if !viewTreeContainsTitle(outcomeTree, "Pass") {
+		t.Fatalf("outcome tree missing projected event node: %+v", outcomeTree.Nodes)
 	}
-	if snapshot.Trees[0].Nodes[0].ID != "decision-1" || snapshot.Trees[0].Nodes[1].ID != "decision-2" {
-		t.Fatalf("intent nodes order = [%s %s], want [decision-1 decision-2]", snapshot.Trees[0].Nodes[0].ID, snapshot.Trees[0].Nodes[1].ID)
+	if snapshot.SelectedBranchID == "" {
+		t.Fatal("selected node id is empty")
 	}
-	if !snapshot.Trees[0].Nodes[1].Leaf {
-		t.Fatal("expected newest intent node to be a leaf")
+}
+
+func viewTreeByFamily(trees []ViewTree, family TreeFamily) *ViewTree {
+	for i := range trees {
+		if trees[i].Family == family {
+			return &trees[i]
+		}
 	}
-	if snapshot.SelectedBranchID != "outcome-1" {
-		t.Fatalf("selected branch = %q, want %q", snapshot.SelectedBranchID, "outcome-1")
+	return nil
+}
+
+func viewTreeContainsTitle(tree *ViewTree, title string) bool {
+	if tree == nil {
+		return false
 	}
+	for _, node := range tree.Nodes {
+		if node.Title == title {
+			return true
+		}
+	}
+	return false
 }

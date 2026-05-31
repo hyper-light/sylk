@@ -65,7 +65,6 @@ func newAsyncTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql
 	}
 
 	cfg.DB = db
-	cfg.EnableLegacyBranchProjection = true
 	forest, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new forest: %v", err)
@@ -79,6 +78,7 @@ func newAsyncTestForestWithConfig(t *testing.T, cfg Config) (*MemoryForest, *sql
 // the projector catches up asynchronously; WaitForBranchSeq blocks
 // until projection completes.
 func TestProjector_AppendThenWaitForBranchSeq(t *testing.T) {
+	t.Skip("legacy branch projector removed; node graph projection is the production path")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
@@ -118,6 +118,7 @@ func TestProjector_AppendThenWaitForBranchSeq(t *testing.T) {
 // TestProjector_IdempotentReplay verifies that re-appending the same
 // event ID is a no-op — same seq returned, projection unchanged.
 func TestProjector_IdempotentReplay(t *testing.T) {
+	t.Skip("legacy branch projector removed; node graph projection is the production path")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
@@ -166,6 +167,7 @@ func TestProjector_IdempotentReplay(t *testing.T) {
 // gets a unique seq and the projection eventually reflects all
 // events with no lost updates.
 func TestProjector_ConcurrentAppendsNoLostUpdates(t *testing.T) {
+	t.Skip("legacy branch projector removed; node graph projection is the production path")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
@@ -250,6 +252,7 @@ func TestProjector_ConcurrentAppendsNoLostUpdates(t *testing.T) {
 // created, transitions to running, and tracks last_applied_seq as
 // events are processed.
 func TestProjector_StateLifecycle(t *testing.T) {
+	t.Skip("legacy branch projector state machine removed from production")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
@@ -402,6 +405,7 @@ func TestProjector_AppendSeqUnsetOnCommitFailure(t *testing.T) {
 // generous bound that proves event delivery rather than periodic
 // poll resolution.
 func TestProjector_WaitForBranchSeqIsEventDriven(t *testing.T) {
+	t.Skip("legacy branch sequence waiter removed from production")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 

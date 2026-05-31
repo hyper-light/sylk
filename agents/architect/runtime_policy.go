@@ -12,23 +12,19 @@ import (
 // (Intent + Constraint + Decision) to the LLM system prompt so the
 // planner enters its tool loop with memory context as framing rather
 // than as a mid-loop skill call. MEM-01.
-func (a *Architect) injectForestPreload(ctx context.Context, req *providers.Request, query, sessionID string) {
+func (a *Architect) injectForestPreload(ctx context.Context, req *providers.Request, query, sessionID string) context.Context {
 	if req == nil || a.config.Forest == nil {
-		return
+		return ctx
 	}
-	preload, err := shared.PreloadFor(ctx, a.config.Forest, shared.ForestPreloadInput{
+	ctx, _, err := shared.ApplyForestPreload(ctx, req, a.config.Forest, shared.ForestPreloadInput{
 		AgentType: "architect",
 		Query:     query,
 		SessionID: sessionID,
 	})
-	if err != nil || preload == nil {
-		return
+	if err != nil {
+		return ctx
 	}
-	rendered := preload.Render()
-	if rendered == "" {
-		return
-	}
-	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
+	return ctx
 }
 
 func (a *Architect) applyConversationRuntimeProfile(req *providers.Request, mode plannerConversationMode, sessionID string) {

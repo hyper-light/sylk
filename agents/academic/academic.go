@@ -1059,7 +1059,7 @@ func (a *Academic) handleConversation(ctx context.Context, fwd *guide.ForwardedR
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
-	a.injectForestPreload(ctx, llmReq, fwd)
+	ctx = a.injectForestPreload(ctx, llmReq, fwd)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -1105,7 +1105,7 @@ func (a *Academic) handleConsultation(ctx context.Context, fwd *guide.ForwardedR
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyLLMRuntimeProfile(ctx, llmReq, "conversation")
-	a.injectForestPreload(ctx, llmReq, fwd)
+	ctx = a.injectForestPreload(ctx, llmReq, fwd)
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
@@ -1168,23 +1168,19 @@ type academicConversationHandoff struct {
 
 // injectForestPreload prepends academic-lane forest projections
 // (Evidence + Outcome + Intent) to the LLM system prompt. MEM-01.
-func (a *Academic) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) {
+func (a *Academic) injectForestPreload(ctx context.Context, req *providers.Request, fwd *guide.ForwardedRequest) context.Context {
 	if req == nil || fwd == nil || a.config.Forest == nil {
-		return
+		return ctx
 	}
-	preload, err := shared.PreloadFor(ctx, a.config.Forest, shared.ForestPreloadInput{
+	ctx, _, err := shared.ApplyForestPreload(ctx, req, a.config.Forest, shared.ForestPreloadInput{
 		AgentType: "academic",
 		Query:     fwd.Input,
 		SessionID: fwd.SessionID,
 	})
-	if err != nil || preload == nil {
-		return
+	if err != nil {
+		return ctx
 	}
-	rendered := preload.Render()
-	if rendered == "" {
-		return
-	}
-	req.SystemPrompt = rendered + "\n\n---\n\n" + req.SystemPrompt
+	return ctx
 }
 
 func academicConversationHandoffFromForwarded(fwd *guide.ForwardedRequest) *academicConversationHandoff {

@@ -9,9 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/adalundhe/sylk/core/activity"
 	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
+	contextskills "github.com/adalundhe/sylk/core/context/skills"
 	"github.com/adalundhe/sylk/core/fabric"
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/llmruntime"
 	"github.com/adalundhe/sylk/core/providers"
 	"github.com/adalundhe/sylk/core/resources"
@@ -43,6 +46,7 @@ type GuideResponder struct {
 	toolInvoker func(ctx context.Context, name string, arguments string) (string, error)
 	maxToolRuns int
 	eventLogger *agentlog.SessionEventLogger
+	forest      contextskills.ForestService
 }
 
 type guideThoughtEmitter func(string)
@@ -137,6 +141,7 @@ func (r *GuideResponder) respondInternal(
 	defer cancel()
 
 	req := r.buildRequest(request)
+	guardedCtx = r.applyForestPreload(guardedCtx, req, request)
 	emitGuideEarlyUsage(guardedCtx, estimateGuidePromptInputTokens(req))
 
 	seen := make(map[guideToolCallSignature]int, r.maxToolRuns)
@@ -185,6 +190,84 @@ func (r *GuideResponder) respondInternal(
 	}
 
 	return "", nil, fmt.Errorf("guide model %s exhausted tool-call loop", r.model)
+}
+
+func (r *GuideResponder) applyForestPreload(
+	ctx context.Context,
+	req *providers.Request,
+	request GuideSelfResponseRequest,
+) context.Context {
+	if r == nil || r.forest == nil || req == nil {
+		return ctx
+	}
+	packets, err := r.forest.RetrieveForest(ctx, forest.Query{
+		Query:                  request.Input,
+		SessionID:              request.SessionID,
+		AgentID:                request.AgentID,
+		AgentType:              "guide",
+		IncludeCounterEvidence: true,
+	})
+	if err != nil {
+		guideForestPreloadFailed(req, "retrieve_failed", err)
+		return ctx
+	}
+	cursor, err := r.forest.CreateForestCursor(ctx, forest.ForestCursorInput{
+		SessionID: request.SessionID,
+		AgentID:   request.AgentID,
+		Packets:   packets,
+	})
+	if err != nil {
+		guideForestPreloadFailed(req, "cursor_failed", err)
+		return ctx
+	}
+	projection, err := forest.BuildRoleForestProjection("guide", packets, cursor, 0)
+	if err != nil {
+		guideForestPreloadFailed(req, "projection_failed", err)
+		return ctx
+	}
+	if projection.Text != "" {
+		req.SystemPrompt = projection.Text + "\n\n---\n\n" + req.SystemPrompt
+	}
+	req.Metadata = guideForestPreloadMetadata(req.Metadata, cursor)
+	ctx = activity.WithBaggage(ctx, "forest_cursor_id", cursor.ID)
+	ctx = activity.WithBaggage(ctx, "forest_active_nodes", strings.Join(cursor.ActiveNodeIDs, ","))
+	ctx = activity.WithBaggage(ctx, "forest_active_clusters", strings.Join(cursor.ActiveClusterIDs, ","))
+	return ctx
+}
+
+func guideForestPreloadFailed(req *providers.Request, reason string, err error) {
+	if req != nil {
+		req.Metadata = guideForestPreloadNoCursorMetadata(req.Metadata, reason)
+	}
+	if err != nil {
+		guideFileLog().Warn("guide_forest_preload_failed", "reason", reason, "error", err)
+	}
+}
+
+func guideForestPreloadNoCursorMetadata(metadata map[string]any, reason string) map[string]any {
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	metadata["forest_no_cursor_reason"] = reason
+	return metadata
+}
+
+func guideForestPreloadMetadata(metadata map[string]any, cursor *forest.ForestCursor) map[string]any {
+	if metadata == nil {
+		metadata = make(map[string]any)
+	}
+	if cursor == nil {
+		metadata["forest_no_cursor_reason"] = "no_cursor"
+		return metadata
+	}
+	metadata["forest_cursor_id"] = cursor.ID
+	metadata["forest_active_node_ids"] = append([]string(nil), cursor.ActiveNodeIDs...)
+	metadata["forest_active_cluster_ids"] = append([]string(nil), cursor.ActiveClusterIDs...)
+	metadata["forest_risk_flags"] = append([]string(nil), cursor.RiskFlags...)
+	if cursor.NoCursorReason != "" {
+		metadata["forest_no_cursor_reason"] = cursor.NoCursorReason
+	}
+	return metadata
 }
 
 func (r *GuideResponder) completeTurn(

@@ -202,7 +202,7 @@ func (a *Architect) composeUserFacingResponseWithTools(
 		Tools:        tools,
 	}
 	a.applyConversationRuntimeProfile(req, mode, request.SessionID)
-	a.injectForestPreload(ctx, req, request.UserQuery, request.SessionID)
+	ctx = a.injectForestPreload(ctx, req, request.UserQuery, request.SessionID)
 
 	ledger := shared.SteeringLedgerFromContext(ctx)
 	// User-facing Architect turns have a synchronous caller waiting for

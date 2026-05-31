@@ -148,9 +148,9 @@ func TestRetrievalAudit_FilterByBranchID(t *testing.T) {
 	ctx := context.Background()
 
 	for i, branchIDs := range [][]string{
-		{"a", "b", "c"},  // returns top-K=2: a, b; c considered-not-returned
-		{"d", "e"},       // unrelated
-		{"x", "a", "y"},  // a appears as 2nd candidate
+		{"a", "b", "c"}, // returns top-K=2: a, b; c considered-not-returned
+		{"d", "e"},      // unrelated
+		{"x", "a", "y"}, // a appears as 2nd candidate
 	} {
 		audit := &RetrievalAuditEvent{
 			SessionID: "sess",
@@ -307,7 +307,7 @@ func TestRetrievalAudit_RetrieveEmitsAudit(t *testing.T) {
 		t.Fatalf("append event: %v", err)
 	}
 
-	_, err := forest.Retrieve(ctx, Query{
+	_, err := forest.retrieveBranchPackets(ctx, Query{
 		Query:     "audit",
 		SessionID: "sess-r",
 		Limit:     5,

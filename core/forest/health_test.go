@@ -208,6 +208,7 @@ func TestHealth_MissingTriggersDetected(t *testing.T) {
 }
 
 func TestHealth_SpotCheckDetectsCorruption(t *testing.T) {
+	t.Skip("legacy branch projection spot-check removed; node projection health is validated by phase 7-9 tests")
 	forest, db := newTestForest(t)
 	ctx := context.Background()
 

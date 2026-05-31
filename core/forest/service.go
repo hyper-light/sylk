@@ -57,18 +57,6 @@ type Config struct {
 	// ingestion and immediate snapshot queries.
 	DisableBackgroundWorkers bool
 
-	// EnableLegacyBranchProjection starts the pre-phase-4 async branch
-	// projector instead of the node graph projector. Production must
-	// leave this false; it exists for legacy projector tests and
-	// migration diagnostics that still exercise forest_branches.
-	EnableLegacyBranchProjection bool
-
-	// EnableLegacyBranchReadModel allows production callers to opt back
-	// into the pre-phase-4 branch read/substrate model while migrating.
-	// The default false path is the phase-4/5/6 node graph, density
-	// cluster, and multi-channel substrate implementation.
-	EnableLegacyBranchReadModel bool
-
 	// ── Issue #3 — selection-bias correction ──
 
 	// CounterfactualLabelWeight is the magnitude applied to training
@@ -344,10 +332,6 @@ type MemoryForest struct {
 
 	// CQRS node projector — single tracked goroutine consumes
 	// forest_ledger in seq order and applies the emergent node graph.
-	// The legacy branch projector is no longer started in production;
-	// SynchronousProjection keeps inline branch materialization only
-	// for compatibility tests that still assert old branch tables.
-	//
 	// One wake channel per projector. Sharing one wake across
 	// projectors causes the signal to be "stolen" — whichever
 	// projector reads first consumes it, leaving the other to wait
@@ -357,7 +341,6 @@ type MemoryForest struct {
 	retrievalCandidatesWake chan struct{} // retrieval candidates projector wake
 	projectorID             string
 	synchronousProjection   bool
-	legacyBranchReadModel   bool
 
 	// seqNotify broadcasts projection watermark advances so
 	// WaitForBranchSeq is event-driven (no DB polling). Updated
@@ -519,7 +502,6 @@ func New(cfg Config) (*MemoryForest, error) {
 		retrievalCandidatesWake:          make(chan struct{}, 1),
 		projectorID:                      generateProjectorID(),
 		synchronousProjection:            cfg.SynchronousProjection,
-		legacyBranchReadModel:            cfg.EnableLegacyBranchReadModel || cfg.EnableLegacyBranchProjection,
 		seqNotify:                        newSeqNotifier(),
 		retrievalAuditIdle:               make(chan struct{}, 1),
 		explorationRng:                   newExplorationRng(cfg.ExplorationSeed),
@@ -601,11 +583,7 @@ func New(cfg Config) (*MemoryForest, error) {
 		// write compatibility branch projections inline but still rely on the
 		// maintenance worker for replay, substrate, and training
 		// schedules.
-		if cfg.EnableLegacyBranchProjection {
-			service.startBranchProjector()
-		} else {
-			service.startNodeProjector()
-		}
+		service.startNodeProjector()
 		service.startRetrievalCandidatesProjector()
 		service.startRetrievalAuditDrainer()
 		service.startImplicitNegativeSweeper()
@@ -809,32 +787,32 @@ func (m *MemoryForest) RecordContent(ctx context.Context, entry *ctxpkg.ContentE
 	return m.AppendEvent(ctx, event)
 }
 
-// RecordOutcome records explicit branch outcome feedback.
+// RecordOutcome records explicit node outcome feedback.
 func (m *MemoryForest) RecordOutcome(ctx context.Context, record OutcomeRecord) error {
-	if strings.TrimSpace(record.BranchID) == "" {
-		return errors.New("branch_id is required")
+	nodeID := strings.TrimSpace(record.NodeID)
+	if nodeID == "" {
+		return errors.New("node_id is required")
 	}
-
-	branch, err := m.getBranch(ctx, record.BranchID)
+	node, err := m.getForestNode(ctx, nodeID)
 	if err != nil {
 		return err
 	}
-	if branch == nil {
-		return fmt.Errorf("branch %s not found", record.BranchID)
+	if node == nil {
+		return fmt.Errorf("node %s not found", nodeID)
 	}
 
 	event := &Event{
-		SessionID:      firstNonEmpty(record.SessionID, branch.SessionID),
-		TaskID:         firstNonEmpty(record.TaskID, branch.TaskID),
+		SessionID:      firstNonEmpty(record.SessionID, node.SessionID),
+		TaskID:         firstNonEmpty(record.TaskID, node.TaskID),
 		AgentID:        record.AgentID,
 		AgentType:      record.AgentType,
 		EventType:      EventTypeOutcomeRecorded,
 		Family:         TreeFamilyOutcome,
-		Scope:          branch.Scope,
-		RootID:         branch.RootID,
-		BranchID:       branch.ID,
-		ParentBranchID: branch.ParentID,
-		IntentID:       firstNonEmpty(branch.IntentID, branch.RootID),
+		Scope:          ScopeEpisodic,
+		RootID:         stableID("node_outcome_root", node.ID),
+		BranchID:       stableID("node_outcome", node.ID, record.CursorID, string(record.Status), record.Summary),
+		ParentBranchID: node.ID,
+		IntentID:       node.Subject.ID,
 		Confidence:     defaultConfidence(record.Confidence),
 		Salience:       defaultSalience(record.Salience),
 		Timestamp:      time.Now().UTC(),
@@ -844,10 +822,31 @@ func (m *MemoryForest) RecordOutcome(ctx context.Context, record OutcomeRecord) 
 		Supersedes:     dedupeStrings(record.Supersedes),
 		Contradicts:    dedupeStrings(record.Contradicts),
 		Payload: map[string]any{
-			"status": record.Status,
+			"status":    record.Status,
+			"node_id":   node.ID,
+			"cursor_id": record.CursorID,
 		},
 	}
 	return m.AppendEvent(ctx, event)
+}
+
+func (m *MemoryForest) getForestNode(ctx context.Context, nodeID string) (*ForestNode, error) {
+	row := m.db.QueryRowContext(ctx, `
+		SELECT node_id, node_kind, source_kind, source_partition, source_key, source_seq,
+		       subject_type, subject_id, session_id, task_id, title, summary, evidence_grade,
+		       confidence, salience, utility, novelty, status, policy_version,
+		       first_seen_at, last_seen_at, payload_hash, metadata
+		FROM forest_nodes
+		WHERE node_id = ?
+	`, nodeID)
+	node, err := scanForestNode(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &node, nil
 }
 
 // AppendEvent records a legacy branch-compatible event in the canonical
@@ -883,16 +882,7 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 			)
 			return err
 		}
-		if m.legacyBranchReadModel {
-			if err := m.projectInlineForTests(ctx, prepared); err != nil {
-				slog.Error("forest_inline_projection_failed",
-					"event_id", prepared.ID,
-					"branch_id", prepared.BranchID,
-					"err", err.Error(),
-				)
-				return err
-			}
-		} else if m.seqNotify != nil {
+		if m.seqNotify != nil {
 			m.seqNotify.Advance(result.Seq)
 		}
 		return nil

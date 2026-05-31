@@ -94,6 +94,12 @@ func (o *Orchestrator) executeConversationLLM(ctx context.Context, cr orchestrat
 		Tools:        tools,
 	}
 	o.applyConversationRuntimeProfile(llmReq)
+	ctx, _, _ = shared.ApplyForestPreload(ctx, llmReq, o.config.Forest, shared.ForestPreloadInput{
+		AgentType: "orchestrator",
+		Query:     cr.UserQuery,
+		SessionID: cr.SessionID,
+		AgentID:   o.config.AgentID,
+	})
 	if len(tools) > 0 {
 		llmReq.ToolChoice = "auto"
 	}
@@ -184,6 +190,12 @@ func (o *Orchestrator) generateIngestionSummary(
 		Temperature:  &temp,
 	}
 	o.applyConversationRuntimeProfile(llmReq)
+	ctx, _, _ = shared.ApplyForestPreload(ctx, llmReq, o.config.Forest, shared.ForestPreloadInput{
+		AgentType: "orchestrator",
+		Query:     prompt,
+		SessionID: o.config.SessionID,
+		AgentID:   o.config.AgentID,
+	})
 
 	llmCtx, cancel := context.WithTimeout(ctx, ingestionLLMTimeout)
 	defer cancel()

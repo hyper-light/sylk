@@ -621,6 +621,17 @@ func (pi *PipelineInspector) Handle(ctx context.Context, fwd *guide.ForwardedReq
 		Tools:     tools,
 	}
 	pi.applyLLMRuntimeProfile(req, "task")
+	taskID := ""
+	if task != nil {
+		taskID = task.TaskID
+	}
+	ctx, _, _ = agentShared.ApplyForestPreload(ctx, req, pi.config.Forest, agentShared.ForestPreloadInput{
+		AgentType: "inspector",
+		Query:     userMessage,
+		SessionID: fwd.SessionID,
+		TaskID:    taskID,
+		AgentID:   pi.id,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentShared.PrependHistoryMessages(req, fwd.ConversationHistory)

@@ -1243,6 +1243,12 @@ func (a *Archivalist) processViaLLM(ctx context.Context, fwd *guide.ForwardedReq
 		MaxTokens:    a.config.MaxOutputTokens,
 	}
 	a.applyConversationRuntimeProfile(llmReq)
+	ctx, _, _ = shared.ApplyForestPreload(ctx, llmReq, a.config.Forest, shared.ForestPreloadInput{
+		AgentType: "archivalist",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+		AgentID:   a.id,
+	})
 
 	shared.PrependHistoryMessages(llmReq, fwd.ConversationHistory)
 

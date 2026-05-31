@@ -39,6 +39,12 @@ func (s *Scribe) generateCommentary(ctx context.Context, history []providers.Mes
 		ToolChoice:             "any",
 		DisableParallelToolUse: true,
 	}
+	ctx, _, _ = shared.ApplyForestPreload(ctx, req, s.config.Forest, shared.ForestPreloadInput{
+		AgentType: "scribe",
+		Query:     s.scribeInput(history),
+		SessionID: s.sessionID,
+		AgentID:   s.id,
+	})
 	s.applyCommentaryRuntimeProfile(req)
 	req.Tools = bundle.buildToolDefinitions()
 

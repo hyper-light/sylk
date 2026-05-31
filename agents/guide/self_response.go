@@ -87,6 +87,9 @@ func resolveGuideSelfResponder(cfg Config, provider providers.ProviderAdapter, m
 			if gr, ok := primary.(*GuideResponder); ok && owner.eventLogger != nil {
 				gr.eventLogger = owner.eventLogger
 			}
+			if gr, ok := primary.(*GuideResponder); ok {
+				gr.forest = owner.config.Forest
+			}
 		}
 		responder = NewFallbackGuideResponder(
 			primary,

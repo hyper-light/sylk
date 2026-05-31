@@ -102,7 +102,7 @@ const guardianForestGuide = `## Memory Forest
 
 Use the Memory Forest when governance decisions should be grounded in precedent rather than only the current diff:
 - **guardian_forest_consult(purpose=evaluate_scope_risk, query=…)**: recall prior conflicts, constraints, and risky scope expansions before approving or escalating
-- **guardian_forest_consult(purpose=get_approval_precedents, query=…)**: recall prior approved or rejected branches relevant to the current safety or approval decision`
+- **guardian_forest_consult(purpose=get_approval_precedents, query=…)**: recall prior approved or rejected outcomes relevant to the current safety or approval decision`
 
 // buildSystemPrompt assembles the system prompt for a given intent.
 func (g *Guardian) buildSystemPrompt(intent GuardianIntent) string {

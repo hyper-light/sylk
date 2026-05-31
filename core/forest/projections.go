@@ -127,11 +127,11 @@ type CapabilityProjection struct {
 // OpportunityProjection exposes adjacent-value branches: proposed
 // upgrades not yet accepted, accepted-in-flight ones, and rejected.
 type OpportunityProjection struct {
-	Query     string         `json:"query"`
-	Proposed  []BranchPacket `json:"proposed,omitempty"`
-	Accepted  []BranchPacket `json:"accepted,omitempty"`
-	Rejected  []BranchPacket `json:"rejected,omitempty"`
-	Flagged   []BranchPacket `json:"flagged,omitempty"`
+	Query    string         `json:"query"`
+	Proposed []BranchPacket `json:"proposed,omitempty"`
+	Accepted []BranchPacket `json:"accepted,omitempty"`
+	Rejected []BranchPacket `json:"rejected,omitempty"`
+	Flagged  []BranchPacket `json:"flagged,omitempty"`
 }
 
 // -----------------------------------------------------------------------------
@@ -292,7 +292,7 @@ func (m *MemoryForest) retrieveFamily(
 	family TreeFamily,
 	includeCounter bool,
 ) ([]*BranchPacket, error) {
-	return m.Retrieve(ctx, Query{
+	return m.retrieveBranchPackets(ctx, Query{
 		Query:                  input.Query,
 		SessionID:              input.SessionID,
 		TaskID:                 input.TaskID,

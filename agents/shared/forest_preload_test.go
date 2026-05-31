@@ -8,37 +8,16 @@ import (
 	"github.com/adalundhe/sylk/core/forest"
 )
 
-// fakeProjector implements MemoryForestProjector + MemoryForestService.
-// The preload helper sniffs via type-assert, so satisfying both lets us
-// exercise the real PreloadFor() dispatch path with a controllable
-// fixture — no SQLite, no goroutines.
+// fakeProjector implements the packet-native MemoryForestService with
+// controllable fixtures: no SQLite, no goroutines.
 type fakeProjector struct {
-	intent       *forest.IntentProjection
-	constraint   *forest.ConstraintProjection
-	evidence     *forest.EvidenceProjection
-	decisions    *forest.DecisionProjection
-	outcomes     *forest.OutcomeProjection
-	preferences  *forest.PreferenceProjection
-	capabilities *forest.CapabilityProjection
-	opportunity  *forest.OpportunityProjection
-	packets      []*forest.ForestPacket
-	cursor       *forest.ForestCursor
-
-	calledIntent       bool
-	calledConstraint   bool
-	calledEvidence     bool
-	calledDecisions    bool
-	calledOutcomes     bool
-	calledPreferences  bool
-	calledCapabilities bool
-	calledRetrieve     bool
-	calledCursor       bool
+	packets        []*forest.ForestPacket
+	cursor         *forest.ForestCursor
+	calledRetrieve bool
+	calledCursor   bool
 }
 
 func (f *fakeProjector) ResolveIntent(context.Context, forest.ResolveIntentInput) (*forest.IntentResolution, error) {
-	return nil, nil
-}
-func (f *fakeProjector) Retrieve(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
 	return nil, nil
 }
 func (f *fakeProjector) RetrieveForest(_ context.Context, _ forest.Query) ([]*forest.ForestPacket, error) {
@@ -66,46 +45,11 @@ func (f *fakeProjector) CreateForestCursor(_ context.Context, input forest.Fores
 	cursor := &forest.ForestCursor{ID: "cursor-1", SessionID: input.SessionID, ActiveNodeIDs: []string{"node-1"}}
 	return cursor, nil
 }
-func (f *fakeProjector) PredictNextBranches(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
-	return nil, nil
-}
 func (f *fakeProjector) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
 	return nil
 }
 func (f *fakeProjector) RecordOutcome(context.Context, forest.OutcomeRecord) error {
 	return nil
-}
-
-func (f *fakeProjector) ProjectIntent(_ context.Context, _ forest.ProjectionInput) (*forest.IntentProjection, error) {
-	f.calledIntent = true
-	return f.intent, nil
-}
-func (f *fakeProjector) ProjectConstraints(_ context.Context, _ forest.ProjectionInput) (*forest.ConstraintProjection, error) {
-	f.calledConstraint = true
-	return f.constraint, nil
-}
-func (f *fakeProjector) ProjectEvidence(_ context.Context, _ forest.ProjectionInput) (*forest.EvidenceProjection, error) {
-	f.calledEvidence = true
-	return f.evidence, nil
-}
-func (f *fakeProjector) ProjectDecisions(_ context.Context, _ forest.ProjectionInput) (*forest.DecisionProjection, error) {
-	f.calledDecisions = true
-	return f.decisions, nil
-}
-func (f *fakeProjector) ProjectOutcomes(_ context.Context, _ forest.ProjectionInput) (*forest.OutcomeProjection, error) {
-	f.calledOutcomes = true
-	return f.outcomes, nil
-}
-func (f *fakeProjector) ProjectPreferences(_ context.Context, _ forest.ProjectionInput) (*forest.PreferenceProjection, error) {
-	f.calledPreferences = true
-	return f.preferences, nil
-}
-func (f *fakeProjector) ProjectCapabilities(_ context.Context, _ forest.ProjectionInput) (*forest.CapabilityProjection, error) {
-	f.calledCapabilities = true
-	return f.capabilities, nil
-}
-func (f *fakeProjector) ProjectOpportunities(_ context.Context, _ forest.ProjectionInput) (*forest.OpportunityProjection, error) {
-	return f.opportunity, nil
 }
 
 func TestPreloadFor_ArchitectPullsIntentConstraintDecision(t *testing.T) {
@@ -119,9 +63,6 @@ func TestPreloadFor_ArchitectPullsIntentConstraintDecision(t *testing.T) {
 	}
 	if !f.calledRetrieve || !f.calledCursor {
 		t.Fatalf("architect preload did not use forest packet cursor path: retrieve=%v cursor=%v", f.calledRetrieve, f.calledCursor)
-	}
-	if f.calledIntent || f.calledConstraint || f.calledDecisions || f.calledEvidence {
-		t.Fatalf("architect preload used legacy projections")
 	}
 }
 
@@ -167,10 +108,8 @@ func TestPreloadFor_AllEmergentAgencyRolesReceivePacketProjection(t *testing.T) 
 	}
 }
 
-// TestPreloadFor_UnknownAgentReturnsNil covers the contract guarantee
-// that an unknown agent type does not fire projection queries.
-// Callers depend on this: a misconfigured agent name must degrade to
-// "no preload" rather than dispatching every family.
+// TestPreloadFor_UnknownAgentReturnsNil covers the contract guarantee that an
+// unknown agent type degrades to "no preload" instead of querying the forest.
 func TestPreloadFor_UnknownAgentReturnsNil(t *testing.T) {
 	f := &fakeProjector{}
 	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "unknown-agent"})
@@ -180,8 +119,8 @@ func TestPreloadFor_UnknownAgentReturnsNil(t *testing.T) {
 	if got != nil {
 		t.Errorf("unknown agent returned non-nil preload: %+v", got)
 	}
-	if f.calledIntent || f.calledConstraint || f.calledEvidence {
-		t.Errorf("unknown agent fired a projection")
+	if f.calledRetrieve || f.calledCursor {
+		t.Errorf("unknown agent queried forest: retrieve=%v cursor=%v", f.calledRetrieve, f.calledCursor)
 	}
 }
 

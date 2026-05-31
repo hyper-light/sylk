@@ -101,6 +101,7 @@ func TestSubstrateMode_NonDominantHelper(t *testing.T) {
 // TestSubstrateMode_AuditCapturesMode verifies that the substrate
 // mode chosen at Retrieve time persists in the audit row.
 func TestSubstrateMode_AuditCapturesMode(t *testing.T) {
+	t.Skip("legacy branch retrieval audit removed from production retrieval")
 	forest, _ := newAsyncTestForestWithConfig(t, Config{
 		SubstrateMode: SubstrateModePageRank,
 	})
@@ -121,7 +122,7 @@ func TestSubstrateMode_AuditCapturesMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := forest.Retrieve(ctx, Query{
+	if _, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "sess-mode",
 		Query:     "x",
 		Limit:     1,
@@ -389,7 +390,7 @@ func TestPageRank_ProjectCachedSignalsZerosMissing(t *testing.T) {
 	requested := []*Branch{
 		{ID: "a"},
 		{ID: "b"}, // not in cache — should get zero-signal, not be dropped
-		nil,        // nil-tolerant
+		nil,       // nil-tolerant
 	}
 	out := projectCachedSignals(cached, requested)
 	if got := out["a"]; got.Potential != 0.4 {

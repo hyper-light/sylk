@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/adalundhe/sylk/core/forest"
 	"github.com/adalundhe/sylk/core/providers"
 )
 
@@ -29,6 +30,76 @@ type stubStreamGuideResponder struct {
 	err         error
 	responds    int
 	streamCalls int
+}
+
+type captureGuideProvider struct {
+	req *providers.Request
+}
+
+func (p *captureGuideProvider) Name() string { return "capture-guide-provider" }
+
+func (p *captureGuideProvider) SupportedModels() []providers.ModelInfo {
+	return []providers.ModelInfo{{ID: "test-guide-model", Name: "test-guide-model", MaxContext: 200000}}
+}
+
+func (p *captureGuideProvider) Complete(_ context.Context, req *providers.Request) (*providers.Response, error) {
+	p.req = req
+	return &providers.Response{Content: "forest-aware guide response"}, nil
+}
+
+func (p *captureGuideProvider) Stream(_ context.Context, _ *providers.Request) (<-chan *providers.StreamChunk, error) {
+	ch := make(chan *providers.StreamChunk)
+	close(ch)
+	return ch, nil
+}
+
+func (p *captureGuideProvider) CountTokens(_ []providers.Message) (int, error) { return 0, nil }
+
+func (p *captureGuideProvider) MaxContextTokens(_ string) int { return 200000 }
+
+func (p *captureGuideProvider) HealthCheck(_ context.Context) error { return nil }
+
+type guideForestPreloadStub struct{}
+
+func (s guideForestPreloadStub) ResolveIntent(context.Context, forest.ResolveIntentInput) (*forest.IntentResolution, error) {
+	return &forest.IntentResolution{}, nil
+}
+
+func (s guideForestPreloadStub) RetrieveForest(context.Context, forest.Query) ([]*forest.ForestPacket, error) {
+	return []*forest.ForestPacket{{
+		Node: forest.ForestNode{
+			ID:            "guide-node",
+			Kind:          forest.ForestNodeClaim,
+			Title:         "Guide precedent",
+			EvidenceGrade: forest.EvidenceGradeValidated,
+		},
+		ClusterIDs:      []string{"guide-cluster"},
+		Evidence:        []forest.ForestEvidence{{RefType: "node", RefID: "guide-node", NodeID: "guide-node", Grade: forest.EvidenceGradeValidated}},
+		RiskScore:       1,
+		ValidationNeed:  0,
+		Score:           1,
+		PolicyVersion:   "test",
+		SkippedEvidence: "",
+	}}, nil
+}
+
+func (s guideForestPreloadStub) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	return &forest.ForestCursor{
+		ID:               "cursor-guide",
+		SessionID:        input.SessionID,
+		AgentID:          input.AgentID,
+		ActiveNodeIDs:    []string{"guide-node"},
+		ActiveClusterIDs: []string{"guide-cluster"},
+		RiskFlags:        []string{"context.under_review"},
+	}, nil
+}
+
+func (s guideForestPreloadStub) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
+	return nil
+}
+
+func (s guideForestPreloadStub) RecordOutcome(context.Context, forest.OutcomeRecord) error {
+	return nil
 }
 
 func (r *stubStreamGuideResponder) Respond(_ context.Context, _ GuideSelfResponseRequest) (string, error) {
@@ -71,6 +142,36 @@ func TestStaticGuideResponder_Status(t *testing.T) {
 	want := "Guide is running. Pending requests: 3. Registered agents: 2."
 	if reply != want {
 		t.Fatalf("reply = %q, want %q", reply, want)
+	}
+}
+
+func TestGuideResponderInjectsForestProjectionAndCursor(t *testing.T) {
+	provider := &captureGuideProvider{}
+	responder := NewGuideResponder(provider, "test-guide-model", RouterConfig{}).(*GuideResponder)
+	responder.forest = guideForestPreloadStub{}
+
+	reply, err := responder.Respond(context.Background(), GuideSelfResponseRequest{
+		Input:     "route this with memory",
+		SessionID: "session-guide",
+		AgentID:   "guide",
+	})
+	if err != nil {
+		t.Fatalf("respond: %v", err)
+	}
+	if reply != "forest-aware guide response" {
+		t.Fatalf("reply = %q", reply)
+	}
+	if provider.req == nil {
+		t.Fatal("provider did not receive request")
+	}
+	if !strings.Contains(provider.req.SystemPrompt, "Memory Forest projection role=guide cursor=cursor-guide") {
+		t.Fatalf("system prompt missing guide forest projection: %q", provider.req.SystemPrompt)
+	}
+	if !strings.Contains(provider.req.SystemPrompt, "evidence_refs: node:guide-node") {
+		t.Fatalf("system prompt missing evidence refs: %q", provider.req.SystemPrompt)
+	}
+	if got := provider.req.Metadata["forest_cursor_id"]; got != "cursor-guide" {
+		t.Fatalf("forest_cursor_id metadata = %#v", got)
 	}
 }
 

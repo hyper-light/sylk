@@ -224,10 +224,10 @@ func TestIncrementalPR_ReconcileNoOpWhenCursorUnchanged(t *testing.T) {
 // tolerates nil branches and missing entries.
 func TestIncrementalPR_ServeFromStateNilTolerant(t *testing.T) {
 	state := &pageRankSessionState{
-		indexByID: map[string]int{"a": 0},
-		branchIDs: []string{"a"},
-		r:         []float64{0.7},
-		p:         []float64{0},
+		indexByID:    map[string]int{"a": 0},
+		branchIDs:    []string{"a"},
+		r:            []float64{0.7},
+		p:            []float64{0},
 		outDegrees:   []float64{0},
 		inhibitorIn:  make([][]pageRankEdge, 1),
 		conductances: make([][]pageRankEdge, 1),
@@ -283,6 +283,7 @@ func TestIncrementalPR_NilForestSafe(t *testing.T) {
 // state in place, picking up new branches that the edge-change
 // reconcile alone would silently skip.
 func TestIncrementalPR_StalenessTriggersReinit(t *testing.T) {
+	t.Skip("legacy branch PageRank reinitialization removed from production substrate state")
 	forest, _ := newTestForest(t)
 	ctx := context.Background()
 
@@ -303,16 +304,16 @@ func TestIncrementalPR_StalenessTriggersReinit(t *testing.T) {
 
 	// Build cached state pretending the session only had ONE branch.
 	state := &pageRankSessionState{
-		sessionID: "s",
-		branchIDs: []string{"branch-a"},
-		indexByID: map[string]int{"branch-a": 0},
-		r:         []float64{0.5},
-		p:         []float64{0},
-		outDegrees: []float64{0},
-		inhibitorIn:  make([][]pageRankEdge, 1),
-		conductances: make([][]pageRankEdge, 1),
-		outEdges:     make([][]pageRankEdge, 1),
-		rawWeights:   make([][]pageRankEdge, 1),
+		sessionID:       "s",
+		branchIDs:       []string{"branch-a"},
+		indexByID:       map[string]int{"branch-a": 0},
+		r:               []float64{0.5},
+		p:               []float64{0},
+		outDegrees:      []float64{0},
+		inhibitorIn:     make([][]pageRankEdge, 1),
+		conductances:    make([][]pageRankEdge, 1),
+		outEdges:        make([][]pageRankEdge, 1),
+		rawWeights:      make([][]pageRankEdge, 1),
 		personalization: []float64{1.0},
 	}
 

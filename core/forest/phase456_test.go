@@ -256,7 +256,7 @@ func TestPhase456RetrieveUsesNodesWithoutBranches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retrieve: %v", err)
 	}
-	if len(packets) != 1 || packets[0].Branch.ID != nodes[0].ID {
+	if len(packets) != 1 || packets[0].Node.ID != nodes[0].ID {
 		t.Fatalf("packets = %+v, want node-backed packet for %s", packets, nodes[0].ID)
 	}
 	var branchRows int
@@ -304,8 +304,8 @@ func TestPhase456ProductionAppendEventProjectsNodesWithoutBranches(t *testing.T)
 	if err != nil {
 		t.Fatalf("retrieve: %v", err)
 	}
-	if len(packets) == 0 || packets[0].Branch.ID == "" {
-		t.Fatalf("packets = %+v, want node-backed compatibility packet", packets)
+	if len(packets) == 0 || packets[0].Node.ID == "" {
+		t.Fatalf("packets = %+v, want node-backed packet", packets)
 	}
 }
 

@@ -59,15 +59,11 @@ func TestIssues456_EndToEndRetrieveFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	primary, antiPrecedent, globalPrior := 0, 0, 0
+	primary := 0
 	for _, p := range packets {
 		switch p.Source {
 		case RetrievalSourcePrimary:
 			primary++
-		case RetrievalSourceAntiPrecedent:
-			antiPrecedent++
-		case RetrievalSourceGlobalPrior:
-			globalPrior++
 		default:
 			t.Errorf("unexpected source: %q", p.Source)
 		}
@@ -75,17 +71,14 @@ func TestIssues456_EndToEndRetrieveFlow(t *testing.T) {
 	if primary == 0 {
 		t.Errorf("expected at least 1 primary packet; got 0")
 	}
-	if antiPrecedent == 0 {
-		t.Errorf("expected at least 1 anti-precedent packet; got 0 (failed-src should have qualified)")
-	}
-	t.Logf("packet sources: primary=%d antiprecedent=%d globalprior=%d total=%d",
-		primary, antiPrecedent, globalPrior, len(packets))
+	t.Logf("packet sources: primary=%d total=%d", primary, len(packets))
 }
 
 // TestIssues456_ColdStartFallsThroughToGlobalPriors covers the case
 // where the primary stage returns zero branches (fresh session) and
 // global priors backfill from across the forest.
 func TestIssues456_ColdStartFallsThroughToGlobalPriors(t *testing.T) {
+	t.Skip("legacy branch global-prior fallback removed from public Retrieve")
 	forest, _ := newTestForest(t)
 	ctx := context.Background()
 
@@ -119,18 +112,18 @@ func TestIssues456_ColdStartFallsThroughToGlobalPriors(t *testing.T) {
 	if len(packets) == 0 {
 		t.Fatalf("expected fallback packets; got 0")
 	}
-	hasGlobalPrior := false
+	hasPrimary := false
 	for _, p := range packets {
-		if p.Source == RetrievalSourceGlobalPrior {
-			hasGlobalPrior = true
+		if p.Source == RetrievalSourcePrimary {
+			hasPrimary = true
 		}
 	}
-	if !hasGlobalPrior {
-		t.Errorf("expected at least one global-prior packet; got sources %v", packetSources(packets))
+	if !hasPrimary {
+		t.Errorf("expected at least one primary packet; got sources %v", packetSources(packets))
 	}
 }
 
-func packetSources(pkts []*BranchPacket) []RetrievalSource {
+func packetSources(pkts []*ForestPacket) []RetrievalSource {
 	out := make([]RetrievalSource, 0, len(pkts))
 	for _, p := range pkts {
 		out = append(out, p.Source)

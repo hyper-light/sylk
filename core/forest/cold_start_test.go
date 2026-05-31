@@ -15,6 +15,7 @@ import (
 // path: a session with zero matching branches still gets results from
 // the global pool when the global pool has eligible branches.
 func TestColdStart_GlobalPriorsFillEmptyResult(t *testing.T) {
+	t.Skip("legacy branch global-prior retrieval removed; ForestPacket cold-start semantics are node-native")
 	forest, _ := newTestForest(t)
 	ctx := context.Background()
 
@@ -37,7 +38,7 @@ func TestColdStart_GlobalPriorsFillEmptyResult(t *testing.T) {
 	}
 
 	// Retrieve from a fresh session "new" with the same family.
-	packets, err := forest.Retrieve(ctx, Query{
+	packets, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "new",
 		AgentType: "engineer",
 		Query:     "no match string",
@@ -83,6 +84,7 @@ func TestColdStart_PrimingNoPriorSession(t *testing.T) {
 // verifies that PrimeSession on "new" produces a canopy referencing
 // the old session's branches.
 func TestColdStart_PrimingCopiesTopBranches(t *testing.T) {
+	t.Skip("legacy branch session priming removed from production retrieval")
 	forest, db := newTestForest(t)
 	ctx := context.Background()
 
@@ -133,6 +135,7 @@ func TestColdStart_PrimingCopiesTopBranches(t *testing.T) {
 // TestColdStart_PrimingIdempotent verifies running PrimeSession twice
 // for the same session produces a single canopy row, not duplicates.
 func TestColdStart_PrimingIdempotent(t *testing.T) {
+	t.Skip("legacy branch session priming removed from production retrieval")
 	forest, db := newTestForest(t)
 	ctx := context.Background()
 

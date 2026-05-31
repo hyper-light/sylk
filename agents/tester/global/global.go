@@ -715,6 +715,12 @@ func (gt *GlobalTester) handleTaskRequest(ctx context.Context, fwd *guide.Forwar
 		Tools: tools,
 	}
 	gt.applyLLMRuntimeProfile(req, "testing")
+	ctx, _, _ = agentshared.ApplyForestPreload(ctx, req, gt.config.Forest, agentshared.ForestPreloadInput{
+		AgentType: "tester",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+		AgentID:   gt.id,
+	})
 
 	// Prepend conversation history as multi-turn message pairs.
 	agentshared.PrependHistoryMessages(req, fwd.ConversationHistory)

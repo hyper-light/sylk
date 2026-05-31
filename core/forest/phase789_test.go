@@ -290,6 +290,12 @@ func TestPhase789CursorImmutableValidatedAndCompacted(t *testing.T) {
 	for i, node := range nodes {
 		packets = append(packets, phase789Packet(node, float64(i+1)))
 	}
+	packets[len(packets)-1].BridgeRisks = []ForestBridgeRisk{{
+		BridgeID:        "bridge-cursor",
+		NodeID:          nodes[len(nodes)-1].ID,
+		SourceClusterID: "cluster-source",
+		TargetClusterID: "cluster-target",
+	}}
 	cursor, err := forest.CreateForestCursor(context.Background(), ForestCursorInput{
 		SessionID: "session-phase789-cursor",
 		AgentID:   "agent-cursor",
@@ -309,6 +315,14 @@ func TestPhase789CursorImmutableValidatedAndCompacted(t *testing.T) {
 	}
 	if strings.Join(loaded.ActiveNodeIDs, ",") != strings.Join(cursor.ActiveNodeIDs, ",") {
 		t.Fatalf("loaded cursor mismatch: %+v != %+v", loaded.ActiveNodeIDs, cursor.ActiveNodeIDs)
+	}
+	crossings, ok := loaded.Metadata["bridge_crossings"].([]any)
+	if !ok || len(crossings) != 1 {
+		t.Fatalf("cursor bridge crossing metadata missing source/target clusters: %#v", loaded.Metadata["bridge_crossings"])
+	}
+	crossing, ok := crossings[0].(map[string]any)
+	if !ok || crossing["source_cluster_id"] != "cluster-source" || crossing["target_cluster_id"] != "cluster-target" {
+		t.Fatalf("cursor bridge crossing source/target mismatch: %#v", crossings[0])
 	}
 	if _, err := db.Exec(`UPDATE forest_cursors SET no_cursor_reason = 'mutated' WHERE cursor_id = ?`, cursor.ID); err == nil {
 		t.Fatal("cursor update unexpectedly succeeded")

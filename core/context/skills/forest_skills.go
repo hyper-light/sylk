@@ -22,16 +22,15 @@ type ForestService interface {
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error
 }
 
-// ForestRecallInput requests branch packets from the forest.
+// ForestRecallInput requests evidence-backed packets from the forest.
 type ForestRecallInput struct {
-	Query                  string   `json:"query"`
-	SessionID              string   `json:"session_id,omitempty"`
-	TaskID                 string   `json:"task_id,omitempty"`
-	IntentID               string   `json:"intent_id,omitempty"`
-	Horizon                string   `json:"horizon,omitempty"`
-	Families               []string `json:"families,omitempty"`
-	Limit                  int      `json:"limit,omitempty"`
-	IncludeCounterEvidence bool     `json:"include_counter_evidence,omitempty"`
+	Query                  string `json:"query"`
+	SessionID              string `json:"session_id,omitempty"`
+	TaskID                 string `json:"task_id,omitempty"`
+	IntentID               string `json:"intent_id,omitempty"`
+	Horizon                string `json:"horizon,omitempty"`
+	Limit                  int    `json:"limit,omitempty"`
+	IncludeCounterEvidence bool   `json:"include_counter_evidence,omitempty"`
 }
 
 // ForestRecallOutput returns forest packets.
@@ -42,14 +41,13 @@ type ForestRecallOutput struct {
 
 // RecallRecentInput requests recent preserved context from the Memory Forest.
 type RecallRecentInput struct {
-	Query                  string   `json:"query,omitempty"`
-	SessionID              string   `json:"session_id,omitempty"`
-	TaskID                 string   `json:"task_id,omitempty"`
-	IntentID               string   `json:"intent_id,omitempty"`
-	Horizon                string   `json:"horizon,omitempty"`
-	Families               []string `json:"families,omitempty"`
-	Limit                  int      `json:"limit,omitempty"`
-	IncludeCounterEvidence *bool    `json:"include_counter_evidence,omitempty"`
+	Query                  string `json:"query,omitempty"`
+	SessionID              string `json:"session_id,omitempty"`
+	TaskID                 string `json:"task_id,omitempty"`
+	IntentID               string `json:"intent_id,omitempty"`
+	Horizon                string `json:"horizon,omitempty"`
+	Limit                  int    `json:"limit,omitempty"`
+	IncludeCounterEvidence *bool  `json:"include_counter_evidence,omitempty"`
 }
 
 // RecallRecentOutput returns a compact continuity summary plus the raw packets.
@@ -61,9 +59,10 @@ type RecallRecentOutput struct {
 	Cursor  *forest.ForestCursor     `json:"cursor,omitempty"`
 }
 
-// ForestOutcomeInput records explicit branch outcome feedback.
+// ForestOutcomeInput records explicit node outcome feedback.
 type ForestOutcomeInput struct {
-	BranchID   string  `json:"branch_id"`
+	NodeID     string  `json:"node_id"`
+	CursorID   string  `json:"cursor_id,omitempty"`
 	SessionID  string  `json:"session_id,omitempty"`
 	TaskID     string  `json:"task_id,omitempty"`
 	Status     string  `json:"status"`
@@ -98,16 +97,9 @@ type ForestProposalOutput struct {
 	Proposal forest.ForestClaimProposal `json:"proposal"`
 }
 
-// NewForestSkill returns the consolidated `forest(op=…)` skill that
-// replaces the four separate read-side forest skills
-// (forest_resolve_intent, forest_recall, recall_recent,
-// forest_predict_next_branches) in the LLM catalog. Op dispatch routes
-// to the existing per-op builders so behavior is unchanged; the
-// surface the agent sees is one verb with four ops.
-//
-// forest_record_outcome stays a distinct skill — it's the only
-// mutating entry point in the forest surface and its name makes the
-// write semantics obvious to the model.
+// NewForestSkill returns a compatibility wrapper over the ForestPacket-native
+// read operations. It is not registered in the LLM-visible catalog; phase-9
+// agents receive the agency-aware forest.* skill surface below.
 func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
 	resolveIntent := NewForestResolveIntentSkill(deps)
 	recall := NewForestRecallSkill(deps)
@@ -118,11 +110,11 @@ func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
 		Description("Query the Memory Forest. One primitive for every read-side operation across session/task/project horizons.\n\n"+
 			"Ops:\n"+
 			"- resolve_intent: Resolve the active user intent, constraints, preferences, and likely outcome hints (params: query, horizon?, limit?)\n"+
-			"- recall: Retrieve ranked branch packets with support, conflicts, and next-action hints (params: query, horizon?, families?, limit?, include_counter_evidence?)\n"+
+			"- recall: Retrieve evidence-backed ForestPackets with support, conflicts, cursor context, and validation needs (params: query, horizon?, limit?, include_counter_evidence?)\n"+
 			"- recall_recent: Recover recent preserved context so a terse follow-up can continue from earlier discussion (params: query?, horizon?, limit?, include_counter_evidence?)\n"+
-			"- predict_next: Predict low-risk adjacent branches that could safely improve the current work (params: query, horizon?, limit?)").
+			"- predict_next: Retrieve low-risk adjacent ForestPackets that could safely improve the current work (params: query, horizon?, limit?)").
 		Domain(RetrievalDomain).
-		Keywords("forest", "memory", "recall", "intent", "constraint", "preference", "precedent", "branch", "history", "continuity", "predict", "adjacent").
+		Keywords("forest", "memory", "recall", "intent", "constraint", "preference", "precedent", "node", "history", "continuity", "predict", "adjacent").
 		Priority(100).
 		EnumParam("op", "Forest query operation", []string{"resolve_intent", "recall", "recall_recent", "predict_next"}, true).
 		StringParam("query", "Natural language query (required for resolve_intent/recall/predict_next; optional for recall_recent)", false).
@@ -136,7 +128,6 @@ func NewForestSkill(deps *RetrievalDependencies) *skills.Skill {
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		ArrayParam("families", "Optional tree families to constrain recall/recall_recent", "string", false).
 		IntParam("limit", "Maximum number of packets to return", false).
 		BoolParam("include_counter_evidence", "Whether to include contradictory evidence (recall/recall_recent)", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -175,7 +166,7 @@ func NewForestRetrieveEvidenceSkill(deps *RetrievalDependencies) *skills.Skill {
 		IntParam("limit", "Maximum packets to return", false).
 		BoolParam("include_counter_evidence", "Include quarantined or contradictory evidence", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
-			return NewForestRecallSkill(deps).Handler(ctx, input)
+			return executeForestEvidenceQuery(ctx, input, deps, false)
 		}).
 		Build()
 }
@@ -301,11 +292,11 @@ func NewForestResolveIntentSkill(deps *RetrievalDependencies) *skills.Skill {
 // NewForestRecallSkill creates the forest_recall skill.
 func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 	return skills.NewSkill("forest_recall").
-		Description("Retrieve ranked branch packets from the Memory Forest, including support, conflicts, and recommended next actions.").
+		Description("Retrieve evidence-backed ForestPackets from the Memory Forest, including support, conflicts, cursor context, and validation needs.").
 		Domain(RetrievalDomain).
-		Keywords("recall", "precedent", "branch", "history", "forest").
+		Keywords("recall", "precedent", "node", "history", "forest").
 		Priority(100).
-		StringParam("query", "Natural language query for branch recall", true).
+		StringParam("query", "Natural language query for forest packet recall", true).
 		StringParam("session_id", "Optional session identifier", false).
 		StringParam("task_id", "Optional task identifier for task-scoped recall", false).
 		StringParam("intent_id", "Optional explicit intent identifier", false).
@@ -316,7 +307,6 @@ func NewForestRecallSkill(deps *RetrievalDependencies) *skills.Skill {
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		ArrayParam("families", "Optional tree families to constrain recall", "string", false).
 		IntParam("limit", "Maximum number of packets to return", false).
 		BoolParam("include_counter_evidence", "Whether to include contradictory evidence", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -372,7 +362,6 @@ func NewRecallRecentSkill(deps *RetrievalDependencies) *skills.Skill {
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		ArrayParam("families", "Optional tree families to constrain recall", "string", false).
 		IntParam("limit", "Maximum number of packets to inspect", false).
 		BoolParam("include_counter_evidence", "Whether to include contradictory evidence", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
@@ -385,10 +374,11 @@ func NewRecallRecentSkill(deps *RetrievalDependencies) *skills.Skill {
 		Build()
 }
 
-// NewForestPredictNextSkill creates the forest_predict_next_branches skill.
+// NewForestPredictNextSkill creates the forest_predict_next_branches
+// compatibility skill over ForestPacket retrieval.
 func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 	return skills.NewSkill("forest_predict_next_branches").
-		Description("Predict low-risk adjacent branches that could safely improve the current work beyond literal prompt compliance.").
+		Description("Retrieve low-risk adjacent ForestPackets that could safely improve the current work beyond literal prompt compliance.").
 		Domain(RetrievalDomain).
 		Keywords("predict", "next", "opportunity", "adjacent value", "forest").
 		Priority(95).
@@ -441,11 +431,12 @@ func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
 
 func newForestRecordOutcomeSkill(name string, deps *RetrievalDependencies) *skills.Skill {
 	return skills.NewSkill(name).
-		Description("Record explicit outcome feedback for a branch so the forest can reconsolidate and learn from the result.").
+		Description("Record explicit outcome feedback for a forest node so the forest can reconsolidate and learn from the result.").
 		Domain(RetrievalDomain).
 		Keywords("outcome", "feedback", "learn", "reconsolidate", "forest").
 		Priority(90).
-		StringParam("branch_id", "Branch identifier to update", true).
+		StringParam("node_id", "Forest node identifier to update", true).
+		StringParam("cursor_id", "Optional forest cursor that surfaced the node", false).
 		StringParam("session_id", "Optional session identifier", false).
 		StringParam("task_id", "Optional task identifier", false).
 		StringParam("status", "Outcome status: succeeded, failed, or mixed", true).
@@ -462,7 +453,8 @@ func newForestRecordOutcomeSkill(name string, deps *RetrievalDependencies) *skil
 			}
 			sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
 			if err := deps.Forest.RecordOutcome(ctx, forest.OutcomeRecord{
-				BranchID:   params.BranchID,
+				NodeID:     params.NodeID,
+				CursorID:   params.CursorID,
 				SessionID:  sessionID,
 				TaskID:     taskID,
 				Status:     forest.OutcomeStatus(params.Status),
@@ -486,11 +478,16 @@ func executeForestEvidenceQuery(ctx context.Context, input json.RawMessage, deps
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
 	sessionID, taskID := resolveForestSkillScope(ctx, params.SessionID, params.TaskID)
+	horizon, err := resolveForestSkillHorizon(params.Horizon, sessionID, taskID)
+	if err != nil {
+		return nil, err
+	}
 	packets, err := deps.Forest.RetrieveForest(ctx, forest.Query{
 		Query:                  params.Query,
 		SessionID:              sessionID,
 		TaskID:                 taskID,
 		IntentID:               params.IntentID,
+		Horizon:                horizon,
 		Limit:                  params.Limit,
 		IncludeCounterEvidence: includeCounter || params.IncludeCounterEvidence,
 	})
@@ -529,7 +526,16 @@ func validationSuggestionsFromPackets(output *ForestRecallOutput) *ForestValidat
 
 func rejectPrivilegedForestProposal(summary string) error {
 	normalized := strings.ToLower(summary)
-	for _, blocked := range []string{"install skill", "alter permission", "change permission", "grant permission"} {
+	for _, blocked := range []string{
+		"install skill",
+		"generated skill",
+		"enable skill",
+		"alter permission",
+		"change permission",
+		"grant permission",
+		"escalate permission",
+		"bypass permission",
+	} {
 		if strings.Contains(normalized, blocked) {
 			return fmt.Errorf("forest proposal rejected: generated skills and permission changes require governance outside forest skills")
 		}
@@ -622,34 +628,6 @@ func ExecuteRecallRecent(
 		Packets: packets,
 		Cursor:  cursor,
 	}, nil
-}
-
-func parseForestFamilies(values []string) []forest.TreeFamily {
-	if len(values) == 0 {
-		return nil
-	}
-	families := make([]forest.TreeFamily, 0, len(values))
-	for _, value := range values {
-		// Issue #11 Phase 3: accept both canonical (intent / constraint
-		// / evidence / outcome / antipattern) and legacy values from
-		// any caller that hasn't migrated. The forest's normalizeQuery
-		// boundary canonicalizes deprecated values into their merged
-		// targets so this parser doesn't have to translate.
-		switch forest.TreeFamily(value) {
-		case forest.TreeFamilyIntent,
-			forest.TreeFamilyConstraint,
-			forest.TreeFamilyEvidence,
-			forest.TreeFamilyOutcome,
-			forest.TreeFamilyAntiPattern,
-			forest.TreeFamilyDecision,
-			forest.TreeFamilyPreference,
-			forest.TreeFamilyCapability,
-			forest.TreeFamilyOpportunity,
-			forest.TreeFamilyConflict:
-			families = append(families, forest.TreeFamily(value))
-		}
-	}
-	return families
 }
 
 func resolveForestSkillScope(ctx context.Context, sessionID, taskID string) (string, string) {
@@ -785,24 +763,24 @@ func formatRecentRecallFocus(packet *forest.ForestPacket) string {
 	if summary == "" {
 		return ""
 	}
-	label := strings.TrimSpace(string(packet.Node.Kind))
+	label := recallNodeLabel(packet.Node.Kind)
 	if label == "" {
 		return trimRecallSentence(summary)
 	}
 	return label + ": " + trimRecallSentence(summary)
 }
 
-func recallFamilyLabel(family forest.TreeFamily) string {
-	switch family {
-	case forest.TreeFamilyIntent:
+func recallNodeLabel(kind forest.ForestNodeKind) string {
+	switch kind {
+	case forest.ForestNodeClaim, forest.ForestNodeInteraction, forest.ForestNodePolicyTrial, forest.ForestNodeSkillCandidate:
 		return "Intent"
-	case forest.TreeFamilyConstraint:
+	case forest.ForestNodeValidation:
 		return "Constraint"
-	case forest.TreeFamilyEvidence:
+	case forest.ForestNodeArtifact, forest.ForestNodeTestament, forest.ForestNodeContent:
 		return "Evidence"
-	case forest.TreeFamilyOutcome:
+	case forest.ForestNodeOutcome, forest.ForestNodeRemediation:
 		return "Outcome"
-	case forest.TreeFamilyAntiPattern:
+	case forest.ForestNodeContradiction:
 		return "AntiPattern"
 	default:
 		return ""

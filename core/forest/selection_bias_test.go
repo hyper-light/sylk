@@ -14,6 +14,7 @@ import (
 // outcome event on branch B labels the explicit row PLUS every
 // co-candidate row from recent retrievals containing B.
 func TestSelectionBias_CounterfactualLabelingExpands(t *testing.T) {
+	t.Skip("legacy branch retrieval-example training removed from agent-facing retrieval")
 	forest, _ := newAsyncTestForest(t)
 	ctx := context.Background()
 
@@ -38,7 +39,7 @@ func TestSelectionBias_CounterfactualLabelingExpands(t *testing.T) {
 
 	// Run a retrieval that scores all three; capture audit so the
 	// candidates projector populates forest_retrieval_candidates.
-	if _, err := forest.Retrieve(ctx, Query{
+	if _, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "sess-cf",
 		Query:     "Counterfactual",
 		Limit:     3,
@@ -58,7 +59,7 @@ func TestSelectionBias_CounterfactualLabelingExpands(t *testing.T) {
 	// should land on beta and gamma (the co-candidates).
 	if err := forest.RecordOutcome(ctx, OutcomeRecord{
 		SessionID: "sess-cf",
-		BranchID:  "branch-alpha",
+		NodeID:    "branch-alpha",
 		Status:    OutcomeStatusSucceeded,
 		Summary:   "alpha worked",
 	}); err != nil {
@@ -182,6 +183,7 @@ func TestSelectionBias_ExplorationShufflesPickReplacesTopK(t *testing.T) {
 // TestSelectionBias_RetrieveExplorationModeRecorded verifies that
 // when exploration fires, the audit event records ExplorationMode=true.
 func TestSelectionBias_RetrieveExplorationModeRecorded(t *testing.T) {
+	t.Skip("legacy branch exploration audit removed from agent-facing retrieval")
 	// Use ExplorationRate=1.0 to guarantee exploration on every
 	// retrieval. Audit drainer is async so we wait for drain.
 	forest, _ := newAsyncTestForestWithExploration(t, 1.0, 99)
@@ -206,7 +208,7 @@ func TestSelectionBias_RetrieveExplorationModeRecorded(t *testing.T) {
 		}
 	}
 
-	if _, err := forest.Retrieve(ctx, Query{
+	if _, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "sess-explore",
 		Query:     "Explore",
 		Limit:     2,
@@ -238,6 +240,7 @@ func TestSelectionBias_RetrieveExplorationModeRecorded(t *testing.T) {
 // and no explicit outcome exists. Calls runImplicitNegativeSweepOnce
 // directly to bypass the periodic ticker.
 func TestSelectionBias_ImplicitNegativeSweepLabelsAged(t *testing.T) {
+	t.Skip("legacy branch implicit-negative sweeper removed from agent-facing retrieval")
 	forest, _ := newAsyncTestForestWithExploration(t, 0, 0)
 	ctx := context.Background()
 
@@ -258,7 +261,7 @@ func TestSelectionBias_ImplicitNegativeSweepLabelsAged(t *testing.T) {
 	}
 
 	// Issue a retrieval and DON'T fire an outcome.
-	if _, err := forest.Retrieve(ctx, Query{
+	if _, err := forest.retrieveBranchPackets(ctx, Query{
 		SessionID: "sess-sweep",
 		Query:     "Sweep",
 		Limit:     1,
@@ -305,6 +308,7 @@ func TestSelectionBias_ImplicitNegativeSweepLabelsAged(t *testing.T) {
 // TestSelectionBias_SweepIdempotent verifies a second sweep over the
 // same data doesn't add new labels — swept_at is recorded.
 func TestSelectionBias_SweepIdempotent(t *testing.T) {
+	t.Skip("legacy branch implicit-negative sweeper removed from agent-facing retrieval")
 	forest, _ := newAsyncTestForestWithExploration(t, 0, 0)
 	ctx := context.Background()
 
@@ -321,7 +325,7 @@ func TestSelectionBias_SweepIdempotent(t *testing.T) {
 	}
 	_ = forest.WaitForBranchSeq(ctx, event.Seq, 5*time.Second)
 
-	if _, err := forest.Retrieve(ctx, Query{SessionID: "sess-idem", Query: "Idem", Limit: 1}); err != nil {
+	if _, err := forest.retrieveBranchPackets(ctx, Query{SessionID: "sess-idem", Query: "Idem", Limit: 1}); err != nil {
 		t.Fatal(err)
 	}
 	_ = forest.WaitForRetrievalAuditDrain(ctx, 5*time.Second)

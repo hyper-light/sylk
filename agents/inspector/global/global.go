@@ -587,6 +587,12 @@ func (gi *GlobalInspector) handleTaskRequest(ctx context.Context, fwd *guide.For
 		Tools:     tools,
 	}
 	gi.applyLLMRuntimeProfile(req, "task")
+	ctx, _, _ = agentShared.ApplyForestPreload(ctx, req, gi.config.Forest, agentShared.ForestPreloadInput{
+		AgentType: "inspector",
+		Query:     fwd.Input,
+		SessionID: fwd.SessionID,
+		AgentID:   gi.id,
+	})
 
 	ledger := agentShared.SteeringLedgerFromContext(ctx)
 	result, err := agentShared.ExecuteTurnLoop(ctx, ledger, req, func() (string, error) {

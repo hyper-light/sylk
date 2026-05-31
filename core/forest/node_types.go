@@ -118,6 +118,7 @@ type ForestPacket struct {
 	Quarantine        ForestQuarantine              `json:"quarantine"`
 	ProposedClaims    []ForestClaimProposalTemplate `json:"proposed_claims,omitempty"`
 	SkippedEvidence   string                        `json:"skipped_evidence,omitempty"`
+	Source            RetrievalSource               `json:"source,omitempty"`
 	Score             float64                       `json:"score"`
 	RiskScore         float64                       `json:"risk_score"`
 	ValidationNeed    float64                       `json:"validation_need"`

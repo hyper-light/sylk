@@ -660,6 +660,11 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 			return OutbreakMaintenanceResult{}, fmt.Errorf("emit remediation proposal: %w", err)
 		}
 	}
+	if status == OutbreakStatusProposed && proposal.GuardianReviewRequired {
+		if err := m.emitGuardianOutbreakReview(ctx, proposal); err != nil {
+			return OutbreakMaintenanceResult{}, err
+		}
+	}
 	if status == OutbreakStatusSuperseded {
 		return OutbreakMaintenanceResult{OutbreaksUpdated: 1, Superseded: 1}, nil
 	}
@@ -667,6 +672,30 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 		return OutbreakMaintenanceResult{OutbreaksUpdated: 1}, nil
 	}
 	return OutbreakMaintenanceResult{OutbreaksUpdated: 1, ProposalsEmitted: 1}, nil
+}
+
+func (m *MemoryForest) emitGuardianOutbreakReview(ctx context.Context, proposal ForestClaimProposal) error {
+	_, err := m.AppendLedgerRecord(ctx, LedgerRecord{
+		SourceKind:  LedgerSourceMaintenance,
+		SourceID:    proposal.ID,
+		SourceKey:   "guardian_outbreak_review:" + proposal.ID,
+		EventKind:   "guardian.review_required",
+		SessionID:   "global",
+		SubjectType: "forest_claim_proposal",
+		SubjectID:   proposal.ID,
+		OccurredAt:  time.Now().UTC(),
+		Payload: map[string]any{
+			"proposal_id":   proposal.ID,
+			"cluster_id":    proposal.ClusterID,
+			"dimension":     proposal.Dimension,
+			"outbreak_id":   proposal.SourceOutbreakID,
+			"evidence_refs": proposal.EvidenceRefs,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("emit guardian outbreak review: %w", err)
+	}
+	return nil
 }
 
 func (m *MemoryForest) outbreakProposalAlreadyOpen(ctx context.Context, candidate outbreakCandidate, proposal ForestClaimProposal) (bool, error) {

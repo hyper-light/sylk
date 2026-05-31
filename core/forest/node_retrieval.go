@@ -22,31 +22,7 @@ func (m *MemoryForest) hasRetrievalNodes(ctx context.Context, sessionID string) 
 }
 
 func (m *MemoryForest) shouldRetrieveFromNodes(ctx context.Context, sessionID string) (bool, error) {
-	hasNodes, err := m.hasRetrievalNodes(ctx, sessionID)
-	if err != nil || !hasNodes {
-		return false, err
-	}
-	if !m.legacyBranchReadModel {
-		return true, nil
-	}
-	hasBranches, err := m.hasRetrievalBranches(ctx, sessionID)
-	if err != nil {
-		return false, err
-	}
-	return !hasBranches, nil
-}
-
-func (m *MemoryForest) hasRetrievalBranches(ctx context.Context, sessionID string) (bool, error) {
-	var count int
-	err := m.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM forest_branches
-		WHERE session_id = ? OR ? = ''
-	`, normalizeForestSessionID(sessionID), strings.TrimSpace(sessionID)).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("count retrieval branches: %w", err)
-	}
-	return count > 0, nil
+	return m.hasRetrievalNodes(ctx, sessionID)
 }
 
 func (m *MemoryForest) retrieveNodePackets(ctx context.Context, query Query) ([]*BranchPacket, error) {
@@ -70,6 +46,219 @@ func (m *MemoryForest) retrieveForestPackets(ctx context.Context, query Query) (
 		limit = m.substrateLimit
 	}
 	m.substrateStateMu.RLock()
+	defer m.substrateStateMu.RUnlock()
+	candidates, err := m.loadForestPacketCandidates(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+	expanded, err := m.expandForestPacketCandidates(ctx, query, candidates, limit)
+	if err != nil {
+		return nil, err
+	}
+	packets := mergeForestPacketCandidates(candidates, expanded)
+	hydrated := make([]*ForestPacket, 0, len(packets))
+	for _, packet := range packets {
+		if err := m.hydrateForestPacket(ctx, packet, query, limit); err != nil {
+			return nil, err
+		}
+		if packet.Quarantine.Quarantined && !query.IncludeCounterEvidence {
+			continue
+		}
+		hydrated = append(hydrated, packet)
+	}
+	packets = diversifyForestPackets(hydrated, limit)
+	return packets, nil
+}
+
+func (m *MemoryForest) loadForestPacketCandidates(ctx context.Context, query Query, limit int) ([]*ForestPacket, error) {
+	sqlText, args := forestPacketCandidateSQL(query, retrievalCandidateLimit(limit))
+	rows, err := m.db.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query forest packet candidates: %w", err)
+	}
+	defer rows.Close()
+	packets := make([]*ForestPacket, 0, retrievalCandidateLimit(limit))
+	for rows.Next() {
+		packet, err := scanForestPacketBase(rows, query)
+		if err != nil {
+			return nil, err
+		}
+		if query.Query != "" && nodeQueryMatch(query.Query, packet.Node.Title, packet.Node.Summary) == 0 {
+			packet.Score *= retrievalNonLexicalPenalty()
+		}
+		packets = append(packets, packet)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return rankForestPacketCandidates(packets, limit), nil
+}
+
+func forestPacketCandidateSQL(query Query, limit int) (string, []any) {
+	args := []any{SubstrateChannelConfidence, SubstrateChannelValidation, SubstrateChannelSuppression}
+	where, whereArgs := forestPacketCandidateWhere(query)
+	args = append(args, whereArgs...)
+	args = append(args, limit)
+	return `
+		SELECT n.node_id, n.node_kind, n.source_partition, n.subject_type, n.subject_id, n.session_id, n.task_id,
+		       n.title, n.summary, n.confidence, n.salience, n.utility, n.evidence_grade,
+		       n.first_seen_at, n.last_seen_at, n.source_seq, n.status, n.novelty,
+		       COALESCE(f_conf.value, 0), COALESCE(f_val.value, 0), COALESCE(f_sup.value, 0)
+		FROM forest_nodes n
+		LEFT JOIN forest_substrate_field f_conf
+			ON f_conf.scope_type = 'node' AND f_conf.scope_id = n.node_id AND f_conf.channel = ?
+		LEFT JOIN forest_substrate_field f_val
+			ON f_val.scope_type = 'node' AND f_val.scope_id = n.node_id AND f_val.channel = ?
+		LEFT JOIN forest_substrate_field f_sup
+			ON f_sup.scope_type = 'node' AND f_sup.scope_id = n.node_id AND f_sup.channel = ?
+		WHERE ` + where + `
+		ORDER BY n.source_seq DESC, n.last_seen_at DESC
+		LIMIT ?
+	`, args
+}
+
+func forestPacketCandidateWhere(query Query) (string, []any) {
+	clauses := []string{"n.status != ?"}
+	args := []any{string(BranchStateSuperseded)}
+	scopeClause, scopeArgs := forestPacketScopeClause(query)
+	clauses = append(clauses, scopeClause)
+	args = append(args, scopeArgs...)
+	if kinds := nodeKindsForFamilies(query.Families); len(kinds) > 0 {
+		placeholders := make([]string, 0, len(kinds))
+		for _, kind := range kinds {
+			placeholders = append(placeholders, "?")
+			args = append(args, string(kind))
+		}
+		clauses = append(clauses, "n.node_kind IN ("+strings.Join(placeholders, ",")+")")
+	}
+	return strings.Join(clauses, " AND "), args
+}
+
+func forestPacketScopeClause(query Query) (string, []any) {
+	sessionID := normalizeForestSessionID(query.SessionID)
+	switch query.Horizon {
+	case CanopyHorizonTask, CanopyHorizonTurn:
+		if query.TaskID != "" {
+			return "n.task_id = ?", []any{query.TaskID}
+		}
+		return "(n.session_id = ? OR ? = '')", []any{sessionID, strings.TrimSpace(query.SessionID)}
+	case CanopyHorizonSession:
+		return "(n.session_id = ? OR ? = '')", []any{sessionID, strings.TrimSpace(query.SessionID)}
+	default:
+		return "1 = 1", nil
+	}
+}
+
+func nodeKindsForFamilies(families []TreeFamily) []ForestNodeKind {
+	seen := make(map[ForestNodeKind]struct{})
+	var kinds []ForestNodeKind
+	for _, family := range canonicalizeFamilies(families) {
+		for _, kind := range nodeKindsForFamily(family) {
+			if _, ok := seen[kind]; ok {
+				continue
+			}
+			seen[kind] = struct{}{}
+			kinds = append(kinds, kind)
+		}
+	}
+	sort.Slice(kinds, func(i, j int) bool { return kinds[i] < kinds[j] })
+	return kinds
+}
+
+func nodeKindsForFamily(family TreeFamily) []ForestNodeKind {
+	switch family {
+	case TreeFamilyIntent:
+		return []ForestNodeKind{ForestNodeClaim, ForestNodeInteraction, ForestNodePolicyTrial, ForestNodeSkillCandidate}
+	case TreeFamilyConstraint:
+		return []ForestNodeKind{ForestNodeValidation, ForestNodePolicyTrial}
+	case TreeFamilyEvidence:
+		return []ForestNodeKind{ForestNodeArtifact, ForestNodeValidation, ForestNodeTestament, ForestNodeContent}
+	case TreeFamilyOutcome:
+		return []ForestNodeKind{ForestNodeOutcome, ForestNodeRemediation}
+	case TreeFamilyAntiPattern:
+		return []ForestNodeKind{ForestNodeContradiction}
+	default:
+		return nil
+	}
+}
+
+func retrievalCandidateLimit(limit int) int {
+	if limit <= 0 {
+		return len(defaultEcologyPolicy().Channels) * nodeProjectionRetryLimit()
+	}
+	return limit * len(defaultEcologyPolicy().Channels)
+}
+
+func retrievalNonLexicalPenalty() float64 {
+	return 1 / float64(len(defaultEcologyPolicy().Channels)+nodeProjectionRetryLimit())
+}
+
+func rankForestPacketCandidates(packets []*ForestPacket, limit int) []*ForestPacket {
+	sort.SliceStable(packets, func(i, j int) bool {
+		if packets[i].Score == packets[j].Score {
+			return packets[i].Node.ID < packets[j].Node.ID
+		}
+		return packets[i].Score > packets[j].Score
+	})
+	if len(packets) > limit {
+		packets = packets[:limit]
+	}
+	return packets
+}
+
+func (m *MemoryForest) expandForestPacketCandidates(ctx context.Context, query Query, seeds []*ForestPacket, limit int) ([]*ForestPacket, error) {
+	ids, scores, err := m.neighborCandidateIDs(ctx, seeds, limit)
+	if err != nil {
+		return nil, err
+	}
+	packets, err := m.forestPacketBasesByID(ctx, query, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, packet := range packets {
+		packet.Score = clampFinite01(packet.Score + scores[packet.Node.ID])
+	}
+	return rankForestPacketCandidates(packets, limit), nil
+}
+
+func (m *MemoryForest) neighborCandidateIDs(ctx context.Context, seeds []*ForestPacket, limit int) ([]string, map[string]float64, error) {
+	seen := make(map[string]struct{}, len(seeds))
+	scores := make(map[string]float64)
+	for _, seed := range seeds {
+		if seed == nil {
+			continue
+		}
+		seen[seed.Node.ID] = struct{}{}
+		neighbors, err := m.neighborsForCluster(ctx, seed.Node, nodeProjectionRetryLimit())
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, neighbor := range neighbors {
+			if _, ok := seen[neighbor.NodeID]; ok {
+				continue
+			}
+			scores[neighbor.NodeID] = clampFinite01(scores[neighbor.NodeID] + neighbor.Score)
+		}
+	}
+	return compactStrings(mapKeys(scores), retrievalCandidateLimit(limit)), scores, nil
+}
+
+func mapKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (m *MemoryForest) forestPacketBasesByID(ctx context.Context, query Query, ids []string) ([]*ForestPacket, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	placeholders, args := placeholdersForStrings(ids)
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT n.node_id, n.node_kind, n.source_partition, n.subject_type, n.subject_id, n.session_id, n.task_id,
 		       n.title, n.summary, n.confidence, n.salience, n.utility, n.evidence_grade,
@@ -82,56 +271,52 @@ func (m *MemoryForest) retrieveForestPackets(ctx context.Context, query Query) (
 			ON f_val.scope_type = 'node' AND f_val.scope_id = n.node_id AND f_val.channel = ?
 		LEFT JOIN forest_substrate_field f_sup
 			ON f_sup.scope_type = 'node' AND f_sup.scope_id = n.node_id AND f_sup.channel = ?
-		WHERE (n.session_id = ? OR ? = '')
-		ORDER BY n.source_seq DESC, n.last_seen_at DESC
-		LIMIT ?
-	`, SubstrateChannelConfidence, SubstrateChannelValidation, SubstrateChannelSuppression,
-		normalizeForestSessionID(query.SessionID), strings.TrimSpace(query.SessionID), limit*len(defaultEcologyPolicy().Channels))
+		WHERE n.node_id IN (`+placeholders+`)
+	`, append([]any{SubstrateChannelConfidence, SubstrateChannelValidation, SubstrateChannelSuppression}, args...)...)
 	if err != nil {
-		m.substrateStateMu.RUnlock()
-		return nil, fmt.Errorf("query forest packets: %w", err)
+		return nil, fmt.Errorf("query neighbor forest packets: %w", err)
 	}
-	packets := make([]*ForestPacket, 0, limit)
+	defer rows.Close()
+	var packets []*ForestPacket
 	for rows.Next() {
 		packet, err := scanForestPacketBase(rows, query)
 		if err != nil {
-			rows.Close()
-			m.substrateStateMu.RUnlock()
 			return nil, err
 		}
 		packets = append(packets, packet)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		m.substrateStateMu.RUnlock()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		m.substrateStateMu.RUnlock()
-		return nil, fmt.Errorf("close forest packets: %w", err)
-	}
-	m.substrateStateMu.RUnlock()
-	hydrated := make([]*ForestPacket, 0, len(packets))
-	for _, packet := range packets {
-		if err := m.hydrateForestPacket(ctx, packet, query, limit); err != nil {
-			return nil, err
-		}
-		if packet.Quarantine.Quarantined && !query.IncludeCounterEvidence {
+	return packets, rows.Err()
+}
+
+func mergeForestPacketCandidates(primary, expanded []*ForestPacket) []*ForestPacket {
+	byID := make(map[string]*ForestPacket, len(primary)+len(expanded))
+	for _, packet := range append(primary, expanded...) {
+		if packet == nil || packet.Node.ID == "" {
 			continue
 		}
-		hydrated = append(hydrated, packet)
+		if existing := byID[packet.Node.ID]; existing != nil && existing.Score >= packet.Score {
+			continue
+		}
+		byID[packet.Node.ID] = packet
 	}
-	packets = hydrated
+	packets := make([]*ForestPacket, 0, len(byID))
+	for _, packet := range byID {
+		packets = append(packets, packet)
+	}
+	return packets
+}
+
+func diversifyForestPackets(packets []*ForestPacket, limit int) []*ForestPacket {
 	sort.SliceStable(packets, func(i, j int) bool {
 		if packets[i].Score == packets[j].Score {
 			return packets[i].Node.ID < packets[j].Node.ID
 		}
 		return packets[i].Score > packets[j].Score
 	})
-	if len(packets) > limit {
-		packets = packets[:limit]
+	if len(packets) <= limit {
+		return packets
 	}
-	return packets, nil
+	return packets[:limit]
 }
 
 func scanForestPacketBase(rows interface {
@@ -178,6 +363,7 @@ func scanForestPacketBase(rows interface {
 				"suppression":       suppression,
 			},
 		},
+		Source:        RetrievalSourcePrimary,
 		Score:         total,
 		PolicyVersion: ecologyPolicyVersion,
 	}, nil
@@ -297,6 +483,7 @@ func (m *MemoryForest) hydrateForestPacket(ctx context.Context, packet *ForestPa
 	packet.BridgeRisks = bridgeRisks
 	packet.ProposedClaims = proposedClaims
 	packet.CounterEvidence = counterEvidenceForPacket(packet, query.IncludeCounterEvidence)
+	packet.SkippedEvidence = skippedCounterEvidenceReason(packet, query)
 	packet.Evidence = evidenceForPacket(packet)
 	packet.RiskScore = forestPacketRisk(packet)
 	packet.ValidationNeed = forestPacketValidationNeed(packet)
@@ -307,6 +494,16 @@ func (m *MemoryForest) hydrateForestPacket(ctx context.Context, packet *ForestPa
 	}
 	packet.Score = clampFinite01(packet.Score * (1 - packet.Quarantine.Factor))
 	return nil
+}
+
+func skippedCounterEvidenceReason(packet *ForestPacket, query Query) string {
+	if packet == nil || query.IncludeCounterEvidence || len(packet.CounterEvidence) > 0 {
+		return ""
+	}
+	if packet.Quarantine.Quarantined || len(packet.BridgeRisks) > 0 {
+		return "counter_evidence_not_requested"
+	}
+	return ""
 }
 
 func (m *MemoryForest) clusterIDsForNode(ctx context.Context, nodeID string, limit int) ([]string, error) {
