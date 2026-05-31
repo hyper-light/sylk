@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/session"
 	"github.com/adalundhe/sylk/ui/msg"
 	"github.com/adalundhe/sylk/ui/theme"
@@ -273,6 +274,7 @@ func (m *Model) handleEventsDropped(v msg.EventsDroppedMsg) (tea.Model, tea.Cmd)
 }
 
 func (m *Model) handleIndexProgress(v msg.IndexProgressMsg) (tea.Model, tea.Cmd) {
+	diagnostics.LogStartup("status_index_progress_msg", "phase", v.Phase, "current", v.Current, "total", v.Total, "done", v.Done)
 	if v.Done {
 		m.progress.Clear()
 	} else {

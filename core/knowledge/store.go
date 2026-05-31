@@ -7,11 +7,13 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/adalundhe/sylk/core/agentlog"
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/knowledge/query"
 )
 
@@ -163,6 +165,7 @@ func (ks *KnowledgeStore) SetProgressObserver(fn ProgressObserver) {
 	ks.mu.Lock()
 	ks.progressFn = fn
 	ks.mu.Unlock()
+	diagnostics.LogStartup("knowledge_store_progress_observer_set", "observer", fn != nil)
 }
 
 // SetLifecycleObserver registers a callback for repeatable partial/full
@@ -174,6 +177,7 @@ func (ks *KnowledgeStore) SetLifecycleObserver(fn LifecycleObserver) {
 	level := ReadinessLevel(ks.level.Load())
 	bgWaiter := ks.bgWaiter
 	ks.mu.Unlock()
+	diagnostics.LogStartup("knowledge_store_lifecycle_observer_set", "observer", fn != nil, "level", int(level), "waiter", bgWaiter != nil)
 
 	if fn == nil {
 		return
@@ -192,6 +196,7 @@ func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
 	ks.mu.Lock()
 	fn := ks.progressFn
 	ks.mu.Unlock()
+	diagnostics.LogStartup("knowledge_store_notify_progress", "phase", phase, "current", current, "total", total, "observer", fn != nil)
 	if fn != nil {
 		fn(phase, current, total)
 	}
@@ -208,6 +213,7 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 	}
 	lifecycleFn := ks.lifecycleFn
 	ks.mu.Unlock()
+	diagnostics.LogStartup("knowledge_store_promote_partial_start", "waiter", bgWaiter != nil, "lifecycle_observer", lifecycleFn != nil)
 
 	ks.coordinator.SetBleveSearcher(searcher)
 
@@ -224,6 +230,7 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 	}
 
 	if ks.Level() >= ReadinessPartial {
+		diagnostics.LogStartup("knowledge_store_promote_partial_already_ready", "level", int(ks.Level()))
 		return
 	}
 
@@ -235,6 +242,7 @@ func (ks *KnowledgeStore) PromotePartial(searcher *query.BleveSearcher, bgWaiter
 	})
 	ks.logger.Info("knowledge promoted to partial",
 		"searchers", ks.coordinator.ReadySearchers())
+	diagnostics.LogStartup("knowledge_store_promote_partial_done", "searchers", strings.Join(ks.coordinator.ReadySearchers(), ","))
 }
 
 // PromoteFull transitions to ReadinessFull (all docs indexed).
@@ -243,6 +251,7 @@ func (ks *KnowledgeStore) PromoteFull() {
 	ks.bgWaiter = nil
 	lifecycleFn := ks.lifecycleFn
 	ks.mu.Unlock()
+	diagnostics.LogStartup("knowledge_store_promote_full_start", "lifecycle_observer", lifecycleFn != nil)
 
 	if lifecycleFn != nil {
 		lifecycleFn(LifecycleEvent{
@@ -252,6 +261,7 @@ func (ks *KnowledgeStore) PromoteFull() {
 	}
 
 	if ks.Level() >= ReadinessFull {
+		diagnostics.LogStartup("knowledge_store_promote_full_already_ready", "level", int(ks.Level()))
 		return
 	}
 
@@ -265,6 +275,7 @@ func (ks *KnowledgeStore) PromoteFull() {
 	})
 	ks.logger.Info("knowledge promoted to full",
 		"searchers", ks.coordinator.ReadySearchers())
+	diagnostics.LogStartup("knowledge_store_promote_full_done", "searchers", strings.Join(ks.coordinator.ReadySearchers(), ","))
 }
 
 // WaitForPartial blocks until ReadinessPartial is reached or ctx is cancelled.

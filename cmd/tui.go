@@ -48,6 +48,7 @@ import (
 	"github.com/adalundhe/sylk/core/container/network"
 	ctxpkg "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/credentials"
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/fetch"
 	forestsvc "github.com/adalundhe/sylk/core/forest"
@@ -85,6 +86,7 @@ func init() {
 }
 
 func runTUI(_ *cobra.Command, _ []string) error {
+	startupTrace("run_tui_enter", "debug_log", diagnostics.StartupTracePath())
 	restoreStdLog := installTUIStdLogSink()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
@@ -115,13 +117,16 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	// Resolve project root early so the parallel bootstrap can initialize
 	// git resources concurrently with agent container creation.
 	projectRoot := resolveProjectRoot()
+	startupTrace("project_root_resolved", "project_root", projectRoot, "mock_mode", tuiMock)
 
 	deps, cleanup, err := bootstrapDeps(ctx, tuiMock, projectRoot)
 	if err != nil {
+		startupTrace("bootstrap_failed", "error", err.Error())
 		stop()
 		restoreErr := restoreStdLog()
 		return errors.Join(fmt.Errorf("bootstrap: %w", err), restoreErr)
 	}
+	startupTrace("bootstrap_succeeded")
 	// Pass stop to ui.Run so it can restore default signal handling
 	// between p.Run() returning and app.Shutdown() — allowing a second
 	// Ctrl+C to force-kill the process during slow shutdown.
@@ -132,9 +137,21 @@ func runTUI(_ *cobra.Command, _ []string) error {
 	cfg.MockMode = tuiMock
 	cfg.ProjectRoot = projectRoot
 
+	startupTrace("ui_run_start")
 	runErr := ui.Run(ctx, cfg, deps)
+	if runErr != nil {
+		startupTrace("ui_run_done", "error", runErr.Error())
+	} else {
+		startupTrace("ui_run_done")
+	}
 	stop()
+	startupTrace("cleanup_start")
 	cleanupErr := cleanup()
+	if cleanupErr != nil {
+		startupTrace("cleanup_done", "error", cleanupErr.Error())
+	} else {
+		startupTrace("cleanup_done")
+	}
 	restoreErr := restoreStdLog()
 	return errors.Join(runErr, cleanupErr, restoreErr)
 }
@@ -168,6 +185,10 @@ const (
 )
 
 const claimsStartupRecoveryActorID = "sys:claims_recovery"
+
+func startupTrace(event string, fields ...any) {
+	diagnostics.LogStartup(event, fields...)
+}
 
 // shutdownTimeout is the overall ceiling on the cleanup function.
 // Derived from: 200ms supervisor + max(per-subsystem budget) for the
@@ -406,6 +427,7 @@ type bootstrapPhase1 struct {
 	sessionMgr      *session.Manager
 	defaultSession  *session.Session
 	bootOps         *boot.OperationsSequencer
+	bootDeltaUnsub  func()
 	bootDispatchers *claims.ServiceDispatcherRegistry
 	descriptors     *handoff.DescriptorRegistry
 	budget          *concurrency.GoroutineBudget
@@ -487,21 +509,28 @@ type bootstrapPhase4 struct {
 
 func (p *bootstrapPhase4) StartKnowledgeBoot() {
 	if p == nil || p.knowledgeBootStart == nil {
+		startupTrace("knowledge_boot_release_noop")
 		return
 	}
 	p.knowledgeBootStartOnce.Do(func() {
+		startupTrace("knowledge_boot_release_close_start")
 		close(p.knowledgeBootStart)
+		startupTrace("knowledge_boot_release_close_done")
 	})
 }
 
 func (p *bootstrapPhase4) waitForKnowledgeBootStart(ctx context.Context) bool {
 	if p == nil || p.knowledgeBootStart == nil {
+		startupTrace("knowledge_boot_wait_no_gate")
 		return true
 	}
+	startupTrace("knowledge_boot_wait_start")
 	select {
 	case <-p.knowledgeBootStart:
+		startupTrace("knowledge_boot_wait_released")
 		return true
 	case <-ctx.Done():
+		startupTrace("knowledge_boot_wait_cancelled", "error", ctx.Err().Error())
 		return false
 	}
 }
@@ -879,34 +908,50 @@ func (h *hydrateOnceCell) result() *providers.HydratedGoogleAuth {
 func bootstrapDeps(ctx context.Context, mockMode bool, projectRoot string) (ui.Deps, func() error, error) {
 	_ = mockMode
 	start := time.Now()
+	startupTrace("bootstrap_deps_start", "project_root", projectRoot)
 	loadBootstrapDotenv(projectRoot)
 
+	startupTrace("bootstrap_phase1_start")
 	phase1, err := buildBootstrapPhase1(ctx, projectRoot, start)
 	if err != nil {
+		startupTrace("bootstrap_phase1_error", "error", err.Error())
 		if phase1 != nil {
 			cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		}
 		return ui.Deps{}, nil, err
 	}
+	startupTrace("bootstrap_phase1_done", "elapsed_ms", time.Since(start).Milliseconds(), "session_id", phaseDefaultSessionID(phase1))
+	startupTrace("bootstrap_phase2_start")
 	phase2, err := runBootstrapPhase2(phase1)
 	if err != nil {
+		startupTrace("bootstrap_phase2_error", "error", err.Error())
 		return ui.Deps{}, nil, err
 	}
+	startupTrace("bootstrap_phase2_done", "elapsed_ms", time.Since(start).Milliseconds())
+	startupTrace("bootstrap_phase3_start")
 	phase3, err := wireBootstrapPhase3(phase1, phase2)
 	if err != nil {
+		startupTrace("bootstrap_phase3_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	startupTrace("bootstrap_phase3_done", "elapsed_ms", time.Since(start).Milliseconds())
+	startupTrace("bootstrap_phase4_start")
 	phase4, err := startBootstrapPhase4(phase1, phase2, phase3)
 	if err != nil {
+		startupTrace("bootstrap_phase4_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	startupTrace("bootstrap_phase4_done", "elapsed_ms", time.Since(start).Milliseconds())
+	startupTrace("bootstrap_build_deps_start")
 	deps, err := buildBootstrapDeps(phase1, phase2, phase3, phase4)
 	if err != nil {
+		startupTrace("bootstrap_build_deps_error", "error", err.Error())
 		cleanupInfra(phase1.runtime, phase1.containerReg, phase1.namespace, phase1.guideBus)
 		return ui.Deps{}, nil, err
 	}
+	startupTrace("bootstrap_build_deps_done", "elapsed_ms", time.Since(start).Milliseconds())
 	slog.Info("bootstrap critical path complete", "elapsed", time.Since(start))
 	return deps, buildBootstrapCleanup(phase1, phase3, phase4), nil
 }
@@ -1156,7 +1201,10 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		return phase1, fmt.Errorf("claims operations boot sequencer: %w", err)
 	}
 	phase1.bootOps = bootOps
-	if _, err := phase1.bootOps.CommitPhase1(ctx, bootstrapPhase1Status(phase1)); err != nil {
+	phase1.bootDeltaUnsub = startBootstrapClaimsDeltaTrace(defaultSession.ClaimsBoard())
+	result, err := phase1.bootOps.CommitPhase1(ctx, bootstrapPhase1Status(phase1))
+	traceBootPhaseCommit("claims_operations_phase1_commit", result, err, phase1.bootOps)
+	if err != nil {
 		return phase1, fmt.Errorf("claims operations phase 1: %w", err)
 	}
 	factory, err := buildIdentityFactory(phase1.descriptors, defaultSession.ID())
@@ -1522,10 +1570,12 @@ func runBootstrapPhase2(phase1 *bootstrapPhase1) (bootstrapPhase2, error) {
 	}
 
 	if phase1.bootOps != nil {
-		if _, err := phase1.bootOps.CommitPhase2(phase1.ctx, boot.Phase2Status{
+		result, err := phase1.bootOps.CommitPhase2(phase1.ctx, boot.Phase2Status{
 			Participants: bootstrapSystemParticipants(phase1, phase2),
 			Context:      map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase2_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return phase2, fmt.Errorf("claims operations phase 2: %w", err)
 		}
 	}
@@ -1687,15 +1737,19 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		orch.SetScribeFactory(phase3.scribeFactory)
 	}
 	if phase1.bootOps != nil {
-		if _, err := phase1.bootOps.CommitPhase3(phase1.ctx, boot.Phase3Status{
+		result, err := phase1.bootOps.CommitPhase3(phase1.ctx, boot.Phase3Status{
 			Backends: bootstrapKnowledgeBackends(phase1),
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase3_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return bootstrapPhase3{}, fmt.Errorf("claims operations phase 3: %w", err)
 		}
 		if err := recoverBootstrapClaimsWork(phase1); err != nil {
+			startupTrace("claims_operations_recovery_error", "error", err.Error())
 			return bootstrapPhase3{}, fmt.Errorf("claims operations recovery: %w", err)
 		}
+		startupTrace("claims_operations_recovery_done")
 	}
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
@@ -1747,6 +1801,77 @@ func bootstrapClaimsBoard(phase1 *bootstrapPhase1) *claims.ClaimsBoard {
 		return nil
 	}
 	return phase1.defaultSession.ClaimsBoard()
+}
+
+func startBootstrapClaimsDeltaTrace(board *claims.ClaimsBoard) func() {
+	if board == nil {
+		return nil
+	}
+	startupTrace("claims_board_delta_watch_start",
+		"session_id", board.SessionID(),
+		"board_id", board.BoardID(),
+		"high_water_sequence", board.HighWaterSequence(),
+	)
+	return board.SubscribeDelta(func(delta claims.BoardMutationDelta) error {
+		startupTrace("claims_board_delta",
+			"session_id", board.SessionID(),
+			"board_id", board.BoardID(),
+			"kind", delta.Kind,
+			"claim_id", delta.ClaimID,
+			"testament_id", delta.TestamentID,
+			"from_status", string(delta.FromStatus),
+			"to_status", string(delta.ToStatus),
+			"agent_id", delta.AgentID,
+			"summary_pending", delta.Summary.Pending,
+			"summary_in_progress", delta.Summary.InProgress,
+			"summary_testified", delta.Summary.Testified,
+			"summary_accepted", delta.Summary.Accepted,
+			"summary_rejected", delta.Summary.Rejected,
+			"high_water_sequence", board.HighWaterSequence(),
+		)
+		return nil
+	})
+}
+
+func traceBootPhaseCommit(event string, result boot.PhaseCommitResult, err error, ops *boot.OperationsSequencer) {
+	fields := []any{
+		"phase", string(result.Phase),
+		"claim_id", result.ClaimID,
+		"testament_id", result.TestamentID,
+		"participant_claims", len(result.ParticipantClaimIDs),
+		"participant_testaments", len(result.ParticipantTestamentIDs),
+	}
+	if err != nil {
+		fields = append(fields, "error", err.Error())
+	}
+	startupTrace(event, fields...)
+	traceBootHealth(event+"_health", ops)
+}
+
+func traceBootHealth(event string, ops *boot.OperationsSequencer) {
+	if ops == nil {
+		return
+	}
+	health := ops.BootHealth()
+	startupTrace(event,
+		"board_id", health.BoardID,
+		"session_id", health.SessionID,
+		"high_water_sequence", health.HighWaterSequence,
+		"outbox_lag", health.OutboxLag,
+		"terminal_failures", health.TerminalFailures,
+		"phase_count", len(health.Phases),
+	)
+	for _, phase := range health.Phases {
+		startupTrace(event+"_phase",
+			"phase", string(phase.Phase),
+			"outcome", phase.Outcome,
+			"claim_id", phase.ClaimID,
+			"testament_id", phase.TestamentID,
+			"readiness_count", phase.ReadinessCount,
+			"failure_count", phase.FailureCount,
+			"warning_count", len(phase.Warnings),
+		)
+	}
 }
 
 func serviceRecoveryParticipants(registry *claims.ServiceDispatcherRegistry, sessionID string) []claims.ParticipantRegistration {
@@ -1805,16 +1930,21 @@ func schedulePhase4Task(
 
 func waitForBootBleveReady(ctx context.Context, store *knowledge.KnowledgeStore) error {
 	if store == nil {
+		startupTrace("knowledge_boot_bleve_ready_store_nil")
 		return nil
 	}
 	if err := store.WaitForPartial(ctx); err != nil {
+		startupTrace("knowledge_boot_bleve_ready_partial_cancelled", "error", err.Error())
 		return nil
 	}
+	startupTrace("knowledge_boot_bleve_ready_partial_observed")
 	bgWaiter := store.BackgroundWaiter()
 	if bgWaiter == nil {
 		if ctx.Err() != nil {
+			startupTrace("knowledge_boot_bleve_ready_no_waiter_cancelled", "error", ctx.Err().Error())
 			return nil
 		}
+		startupTrace("knowledge_boot_bleve_ready_no_waiter_promote_full")
 		store.PromoteFull()
 		return nil
 	}
@@ -1822,13 +1952,16 @@ func waitForBootBleveReady(ctx context.Context, store *knowledge.KnowledgeStore)
 	select {
 	case <-bgWaiter.Ready():
 		if ctx.Err() != nil {
+			startupTrace("knowledge_boot_bleve_ready_ready_cancelled", "error", ctx.Err().Error())
 			return nil
 		}
 		// Full promotion is the only user-visible transition needed here.
 		// Reopening/adopting a fresh owned Bleve store during shutdown can block
 		// on repository-sized I/O, so cleanup relies on backend.Close instead.
+		startupTrace("knowledge_boot_bleve_ready_promote_full")
 		store.PromoteFull()
 	case <-ctx.Done():
+		startupTrace("knowledge_boot_bleve_ready_wait_cancelled", "error", ctx.Err().Error())
 	}
 	return nil
 }
@@ -2262,16 +2395,20 @@ func startBootstrapPhase4(
 		knowledgeBootStart: make(chan struct{}),
 	}
 	if phase1.bootOps != nil {
-		if _, err := phase1.bootOps.CommitPhase4(phase1.ctx, boot.Phase4Status{
+		result, err := phase1.bootOps.CommitPhase4(phase1.ctx, boot.Phase4Status{
 			Services: bootstrapInfrastructureServices(phase1, phase2, phase3),
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase4_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return nil, fmt.Errorf("claims operations phase 4: %w", err)
 		}
-		if _, err := phase1.bootOps.CommitPhase5(phase1.ctx, boot.Phase5Status{
+		result, err = phase1.bootOps.CommitPhase5(phase1.ctx, boot.Phase5Status{
 			Agents:  bootstrapAlwaysHotAgents(phase1, phase3),
 			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase5_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return nil, fmt.Errorf("claims operations phase 5: %w", err)
 		}
 	}
@@ -2387,19 +2524,31 @@ func startBootstrapPhase4(
 		if !phase4.waitForKnowledgeBootStart(bgCtx) {
 			return nil
 		}
+		startupTrace("knowledge_boot_pipeline_start")
 		result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
 			ProjectRoot: phase1.projectRoot,
 			Logger:      phase4.bootLogger,
-			OnProgress:  phase1.knowledgeStore.NotifyProgress,
-			Scope:       phase1.scope,
+			OnProgress: func(phase string, current, total int64) {
+				startupTrace("knowledge_boot_pipeline_progress", "phase", phase, "current", current, "total", total)
+				phase1.knowledgeStore.NotifyProgress(phase, current, total)
+			},
+			Scope: phase1.scope,
 		})
 		if err != nil {
+			startupTrace("knowledge_boot_pipeline_error", "error", err.Error())
 			slog.Warn("knowledge boot failed (non-critical)", "error", err)
 			startLibrarianKnowledgeSync(phase1, phase4, true)
 			return nil
 		}
+		startupTrace("knowledge_boot_pipeline_done",
+			"files_processed", result.FilesProcessed,
+			"docs_created", result.DocsCreated,
+			"vectors_created", result.VectorsCreated,
+			"background_indexer", result.BackgroundIndexer != nil,
+		)
 		backend := phase1.knowledgeBackend
 		if backend == nil {
+			startupTrace("knowledge_boot_backend_missing")
 			slog.Warn("knowledge backend unavailable (non-critical)")
 			startLibrarianKnowledgeSync(phase1, phase4, false)
 			return nil
@@ -2411,11 +2560,14 @@ func startBootstrapPhase4(
 			refreshErr = backend.RefreshFromDisk(bgCtx)
 		}
 		if refreshErr != nil {
+			startupTrace("knowledge_boot_backend_refresh_error", "error", refreshErr.Error())
 			slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
 			startLibrarianKnowledgeSync(phase1, phase4, true)
 			return nil
 		}
+		startupTrace("knowledge_boot_promote_partial_start")
 		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), result.BackgroundIndexer, backend)
+		startupTrace("knowledge_boot_promote_partial_done")
 		startLibrarianKnowledgeSync(phase1, phase4, false)
 		return nil
 	})
@@ -2423,6 +2575,7 @@ func startBootstrapPhase4(
 		if !phase4.waitForKnowledgeBootStart(bgCtx) {
 			return nil
 		}
+		startupTrace("knowledge_boot_bleve_ready_wait_start")
 		return waitForBootBleveReady(bgCtx, phase1.knowledgeStore)
 	})
 
@@ -2450,6 +2603,11 @@ func buildBootstrapCleanup(
 		phase1.scope.SignalShutdown()
 		for _, c := range phase1.containerReg.All() {
 			c.SignalShutdown()
+		}
+		if phase1.bootDeltaUnsub != nil {
+			phase1.bootDeltaUnsub()
+			phase1.bootDeltaUnsub = nil
+			startupTrace("claims_board_delta_watch_stopped")
 		}
 
 		select {
@@ -2612,25 +2770,32 @@ func buildBootstrapDeps(
 		AgentModelStore: phase4.modelStore,
 		KnowledgeStore:  phase1.knowledgeStore,
 		StartKnowledgeBoot: func() {
+			startupTrace("start_knowledge_boot_release")
 			phase4.StartKnowledgeBoot()
 		},
 		Forest: phase1.forest,
 	}
 	if phase1.bootOps != nil {
-		if _, err := phase1.bootOps.CommitPhase6(phase1.ctx, boot.Phase6Status{
+		result, err := phase1.bootOps.CommitPhase6(phase1.ctx, boot.Phase6Status{
 			Surfaces: bootstrapUserFacingSurfaces(phase1, phase3),
 			Context:  map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase6_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return ui.Deps{}, fmt.Errorf("claims operations phase 6: %w", err)
 		}
-		if _, err := phase1.bootOps.CommitPhase7(phase1.ctx, boot.Phase7Status{
+		result, err = phase1.bootOps.CommitPhase7(phase1.ctx, boot.Phase7Status{
 			Context: map[string]any{"session_id": phaseDefaultSessionID(phase1)},
-		}); err != nil {
+		})
+		traceBootPhaseCommit("claims_operations_phase7_commit", result, err, phase1.bootOps)
+		if err != nil {
 			return ui.Deps{}, fmt.Errorf("claims operations phase 7: %w", err)
 		}
 		if err := startBootstrapClaimsOperationsAudits(phase1); err != nil {
+			startupTrace("claims_operations_audits_error", "error", err.Error())
 			return ui.Deps{}, fmt.Errorf("claims operations audits: %w", err)
 		}
+		startupTrace("claims_operations_audits_started")
 	}
 	return deps, nil
 }

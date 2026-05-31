@@ -16,6 +16,7 @@ import (
 	"github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/ui/msg"
 )
 
@@ -159,6 +160,7 @@ func (b *ClaimsBridge) debug(event string, fields ...any) {
 	args = append(args, "bridge_id", b.id)
 	args = append(args, fields...)
 	guide.DebugFileLog().Info("CLAIMS_UI_DEBUG: "+event, args...)
+	diagnostics.LogStartup("claims_bridge_"+event, args...)
 }
 
 func (b *ClaimsBridge) Start(program TeaProgram) error {
@@ -375,8 +377,28 @@ func (b *ClaimsBridge) startBoardDeltaWatch(sessionID string, board *claims.Clai
 func (b *ClaimsBridge) processBoardMutationDelta(sessionID string, board *claims.ClaimsBoard, delta claims.BoardMutationDelta) error {
 	activeBoard, activeSession := b.currentBoard()
 	if activeBoard != board || activeSession != sessionID {
+		diagnostics.LogStartup("claims_bridge_delta_ignored_stale",
+			"session_id", sessionID,
+			"active_session", activeSession,
+			"kind", delta.Kind,
+			"claim_id", delta.ClaimID,
+		)
 		return nil
 	}
+	diagnostics.LogStartup("claims_bridge_delta_received",
+		"session_id", sessionID,
+		"board_id", board.BoardID(),
+		"kind", delta.Kind,
+		"claim_id", delta.ClaimID,
+		"testament_id", delta.TestamentID,
+		"agent_id", delta.AgentID,
+		"summary_total", delta.Summary.Total,
+		"summary_pending", delta.Summary.Pending,
+		"summary_in_progress", delta.Summary.InProgress,
+		"summary_testified", delta.Summary.Testified,
+		"summary_accepted", delta.Summary.Accepted,
+		"summary_rejected", delta.Summary.Rejected,
+	)
 
 	switch strings.TrimSpace(delta.Kind) {
 	case "claim_created", "claim_posted":
@@ -2499,12 +2521,32 @@ func (b *ClaimsBridge) enrichMetaFromProjectionLocked(claimID string, meta claim
 
 func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoardProjection) {
 	if proj == nil {
+		diagnostics.LogStartup("claims_bridge_replay_projection_nil", "session_id", sessionID)
 		return
 	}
+	terminalClaims := 0
+	for i := range proj.Claims {
+		if proj.Claims[i].Status.IsTerminal() {
+			terminalClaims++
+		}
+	}
+	diagnostics.LogStartup("claims_bridge_replay_projection_start",
+		"session_id", sessionID,
+		"claims", len(proj.Claims),
+		"terminal_claims", terminalClaims,
+		"testaments", len(proj.Testaments),
+	)
 	b.emitCounterProjection(sessionID, proj)
 	for i := range proj.Claims {
 		c := &proj.Claims[i]
 		if c.Status.IsTerminal() {
+			diagnostics.LogStartup("claims_bridge_replay_terminal_claim_skipped",
+				"session_id", sessionID,
+				"claim_id", c.ID,
+				"action_type", string(c.ActionType),
+				"status", string(c.Status),
+				"lifecycle_status", string(c.LifecycleStatus),
+			)
 			continue
 		}
 		b.handleClaimCreated(sessionID, c)

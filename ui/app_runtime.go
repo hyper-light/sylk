@@ -12,6 +12,7 @@ import (
 
 	"github.com/adalundhe/sylk/agents/guide"
 	"github.com/adalundhe/sylk/core/boot"
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/knowledge"
 	"github.com/adalundhe/sylk/ui/bridge"
 	"github.com/adalundhe/sylk/ui/component"
@@ -323,7 +324,9 @@ func (m *AppModel) codePanelGroup() layout.PanelGroup {
 
 func (m *AppModel) startBridges() tea.Cmd {
 	return func() tea.Msg {
+		diagnostics.LogStartup("ui_start_bridges_cmd")
 		if m.bridgeProgram == nil {
+			diagnostics.LogStartup("ui_start_bridges_missing_program")
 			return bridgeReadyMsg{Err: errors.New("bridge program not initialized")}
 		}
 		return bridgeReadyMsg{Err: m.StartBridges(m.bridgeProgram)}
@@ -337,13 +340,16 @@ type bridgeReadyMsg struct {
 
 func (m *AppModel) handleBridgeReady(ready bridgeReadyMsg) tea.Cmd {
 	if ready.Err != nil {
+		diagnostics.LogStartup("ui_bridge_ready_error", "error", ready.Err.Error())
 		m.bridgeStartupErr = ready.Err
 		return tea.Quit
 	}
 	if m.bridgesStarted {
+		diagnostics.LogStartup("ui_bridge_ready_duplicate")
 		return nil
 	}
 	m.bridgesStarted = true
+	diagnostics.LogStartup("ui_bridge_ready", "start_knowledge_boot", m.deps.StartKnowledgeBoot != nil)
 	if m.deps.StartKnowledgeBoot != nil {
 		m.deps.StartKnowledgeBoot()
 	}
@@ -357,38 +363,62 @@ func (m *AppModel) handleBridgeReady(ready bridgeReadyMsg) tea.Cmd {
 // StartBridges connects all event bridges to the running tea.Program.
 // This must be called after tea.NewProgram is created.
 func (m *AppModel) StartBridges(program bridge.TeaProgram) error {
+	diagnostics.LogStartup("ui_start_bridges_start",
+		"accountant_bridge", m.accountantBridge != nil,
+		"session_bridge", m.sessionBridge != nil,
+		"lsp_bridge", m.lspBridge != nil,
+		"git_bridge", m.gitBridge != nil,
+		"pipeline_bridge", m.pipelineBridge != nil,
+		"claims_bridge", m.claimsBridge != nil,
+		"proposal_bridge", m.proposalBridge != nil,
+	)
 	bridges := []bridge.Bridge{
 		m.accountantBridge,
 		m.sessionBridge,
 		m.lspBridge,
 	}
 	for _, b := range bridges {
+		if b == nil {
+			diagnostics.LogStartup("ui_bridge_start_skipped", "reason", "bridge_nil")
+			continue
+		}
+		diagnostics.LogStartup("ui_bridge_start", "name", b.Name())
 		if err := b.Start(program); err != nil {
+			diagnostics.LogStartup("ui_bridge_start_error", "name", b.Name(), "error", err.Error())
 			return err
 		}
 	}
 	if m.gitBridge != nil {
+		diagnostics.LogStartup("ui_bridge_start", "name", m.gitBridge.Name())
 		if err := m.gitBridge.Start(program); err != nil {
+			diagnostics.LogStartup("ui_bridge_start_error", "name", m.gitBridge.Name(), "error", err.Error())
 			return err
 		}
 	}
 	if m.pipelineBridge != nil {
+		diagnostics.LogStartup("ui_bridge_start", "name", m.pipelineBridge.Name())
 		if err := m.pipelineBridge.Start(program); err != nil {
+			diagnostics.LogStartup("ui_bridge_start_error", "name", m.pipelineBridge.Name(), "error", err.Error())
 			return err
 		}
 	}
 	if m.claimsBridge != nil {
+		diagnostics.LogStartup("ui_bridge_start", "name", m.claimsBridge.Name())
 		if err := m.claimsBridge.Start(program); err != nil {
+			diagnostics.LogStartup("ui_bridge_start_error", "name", m.claimsBridge.Name(), "error", err.Error())
 			return err
 		}
 		m.syncClaimsBridgeToActiveSession()
 	}
 	if m.proposalBridge != nil {
+		diagnostics.LogStartup("ui_bridge_start", "name", m.proposalBridge.Name())
 		if err := m.proposalBridge.Start(program); err != nil {
+			diagnostics.LogStartup("ui_bridge_start_error", "name", m.proposalBridge.Name(), "error", err.Error())
 			return err
 		}
 	}
 	m.startIndexProgressObserver(program)
+	diagnostics.LogStartup("ui_start_bridges_done")
 	return nil
 }
 
@@ -399,14 +429,17 @@ func (m *AppModel) syncClaimsBridgeToActiveSession() {
 	active, ok := m.deps.SessionManager.GetActive()
 	if !ok || active == nil {
 		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_session_missing")
+		diagnostics.LogStartup("claims_bridge_initial_session_missing")
 		return
 	}
 	sessionID := strings.TrimSpace(active.ID())
 	if sessionID == "" {
 		uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_session_empty")
+		diagnostics.LogStartup("claims_bridge_initial_session_empty")
 		return
 	}
 	uiDebugFileLog().Info("CLAIMS_UI_DEBUG: claims_bridge_initial_switch", "session_id", sessionID)
+	diagnostics.LogStartup("claims_bridge_initial_switch", "session_id", sessionID)
 	m.claimsBridge.SwitchSession(sessionID)
 }
 
@@ -452,22 +485,28 @@ var pipelinePhaseMap = map[string]status.IndexPhase{
 func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 	ks := m.deps.KnowledgeStore
 	if ks == nil {
+		diagnostics.LogStartup("index_progress_observer_skipped", "reason", "knowledge_store_nil")
 		return
 	}
 	scope := m.deps.Scope
 	if scope == nil {
+		diagnostics.LogStartup("index_progress_observer_skipped", "reason", "scope_nil")
 		return
 	}
+	diagnostics.LogStartup("index_progress_observer_install")
 
 	// Register the pipeline progress observer immediately so we catch
 	// phases that fire before the background indexer exists. Pipeline
 	// phases fire after completion, so we send current=1, total=1 to
 	// snap the stage's bar segment to full.
 	ks.SetProgressObserver(func(phase string, current, total int64) {
+		diagnostics.LogStartup("index_progress_observer_event", "phase", phase, "current", current, "total", total)
 		uiPhase, ok := pipelinePhaseMap[phase]
 		if !ok {
+			diagnostics.LogStartup("index_progress_observer_unknown_phase", "phase", phase, "current", current, "total", total)
 			return // Skip unknown phases including "done"; real Done comes from bgWaiter.Ready().
 		}
+		diagnostics.LogStartup("index_progress_observer_send", "phase", phase, "ui_phase", int(uiPhase))
 		program.Send(msg.IndexProgressMsg{
 			Phase:   int(uiPhase),
 			Current: 1,
@@ -494,11 +533,13 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 	startWaiterWatch := func(bgWaiter knowledge.BackgroundIndexWaiter) {
 		cancelActiveWaiter()
 		if bgWaiter == nil {
+			diagnostics.LogStartup("index_waiter_watch_skipped", "reason", "waiter_nil")
 			return
 		}
 
 		seq := waiterSeq.Add(1)
 		if indexed, total := bgWaiter.Progress(); total > 0 {
+			diagnostics.LogStartup("index_waiter_watch_initial_progress", "seq", seq, "indexed", indexed, "total", total)
 			program.Send(msg.IndexProgressMsg{
 				Phase:   int(status.PhaseIndex),
 				Current: indexed,
@@ -508,8 +549,10 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 
 		bgWaiter.OnProgress(func(indexed, total int64) {
 			if waiterSeq.Load() != seq {
+				diagnostics.LogStartup("index_waiter_progress_stale", "seq", seq, "current_seq", waiterSeq.Load(), "indexed", indexed, "total", total)
 				return
 			}
+			diagnostics.LogStartup("index_waiter_progress", "seq", seq, "indexed", indexed, "total", total)
 			program.Send(msg.IndexProgressMsg{
 				Phase:   int(status.PhaseIndex),
 				Current: indexed,
@@ -527,22 +570,28 @@ func (m *AppModel) startIndexProgressObserver(program bridge.TeaProgram) {
 			select {
 			case <-bgWaiter.Ready():
 				if scopeCtx.Err() != nil || waitCtx.Err() != nil || waiterSeq.Load() != seq {
+					diagnostics.LogStartup("index_waiter_ready_ignored", "seq", seq, "scope_err", scopeCtx.Err(), "wait_err", waitCtx.Err(), "current_seq", waiterSeq.Load())
 					return nil
 				}
+				diagnostics.LogStartup("index_waiter_ready", "seq", seq)
 				program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
 			case <-waitCtx.Done():
+				diagnostics.LogStartup("index_waiter_watch_cancelled", "seq", seq, "error", waitCtx.Err().Error())
 			case <-scopeCtx.Done():
+				diagnostics.LogStartup("index_waiter_watch_scope_cancelled", "seq", seq, "error", scopeCtx.Err().Error())
 			}
 			return nil
 		})
 	}
 
 	ks.SetLifecycleObserver(func(event knowledge.LifecycleEvent) {
+		diagnostics.LogStartup("knowledge_lifecycle_event", "kind", int(event.Kind), "level", int(event.Level), "waiter", event.Waiter != nil)
 		switch event.Kind {
 		case knowledge.LifecycleEventPartial:
 			startWaiterWatch(event.Waiter)
 		case knowledge.LifecycleEventFull:
 			cancelActiveWaiter()
+			diagnostics.LogStartup("knowledge_lifecycle_full_send_done")
 			program.Send(msg.IndexProgressMsg{Phase: int(status.PhaseDone), Done: true})
 		}
 	})
@@ -1424,6 +1473,7 @@ func (a *programAdapter) Send(m any) {
 
 // Run creates and runs the Bubble Tea program. This is the main entry point.
 func Run(ctx context.Context, cfg Config, deps Deps) error {
+	diagnostics.LogStartup("ui_run_enter", "project_root", cfg.ProjectRoot, "mock_mode", cfg.MockMode)
 	// Resolve project root: explicit → git root → CWD.
 	root := cfg.ProjectRoot
 	if root == "" {
@@ -1435,8 +1485,15 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		}
 		cfg.ProjectRoot = root
 	}
+	diagnostics.LogStartup("ui_run_root_ready", "project_root", root)
 
 	app := New(ctx, cfg, deps)
+	diagnostics.LogStartup("ui_app_model_created",
+		"session_manager", deps.SessionManager != nil,
+		"guide_bus", deps.GuideBus != nil,
+		"knowledge_store", deps.KnowledgeStore != nil,
+		"start_knowledge_boot", deps.StartKnowledgeBoot != nil,
+	)
 	app.fileTree.SetRoot(root)
 
 	p := tea.NewProgram(
@@ -1445,12 +1502,19 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		tea.WithMouseAllMotion(),
 		tea.WithContext(ctx),
 	)
+	diagnostics.LogStartup("ui_tea_program_created")
 
 	adapter := &programAdapter{program: p}
 	app.bridgeProgram = adapter
 
 	_, err := p.Run()
+	if err != nil {
+		diagnostics.LogStartup("ui_tea_program_returned", "error", err.Error())
+	} else {
+		diagnostics.LogStartup("ui_tea_program_returned")
+	}
 	if app.bridgeStartupErr != nil {
+		diagnostics.LogStartup("ui_bridge_startup_error_joined", "error", app.bridgeStartupErr.Error())
 		err = errors.Join(err, app.bridgeStartupErr)
 	}
 
@@ -1464,5 +1528,12 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 		return err
 	}
 
-	return app.Shutdown()
+	diagnostics.LogStartup("ui_app_shutdown_start")
+	shutdownErr := app.Shutdown()
+	if shutdownErr != nil {
+		diagnostics.LogStartup("ui_app_shutdown_done", "error", shutdownErr.Error())
+	} else {
+		diagnostics.LogStartup("ui_app_shutdown_done")
+	}
+	return shutdownErr
 }
