@@ -154,6 +154,24 @@ func TestStartIndexProgressObserver_SendsInitialBackgroundIndexPhaseBeforeFirstB
 	}
 }
 
+func TestStartIndexProgressObserver_ReplaysBufferedPipelineProgress(t *testing.T) {
+	ks := knowledge.NewKnowledgeStore(nil, nil)
+	ks.NotifyProgress("ingest", 4, 6)
+
+	scope := newIndexProgressScope(t)
+	app := &AppModel{deps: Deps{KnowledgeStore: ks, Scope: scope}}
+	program := newRecordingTeaProgram()
+
+	app.startIndexProgressObserver(program)
+
+	progress := program.waitForIndexProgress(t, func(progress msg.IndexProgressMsg) bool {
+		return !progress.Done && progress.Phase == int(status.PhaseEmbed)
+	})
+	if progress.Current != 1 || progress.Total != 1 {
+		t.Fatalf("replayed pipeline progress = %#v, want snapped stage completion 1/1", progress)
+	}
+}
+
 func TestStartIndexProgressObserver_TracksReplacementBackgroundWaitersAcrossSyncs(t *testing.T) {
 	ks := knowledge.NewKnowledgeStore(nil, nil)
 	waiter1 := newMockBackgroundWaiter(0, 8)
