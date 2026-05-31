@@ -135,7 +135,7 @@ func TestClaimsNative_ToolArtifactUsesArgsMetadataForInputSummary(t *testing.T) 
 	}
 }
 
-func TestClaimsNative_LifecycleArtifactReplayUpdatesSingleRow(t *testing.T) {
+func TestClaimsNative_LifecycleArtifactRowsAreIgnored(t *testing.T) {
 	m := newChatForClaimsTest(t)
 
 	base := msg.ClaimArtifactAddedMsg{
@@ -155,15 +155,11 @@ func TestClaimsNative_LifecycleArtifactReplayUpdatesSingleRow(t *testing.T) {
 	m.Update(base)
 
 	row := m.ArtifactRowByID("art-lifecycle")
-	if row == nil {
-		t.Fatal("lifecycle artifact row missing")
+	if row != nil {
+		t.Fatalf("lifecycle artifact row should not render as a tool row: %+v", row)
 	}
-	if got := row.Metadata["lifecycle_status"]; got != "validating" {
-		t.Fatalf("lifecycle_status = %#v, want validating", got)
-	}
-	cycle := m.ClaimRowByCycleID("cycle-lifecycle")
-	if cycle == nil || len(cycle.Artifacts) != 1 {
-		t.Fatalf("cycle artifacts = %+v, want one stable artifact row", cycle)
+	if cycle := m.ClaimRowByCycleID("cycle-lifecycle"); cycle != nil && len(cycle.Artifacts) != 0 {
+		t.Fatalf("cycle artifacts = %+v, want no lifecycle pseudo rows", cycle)
 	}
 }
 

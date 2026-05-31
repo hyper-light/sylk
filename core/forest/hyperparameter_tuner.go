@@ -490,7 +490,7 @@ func (t *HyperParameterTuner) ObserveAndAdapt(ctx context.Context, obs Adaptatio
 	// support.
 	relImprovement := (currentMean - proposedMean) / math.Max(currentMean, 1/float64(policyCandidatePopulationLimit()*policyCandidatePopulationLimit()))
 	if relativeImprovementClearsGate(relImprovement) && welchSignificant(t.adapt.recent, t.adapt.proposedRecent, policyTrialAlpha()) {
-		t.promotePolicyCandidate(ctx)
+		t.proposePolicyCandidatePromotion(ctx)
 		return
 	}
 	if relImprovement <= -policyRelativeImprovementThreshold() || time.Since(t.adapt.trialStart) > maxAdaptTrialDuration {
@@ -506,6 +506,10 @@ func (t *HyperParameterTuner) ObserveAndAdapt(ctx context.Context, obs Adaptatio
 //
 // When no trial is active, always returns (active, false).
 func (t *HyperParameterTuner) SnapshotForTrial(seed uint32) (*HyperParameters, bool) {
+	return t.SnapshotForTrialContext(context.Background(), "", seed)
+}
+
+func (t *HyperParameterTuner) SnapshotForTrialContext(ctx context.Context, cohortKey string, seed uint32) (*HyperParameters, bool) {
 	if t == nil {
 		return PlaceholderHyperParameters(), false
 	}
@@ -517,10 +521,20 @@ func (t *HyperParameterTuner) SnapshotForTrial(seed uint32) (*HyperParameters, b
 	if proposed == nil || candidateID == "" {
 		return t.Get(), false
 	}
+	arm := PolicyTrialArmChampion
+	if t.policy != nil {
+		_, assignedArm, err := t.policy.AssignTrial(ctx, candidateID, cohortKey, seed)
+		if err == nil {
+			arm = assignedArm
+		}
+		if err != nil && t.logger != nil {
+			t.logger.Debug("forest policy trial assignment failed", "err", err)
+		}
+	}
 	// Deterministic 50/50 split keyed off the caller-supplied
 	// seed so a single retrieval's score & log entries agree on
 	// which variant was used.
-	if seed%2 == 0 {
+	if arm == PolicyTrialArmChallenger {
 		return proposed, true
 	}
 	return t.Get(), false
@@ -534,21 +548,54 @@ func (t *HyperParameterTuner) policyCandidateFromRecentLocked(ctx context.Contex
 	return t.policy.ProposeCandidateFromObservations(ctx, t.Get(), recent)
 }
 
-// promotePolicyCandidate asks the policy engine to activate the
-// persisted candidate. Called with adapt.mu held.
-func (t *HyperParameterTuner) promotePolicyCandidate(ctx context.Context) {
+// proposePolicyCandidatePromotion asks the policy engine to emit a
+// validation-backed policy promotion proposal. Runtime adaptation never
+// activates directly; activation requires a later accepted forest claim.
+func (t *HyperParameterTuner) proposePolicyCandidatePromotion(ctx context.Context) {
 	if t.policy == nil || t.adapt.policyCandidateID == "" {
 		return
 	}
 	candidateID := t.adapt.policyCandidateID
 	champion := policyOutcomesFromObservations(candidateID, t.policy.activePolicyID(ctx), PolicyOutcomeArmChampion, t.adapt.recent)
 	challenger := policyOutcomesFromObservations(candidateID, candidateID, PolicyOutcomeArmChallenger, t.adapt.proposedRecent)
+	if err := t.recordPolicyOutcomes(ctx, append(champion, challenger...)); err != nil {
+		t.logger.Warn("forest policy outcome recording failed", "candidate_id", candidateID, "err", err)
+		t.resetPolicyTrialLocked()
+		return
+	}
 	fitness := ComputePolicyFitness(champion, challenger)
-	promoted, err := t.policy.PromoteCandidate(ctx, candidateID, fitness)
+	err := t.policy.ProposeCandidatePromotion(ctx, candidateID, fitness)
 	if err != nil {
 		t.logger.Info("forest policy candidate rejected", "candidate_id", candidateID, "err", err)
 		t.resetPolicyTrialLocked()
 		return
+	}
+	t.logger.Info("forest policy promotion proposed via runtime adaptation",
+		"policy_candidate_id", candidateID,
+		"trial_duration", time.Since(t.adapt.trialStart),
+	)
+	t.resetPolicyTrialLocked()
+}
+
+func (t *HyperParameterTuner) recordPolicyOutcomes(ctx context.Context, outcomes []PolicyOutcome) error {
+	if t == nil || t.policy == nil {
+		return nil
+	}
+	for _, outcome := range outcomes {
+		if err := t.policy.RecordPolicyOutcome(ctx, outcome); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *HyperParameterTuner) ActivateAcceptedPolicyCandidate(ctx context.Context, candidateID, acceptedClaimID string) (*HyperParameters, error) {
+	if t == nil || t.policy == nil {
+		return nil, fmt.Errorf("hyperparameter policy engine is required")
+	}
+	promoted, err := t.policy.ActivateAcceptedCandidate(ctx, candidateID, acceptedClaimID)
+	if err != nil {
+		return nil, err
 	}
 	for field := range promoted.Provenance {
 		if promoted.Provenance[field] != SourceConfig {
@@ -558,20 +605,13 @@ func (t *HyperParameterTuner) promotePolicyCandidate(ctx context.Context) {
 	promoted.SnapshotID = t.snapshotCounter.Add(1)
 	promoted.UpdatedAt = time.Now().UTC()
 	if err := promoted.Validate(); err != nil {
-		t.logger.Warn("promoted policy snapshot invalid; rejecting", "err", err)
-		t.resetPolicyTrialLocked()
-		return
+		return nil, fmt.Errorf("accepted policy snapshot invalid: %w", err)
 	}
 	if err := t.store.Save(ctx, promoted); err != nil {
-		t.logger.Warn("promote policy: persist failed; in-memory swap proceeds", "err", err)
+		return nil, fmt.Errorf("persist accepted policy snapshot: %w", err)
 	}
 	t.setActive(promoted)
-	t.logger.Info("forest policy promoted via runtime adaptation",
-		"snapshot_id", promoted.SnapshotID,
-		"policy_candidate_id", candidateID,
-		"trial_duration", time.Since(t.adapt.trialStart),
-	)
-	t.resetPolicyTrialLocked()
+	return promoted, nil
 }
 
 // rejectProposed discards the current proposal and resets trial
@@ -639,6 +679,7 @@ func policyOutcomeFromObservation(candidateID, policyID, arm string, obs Adaptat
 		Cost:               obs.Cost,
 		Ecology:            obs.Ecology,
 		ValidationPassRate: obs.ValidationPassRate,
+		ArtifactQuality:    obs.ArtifactQuality,
 		LatencyMicros:      obs.LatencyMicros,
 		ContradictionDelta: obs.ContradictionDelta,
 		SampleCount:        obs.SampleCount,

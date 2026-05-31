@@ -314,14 +314,14 @@ func (db *DurableBoard) rebuildProjectors(names []string) []ClaimsProjector {
 	}
 	want := normalizeProjectorNames(names)
 	if len(want) == 0 {
-		return append([]ClaimsProjector(nil), db.projectors...)
+		return db.snapshotProjectors()
 	}
 	allowed := make(map[string]struct{}, len(want))
 	for _, name := range want {
 		allowed[name] = struct{}{}
 	}
 	var out []ClaimsProjector
-	for _, projector := range db.projectors {
+	for _, projector := range db.snapshotProjectors() {
 		if projector == nil {
 			continue
 		}

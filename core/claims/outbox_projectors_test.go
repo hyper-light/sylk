@@ -116,6 +116,43 @@ func TestClaimsOutbox_ProjectorStatusTransitions(t *testing.T) {
 	}
 }
 
+func TestClaimsOutbox_AddProjectorQueuesExistingRecords(t *testing.T) {
+	outbox, err := OpenClaimsOutbox(t.TempDir(), []string{ProjectorFabric})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+
+	record := ClaimsOutboxRecord{
+		BoardID:      "board-1",
+		SessionID:    "session-1",
+		Sequence:     1,
+		EntityType:   "claim",
+		EntityID:     "claim-1",
+		MutationKind: "claim_issued",
+	}
+	if err := outbox.Insert(record); err != nil {
+		t.Fatal(err)
+	}
+
+	if queued := outbox.AddProjector(ProjectorKnowledge); queued != 1 {
+		t.Fatalf("queued records = %d, want 1", queued)
+	}
+	pending := outbox.Pending(ProjectorKnowledge, operationsDefaultOutboxBatch, time.Now().UTC())
+	if len(pending) != 1 {
+		t.Fatalf("knowledge pending = %d, want 1", len(pending))
+	}
+	if err := outbox.MarkSucceeded(pending[0].ID, ProjectorKnowledge); err != nil {
+		t.Fatal(err)
+	}
+	if queued := outbox.AddProjector(ProjectorKnowledge); queued != 0 {
+		t.Fatalf("requeued records = %d, want 0", queued)
+	}
+	if got := outbox.Pending(ProjectorKnowledge, operationsDefaultOutboxBatch, time.Now().UTC()); len(got) != 0 {
+		t.Fatalf("knowledge pending after success = %d, want 0", len(got))
+	}
+}
+
 func TestClaimsOutbox_LeaseExpires(t *testing.T) {
 	outbox, err := OpenClaimsOutbox(t.TempDir(), []string{ProjectorFabric})
 	if err != nil {
@@ -385,6 +422,37 @@ func TestDurableBoard_BoardMethodsWriteWALAndOutbox(t *testing.T) {
 	}
 	if got := db2.Board().HighWaterSequence(); got != high {
 		t.Fatalf("replayed high-water = %d, want %d", got, high)
+	}
+}
+
+func TestDurableBoard_AddProjectorQueuesExistingOutboxRecords(t *testing.T) {
+	dir := t.TempDir()
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-dynamic-projector",
+		SessionID:  "session-dynamic-projector",
+		TaskID:     "task",
+		SessionDir: filepath.Join(dir, "session-dynamic-projector"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	claim := directedClaimForOutboxIsolation("claim-dynamic-projector")
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "guide", Type: ActionTypeTask}, []Claim{claim}); err != nil {
+		t.Fatal(err)
+	}
+
+	projector := &countingProjector{name: ProjectorKnowledge}
+	if queued := db.AddProjector(projector); queued == 0 {
+		t.Fatalf("queued records = %d, want existing records queued", queued)
+	}
+	db.DrainOutbox(context.Background(), operationsDefaultOutboxBatch)
+	if projector.count == 0 {
+		t.Fatalf("dynamic projector count = 0, want existing records projected")
+	}
+	if queued := db.AddProjector(projector); queued != 0 {
+		t.Fatalf("second dynamic projector queued records = %d, want 0", queued)
 	}
 }
 

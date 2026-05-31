@@ -9,12 +9,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 const (
 	PolicyStatusActive              = "active"
 	PolicyStatusRetired             = "retired"
 	PolicyCandidateStatusTrialing   = "trialing"
+	PolicyCandidateStatusProposed   = "promotion_proposed"
 	PolicyCandidateStatusRejected   = "rejected"
 	PolicyCandidateStatusPromoted   = "promoted"
 	PolicyTrialArmChampion          = "champion"
@@ -118,6 +121,7 @@ type PolicyOutcome struct {
 	Cost               float64
 	Ecology            float64
 	ValidationPassRate float64
+	ArtifactQuality    float64
 	LatencyMicros      int64
 	ContradictionDelta float64
 	SampleCount        int64
@@ -440,10 +444,10 @@ func evidenceRefsFromObservations(recent []AdaptationObservation) []string {
 func (e *ForestPolicyEngine) candidatePopulationAvailable(ctx context.Context) (bool, error) {
 	var count int
 	err := e.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM forest_policy_candidates
-		WHERE status = ?
-	`, PolicyCandidateStatusTrialing).Scan(&count)
+			SELECT COUNT(*)
+			FROM forest_policy_candidates
+			WHERE status IN (?, ?)
+		`, PolicyCandidateStatusTrialing, PolicyCandidateStatusProposed).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("count policy candidates: %w", err)
 	}
@@ -556,16 +560,17 @@ func (e *ForestPolicyEngine) RecordPolicyOutcome(ctx context.Context, outcome Po
 		return fmt.Errorf("policy outcome requires candidate_id and policy_id")
 	}
 	_, err := e.db.ExecContext(ctx, `
-		INSERT INTO forest_policy_outcomes
-			(outcome_id, candidate_id, policy_id, trial_id, arm, correctness,
-			 safety, cost, ecology, validation_pass_rate, latency_micros,
-			 contradiction_delta, sample_count, evidence_refs, observed_at, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(outcome_id) DO NOTHING
-	`, policyOutcomeID(outcome), outcome.CandidateID, outcome.PolicyID, outcome.TrialID, outcome.Arm,
+			INSERT INTO forest_policy_outcomes
+				(outcome_id, candidate_id, policy_id, trial_id, arm, correctness,
+				 safety, cost, ecology, validation_pass_rate, latency_micros,
+				 artifact_quality, contradiction_delta, sample_count, evidence_refs,
+				 observed_at, metadata)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(outcome_id) DO NOTHING
+		`, policyOutcomeID(outcome), outcome.CandidateID, outcome.PolicyID, outcome.TrialID, outcome.Arm,
 		outcome.Correctness, outcome.Safety, outcome.Cost, outcome.Ecology, outcome.ValidationPassRate,
-		outcome.LatencyMicros, outcome.ContradictionDelta, outcome.SampleCount, encodeStringList(outcome.EvidenceRefs),
-		outcome.ObservedAt.Unix(), marshalJSON(outcome.Metadata))
+		outcome.LatencyMicros, outcome.ArtifactQuality, outcome.ContradictionDelta, outcome.SampleCount,
+		encodeStringList(outcome.EvidenceRefs), outcome.ObservedAt.Unix(), marshalJSON(outcome.Metadata))
 	if err != nil {
 		return fmt.Errorf("record policy outcome: %w", err)
 	}
@@ -582,6 +587,7 @@ func normalizePolicyOutcome(outcome PolicyOutcome) PolicyOutcome {
 	outcome.Cost = clampFinite01(outcome.Cost)
 	outcome.Ecology = clampFinite01(outcome.Ecology)
 	outcome.ValidationPassRate = clampFinite01(outcome.ValidationPassRate)
+	outcome.ArtifactQuality = clampFinite01(outcome.ArtifactQuality)
 	outcome.EvidenceRefs = dedupeStrings(outcome.EvidenceRefs)
 	if outcome.ObservedAt.IsZero() {
 		outcome.ObservedAt = time.Now().UTC()
@@ -617,6 +623,7 @@ func aggregatePolicyFitness(outcomes []PolicyOutcome) PolicyFitness {
 		f.Cost += normalized.Cost
 		f.Ecology += normalized.Ecology
 		f.ValidationPassRate += normalized.ValidationPassRate
+		f.ArtifactQuality += normalized.ArtifactQuality
 		f.ContradictionReduction += normalized.ContradictionDelta
 		f.SampleCount += normalized.SampleCount
 		f.EvidenceRefs = append(f.EvidenceRefs, normalized.EvidenceRefs...)
@@ -628,6 +635,7 @@ func aggregatePolicyFitness(outcomes []PolicyOutcome) PolicyFitness {
 	f.Cost /= denom
 	f.Ecology /= denom
 	f.ValidationPassRate /= denom
+	f.ArtifactQuality /= denom
 	f.ContradictionReduction /= denom
 	f.EvidenceRefs = dedupeStrings(f.EvidenceRefs)
 	f.IndependentSignalCount = policyIndependentSignals(f)
@@ -642,6 +650,9 @@ func policyPromotionDecision(champion, challenger PolicyFitness) (bool, string) 
 	}
 	if len(challenger.EvidenceRefs) == 0 || challenger.ValidationPassRate <= 0 {
 		return false, "missing_validation_evidence"
+	}
+	if challenger.ArtifactQuality <= 0 {
+		return false, "missing_artifact_quality_evidence"
 	}
 	if challenger.IndependentSignalCount < policyRequiredSignalCount() {
 		return false, "insufficient_independent_signals"
@@ -671,28 +682,59 @@ func policyConfidenceLowerBound(f PolicyFitness) float64 {
 	return clampFinite01(total - margin)
 }
 
-func (e *ForestPolicyEngine) PromoteCandidate(ctx context.Context, candidateID string, fitness PolicyFitness) (*HyperParameters, error) {
+func (e *ForestPolicyEngine) ProposeCandidatePromotion(ctx context.Context, candidateID string, fitness PolicyFitness) error {
 	e.promotionMu.Lock()
 	defer e.promotionMu.Unlock()
 	candidate, err := e.loadPolicyCandidate(ctx, candidateID)
 	if err != nil {
+		return err
+	}
+	if candidate.Status != PolicyCandidateStatusTrialing {
+		return fmt.Errorf("policy candidate %s status %s is not proposal-ready", candidate.ID, candidate.Status)
+	}
+	if !fitness.PromotionAllowed {
+		return e.rejectPolicyCandidate(ctx, candidate.ID, fitness.PromotionBlockedReason)
+	}
+	if len(fitness.EvidenceRefs) == 0 {
+		return e.rejectPolicyCandidate(ctx, candidate.ID, "missing_validation_evidence")
+	}
+	return e.commitPolicyPromotionProposal(ctx, candidate, fitness)
+}
+
+func (e *ForestPolicyEngine) ActivateAcceptedCandidate(ctx context.Context, candidateID, acceptedClaimID string) (*HyperParameters, error) {
+	e.promotionMu.Lock()
+	defer e.promotionMu.Unlock()
+	if strings.TrimSpace(acceptedClaimID) == "" {
+		return nil, fmt.Errorf("accepted policy promotion claim is required")
+	}
+	accepted, err := e.acceptedForestClaimExists(ctx, acceptedClaimID)
+	if err != nil {
 		return nil, err
 	}
+	if !accepted {
+		return nil, fmt.Errorf("accepted policy promotion claim %s not found", acceptedClaimID)
+	}
+	candidate, err := e.loadPolicyCandidate(ctx, candidateID)
+	if err != nil {
+		return nil, err
+	}
+	if candidate.Status != PolicyCandidateStatusProposed {
+		return nil, fmt.Errorf("policy candidate %s status %s is not activation-ready", candidate.ID, candidate.Status)
+	}
+	fitness := policyFitnessFromCandidate(candidate)
 	if !fitness.PromotionAllowed {
 		return nil, e.rejectPolicyCandidate(ctx, candidate.ID, fitness.PromotionBlockedReason)
 	}
-	if len(fitness.EvidenceRefs) == 0 {
-		return nil, e.rejectPolicyCandidate(ctx, candidate.ID, "missing_validation_evidence")
-	}
-	if err := e.commitPolicyPromotion(ctx, candidate, fitness); err != nil {
+	if err := e.commitPolicyActivation(ctx, candidate, fitness, acceptedClaimID); err != nil {
 		return nil, err
 	}
+	promoted := candidate.HyperParameters.Clone()
 	if e.store != nil {
-		if err := e.store.Save(ctx, candidate.HyperParameters); err != nil {
-			return nil, fmt.Errorf("persist promoted policy snapshot: %w", err)
+		if err := e.store.Save(ctx, promoted); err != nil {
+			return nil, fmt.Errorf("persist accepted policy snapshot: %w", err)
 		}
 	}
-	return candidate.HyperParameters.Clone(), nil
+	return promoted, nil
 }
 
 func (e *ForestPolicyEngine) loadPolicyCandidate(ctx context.Context, candidateID string) (*PolicyCandidate, error) {
@@ -731,6 +773,19 @@ func scanPolicyCandidate(row interface{ Scan(dest ...any) error }) (*PolicyCandi
 	return candidate, nil
 }
 
+func policyFitnessFromCandidate(candidate *PolicyCandidate) PolicyFitness {
+	var fitness PolicyFitness
+	if candidate == nil || len(candidate.Metadata) == 0 {
+		return fitness
+	}
+	raw, ok := candidate.Metadata["fitness"]
+	if !ok {
+		return fitness
+	}
+	_ = unmarshalJSON(marshalJSON(raw), &fitness)
+	return fitness
+}
+
 func (e *ForestPolicyEngine) rejectPolicyCandidate(ctx context.Context, candidateID, reason string) error {
 	if err := e.markPolicyCandidateRejected(ctx, candidateID, reason); err != nil {
 		return err
@@ -750,30 +805,51 @@ func (e *ForestPolicyEngine) markPolicyCandidateRejected(ctx context.Context, ca
 	return nil
 }
 
-func (e *ForestPolicyEngine) commitPolicyPromotion(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
+func (e *ForestPolicyEngine) commitPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin policy promotion: %w", err)
+		return fmt.Errorf("begin policy promotion proposal: %w", err)
 	}
 	defer tx.Rollback()
-	if err := updatePolicyPromotionRows(ctx, tx, candidate, fitness); err != nil {
+	if err := updatePolicyPromotionProposalRows(ctx, tx, candidate, fitness); err != nil {
 		return err
 	}
-	if err := e.upsertPolicyPromotionArtifactTx(ctx, tx, candidate, fitness); err != nil {
+	if err := e.upsertPolicyPromotionArtifactTx(ctx, tx, candidate, fitness, "proposed", "requires_validation", ""); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit policy promotion: %w", err)
+		return fmt.Errorf("commit policy promotion proposal: %w", err)
 	}
 	return e.emitPolicyPromotionProposal(ctx, candidate, fitness)
 }
 
-func updatePolicyPromotionRows(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness) error {
+func updatePolicyPromotionProposalRows(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness) error {
+	now := time.Now().UTC().Unix()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE forest_policy_candidates
+		SET status = ?, validation_evidence_refs = ?, updated_at = ?, metadata = ?
+		WHERE candidate_id = ? AND status = ?
+	`, PolicyCandidateStatusProposed, encodeStringList(fitness.EvidenceRefs), now,
+		marshalJSON(map[string]any{
+			"fitness":     fitness,
+			"proposal_id": policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs),
+		}), candidate.ID, PolicyCandidateStatusTrialing); err != nil {
+		return fmt.Errorf("mark policy candidate promotion proposed: %w", err)
+	}
+	return nil
+}
+
+func (e *ForestPolicyEngine) commitPolicyActivation(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness, acceptedClaimID string) error {
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin accepted policy activation: %w", err)
+	}
+	defer tx.Rollback()
 	now := time.Now().UTC().Unix()
 	if _, err := tx.ExecContext(ctx, `UPDATE forest_policies SET status = ?, updated_at = ? WHERE status = ?`, PolicyStatusRetired, now, PolicyStatusActive); err != nil {
 		return fmt.Errorf("retire active policy: %w", err)
 	}
-	policyID := stableID("forest_policy", candidate.ID, encodeStringList(fitness.EvidenceRefs))
+	policyID := stableID("forest_policy", candidate.ID, encodeStringList(fitness.EvidenceRefs), acceptedClaimID)
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_policies
 			(policy_id, policy_version, status, source, genome, hyperparameters,
@@ -782,39 +858,56 @@ func updatePolicyPromotionRows(ctx context.Context, tx *sql.Tx, candidate *Polic
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, policyID, candidate.Version, PolicyStatusActive, candidate.Source, marshalJSON(candidate.Genome), marshalJSON(candidate.HyperParameters),
 		encodeStringList(fitness.EvidenceRefs), PolicyRollbackUsePreviousActive, marshalJSON(fitness), now, now, now,
-		marshalJSON(map[string]any{"candidate_id": candidate.ID})); err != nil {
-		return fmt.Errorf("insert promoted policy: %w", err)
+		marshalJSON(map[string]any{"candidate_id": candidate.ID, "accepted_claim_id": acceptedClaimID})); err != nil {
+		return fmt.Errorf("insert accepted policy: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE forest_policy_candidates
-		SET status = ?, validation_evidence_refs = ?, updated_at = ?, metadata = ?
+		SET status = ?, updated_at = ?, metadata = ?
 		WHERE candidate_id = ? AND status = ?
-	`, PolicyCandidateStatusPromoted, encodeStringList(fitness.EvidenceRefs), now,
-		marshalJSON(map[string]any{"fitness": fitness}), candidate.ID, PolicyCandidateStatusTrialing); err != nil {
-		return fmt.Errorf("mark policy candidate promoted: %w", err)
+	`, PolicyCandidateStatusPromoted, now,
+		marshalJSON(map[string]any{"fitness": fitness, "accepted_claim_id": acceptedClaimID}), candidate.ID, PolicyCandidateStatusProposed); err != nil {
+		return fmt.Errorf("mark policy candidate activated: %w", err)
+	}
+	if err := e.upsertPolicyPromotionArtifactTx(ctx, tx, candidate, fitness, "accepted", "validated", acceptedClaimID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit accepted policy activation: %w", err)
 	}
 	return nil
 }
 
-func (e *ForestPolicyEngine) upsertPolicyPromotionArtifactTx(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness) error {
+func (e *ForestPolicyEngine) upsertPolicyPromotionArtifactTx(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness, artifactStatus, validationStatus, acceptedClaimID string) error {
 	if ok, err := e.tableExistsTx(ctx, tx, "forest_artifacts"); err != nil || !ok {
 		return err
 	}
 	artifactID := stableID(PolicyPromotionArtifactKind, candidate.ID, encodeStringList(fitness.EvidenceRefs))
 	now := time.Now().UTC().Unix()
+	metadata := map[string]any{
+		"candidate":       candidate,
+		"fitness":         fitness,
+		"rollback_policy": PolicyRollbackUsePreviousActive,
+		"proposal_id":     policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs),
+	}
+	if strings.TrimSpace(acceptedClaimID) != "" {
+		metadata["accepted_claim_id"] = strings.TrimSpace(acceptedClaimID)
+	}
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_artifacts
 			(artifact_id, claim_id, generator_participant, artifact_name, artifact_kind,
 			 data_type, content_ref, status, validation_status, last_sequence,
 			 first_seen_at, last_seen_at, payload_hash, metadata)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-		ON CONFLICT(artifact_id) DO UPDATE SET
-			last_seen_at = excluded.last_seen_at,
-			metadata = excluded.metadata
-	`, artifactID, candidate.ID, "memory_forest", "Forest policy promotion", PolicyPromotionArtifactKind,
-		"policy", "forest_policy:"+candidate.ID, "proposed", "validated", now, now,
+			ON CONFLICT(artifact_id) DO UPDATE SET
+				status = excluded.status,
+				validation_status = excluded.validation_status,
+				last_seen_at = excluded.last_seen_at,
+				metadata = excluded.metadata
+	`, artifactID, policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs), "memory_forest", "Forest policy promotion", PolicyPromotionArtifactKind,
+		"policy", "forest_policy:"+candidate.ID, artifactStatus, validationStatus, now, now,
 		stableID("policy_payload", candidate.ID, marshalJSON(fitness)),
-		marshalJSON(map[string]any{"candidate": candidate, "fitness": fitness, "rollback_policy": PolicyRollbackUsePreviousActive}))
+		marshalJSON(metadata))
 	if err != nil {
 		return fmt.Errorf("upsert policy promotion artifact: %w", err)
 	}
@@ -822,6 +915,10 @@ func (e *ForestPolicyEngine) upsertPolicyPromotionArtifactTx(ctx context.Context
 }
 
 func (e *ForestPolicyEngine) tableExistsTx(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
+	return tableExistsTx(ctx, tx, table)
+}
+
+func tableExistsTx(ctx context.Context, tx *sql.Tx, table string) (bool, error) {
 	var name string
 	err := tx.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 	if err == sql.ErrNoRows {
@@ -833,12 +930,35 @@ func (e *ForestPolicyEngine) tableExistsTx(ctx context.Context, tx *sql.Tx, tabl
 	return true, nil
 }
 
+func (e *ForestPolicyEngine) acceptedForestClaimExists(ctx context.Context, claimID string) (bool, error) {
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return false, nil
+	}
+	var count int
+	err := e.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_ledger
+		WHERE subject_type = ?
+		  AND subject_id = ?
+		  AND event_kind = ?
+	`, claims.RelatedTypeClaim, claimID, string(claims.DeltaActionClaimSatisfied)).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check accepted forest claim: %w", err)
+	}
+	return count > 0, nil
+}
+
+func policyPromotionProposalID(candidateID string, refs []string) string {
+	return "forest_policy_promotion:" + stableID(strings.TrimSpace(candidateID), encodeStringList(refs))
+}
+
 func (e *ForestPolicyEngine) emitPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
 	if e.proposalSink == nil {
 		return nil
 	}
 	proposal := ForestClaimProposal{
-		ID:                     "forest_policy_promotion:" + stableID(candidate.ID, encodeStringList(fitness.EvidenceRefs)),
+		ID:                     policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs),
 		ClusterID:              "forest_policy",
 		Dimension:              PolicyPromotionDimension,
 		Summary:                "Promote validated forest policy candidate " + candidate.ID,

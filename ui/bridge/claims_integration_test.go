@@ -1874,13 +1874,19 @@ func TestBridgeIntegration_CanonicalTerminalClaimClosesPeerInvocation(t *testing
 	}
 }
 
-func TestBridgeIntegration_CanonicalArtifactLifecycleDeltasUpdateStableRow(t *testing.T) {
+func TestBridgeIntegration_CanonicalArtifactLifecycleProjectsPresentableArtifact(t *testing.T) {
 	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-artifact-lifecycle")
 	defer cleanup()
 
 	claimID, validationID := postBridgeLifecycleClaim(t, board, "ses-canonical-artifact-lifecycle")
 	drainBridge(t, prog, "claim setup")
 	artifact := bridgeLifecyclePlanArtifact(t, claimID, "architect")
+	artifact.Presentation = &claims.Presentation{
+		Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+		Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		Format:    claims.PresentationFormatMarkdown,
+		Placement: claims.PresentationPlacementInline,
+	}
 	generated, err := board.GenerateArtifact(context.Background(), artifact, "architect", claims.ArtifactLifecycleOptions{Reason: "artifact generated"})
 	if err != nil {
 		t.Fatalf("GenerateArtifact: %v", err)
@@ -1897,30 +1903,26 @@ func TestBridgeIntegration_CanonicalArtifactLifecycleDeltasUpdateStableRow(t *te
 	}
 	drainBridge(t, prog, "artifact lifecycle deltas")
 
-	var statuses []string
-	completions := 0
+	presentations := 0
 	for _, m := range prog.Snapshot() {
 		switch typed := m.(type) {
-		case msg.ClaimArtifactAddedMsg:
-			if typed.ArtifactID == generated.ID && typed.Kind == claimsBridgeArtifactLifecycleKind {
-				statuses = append(statuses, metadataString(typed.Metadata, "lifecycle_status"))
+		case msg.ClaimPresentationMsg:
+			if typed.SourceID == generated.ID {
+				presentations++
 			}
-		case msg.ClaimArtifactCompletedMsg:
-			if typed.StartArtifactID == generated.ID {
-				completions++
+		case msg.ClaimArtifactAddedMsg:
+			if typed.Kind == "artifact_lifecycle" {
+				t.Fatalf("artifact lifecycle delta rendered as pseudo tool row: %+v", typed)
 			}
 		}
 	}
-	if !containsAllStrings(statuses, "generated", "received", "attached", "validating", "validated") {
+	if presentations != 1 {
 		debugSnapshot(t, prog, "artifact lifecycle deltas")
-		t.Fatalf("artifact lifecycle statuses = %v, want generated/received/attached/validating/validated", statuses)
-	}
-	if completions != 1 {
-		t.Fatalf("artifact lifecycle completions = %d, want 1", completions)
+		t.Fatalf("presentations for artifact %s = %d, want 1", generated.ID, presentations)
 	}
 }
 
-func TestBridgeIntegration_CanonicalValidationLifecycleRendersUnderArtifact(t *testing.T) {
+func TestBridgeIntegration_CanonicalValidationLifecycleDoesNotRenderPseudoRows(t *testing.T) {
 	_, board, prog, cleanup := setupBridgeOnSession(t, "ses-canonical-validation-lifecycle")
 	defer cleanup()
 
@@ -1942,34 +1944,10 @@ func TestBridgeIntegration_CanonicalValidationLifecycleRendersUnderArtifact(t *t
 	}
 	drainBridge(t, prog, "validation lifecycle deltas")
 
-	var validationRows []msg.ClaimArtifactAddedMsg
-	completions := 0
 	for _, m := range prog.Snapshot() {
-		switch typed := m.(type) {
-		case msg.ClaimArtifactAddedMsg:
-			if typed.ArtifactID == validationID && typed.Kind == claimsBridgeValidationLifecycleKind {
-				validationRows = append(validationRows, typed)
-			}
-		case msg.ClaimArtifactCompletedMsg:
-			if typed.StartArtifactID == validationID {
-				completions++
-			}
+		if typed, ok := m.(msg.ClaimArtifactAddedMsg); ok && typed.Kind == "validation_lifecycle" {
+			t.Fatalf("validation lifecycle delta rendered as pseudo tool row under artifact %s: %+v", generated.ID, typed)
 		}
-	}
-	if len(validationRows) == 0 {
-		debugSnapshot(t, prog, "validation lifecycle deltas")
-		t.Fatal("expected validation lifecycle artifact rows")
-	}
-	for _, row := range validationRows {
-		if row.ParentRowID != generated.ID {
-			t.Fatalf("validation ParentRowID = %q, want artifact %q", row.ParentRowID, generated.ID)
-		}
-		if row.ClaimID != claimID {
-			t.Fatalf("validation ClaimID = %q, want %q", row.ClaimID, claimID)
-		}
-	}
-	if completions != 1 {
-		t.Fatalf("validation lifecycle completions = %d, want 1", completions)
 	}
 }
 
@@ -2162,7 +2140,7 @@ func TestBridgeIntegration_PromptOpensCycleForSubject(t *testing.T) {
 	}
 }
 
-func TestBridgeIntegration_GuideClassificationIsVisibleButDoesNotClaimRouteStream(t *testing.T) {
+func TestBridgeIntegration_GuideClassificationClaimIsHiddenFromUserSurfaces(t *testing.T) {
 	_, board, prog, cleanup := setupBridgeOnSession(t, "sess-guide-classify-panel-only")
 	defer cleanup()
 
@@ -2192,25 +2170,17 @@ func TestBridgeIntegration_GuideClassificationIsVisibleButDoesNotClaimRouteStrea
 	}
 	drainBridge(t, prog, "guide classification open")
 
-	var openMsg *msg.ClaimsAgentStatusMsg
 	for _, m := range prog.Snapshot() {
-		s, ok := m.(msg.ClaimsAgentStatusMsg)
-		if ok && s.Active && s.CycleID == claimID {
-			openMsg = &s
-			break
+		switch typed := m.(type) {
+		case msg.ClaimsAgentStatusMsg:
+			if typed.CycleID == claimID {
+				t.Fatalf("guide classification claim opened a visible cycle: %+v", typed)
+			}
+		case msg.ClaimContextMsg:
+			if typed.ClaimID == claimID {
+				t.Fatalf("guide classification claim emitted visible context: %+v", typed)
+			}
 		}
-	}
-	if openMsg == nil {
-		t.Fatal("expected guide classification ClaimsAgentStatusMsg")
-	}
-	if openMsg.SuppressChat {
-		t.Fatal("guide classification claim must be visible in chat")
-	}
-	if openMsg.State != "classifying" {
-		t.Fatalf("State = %q, want classifying", openMsg.State)
-	}
-	if openMsg.StreamCorrelationID != "" {
-		t.Fatalf("StreamCorrelationID = %q, want empty so routed agent owns the route stream", openMsg.StreamCorrelationID)
 	}
 
 	if err := board.SetClaimContext(context.Background(), claimID, "Request forwarded"); err != nil {
@@ -2218,22 +2188,10 @@ func TestBridgeIntegration_GuideClassificationIsVisibleButDoesNotClaimRouteStrea
 	}
 	drainBridge(t, prog, "guide classification forwarded context")
 
-	var contextMsg *msg.ClaimContextMsg
 	for _, m := range prog.Snapshot() {
-		c, ok := m.(msg.ClaimContextMsg)
-		if ok && c.ClaimID == claimID && c.Context == "Request forwarded" {
-			contextMsg = &c
-			break
+		if c, ok := m.(msg.ClaimContextMsg); ok && c.ClaimID == claimID {
+			t.Fatalf("guide classification context must stay hidden: %+v", c)
 		}
-	}
-	if contextMsg == nil {
-		t.Fatal("expected guide classification ClaimContextMsg")
-	}
-	if contextMsg.SuppressChat {
-		t.Fatal("guide classification context must be visible in chat")
-	}
-	if contextMsg.State != "routing" {
-		t.Fatalf("context State = %q, want routing", contextMsg.State)
 	}
 }
 
@@ -2311,7 +2269,7 @@ func TestBridgeIntegration_ClaimContextRoutesToUI(t *testing.T) {
 	}
 }
 
-func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.T) {
+func TestBridgeIntegration_ProviderGatewayServiceClaimsHiddenFromUserSurfaces(t *testing.T) {
 	serviceRoute := "sys:provider_gateway"
 	resolver := claims.AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
 		switch strings.TrimSpace(agentID) {
@@ -2342,6 +2300,12 @@ func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.
 	claimID := board.Projection().Claims[0].ID
 	drainBridge(t, prog, "service claim open")
 
+	for _, m := range prog.Snapshot() {
+		if status, ok := m.(msg.ClaimsAgentStatusMsg); ok && status.CycleID == claimID {
+			t.Fatalf("provider gateway service claim opened visible cycle: %+v", status)
+		}
+	}
+
 	br.OnArtifactAdded(claimID, serviceRoute, board.SessionID(), &claims.Artifact{
 		ID:        "service-tool-started",
 		AgentID:   serviceRoute,
@@ -2351,21 +2315,10 @@ func TestBridgeIntegration_ServiceArtifactCarriesParticipantMetadata(t *testing.
 	})
 	drainBridge(t, prog, "service artifact")
 
-	var got *msg.ClaimArtifactAddedMsg
 	for _, m := range prog.Snapshot() {
 		if artifact, ok := m.(msg.ClaimArtifactAddedMsg); ok && artifact.ArtifactID == "service-tool-started" {
-			got = &artifact
-			break
+			t.Fatalf("provider gateway service artifact must stay off user surfaces: %+v", artifact)
 		}
-	}
-	if got == nil {
-		t.Fatal("expected service artifact message")
-	}
-	if got.TargetParticipantCategory != string(claims.ParticipantCategoryService) || got.TargetParticipantRoute != serviceRoute {
-		t.Fatalf("target participant = category %q route %q, want service %q", got.TargetParticipantCategory, got.TargetParticipantRoute, serviceRoute)
-	}
-	if got.ArtifactParticipantCategory != string(claims.ParticipantCategoryService) || got.ArtifactParticipantRoute != serviceRoute {
-		t.Fatalf("artifact participant = category %q route %q, want service %q", got.ArtifactParticipantCategory, got.ArtifactParticipantRoute, serviceRoute)
 	}
 }
 

@@ -98,6 +98,7 @@ type DurableBoard struct {
 	seq          uint64
 	seen         map[string]uint64
 	outbox       *ClaimsOutbox
+	projectorsMu sync.RWMutex
 	projectors   []ClaimsProjector
 	operations   ClaimsOperationsConfig
 	replayIssues []WALReplayIssue
@@ -383,14 +384,15 @@ func (db *DurableBoard) appendCommittedEvent(kind, agentID string, payload any, 
 }
 
 func (db *DurableBoard) projectOutbox(_ context.Context) {
-	if db == nil || db.outbox == nil || len(db.projectors) == 0 || db.board == nil {
+	projectors := db.snapshotProjectors()
+	if db == nil || db.outbox == nil || len(projectors) == 0 || db.board == nil {
 		return
 	}
 	if db.board.scope == nil {
 		return
 	}
 	now := time.Now().UTC()
-	for _, projector := range db.projectors {
+	for _, projector := range projectors {
 		if projector == nil {
 			continue
 		}
@@ -400,6 +402,50 @@ func (db *DurableBoard) projectOutbox(_ context.Context) {
 		}
 		db.scheduleOutboxProjector(projector)
 	}
+}
+
+// AddProjector attaches a deterministic outbox projector to this board after
+// open. Existing outbox records are queued for the new projector without
+// disturbing any projector_status events already replayed from disk.
+func (db *DurableBoard) AddProjector(projector ClaimsProjector) int {
+	name := projectorName(projector)
+	if db == nil || name == "" || db.outbox == nil {
+		return 0
+	}
+	if !db.appendProjector(projector, name) {
+		return 0
+	}
+	queued := db.outbox.AddProjector(name)
+	db.projectOutbox(context.Background())
+	return queued
+}
+
+func (db *DurableBoard) appendProjector(projector ClaimsProjector, name string) bool {
+	db.projectorsMu.Lock()
+	defer db.projectorsMu.Unlock()
+	for _, existing := range db.projectors {
+		if projectorName(existing) == name {
+			return false
+		}
+	}
+	db.projectors = append(db.projectors, projector)
+	return true
+}
+
+func (db *DurableBoard) snapshotProjectors() []ClaimsProjector {
+	if db == nil {
+		return nil
+	}
+	db.projectorsMu.RLock()
+	defer db.projectorsMu.RUnlock()
+	return append([]ClaimsProjector(nil), db.projectors...)
+}
+
+func projectorName(projector ClaimsProjector) string {
+	if projector == nil {
+		return ""
+	}
+	return strings.TrimSpace(projector.Name())
 }
 
 func (db *DurableBoard) scheduleOutboxProjector(projector ClaimsProjector) {
@@ -456,10 +502,11 @@ func outboxProjectorWorkerDescription(name string) string {
 // mutations schedule this on the board scope; tests and repair tools call it
 // directly to make projection catch-up deterministic.
 func (db *DurableBoard) DrainOutbox(ctx context.Context, limit int) int {
-	if db == nil || db.outbox == nil || len(db.projectors) == 0 || db.board == nil {
+	projectors := db.snapshotProjectors()
+	if db == nil || db.outbox == nil || len(projectors) == 0 || db.board == nil {
 		return 0
 	}
-	return db.outbox.ProjectPending(ctx, db.board, db.projectors, limit)
+	return db.outbox.ProjectPending(ctx, db.board, projectors, limit)
 }
 
 // DrainOutboxProjector synchronously projects pending records for one
@@ -481,7 +528,7 @@ func (db *DurableBoard) projectorByName(name string) ClaimsProjector {
 	if db == nil || name == "" {
 		return nil
 	}
-	for _, projector := range db.projectors {
+	for _, projector := range db.snapshotProjectors() {
 		if projector != nil && projector.Name() == name {
 			return projector
 		}
@@ -493,7 +540,7 @@ func (db *DurableBoard) hasProjector(name string) bool {
 	if db == nil {
 		return false
 	}
-	for _, p := range db.projectors {
+	for _, p := range db.snapshotProjectors() {
 		if p != nil && p.Name() == name {
 			return true
 		}

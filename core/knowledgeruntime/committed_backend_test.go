@@ -6,10 +6,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
 )
+
+const refreshBusyReturnBudget = 50 * time.Millisecond
 
 func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotCreateMissingBleve(t *testing.T) {
 	projectRoot := t.TempDir()
@@ -74,6 +77,23 @@ func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotBuildMissingMet
 	}
 	if _, err := backend.Search(context.Background(), &search.SearchRequest{Query: "anything", Limit: 1}); err != nil {
 		t.Fatalf("Search after metadata-degraded refresh: %v", err)
+	}
+}
+
+func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotWaitBehindWriter(t *testing.T) {
+	backend := NewCommittedKnowledgeBackend(t.TempDir(), nil)
+	defer backend.Close()
+
+	backend.refreshMu.Lock()
+	defer backend.refreshMu.Unlock()
+
+	start := time.Now()
+	err := backend.RefreshExistingFromDisk(context.Background())
+	if !errors.Is(err, ErrCommittedBackendBusy) {
+		t.Fatalf("RefreshExistingFromDisk error = %v, want ErrCommittedBackendBusy", err)
+	}
+	if elapsed := time.Since(start); elapsed > refreshBusyReturnBudget {
+		t.Fatalf("RefreshExistingFromDisk waited %s behind writer, want immediate busy result", elapsed)
 	}
 }
 

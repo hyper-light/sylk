@@ -3,17 +3,21 @@ package forest
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 const (
 	SkillCandidateStatusProposed                  = "proposed"
 	SkillCandidateStatusRejected                  = "rejected"
 	SkillCandidateStatusValidated                 = "validated"
+	SkillCandidateStatusPromotionProposed         = "promotion_proposed"
 	SkillCandidateStatusAcceptedPendingActivation = "accepted_pending_activation"
 	SkillCandidateStatusDuplicate                 = "duplicate"
 
@@ -152,6 +156,16 @@ func (m *MemoryForest) applySkillCandidateGuards(ctx context.Context, candidate 
 		markSkillCandidateRejected(candidate, "permission expansion requires explicit approval claim")
 		return fmt.Errorf("permission expansion requires explicit approval claim")
 	}
+	if len(candidate.PermissionDiff) > 0 {
+		accepted, err := m.acceptedForestClaimExists(ctx, candidate.ExplicitPermissionClaimID)
+		if err != nil {
+			return err
+		}
+		if !accepted {
+			markSkillCandidateRejected(candidate, "permission expansion claim is not accepted")
+			return fmt.Errorf("permission expansion claim %s is not accepted", candidate.ExplicitPermissionClaimID)
+		}
+	}
 	if containsSelfActivationRequest(candidate) {
 		markSkillCandidateRejected(candidate, "skill candidate cannot activate or install itself")
 		return fmt.Errorf("skill candidate cannot activate or install itself")
@@ -206,12 +220,37 @@ func skillNameExists(name string, existing []string) bool {
 
 func containsSelfActivationRequest(candidate *GeneratedSkillCandidate) bool {
 	text := normalizeText(candidate.Name + " " + candidate.Trigger + " " + candidate.PromotionRationale + " " + encodeStringList(candidate.PermissionDiff))
-	for _, denied := range []string{"install itself", "activate itself", "self activate", "self-install"} {
-		if strings.Contains(text, denied) {
+	return containsAnyPhrase(text, deniedSelfActivationPhrases())
+}
+
+func containsAnyPhrase(text string, phrases []string) bool {
+	for _, denied := range phrases {
+		if strings.Contains(text, normalizeText(denied)) {
 			return true
 		}
 	}
 	return false
+}
+
+func deniedSelfActivationPhrases() []string {
+	return []string{"install itself", "activate itself", "self activate", "self-install"}
+}
+
+func deniedSkillAuthorityPhrases() []string {
+	return []string{"install skill", "activate skill", "load extension", "grant permission", "bypass guardian"}
+}
+
+func hiddenPermissionPhrases() []string {
+	return []string{"network access", "filesystem write", "shell command", "external api", "user approval bypass"}
+}
+
+func skillFilesContent(files []SkillCandidateFile) string {
+	var builder strings.Builder
+	for _, file := range files {
+		builder.WriteString(file.Content)
+		builder.WriteByte('\n')
+	}
+	return builder.String()
 }
 
 func skillCandidateFiles(candidate GeneratedSkillCandidate) []SkillCandidateFile {
@@ -225,7 +264,13 @@ func skillCandidateFiles(candidate GeneratedSkillCandidate) []SkillCandidateFile
 		{
 			Path:     path.Join(slug, "examples", "positive.json"),
 			FileKind: "example_fixture",
-			Content:  marshalJSON(map[string]any{"trigger": candidate.Trigger, "role_scope": candidate.RoleScope, "source_meme_ids": candidate.SourceMemeIDs}),
+			Content: marshalJSON(map[string]any{
+				"trigger":          candidate.Trigger,
+				"role_scope":       candidate.RoleScope,
+				"source_meme_ids":  candidate.SourceMemeIDs,
+				"source_node_ids":  candidate.SourceNodeIDs,
+				"source_claim_ids": candidate.SourceClaimIDs,
+			}),
 		},
 		{
 			Path:     path.Join(slug, "validators", "static.json"),
@@ -233,6 +278,10 @@ func skillCandidateFiles(candidate GeneratedSkillCandidate) []SkillCandidateFile
 			Content: marshalJSON(map[string]any{
 				"validators":    skillCandidateValidators(),
 				"proposal_only": true,
+				"regression_set": map[string]any{
+					"baseline_behavior":  "no_active_skill_change",
+					"candidate_behavior": candidate.Trigger,
+				},
 			}),
 		},
 		{
@@ -284,6 +333,9 @@ func (m *MemoryForest) persistSkillCandidate(ctx context.Context, candidate Gene
 	if err := upsertSkillCandidateTx(ctx, tx, candidate); err != nil {
 		return err
 	}
+	if err := m.upsertSkillCandidateArtifactTx(ctx, tx, candidate); err != nil {
+		return err
+	}
 	for _, file := range files {
 		if err := upsertSkillCandidateFileTx(ctx, tx, candidate.CandidateID, file); err != nil {
 			return err
@@ -293,6 +345,71 @@ func (m *MemoryForest) persistSkillCandidate(ctx context.Context, candidate Gene
 		return fmt.Errorf("commit skill candidate tx: %w", err)
 	}
 	return nil
+}
+
+func (m *MemoryForest) upsertSkillCandidateArtifactTx(ctx context.Context, tx *sql.Tx, candidate GeneratedSkillCandidate) error {
+	if ok, err := tableExistsTx(ctx, tx, "forest_artifacts"); err != nil || !ok {
+		return err
+	}
+	now := time.Now().UTC().Unix()
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_artifacts
+			(artifact_id, claim_id, generator_participant, artifact_name, artifact_kind,
+			 data_type, content_ref, status, validation_status, last_sequence,
+			 first_seen_at, last_seen_at, payload_hash, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+		ON CONFLICT(artifact_id) DO UPDATE SET
+			status = excluded.status,
+			validation_status = excluded.validation_status,
+			last_seen_at = excluded.last_seen_at,
+			payload_hash = excluded.payload_hash,
+			metadata = excluded.metadata
+	`, skillCandidateArtifactID(candidate.CandidateID), generatedSkillUtilityClaimID(candidate), "memory_forest",
+		candidate.Name, SkillCandidateArtifactType, "skill_candidate", "forest_skill_candidate:"+candidate.CandidateID,
+		skillCandidateArtifactStatus(candidate), skillCandidateArtifactValidationStatus(candidate), now, now, stableID("skill_candidate_payload", candidate.CandidateID, marshalJSON(candidate)),
+		marshalJSON(map[string]any{
+			"candidate_id":           candidate.CandidateID,
+			"proposal_only":          true,
+			"source_meme_ids":        candidate.SourceMemeIDs,
+			"source_validation_refs": candidate.SourceValidationRefs,
+			"permission_diff":        candidate.PermissionDiff,
+		}))
+	if err != nil {
+		return fmt.Errorf("upsert skill candidate artifact: %w", err)
+	}
+	return nil
+}
+
+func skillCandidateArtifactID(candidateID string) string {
+	return stableID(SkillCandidateArtifactType, strings.TrimSpace(candidateID))
+}
+
+func skillCandidateArtifactStatus(candidate GeneratedSkillCandidate) string {
+	return skillCandidateArtifactStatusForStatus(candidate.Status)
+}
+
+func skillCandidateArtifactStatusForStatus(status string) string {
+	if status == SkillCandidateStatusRejected || status == SkillCandidateStatusDuplicate {
+		return "rejected"
+	}
+	if status == SkillCandidateStatusAcceptedPendingActivation {
+		return "accepted"
+	}
+	return "proposed"
+}
+
+func skillCandidateArtifactValidationStatus(candidate GeneratedSkillCandidate) string {
+	return skillCandidateArtifactValidationStatusForStatus(candidate.Status)
+}
+
+func skillCandidateArtifactValidationStatusForStatus(status string) string {
+	if status == SkillCandidateStatusRejected || status == SkillCandidateStatusDuplicate {
+		return "failed"
+	}
+	if status == SkillCandidateStatusValidated || status == SkillCandidateStatusPromotionProposed || status == SkillCandidateStatusAcceptedPendingActivation {
+		return "validated"
+	}
+	return "requires_validation"
 }
 
 func upsertSkillCandidateTx(ctx context.Context, tx *sql.Tx, candidate GeneratedSkillCandidate) error {
@@ -349,14 +466,57 @@ func (m *MemoryForest) proposeSkillCandidateClaim(ctx context.Context, candidate
 	if len(candidate.SourceValidationRefs) == 0 || candidate.Status != SkillCandidateStatusProposed {
 		return nil
 	}
-	return m.ProposeForestClaim(ctx, ForestClaimProposal{
-		ID:                     "skill_candidate_claim:" + stableID(candidate.CandidateID, encodeStringList(candidate.SourceValidationRefs)),
-		ClusterID:              "skill_foundry",
-		Dimension:              "generated_skill_candidate",
-		Summary:                "Generated skill candidate proposed: " + candidate.Name,
-		EvidenceRefs:           candidate.SourceValidationRefs,
-		GuardianReviewRequired: true,
-	})
+	for _, proposal := range generatedSkillCandidateClaims(candidate) {
+		if err := m.ProposeForestClaim(ctx, proposal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func generatedSkillCandidateClaims(candidate GeneratedSkillCandidate) []ForestClaimProposal {
+	dimensions := []string{
+		"generated_skill_utility",
+		"generated_skill_safety",
+		"generated_skill_correctness",
+		"generated_skill_permission_behavior",
+		"generated_skill_regression_risk",
+	}
+	proposals := make([]ForestClaimProposal, 0, len(dimensions))
+	for _, dimension := range dimensions {
+		proposals = append(proposals, ForestClaimProposal{
+			ID:                     generatedSkillClaimID(candidate, dimension),
+			ClusterID:              "skill_foundry",
+			Dimension:              dimension,
+			Summary:                generatedSkillClaimSummary(candidate, dimension),
+			EvidenceRefs:           candidate.SourceValidationRefs,
+			GuardianReviewRequired: true,
+		})
+	}
+	return proposals
+}
+
+func generatedSkillUtilityClaimID(candidate GeneratedSkillCandidate) string {
+	return generatedSkillClaimID(candidate, "generated_skill_utility")
+}
+
+func generatedSkillClaimID(candidate GeneratedSkillCandidate, dimension string) string {
+	return "skill_candidate_claim:" + stableID(candidate.CandidateID, dimension, encodeStringList(candidate.SourceValidationRefs))
+}
+
+func generatedSkillClaimSummary(candidate GeneratedSkillCandidate, dimension string) string {
+	switch dimension {
+	case "generated_skill_safety":
+		return "Generated skill candidate safety case proposed: " + candidate.Name
+	case "generated_skill_correctness":
+		return "Generated skill candidate correctness case proposed: " + candidate.Name
+	case "generated_skill_permission_behavior":
+		return "Generated skill candidate permission behavior proposed: " + candidate.Name
+	case "generated_skill_regression_risk":
+		return "Generated skill candidate regression risk proposed: " + candidate.Name
+	default:
+		return "Generated skill candidate utility proposed: " + candidate.Name
+	}
 }
 
 func (m *MemoryForest) ValidateSkillCandidate(ctx context.Context, candidateID string) ([]SkillCandidateValidation, error) {
@@ -395,6 +555,10 @@ func runSkillCandidateValidators(candidate GeneratedSkillCandidate, files []Skil
 		validateSkillProposalSafety(candidate),
 		validateSkillFixtures(fileMap),
 		validateSkillSourceEvidence(candidate),
+		validateSkillToolAuthority(candidate, files),
+		validateSkillFixtureExecution(candidate, fileMap),
+		validateSkillRegressionComparison(fileMap),
+		validateSkillHiddenPermissionExpansion(candidate, files),
 	}
 }
 
@@ -425,6 +589,44 @@ func validateSkillSourceEvidence(candidate GeneratedSkillCandidate) SkillCandida
 	return skillValidation("source_evidence", ok, "candidate has source evidence and validation refs", candidate.SourceValidationRefs)
 }
 
+func validateSkillToolAuthority(candidate GeneratedSkillCandidate, files []SkillCandidateFile) SkillCandidateValidation {
+	text := normalizeText(candidate.PromotionRationale + " " + skillFilesContent(files))
+	ok := !containsAnyPhrase(text, deniedSkillAuthorityPhrases())
+	return skillValidation("tool_authority", ok, "candidate does not grant tools, permissions, installation, or activation authority", candidate.SourceValidationRefs)
+}
+
+func validateSkillFixtureExecution(candidate GeneratedSkillCandidate, files map[string]SkillCandidateFile) SkillCandidateValidation {
+	var fixture struct {
+		Trigger     string   `json:"trigger"`
+		Role        string   `json:"role_scope"`
+		SourceMeme  []string `json:"source_meme_ids"`
+		SourceNode  []string `json:"source_node_ids"`
+		SourceClaim []string `json:"source_claim_ids"`
+	}
+	err := json.Unmarshal([]byte(files["positive.json"].Content), &fixture)
+	sourceCount := len(fixture.SourceMeme) + len(fixture.SourceNode) + len(fixture.SourceClaim)
+	ok := err == nil && strings.TrimSpace(fixture.Trigger) == candidate.Trigger && strings.TrimSpace(fixture.Role) == candidate.RoleScope && sourceCount > 0
+	return skillValidation("fixture_execution", ok, "positive fixture parses and binds to the candidate trigger, role, and source memes", candidate.SourceValidationRefs)
+}
+
+func validateSkillRegressionComparison(files map[string]SkillCandidateFile) SkillCandidateValidation {
+	var harness struct {
+		Validators    []string       `json:"validators"`
+		ProposalOnly  bool           `json:"proposal_only"`
+		RegressionSet map[string]any `json:"regression_set"`
+	}
+	err := json.Unmarshal([]byte(files["static.json"].Content), &harness)
+	ok := err == nil && harness.ProposalOnly && len(harness.Validators) >= len(skillCandidateValidators()) && len(harness.RegressionSet) > 0
+	return skillValidation("regression_comparison", ok, "static validator harness declares proposal-only regression comparison fixtures", nil)
+}
+
+func validateSkillHiddenPermissionExpansion(candidate GeneratedSkillCandidate, files []SkillCandidateFile) SkillCandidateValidation {
+	text := normalizeText(skillFilesContent(files))
+	hasHiddenPermission := containsAnyPhrase(text, hiddenPermissionPhrases())
+	ok := !hasHiddenPermission || len(candidate.PermissionDiff) > 0
+	return skillValidation("hidden_permission_expansion", ok, "candidate files contain no hidden permission expansion beyond the declared diff", candidate.SourceValidationRefs)
+}
+
 func skillValidation(name string, ok bool, summary string, evidenceRefs []string) SkillCandidateValidation {
 	status := SkillValidationStatusFailed
 	if ok {
@@ -453,13 +655,31 @@ func (m *MemoryForest) persistSkillCandidateValidation(ctx context.Context, cand
 }
 
 func (m *MemoryForest) updateSkillCandidateStatus(ctx context.Context, candidateID, status string) error {
-	_, err := m.db.ExecContext(ctx, `
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin skill candidate status tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE forest_skill_candidates
 		SET status = ?, updated_at = ?
 		WHERE candidate_id = ?
-	`, status, time.Now().UTC().Unix(), candidateID)
-	if err != nil {
+	`, status, time.Now().UTC().Unix(), candidateID); err != nil {
 		return fmt.Errorf("update skill candidate status: %w", err)
+	}
+	if ok, err := tableExistsTx(ctx, tx, "forest_artifacts"); err != nil {
+		return err
+	} else if ok {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE forest_artifacts
+			SET status = ?, validation_status = ?, last_seen_at = ?
+			WHERE artifact_id = ?
+		`, skillCandidateArtifactStatusForStatus(status), skillCandidateArtifactValidationStatusForStatus(status), time.Now().UTC().Unix(), skillCandidateArtifactID(candidateID)); err != nil {
+			return fmt.Errorf("update skill candidate artifact status: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit skill candidate status tx: %w", err)
 	}
 	return nil
 }
@@ -476,21 +696,61 @@ func (m *MemoryForest) PromoteSkillCandidate(ctx context.Context, candidateID st
 	if !passed {
 		return fmt.Errorf("skill candidate %s has not passed required validations", candidate.CandidateID)
 	}
-	if err := m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusAcceptedPendingActivation); err != nil {
+	if err := m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusPromotionProposed); err != nil {
 		return err
 	}
 	return m.ProposeForestClaim(ctx, ForestClaimProposal{
 		ID:                     "skill_candidate_promotion:" + stableID(candidate.CandidateID),
 		ClusterID:              "skill_foundry",
 		Dimension:              "skill_candidate_promotion",
-		Summary:                "Generated skill candidate accepted pending activation: " + candidate.Name,
+		Summary:                "Generated skill candidate promotion proposed: " + candidate.Name,
 		EvidenceRefs:           candidate.SourceValidationRefs,
 		GuardianReviewRequired: true,
 	})
 }
 
+func (m *MemoryForest) AcceptSkillCandidatePromotion(ctx context.Context, candidateID, acceptedClaimID string) error {
+	candidate, _, err := m.loadSkillCandidate(ctx, candidateID)
+	if err != nil {
+		return err
+	}
+	if candidate.Status != SkillCandidateStatusPromotionProposed {
+		return fmt.Errorf("skill candidate %s status %s is not acceptance-ready", candidate.CandidateID, candidate.Status)
+	}
+	accepted, err := m.acceptedForestClaimExists(ctx, acceptedClaimID)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		return fmt.Errorf("accepted skill promotion claim %s not found", acceptedClaimID)
+	}
+	return m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusAcceptedPendingActivation)
+}
+
 func (m *MemoryForest) ActivateSkillCandidate(ctx context.Context, candidateID string) error {
 	return fmt.Errorf("skill candidate activation is not supported by memory forest; approval must occur outside proposal-only generation")
+}
+
+func (m *MemoryForest) acceptedForestClaimExists(ctx context.Context, claimID string) (bool, error) {
+	if m == nil || m.db == nil {
+		return false, fmt.Errorf("memory forest is required")
+	}
+	claimID = strings.TrimSpace(claimID)
+	if claimID == "" {
+		return false, nil
+	}
+	var count int
+	err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_ledger
+		WHERE subject_type = ?
+		  AND subject_id = ?
+		  AND event_kind = ?
+	`, claims.RelatedTypeClaim, claimID, string(claims.DeltaActionClaimSatisfied)).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("check accepted forest claim: %w", err)
+	}
+	return count > 0, nil
 }
 
 func (m *MemoryForest) skillCandidateValidationGate(ctx context.Context, candidateID string) (bool, error) {
@@ -621,6 +881,10 @@ func skillCandidateValidators() []string {
 		"proposal_only_safety",
 		"fixtures_present",
 		"source_evidence",
+		"tool_authority",
+		"fixture_execution",
+		"regression_comparison",
+		"hidden_permission_expansion",
 	}
 }
 

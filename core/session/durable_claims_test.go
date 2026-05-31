@@ -117,6 +117,66 @@ func TestManager_CreateWiresConfiguredClaimsProjectors(t *testing.T) {
 	}
 }
 
+func TestManager_AddClaimsProjectorQueuesExistingAndFutureSessions(t *testing.T) {
+	root := t.TempDir()
+	mgr := session.NewManager(session.ManagerConfig{})
+	first, err := mgr.Create(context.Background(), session.Config{
+		ID:                 "dynamic-projector-existing",
+		Name:               "dynamic-projector-existing",
+		PersistenceEnabled: true,
+		PersistencePath:    root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.ClaimsBoard().PostAction(context.Background(), claims.Action{AgentID: "guide", Type: claims.ActionTypeTask}, []claims.Claim{{
+		ID:          "claim-existing",
+		AgentID:     "guide",
+		Title:       "Project existing",
+		Description: "Existing outbox records should be queued when the projector is attached.",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	projector := &countingProjector{}
+	if queued := mgr.AddClaimsProjector(projector); queued == 0 {
+		t.Fatalf("queued records = %d, want existing records queued", queued)
+	}
+	first.DurableClaimsBoard().DrainOutbox(context.Background(), claims.DefaultClaimsOperationsConfig().Budgets.OutboxProjectionBatchLimit)
+	if got := projector.count.Load(); got == 0 {
+		t.Fatal("dynamic projector did not project existing session records")
+	}
+
+	second, err := mgr.Create(context.Background(), session.Config{
+		ID:                 "dynamic-projector-future",
+		Name:               "dynamic-projector-future",
+		PersistenceEnabled: true,
+		PersistencePath:    root,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.ClaimsBoard().PostAction(context.Background(), claims.Action{AgentID: "guide", Type: claims.ActionTypeTask}, []claims.Claim{{
+		ID:          "claim-future",
+		AgentID:     "guide",
+		Title:       "Project future",
+		Description: "Future sessions should inherit dynamically attached projectors.",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	before := projector.count.Load()
+	second.DurableClaimsBoard().DrainOutbox(context.Background(), claims.DefaultClaimsOperationsConfig().Budgets.OutboxProjectionBatchLimit)
+	if got := projector.count.Load(); got <= before {
+		t.Fatalf("dynamic projector count = %d, want > %d after future session drain", got, before)
+	}
+	if err := mgr.Close(first.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Close(second.ID()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFeatureFlags_ProjectorsDisabled(t *testing.T) {
 	root := t.TempDir()
 	projector := &countingProjector{}

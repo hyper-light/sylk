@@ -53,6 +53,10 @@ func globalInspectorVisibleSkillNames() []string {
 		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 		"carry_forward",
 	}, "inspector")
 	// Global inspector audits at session level — gets the full

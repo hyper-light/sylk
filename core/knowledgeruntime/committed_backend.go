@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/diagnostics"
 	"github.com/adalundhe/sylk/core/fetch"
 	"github.com/adalundhe/sylk/core/search"
 	"github.com/adalundhe/sylk/core/storage/sylkdir"
@@ -42,6 +43,15 @@ var ErrCommittedBackendUnavailable = errors.New("committed knowledge backend is 
 // ErrCommittedMetadataUnavailable is returned by startup-only read paths when
 // the derived committed metadata cache is not already materialized.
 var ErrCommittedMetadataUnavailable = errors.New("committed knowledge metadata is unavailable")
+
+// ErrCommittedBackendBusy is returned by startup-only read paths when a
+// mutating committed-knowledge operation is already in flight. Startup callers
+// must not wait behind writers; the post-boot sync pipeline will catch up.
+var ErrCommittedBackendBusy = errors.New("committed knowledge backend is busy")
+
+func committedBackendTrace(event string, fields ...any) {
+	diagnostics.LogStartup("committed_backend_"+event, fields...)
+}
 
 // TextDocumentIngestRequest describes a deterministic text document mutation
 // into the committed-global document and knowledge stores.
@@ -534,17 +544,27 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	}
 	canonicalKey := sylkdir.DocumentCanonicalKey(req.DocType, req.Path)
 
+	lockStart := time.Now()
+	committedBackendTrace("upsert_wait_lock", "doc_id", req.DocID, "doc_type", req.DocType.String())
 	b.refreshMu.Lock()
-	defer b.refreshMu.Unlock()
+	committedBackendTrace("upsert_lock_acquired", "wait_ms", time.Since(lockStart).Milliseconds(), "doc_id", req.DocID)
+	upsertStart := time.Now()
+	defer func() {
+		committedBackendTrace("upsert_unlock", "elapsed_ms", time.Since(upsertStart).Milliseconds(), "doc_id", req.DocID)
+		b.refreshMu.Unlock()
+	}()
 
 	sd := sylkdir.New(b.projectRoot)
+	committedBackendTrace("upsert_sylkdir_init_start", "doc_id", req.DocID)
 	if err := sd.Init(); err != nil {
 		return fmt.Errorf("committed ingest: init sylkdir: %w", err)
 	}
+	committedBackendTrace("upsert_sylkdir_lock_start", "doc_id", req.DocID)
 	if err := sd.Lock(); err != nil {
 		return fmt.Errorf("committed ingest: lock sylkdir: %w", err)
 	}
 	defer sd.Unlock()
+	committedBackendTrace("upsert_sylkdir_lock_acquired", "doc_id", req.DocID)
 
 	gm := sylkdir.NewGlobalMetaFromSylkDir(sd)
 	if err := gm.Load(); err != nil {
@@ -573,6 +593,7 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	}); err != nil {
 		return fmt.Errorf("committed ingest: run recovery: %w", err)
 	}
+	committedBackendTrace("upsert_recovery_done", "doc_id", req.DocID)
 
 	var (
 		bleveStore          *sylkdir.GlobalVersionBleveStore
@@ -628,6 +649,7 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	}); err != nil {
 		return fmt.Errorf("committed ingest: commit to global: %w", err)
 	}
+	committedBackendTrace("upsert_commit_done", "doc_id", req.DocID)
 
 	attachedBleve := bleveStore
 	if !refreshAttached {
@@ -636,6 +658,7 @@ func (b *CommittedKnowledgeBackend) upsertJointDocument(ctx context.Context, req
 	if err := b.refreshLocked(ctx, attachedBleve, false, true, false); err != nil {
 		return fmt.Errorf("committed ingest: refresh backend: %w", err)
 	}
+	committedBackendTrace("upsert_refresh_done", "doc_id", req.DocID)
 	transferredAttached = refreshAttached
 	return nil
 }
@@ -768,16 +791,34 @@ func (b *CommittedKnowledgeBackend) unloadEmbedderIfIdle() {
 }
 
 func (b *CommittedKnowledgeBackend) refresh(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool, existingOnly bool) error {
-	b.refreshMu.Lock()
-	defer b.refreshMu.Unlock()
+	lockStart := time.Now()
+	if existingOnly {
+		committedBackendTrace("refresh_try_lock", "existing_only", existingOnly)
+		if !b.refreshMu.TryLock() {
+			committedBackendTrace("refresh_busy", "wait_ms", time.Since(lockStart).Milliseconds())
+			return ErrCommittedBackendBusy
+		}
+	} else {
+		committedBackendTrace("refresh_wait_lock", "existing_only", existingOnly)
+		b.refreshMu.Lock()
+	}
+	committedBackendTrace("refresh_lock_acquired", "wait_ms", time.Since(lockStart).Milliseconds(), "existing_only", existingOnly)
+	refreshStart := time.Now()
+	defer func() {
+		committedBackendTrace("refresh_unlock", "elapsed_ms", time.Since(refreshStart).Milliseconds(), "existing_only", existingOnly)
+		b.refreshMu.Unlock()
+	}()
 	return b.refreshLocked(ctx, attachedBleve, externalBleve, closeRetired, existingOnly)
 }
 
 func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, closeRetired bool, existingOnly bool) error {
+	committedBackendTrace("refresh_locked_start", "external_bleve", externalBleve, "close_retired", closeRetired, "existing_only", existingOnly)
 	nextState, err := b.buildState(ctx, attachedBleve, externalBleve, existingOnly)
 	if err != nil {
+		committedBackendTrace("refresh_locked_build_error", "error", err.Error(), "existing_only", existingOnly)
 		return err
 	}
+	committedBackendTrace("refresh_locked_build_done", "head", nextState.head.String(), "existing_only", existingOnly)
 
 	b.stateMu.Lock()
 	prev := b.state
@@ -787,8 +828,10 @@ func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedB
 		b.retired = nil
 		b.stateMu.Unlock()
 		if err := closeCommittedStates(append(retired, prev)...); err != nil {
+			committedBackendTrace("refresh_locked_close_error", "error", err.Error(), "existing_only", existingOnly)
 			return err
 		}
+		committedBackendTrace("refresh_locked_done", "existing_only", existingOnly)
 		return nil
 	}
 
@@ -801,32 +844,43 @@ func (b *CommittedKnowledgeBackend) refreshLocked(ctx context.Context, attachedB
 		}
 	}
 	b.stateMu.Unlock()
-	return closeCommittedStates(toClose...)
+	if err := closeCommittedStates(toClose...); err != nil {
+		committedBackendTrace("refresh_locked_close_error", "error", err.Error(), "existing_only", existingOnly)
+		return err
+	}
+	committedBackendTrace("refresh_locked_done", "existing_only", existingOnly)
+	return nil
 }
 
 func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBleve *sylkdir.GlobalVersionBleveStore, externalBleve bool, existingOnly bool) (*committedKnowledgeState, error) {
+	buildStart := time.Now()
+	committedBackendTrace("build_state_start", "attached_bleve", attachedBleve != nil, "external_bleve", externalBleve, "existing_only", existingOnly)
 	sd := sylkdir.New(b.projectRoot)
 	gm := sylkdir.NewGlobalMetaFromSylkDir(sd)
 	if err := gm.Load(); err != nil {
 		return nil, fmt.Errorf("committed backend: load global meta: %w", err)
 	}
 	head := gm.GetHead()
+	committedBackendTrace("build_state_global_meta_loaded", "head", head.String(), "elapsed_ms", time.Since(buildStart).Milliseconds())
 
 	nodeStore, err := sylkdir.NewGlobalVersionNodeStore(sd, head)
 	if err != nil {
 		return nil, fmt.Errorf("committed backend: open node store: %w", err)
 	}
+	committedBackendTrace("build_state_node_store_opened", "elapsed_ms", time.Since(buildStart).Milliseconds())
 	edgeStore, err := sylkdir.NewGlobalVersionEdgeStore(sd, head)
 	if err != nil {
 		_ = nodeStore.Close()
 		return nil, fmt.Errorf("committed backend: open edge store: %w", err)
 	}
+	committedBackendTrace("build_state_edge_store_opened", "elapsed_ms", time.Since(buildStart).Milliseconds())
 	docStore, err := sylkdir.NewGlobalVersionDocStore(sd, head)
 	if err != nil {
 		_ = nodeStore.Close()
 		_ = edgeStore.Close()
 		return nil, fmt.Errorf("committed backend: open doc store: %w", err)
 	}
+	committedBackendTrace("build_state_doc_store_opened", "elapsed_ms", time.Since(buildStart).Milliseconds())
 
 	bleveStore := attachedBleve
 	if bleveStore == nil {
@@ -845,6 +899,7 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 		}
 	}
 	bleveStore.SetHead(head)
+	committedBackendTrace("build_state_bleve_opened", "elapsed_ms", time.Since(buildStart).Milliseconds(), "existing_only", existingOnly)
 
 	metaStorePath := filepath.Join(sd.GlobalDataPath(), "committed_metadata.bolt")
 	index, metaStore, err := b.buildMetadataIndex(ctx, head, nodeStore, edgeStore, metaStorePath, existingOnly)
@@ -857,6 +912,7 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 		}
 		return nil, fmt.Errorf("committed backend: open meta store: %w", err)
 	}
+	committedBackendTrace("build_state_metadata_opened", "elapsed_ms", time.Since(buildStart).Milliseconds(), "existing_only", existingOnly)
 
 	return &committedKnowledgeState{
 		head:          head,

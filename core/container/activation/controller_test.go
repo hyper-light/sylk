@@ -824,17 +824,28 @@ func waitForActivationClaims(t *testing.T, board *claims.ClaimsBoard, want int) 
 
 func assertActivationOperationClaim(t *testing.T, board *claims.ClaimsBoard, operation string) {
 	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if hasActivationOperationClaim(board, operation) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("activation operation %q not found", operation)
+}
+
+func hasActivationOperationClaim(board *claims.ClaimsBoard, operation string) bool {
 	for _, claim := range board.Projection().Claims {
 		for _, testament := range board.TestamentsByClaim(claim.ID) {
 			for _, artifact := range testament.Artifacts {
 				data, err := claims.ArtifactData[claims.ActivationRecordArtifactData](artifact)
 				if err == nil && data.Operation == operation {
-					return
+					return true
 				}
 			}
 		}
 	}
-	t.Fatalf("activation operation %q not found", operation)
+	return false
 }
 
 // --- Request Guard Tests ---

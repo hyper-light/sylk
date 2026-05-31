@@ -24,6 +24,8 @@ const (
 
 	MemeOperationExtraction    = "extraction"
 	MemeOperationRecombination = "recombination"
+	MemeOperationMutation      = "mutation"
+	MemeOperationRejection     = "rejection"
 )
 
 type ForestMeme struct {
@@ -62,6 +64,7 @@ type memeExtractionGroup struct {
 	signature  string
 	summary    string
 	nodeIDs    []string
+	edgeIDs    []string
 	grades     []EvidenceGrade
 	confidence float64
 }
@@ -150,7 +153,84 @@ func loadMemeExtractionGroups(ctx context.Context, db *sql.DB, sessionID string,
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate meme extraction nodes: %w", err)
 	}
+	if err := loadMemeExtractionPathGroups(ctx, db, sessionID, limit, groups); err != nil {
+		return nil, err
+	}
 	return groups, nil
+}
+
+func loadMemeExtractionPathGroups(ctx context.Context, db *sql.DB, sessionID string, limit int, groups map[string]memeExtractionGroup) error {
+	query := `
+		SELECT e.edge_id, e.edge_kind, source.node_id, target.node_id,
+		       source.summary, target.summary, source.evidence_grade, target.evidence_grade,
+		       source.confidence, target.confidence
+		FROM forest_node_edges e
+		JOIN forest_nodes source ON source.node_id = e.source_node_id
+		JOIN forest_nodes target ON target.node_id = e.target_node_id
+		WHERE source.evidence_grade IN (?, ?)
+		  AND target.evidence_grade IN (?, ?)
+	`
+	args := []any{
+		string(EvidenceGradeValidated), string(EvidenceGradeFailed),
+		string(EvidenceGradeValidated), string(EvidenceGradeFailed),
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		query += ` AND source.session_id = ? AND target.session_id = ?`
+		args = append(args, strings.TrimSpace(sessionID), strings.TrimSpace(sessionID))
+	}
+	query += ` ORDER BY e.created_at DESC, e.edge_id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("load meme extraction paths: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var edgeID, edgeKind, sourceID, targetID, sourceSummary, targetSummary, sourceGrade, targetGrade string
+		var sourceConfidence, targetConfidence float64
+		if err := rows.Scan(&edgeID, &edgeKind, &sourceID, &targetID, &sourceSummary, &targetSummary, &sourceGrade, &targetGrade, &sourceConfidence, &targetConfidence); err != nil {
+			return fmt.Errorf("scan meme extraction path: %w", err)
+		}
+		group := memeGroupForPath(edgeID, edgeKind, sourceID, targetID, sourceSummary, targetSummary, EvidenceGrade(sourceGrade), EvidenceGrade(targetGrade), sourceConfidence, targetConfidence)
+		if group.signature == "" {
+			continue
+		}
+		key := strings.Join([]string{group.kind, group.polarity, group.signature}, "\x00")
+		merged := groups[key]
+		if merged.kind == "" {
+			merged = group
+		} else {
+			merged.nodeIDs = append(merged.nodeIDs, group.nodeIDs...)
+			merged.edgeIDs = append(merged.edgeIDs, group.edgeIDs...)
+			merged.grades = append(merged.grades, group.grades...)
+			merged.confidence += group.confidence
+		}
+		groups[key] = merged
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate meme extraction paths: %w", err)
+	}
+	return nil
+}
+
+func memeGroupForPath(edgeID, edgeKind, sourceID, targetID, sourceSummary, targetSummary string, sourceGrade, targetGrade EvidenceGrade, sourceConfidence, targetConfidence float64) memeExtractionGroup {
+	polarity := MemePolarityPositive
+	kind := MemeKindRemediation
+	if sourceGrade == EvidenceGradeFailed || targetGrade == EvidenceGradeFailed {
+		polarity = MemePolarityNegative
+		kind = MemeKindNegativePattern
+	}
+	summary := strings.TrimSpace(edgeKind + ": " + sourceSummary + " -> " + targetSummary)
+	return memeExtractionGroup{
+		kind:       kind,
+		polarity:   polarity,
+		signature:  memeSignature(summary),
+		summary:    summary,
+		nodeIDs:    []string{sourceID, targetID},
+		edgeIDs:    []string{edgeID},
+		grades:     []EvidenceGrade{sourceGrade, targetGrade},
+		confidence: clampFinite01(sourceConfidence) + clampFinite01(targetConfidence),
+	}
 }
 
 func memeKindForNode(kind ForestNodeKind, grade EvidenceGrade) (string, string, bool) {
@@ -215,6 +295,34 @@ func upsertMemeExtraction(ctx context.Context, db *sql.DB, group memeExtractionG
 			return fmt.Errorf("upsert meme source: %w", err)
 		}
 	}
+	for _, edgeID := range dedupeStrings(group.edgeIDs) {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO forest_meme_sources
+				(meme_id, source_ref, source_kind, weight, evidence_grade, recorded_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(meme_id, source_ref) DO UPDATE SET
+				weight = excluded.weight,
+				evidence_grade = excluded.evidence_grade,
+				recorded_at = excluded.recorded_at
+		`, memeID, "forest_node_edge:"+edgeID, "forest_node_edge", memeSourceWeight(group), string(memeDominantGrade(group.grades)), now); err != nil {
+			return fmt.Errorf("upsert meme edge source: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO forest_meme_lineage
+			(lineage_id, child_meme_id, parent_meme_ids, operation, reason,
+			 created_at, metadata)
+		VALUES (?, ?, '', ?, ?, ?, ?)
+		ON CONFLICT(lineage_id) DO UPDATE SET
+			created_at = excluded.created_at,
+			metadata = excluded.metadata
+	`, stableID("forest_meme_lineage", memeID, MemeOperationExtraction), memeID, MemeOperationExtraction,
+		"validated repeated forest evidence extraction", now, marshalJSON(map[string]any{
+			"source_node_ids": group.nodeIDs,
+			"source_edge_ids": group.edgeIDs,
+		})); err != nil {
+		return fmt.Errorf("upsert meme extraction lineage: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO forest_meme_fitness
 			(meme_id, fitness_version, fitness, success_count, failure_count,
@@ -247,9 +355,22 @@ func (m *MemoryForest) GenerateMemeCandidates(ctx context.Context, limit int) (M
 	}
 	var result MemeCandidateGenerationResult
 	for i := range memes {
+		if result.Candidates < resolveMemeLimit(limit) {
+			mutated := mutateMeme(memes[i])
+			inserted, err := insertMemeCandidate(ctx, m.db, mutated)
+			if err != nil {
+				return result, err
+			}
+			if inserted {
+				result.Candidates++
+			}
+		}
 		for j := i + 1; j < len(memes) && result.Candidates < resolveMemeLimit(limit); j++ {
 			candidate, err := recombineMemes(memes[i], memes[j])
 			if err != nil {
+				if persistErr := insertRejectedMemeCandidate(ctx, m.db, memes[i], memes[j], err.Error()); persistErr != nil {
+					return result, persistErr
+				}
 				result.Rejected++
 				continue
 			}
@@ -326,20 +447,48 @@ func recombineMemes(left, right ForestMeme) (ForestMeme, error) {
 	}
 	now := time.Now().UTC()
 	return ForestMeme{
-		ID:            stableID("forest_meme_candidate", left.ID, right.ID, signature),
-		Kind:          left.Kind,
-		Signature:     signature,
-		Status:        MemeStatusCandidate,
-		Polarity:      MemePolarityPositive,
-		Summary:       summary,
-		SchemaVersion: memeSchemaVersion(),
-		SourceNodeIDs: dedupeStrings(append(append([]string{}, left.SourceNodeIDs...), right.SourceNodeIDs...)),
-		ParentMemeIDs: dedupeStrings([]string{left.ID, right.ID}),
-		Fitness:       (left.Fitness + right.Fitness) / float64(policyTrialArmCount()),
-		CreatedAt:     now,
-		UpdatedAt:     now,
-		Metadata:      map[string]any{"operation": MemeOperationRecombination},
+		ID:                   stableID("forest_meme_candidate", left.ID, right.ID, signature),
+		Kind:                 left.Kind,
+		Signature:            signature,
+		Status:               MemeStatusCandidate,
+		Polarity:             MemePolarityPositive,
+		Summary:              summary,
+		SchemaVersion:        memeSchemaVersion(),
+		SourceNodeIDs:        dedupeStrings(append(append([]string{}, left.SourceNodeIDs...), right.SourceNodeIDs...)),
+		SourceArtifactRefs:   dedupeStrings(append(append([]string{}, left.SourceArtifactRefs...), right.SourceArtifactRefs...)),
+		SourceValidationRefs: dedupeStrings(append(append([]string{}, left.SourceValidationRefs...), right.SourceValidationRefs...)),
+		ParentMemeIDs:        dedupeStrings([]string{left.ID, right.ID}),
+		Fitness:              (left.Fitness + right.Fitness) / float64(policyTrialArmCount()),
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		Metadata:             map[string]any{"operation": MemeOperationRecombination},
 	}, nil
+}
+
+func mutateMeme(source ForestMeme) ForestMeme {
+	now := time.Now().UTC()
+	summary := strings.TrimSpace("Refine " + source.Summary + " with source validation replay before reuse")
+	signature := memeSignature(summary)
+	return ForestMeme{
+		ID:                   stableID("forest_meme_candidate", source.ID, MemeOperationMutation, signature),
+		Kind:                 source.Kind,
+		Signature:            signature,
+		Status:               MemeStatusCandidate,
+		Polarity:             source.Polarity,
+		Summary:              summary,
+		SchemaVersion:        memeSchemaVersion(),
+		SourceNodeIDs:        source.SourceNodeIDs,
+		SourceArtifactRefs:   source.SourceArtifactRefs,
+		SourceValidationRefs: source.SourceValidationRefs,
+		ParentMemeIDs:        []string{source.ID},
+		Fitness:              source.Fitness,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		Metadata: map[string]any{
+			"operation":                  MemeOperationMutation,
+			"requires_policy_validation": true,
+		},
+	}
 }
 
 func insertMemeCandidate(ctx context.Context, db *sql.DB, meme ForestMeme) (bool, error) {
@@ -364,6 +513,30 @@ func insertMemeCandidate(ctx context.Context, db *sql.DB, meme ForestMeme) (bool
 	return true, nil
 }
 
+func insertRejectedMemeCandidate(ctx context.Context, db *sql.DB, left, right ForestMeme, reason string) error {
+	now := time.Now().UTC()
+	parentIDs := dedupeStrings([]string{left.ID, right.ID})
+	signature := memeSignature(left.Summary + " rejected " + right.Summary)
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO forest_meme_candidates
+			(candidate_id, meme_kind, status, parent_meme_ids, signature, summary,
+			 generation, rejection_reason, created_at, updated_at, metadata)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(meme_kind, signature, parent_meme_ids) DO UPDATE SET
+			status = excluded.status,
+			rejection_reason = excluded.rejection_reason,
+			updated_at = excluded.updated_at,
+			metadata = excluded.metadata
+	`, stableID("forest_meme_rejected", encodeStringList(parentIDs), reason), firstNonEmptyString(left.Kind, right.Kind),
+		MemeStatusRejected, encodeStringList(parentIDs), signature, "Rejected meme variant: "+reason,
+		len(parentIDs), strings.TrimSpace(reason), now.Unix(), now.Unix(),
+		marshalJSON(map[string]any{"operation": MemeOperationRejection}))
+	if err != nil {
+		return fmt.Errorf("insert rejected meme candidate: %w", err)
+	}
+	return nil
+}
+
 func insertMemeLineage(ctx context.Context, db *sql.DB, meme ForestMeme) error {
 	_, err := db.ExecContext(ctx, `
 		INSERT INTO forest_meme_lineage
@@ -372,12 +545,26 @@ func insertMemeLineage(ctx context.Context, db *sql.DB, meme ForestMeme) error {
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(lineage_id) DO NOTHING
 	`, stableID("forest_meme_lineage", meme.ID, encodeStringList(meme.ParentMemeIDs)),
-		meme.ID, encodeStringList(meme.ParentMemeIDs), MemeOperationRecombination,
-		"compatible positive meme recombination", time.Now().UTC().Unix(), marshalJSON(meme.Metadata))
+		meme.ID, encodeStringList(meme.ParentMemeIDs), memeOperation(meme),
+		memeLineageReason(meme), time.Now().UTC().Unix(), marshalJSON(meme.Metadata))
 	if err != nil {
 		return fmt.Errorf("insert meme lineage: %w", err)
 	}
 	return nil
+}
+
+func memeOperation(meme ForestMeme) string {
+	if operation, ok := meme.Metadata["operation"].(string); ok && strings.TrimSpace(operation) != "" {
+		return strings.TrimSpace(operation)
+	}
+	return MemeOperationRecombination
+}
+
+func memeLineageReason(meme ForestMeme) string {
+	if memeOperation(meme) == MemeOperationMutation {
+		return "schema-compatible local meme refinement"
+	}
+	return "compatible positive meme recombination"
 }
 
 func (m *MemoryForest) ActiveNegativeMemeSuppresses(ctx context.Context, text string) (bool, string, error) {

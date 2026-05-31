@@ -62,6 +62,26 @@ func (s *BleveStore) Open() error {
 	return s.manager.Open()
 }
 
+// OpenExisting opens an existing Bleve index without creating, repairing, or
+// rebuilding index files. It is used by startup read paths that must never turn
+// a missing or corrupt derived index into boot-time write work.
+func (s *BleveStore) OpenExisting() error {
+	indexPath := s.IndexPath()
+	if info, err := os.Stat(indexPath); err != nil {
+		return fmt.Errorf("sylkdir: existing bleve index unavailable: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("sylkdir: existing bleve index path is not a directory: %s", indexPath)
+	}
+
+	config := bleve.IndexConfig{
+		Path:          indexPath,
+		MaxConcurrent: runtime.NumCPU(),
+		UnsafeBatch:   true,
+	}
+	s.manager = bleve.NewIndexManagerWithConfig(config)
+	return s.manager.OpenExisting()
+}
+
 // OpenWithConfig opens or creates the Bleve index with custom configuration.
 // The Path field in config is overridden to use this store's path.
 func (s *BleveStore) OpenWithConfig(config bleve.IndexConfig) error {

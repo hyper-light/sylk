@@ -15,9 +15,9 @@ var (
 	A11yAuditPrompt         = prompts.MustLoad("designer", "a11y")
 	TokenValidationPrompt   = prompts.MustLoad("designer", "token")
 
-	DesignerSkillsPolicy   = prompts.MustLoad("designer", "system_skills")
-	DesignerGuardrails     = prompts.MustLoad("designer", "system_guardrails")
-	DesignerCollaboration  = prompts.MustLoad("designer", "collaboration")
+	DesignerSkillsPolicy    = prompts.MustLoad("designer", "system_skills")
+	DesignerGuardrails      = prompts.MustLoad("designer", "system_guardrails")
+	DesignerCollaboration   = prompts.MustLoad("designer", "collaboration")
 	DesignerFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
 	DesignerClaimsNative    = prompts.MustLoad("shared", "claims_native")
 

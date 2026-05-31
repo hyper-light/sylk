@@ -306,10 +306,10 @@ func TestHyperParameterTuner_OverridePriority(t *testing.T) {
 	}
 }
 
-// TestHyperParameterTuner_RuntimePromotion drives the adaptive
-// loop directly: when proposed observations are clearly better than
-// the active arm (and the difference is significant), the proposal
-// is promoted to active.
+// TestHyperParameterTuner_RuntimePromotion drives the adaptive loop
+// directly: when proposed observations are clearly better than the
+// active arm, the policy engine records a promotion proposal. Runtime
+// adaptation does not activate without an accepted claim.
 func TestHyperParameterTuner_RuntimePromotion(t *testing.T) {
 	t.Parallel()
 	db := newRawTunerDB(t)
@@ -355,6 +355,7 @@ func TestHyperParameterTuner_RuntimePromotion(t *testing.T) {
 			Cost:               0.50,
 			Ecology:            0.45,
 			ValidationPassRate: 0.50,
+			ArtifactQuality:    0.50,
 			EvidenceRefs:       []string{fmt.Sprintf("validation:champion:%d", i)},
 			ObservedAt:         time.Now(),
 		}, false)
@@ -368,14 +369,23 @@ func TestHyperParameterTuner_RuntimePromotion(t *testing.T) {
 			Cost:               0.90,
 			Ecology:            0.92,
 			ValidationPassRate: 0.98,
+			ArtifactQuality:    0.98,
 			EvidenceRefs:       []string{fmt.Sprintf("validation:challenger:%d", i)},
 			ObservedAt:         time.Now(),
 		}, true)
 	}
 
 	final := tuner.Get()
-	if final.SnapshotID == original.SnapshotID {
-		t.Fatalf("expected promotion; SnapshotID unchanged at %d", original.SnapshotID)
+	if final.SnapshotID != original.SnapshotID {
+		t.Fatalf("runtime proposal activated without accepted claim: got %d want %d", final.SnapshotID, original.SnapshotID)
+	}
+	assertPolicyCandidateStatus(t, db, PolicyCandidateStatusProposed)
+	var outcomes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_policy_outcomes`).Scan(&outcomes); err != nil {
+		t.Fatalf("count policy outcomes: %v", err)
+	}
+	if outcomes == 0 {
+		t.Fatal("expected persisted policy outcomes")
 	}
 }
 

@@ -11,9 +11,9 @@ import (
 	"github.com/adalundhe/sylk/agents/inspector/shared"
 	agentShared "github.com/adalundhe/sylk/agents/shared"
 	"github.com/adalundhe/sylk/core/activity"
+	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/claims"
 	"github.com/adalundhe/sylk/core/fabric"
-	"github.com/adalundhe/sylk/core/agentlog"
 	"github.com/adalundhe/sylk/core/skills"
 	"github.com/adalundhe/sylk/core/versioning"
 )
@@ -137,7 +137,9 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	pi.skills.Register(claims.QueryBoardSkill(boardProvider, "inspector-pipeline"))
 	pi.skills.Register(claims.RecallForwardSkill(boardProvider, "inspector-pipeline"))
 	pi.skills.Register(claims.PostActionSkill(boardProvider, inboxProvider))
+	pi.skills.Register(claims.SubmitTestamentsSkill(boardProvider))
 	pi.skills.Register(claims.EvaluateValidationSkill(boardProvider))
+	pi.skills.Register(claims.UpdateClaimProgressSkill(boardProvider))
 	pi.skills.Register(claims.PostRemediationClaimsSkill(boardProvider))
 	pi.skills.Register(claims.InspectClaimConflictsSkill(boardProvider))
 	pi.skills.Register(claims.TraverseSkill(boardProvider))
@@ -147,7 +149,6 @@ func (pi *PipelineInspector) registerCoreSkills() {
 	for _, skill := range fabric.ClaimsAwarenessSkills(fabricCfg) {
 		pi.skills.Register(skill)
 	}
-
 
 	// VFS lifecycle skills: handoff_to_ot, discard_pipeline,
 	// finalize_pipeline. Claims-based.

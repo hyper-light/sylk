@@ -92,6 +92,36 @@ func TestGlobalVersionBleveStoreOpenExistingHeadDoesNotCreateMissingIndex(t *tes
 	}
 }
 
+func TestGlobalVersionBleveStoreOpenExistingHeadDoesNotRebuildCorruptIndex(t *testing.T) {
+	tmpDir := t.TempDir()
+	sd := New(tmpDir)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	gm := NewGlobalMetaFromSylkDir(sd)
+	if err := gm.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	gvbs := NewGlobalVersionBleveStore(sd, gm.GetHead())
+	bleveDBPath := filepath.Join(gvbs.HeadBlevePath(), "documents.bleve")
+	if err := os.MkdirAll(bleveDBPath, 0o755); err != nil {
+		t.Fatalf("mkdir corrupt index: %v", err)
+	}
+	markerPath := filepath.Join(bleveDBPath, "not-a-bleve-index")
+	if err := os.WriteFile(markerPath, []byte("corrupt"), 0o644); err != nil {
+		t.Fatalf("write corrupt marker: %v", err)
+	}
+
+	err := gvbs.OpenExistingHead()
+	if !errors.Is(err, ErrBleveHeadUnavailable) {
+		t.Fatalf("OpenExistingHead error = %v, want ErrBleveHeadUnavailable", err)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("corrupt marker was removed or hidden by rebuild: %v", err)
+	}
+}
+
 func TestGlobalVersionBleveStoreIndexAndSearch(t *testing.T) {
 	tmpDir := t.TempDir()
 	sd := New(tmpDir)

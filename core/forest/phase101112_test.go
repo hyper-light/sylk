@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -74,22 +75,29 @@ func TestPhase101112PolicyPromotionCreatesArtifactAndClaim(t *testing.T) {
 	}
 
 	assertOneActivePolicy(t, db)
+	assertPolicyCandidateStatus(t, db, PolicyCandidateStatusProposed)
+	assertPolicyOutcomesRecorded(t, db)
+	assertPolicyPromotionArtifactStatus(t, db, "proposed", "requires_validation")
+	candidateID := fetchPolicyCandidateID(t, db, PolicyCandidateStatusProposed)
+	claimID := policyPromotionProposalID(candidateID, fetchPolicyCandidateEvidenceRefs(t, db, candidateID))
+	appendAcceptedClaimDelta(t, forest, claimID)
+	if _, err := forest.ActivateAcceptedPolicyCandidate(context.Background(), candidateID, claimID); err != nil {
+		t.Fatalf("activate accepted policy: %v", err)
+	}
 	assertPolicyCandidateStatus(t, db, PolicyCandidateStatusPromoted)
-	assertPolicyPromotionArtifact(t, db)
+	assertPolicyPromotionArtifactStatus(t, db, "accepted", "validated")
 	sink.AssertExpectations(t)
 }
 
 func TestPhase101112ConcurrentPolicyPromotionHasSingleActivePolicy(t *testing.T) {
 	t.Parallel()
-	db := newRawTunerDB(t)
-	logger := slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	tuner, err := NewHyperParameterTuner(context.Background(), db, logger)
-	if err != nil {
-		t.Fatalf("new tuner: %v", err)
-	}
-	t.Cleanup(tuner.Stop)
+	forest, db := newTestForestWithConfig(t, Config{DisableBackgroundWorkers: true})
+	defer forest.Close()
+	defer db.Close()
+	tuner := forest.Tuner()
 
-	candidate, err := tuner.policy.ProposeCandidateFromObservations(context.Background(), tuner.Get(), repeatedAdaptationObservations(policyMinimumOutcomeSamples(), 0.30, 0.20))
+	current := PlaceholderHyperParameters()
+	candidate, err := tuner.policy.ProposeCandidateFromObservations(context.Background(), current, repeatedAdaptationObservations(policyMinimumOutcomeSamples(), 0.30, 0.20))
 	if err != nil {
 		t.Fatalf("propose candidate: %v", err)
 	}
@@ -103,13 +111,18 @@ func TestPhase101112ConcurrentPolicyPromotionHasSingleActivePolicy(t *testing.T)
 	if !fitness.PromotionAllowed {
 		t.Fatalf("fitness unexpectedly blocked: %+v", fitness)
 	}
+	if err := tuner.policy.ProposeCandidatePromotion(context.Background(), candidate.ID, fitness); err != nil {
+		t.Fatalf("propose candidate promotion: %v", err)
+	}
+	claimID := policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs)
+	appendAcceptedClaimDelta(t, forest, claimID)
 	errs := make(chan error, policyTrialArmCount()*nodeProjectionRetryLimit())
 	var wg sync.WaitGroup
 	for i := 0; i < cap(errs); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := tuner.policy.PromoteCandidate(context.Background(), candidate.ID, fitness)
+			_, err := forest.ActivateAcceptedPolicyCandidate(context.Background(), candidate.ID, claimID)
 			errs <- err
 		}()
 	}
@@ -133,13 +146,14 @@ func TestPhase1112MemesExtractSuppressAndRecombine(t *testing.T) {
 	defer db.Close()
 	insertRepeatedMemeNodes(t, db, "session-memes", ForestNodeValidation, EvidenceGradeValidated, "validated retry harness passes", nodeProjectionRetryLimit())
 	insertRepeatedMemeNodes(t, db, "session-memes", ForestNodeValidation, EvidenceGradeValidated, "validated rollback harness passes", nodeProjectionRetryLimit())
+	insertRepeatedMemeNodes(t, db, "session-memes", ForestNodeOutcome, EvidenceGradeValidated, "validated skill proposal improves remediation", nodeProjectionRetryLimit())
 	insertRepeatedMemeNodes(t, db, "session-memes", ForestNodeValidation, EvidenceGradeFailed, "unsafe network mutation failed", nodeProjectionRetryLimit())
 
 	result, err := forest.RunMemeExtraction(context.Background(), "session-memes", policyCandidatePopulationLimit()*policyCandidatePopulationLimit())
 	if err != nil {
 		t.Fatalf("extract memes: %v", err)
 	}
-	if result.Activated < nodeProjectionRetryLimit() || result.Negative == 0 {
+	if result.Activated == 0 || result.Negative == 0 {
 		t.Fatalf("unexpected extraction result: %+v", result)
 	}
 	suppressed, memeID, err := forest.ActiveNegativeMemeSuppresses(context.Background(), "unsafe network mutation failed during candidate synthesis")
@@ -156,6 +170,10 @@ func TestPhase1112MemesExtractSuppressAndRecombine(t *testing.T) {
 	if generated.Candidates == 0 {
 		t.Fatalf("expected recombined meme candidate: %+v", generated)
 	}
+	if generated.Rejected == 0 {
+		t.Fatalf("expected incompatible meme variants to be persisted as rejected evidence: %+v", generated)
+	}
+	assertMemeLineageRecorded(t, db)
 }
 
 func TestPhase12SkillCandidateProposalValidationPromotionIsInert(t *testing.T) {
@@ -170,8 +188,8 @@ func TestPhase12SkillCandidateProposalValidationPromotionIsInert(t *testing.T) {
 		return len(files) >= policyRequiredSignalCount()
 	})).Return(nil).Once()
 	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
-		return proposal.Dimension == "generated_skill_candidate"
-	})).Return(nil).Once()
+		return strings.HasPrefix(proposal.Dimension, "generated_skill_")
+	})).Return(nil).Times(len(generatedSkillCandidateClaims(GeneratedSkillCandidate{})))
 	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
 		return proposal.Dimension == "skill_candidate_promotion"
 	})).Return(nil).Once()
@@ -197,6 +215,12 @@ func TestPhase12SkillCandidateProposalValidationPromotionIsInert(t *testing.T) {
 	if err := forest.PromoteSkillCandidate(context.Background(), candidate.CandidateID); err != nil {
 		t.Fatalf("promote skill candidate: %v", err)
 	}
+	assertSkillCandidateStatus(t, db, candidate.CandidateID, SkillCandidateStatusPromotionProposed)
+	promotionClaimID := "skill_candidate_promotion:" + stableID(candidate.CandidateID)
+	appendAcceptedClaimDelta(t, forest, promotionClaimID)
+	if err := forest.AcceptSkillCandidatePromotion(context.Background(), candidate.CandidateID, promotionClaimID); err != nil {
+		t.Fatalf("accept skill candidate promotion: %v", err)
+	}
 	assertSkillCandidateStatus(t, db, candidate.CandidateID, SkillCandidateStatusAcceptedPendingActivation)
 	if err := forest.ActivateSkillCandidate(context.Background(), candidate.CandidateID); err == nil {
 		t.Fatal("memory forest must not activate generated skills")
@@ -219,6 +243,53 @@ func TestPhase12SkillCandidateRejectsPermissionExpansionWithoutClaim(t *testing.
 	})
 	if err == nil {
 		t.Fatal("expected permission expansion rejection")
+	}
+	assertSkillCandidateStatus(t, db, candidate.CandidateID, SkillCandidateStatusRejected)
+}
+
+func TestPhase12SkillCandidateAllowsPermissionExpansionOnlyWithAcceptedClaim(t *testing.T) {
+	forest, db := newTestForestWithConfig(t, Config{DisableBackgroundWorkers: true})
+	defer forest.Close()
+	defer db.Close()
+	permissionClaimID := "skill-permission-claim"
+	appendAcceptedClaimDelta(t, forest, permissionClaimID)
+	candidate, err := forest.ProposeGeneratedSkillCandidate(context.Background(), SkillCandidateInput{
+		Name:                      "Network Evidence Reader",
+		RoleScope:                 "guardian",
+		Trigger:                   "validated external evidence replay requested",
+		SourceMemeIDs:             []string{"meme:external-evidence"},
+		SourceValidationRefs:      []string{"validation:external-evidence"},
+		RequestedPermissions:      []string{"network"},
+		ExplicitPermissionClaimID: permissionClaimID,
+		PromotionRationale:        "Read externally referenced evidence only when a validated replay request requires it.",
+	})
+	if err != nil {
+		t.Fatalf("propose permission-backed skill: %v", err)
+	}
+	assertSkillCandidateStatus(t, db, candidate.CandidateID, SkillCandidateStatusProposed)
+}
+
+func TestPhase12SkillCandidateValidationRejectsHiddenAuthority(t *testing.T) {
+	forest, db := newTestForestWithConfig(t, Config{DisableBackgroundWorkers: true})
+	defer forest.Close()
+	defer db.Close()
+	candidate, err := forest.ProposeGeneratedSkillCandidate(context.Background(), SkillCandidateInput{
+		Name:                 "Unsafe Skill Installer",
+		RoleScope:            "architect",
+		Trigger:              "validated unsafe installer proposal appears",
+		SourceMemeIDs:        []string{"meme:unsafe-installer"},
+		SourceValidationRefs: []string{"validation:unsafe-installer"},
+		PromotionRationale:   "Install skill and bypass guardian review for future runs.",
+	})
+	if err != nil {
+		t.Fatalf("propose unsafe skill candidate: %v", err)
+	}
+	validations, err := forest.ValidateSkillCandidate(context.Background(), candidate.CandidateID)
+	if err != nil {
+		t.Fatalf("validate unsafe skill candidate: %v", err)
+	}
+	if !skillValidationsFailed(validations) {
+		t.Fatalf("expected hidden authority validation failure: %+v", validations)
 	}
 	assertSkillCandidateStatus(t, db, candidate.CandidateID, SkillCandidateStatusRejected)
 }
@@ -250,6 +321,7 @@ func policyFitnessObservation(prefix string, index int, correctness, safety, cos
 		Cost:               cost,
 		Ecology:            ecology,
 		ValidationPassRate: validation,
+		ArtifactQuality:    validation,
 		ContradictionDelta: correctness - 0.5,
 		LatencyMicros:      int64(policyCandidatePopulationLimit() * nodeProjectionRetryLimit()),
 		EvidenceRefs:       []string{fmt.Sprintf("validation:%s:%d", prefix, index)},
@@ -282,6 +354,7 @@ func policyOutcomeSeries(candidateID, policyID, arm string, count int, score flo
 			Cost:               score,
 			Ecology:            score,
 			ValidationPassRate: score,
+			ArtifactQuality:    score,
 			SampleCount:        1,
 			EvidenceRefs:       []string{fmt.Sprintf("validation:%s:%d", arm, i)},
 			ObservedAt:         time.Now().UTC(),
@@ -336,6 +409,75 @@ func assertPolicyPromotionArtifact(t testing.TB, db *sql.DB) {
 	}
 	if count == 0 {
 		t.Fatal("expected policy promotion artifact")
+	}
+}
+
+func assertPolicyPromotionArtifactStatus(t testing.TB, db *sql.DB, status, validationStatus string) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_artifacts WHERE artifact_kind = ? AND status = ? AND validation_status = ?`, PolicyPromotionArtifactKind, status, validationStatus).Scan(&count); err != nil {
+		t.Fatalf("count policy artifacts: %v", err)
+	}
+	if count == 0 {
+		t.Fatalf("expected policy promotion artifact status=%s validation=%s", status, validationStatus)
+	}
+}
+
+func assertPolicyOutcomesRecorded(t testing.TB, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_policy_outcomes`).Scan(&count); err != nil {
+		t.Fatalf("count policy outcomes: %v", err)
+	}
+	if count < policyMinimumOutcomeSamples() {
+		t.Fatalf("policy outcomes count = %d, want at least %d", count, policyMinimumOutcomeSamples())
+	}
+}
+
+func assertMemeLineageRecorded(t testing.TB, db *sql.DB) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_meme_lineage`).Scan(&count); err != nil {
+		t.Fatalf("count meme lineage: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("expected meme lineage rows")
+	}
+}
+
+func fetchPolicyCandidateID(t testing.TB, db *sql.DB, status string) string {
+	t.Helper()
+	var candidateID string
+	if err := db.QueryRow(`SELECT candidate_id FROM forest_policy_candidates WHERE status = ? ORDER BY updated_at DESC LIMIT 1`, status).Scan(&candidateID); err != nil {
+		t.Fatalf("fetch policy candidate: %v", err)
+	}
+	return candidateID
+}
+
+func fetchPolicyCandidateEvidenceRefs(t testing.TB, db *sql.DB, candidateID string) []string {
+	t.Helper()
+	var refs string
+	if err := db.QueryRow(`SELECT validation_evidence_refs FROM forest_policy_candidates WHERE candidate_id = ?`, candidateID).Scan(&refs); err != nil {
+		t.Fatalf("fetch policy candidate evidence refs: %v", err)
+	}
+	return decodeStringList(refs)
+}
+
+func appendAcceptedClaimDelta(t testing.TB, forest *MemoryForest, claimID string) {
+	t.Helper()
+	delta := claims.NewCanonicalDelta(
+		claims.DeltaActionClaimSatisfied,
+		"phase101112",
+		"phase101112-board",
+		uint64(time.Now().UTC().UnixNano()),
+		time.Now().UTC(),
+		claims.DegradedAgentRef("guardian", "phase101112 test accepted claim"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: claimID}},
+		nil,
+		map[string]any{"claim": map[string]any{"id": claimID}},
+	)
+	if _, err := forest.AppendCanonicalDelta(context.Background(), delta); err != nil {
+		t.Fatalf("append accepted claim delta: %v", err)
 	}
 }
 

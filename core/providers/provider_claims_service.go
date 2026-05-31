@@ -3,6 +3,8 @@ package providers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -32,13 +34,35 @@ func newProviderGatewayExecutionBackend(provider ProviderAdapter, req *Request) 
 	}
 }
 
-func (b *providerGatewayExecutionBackend) HandleProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (claims.ProviderGatewayCallArtifactData, error) {
+func (b *providerGatewayExecutionBackend) HandleProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (data claims.ProviderGatewayCallArtifactData, err error) {
+	if b == nil || b.inner == nil {
+		return req.Requested, errProviderGatewayServiceUnavailable
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("provider gateway backend panic: %v", recovered)
+			data = req.Requested
+			data.Error = err.Error()
+			b.mu.Lock()
+			b.data = data
+			b.resp = nil
+			b.mu.Unlock()
+			slogProviderGatewayPanic(recovered)
+		}
+	}()
 	data, resp, err := b.inner.ExecuteProviderGatewayCall(ctx, req)
 	b.mu.Lock()
 	b.data = data
 	b.resp = cloneProviderResponse(resp)
 	b.mu.Unlock()
 	return data, err
+}
+
+func slogProviderGatewayPanic(recovered any) {
+	claims.RouteDebugLog().Info("provider_gateway_backend_panic",
+		"panic", fmt.Sprint(recovered),
+		"stack", string(debug.Stack()),
+	)
 }
 
 func (b *providerGatewayExecutionBackend) Result() (claims.ProviderGatewayCallArtifactData, *Response) {

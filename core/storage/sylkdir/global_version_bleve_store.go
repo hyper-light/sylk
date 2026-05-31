@@ -106,7 +106,7 @@ func (gvbs *GlobalVersionBleveStore) openExistingLocked() error {
 	}
 
 	store := NewBleveStoreAtPath(blevePath)
-	if err := store.Open(); err != nil {
+	if err := store.OpenExisting(); err != nil {
 		_ = store.Close()
 		return fmt.Errorf("%w: open %s: %v", ErrBleveHeadUnavailable, blevePath, err)
 	}

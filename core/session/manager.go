@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -245,16 +246,83 @@ func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bo
 	return board, nil
 }
 
+// AddClaimsProjector attaches a projector to future sessions and to every
+// already-open durable session board. It is used for post-boot knowledge
+// mirror registration so replayed claims are queued without allowing the
+// mirror to mutate `.sylk` during startup.
+func (m *Manager) AddClaimsProjector(projector claims.ClaimsProjector) int {
+	name := sessionProjectorName(projector)
+	if m == nil || name == "" || m.closed.Load() {
+		return 0
+	}
+	if !m.projectorEnabled(name) {
+		return 0
+	}
+	m.addConfiguredProjector(projector, name)
+	return m.addProjectorToOpenSessions(projector)
+}
+
+func (m *Manager) addProjectorToOpenSessions(projector claims.ClaimsProjector) int {
+	queued := 0
+	for _, s := range m.List() {
+		queued += addProjectorToSession(s, projector)
+	}
+	return queued
+}
+
+func addProjectorToSession(s *Session, projector claims.ClaimsProjector) int {
+	if s == nil {
+		return 0
+	}
+	board := s.DurableClaimsBoard()
+	if board == nil {
+		return 0
+	}
+	return board.AddProjector(projector)
+}
+
+func (m *Manager) addConfiguredProjector(projector claims.ClaimsProjector, name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, existing := range m.claimsProjectors {
+		if sessionProjectorName(existing) == name {
+			return
+		}
+	}
+	m.claimsProjectors = append(m.claimsProjectors, projector)
+}
+
+func (m *Manager) projectorEnabled(name string) bool {
+	m.mu.RLock()
+	rollout := m.claimsRollout
+	m.mu.RUnlock()
+	if !rollout.ClaimsOutbox {
+		return false
+	}
+	return name != claims.ProjectorKnowledge || rollout.ClaimsKnowledgeMirrorEnabled()
+}
+
+func sessionProjectorName(projector claims.ClaimsProjector) string {
+	if projector == nil {
+		return ""
+	}
+	return strings.TrimSpace(projector.Name())
+}
+
 func (m *Manager) rolloutProjectors() []claims.ClaimsProjector {
-	if !m.claimsRollout.ClaimsOutbox {
+	m.mu.RLock()
+	rollout := m.claimsRollout
+	configured := append([]claims.ClaimsProjector(nil), m.claimsProjectors...)
+	m.mu.RUnlock()
+	if !rollout.ClaimsOutbox {
 		return nil
 	}
-	projectors := make([]claims.ClaimsProjector, 0, len(m.claimsProjectors))
-	for _, projector := range m.claimsProjectors {
+	projectors := make([]claims.ClaimsProjector, 0, len(configured))
+	for _, projector := range configured {
 		if projector == nil {
 			continue
 		}
-		if projector.Name() == claims.ProjectorKnowledge && !m.claimsRollout.ClaimsKnowledgeMirrorEnabled() {
+		if projector.Name() == claims.ProjectorKnowledge && !rollout.ClaimsKnowledgeMirrorEnabled() {
 			continue
 		}
 		projectors = append(projectors, projector)

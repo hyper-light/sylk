@@ -468,6 +468,7 @@ type bootstrapPhase1 struct {
 	planStore        *architect.PlanStore
 	knowledgeStore   *knowledge.KnowledgeStore
 	knowledgeBackend *knowledgeruntime.CommittedKnowledgeBackend
+	claimsRollout    claims.RolloutConfig
 	forest           *forestsvc.MemoryForest
 	forestContent    *ctxpkg.UniversalContentStore
 	forestVectorDB   *vectorgraphdb.VectorGraphDB
@@ -533,6 +534,7 @@ func (p *bootstrapPhase4) StartKnowledgeSyncAfterBoot(phase1 *bootstrapPhase1) {
 		return
 	}
 	p.knowledgeSyncStartOnce.Do(func() {
+		startClaimsKnowledgeMirrorAfterBoot(phase1)
 		startLibrarianKnowledgeSync(phase1, p, p.knowledgeSyncInitial.Load())
 	})
 }
@@ -1187,15 +1189,12 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	claimsDeltaBus := guide.NewClaimsBusAdapter(guideChannelBus)
 	claimsRollout := claims.RolloutConfigFromEnvironment()
 	claims.SetDefaultRolloutConfig(claimsRollout)
+	phase1.claimsRollout = claimsRollout
 	phase1.knowledgeBackend = knowledgeruntime.NewCommittedKnowledgeBackend(projectRoot, slog.Default())
 	if claimsRollout.ClaimsKnowledgeMirrorEnabled() {
 		claims.SetDefaultRecallForwardEnrichmentProvider(knowledgeruntime.NewClaimsKnowledgeQueryIndex(phase1.knowledgeBackend))
 	} else {
 		claims.SetDefaultRecallForwardEnrichmentProvider(nil)
-	}
-	claimsProjectors := []claims.ClaimsProjector{}
-	if claimsRollout.ClaimsKnowledgeMirrorEnabled() {
-		claimsProjectors = append(claimsProjectors, knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend))
 	}
 	phase1.identityReg = container.NewAgentIdentityRegistryWithUID(phase1.bootIdentity.IdentityRegistryUID, []string{
 		"guide", "architect", "engineer", "designer", "inspector", "tester",
@@ -1207,7 +1206,6 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 		Scope:            phase1.scope,
 		DeltaBus:         claimsDeltaBus,
 		AgentRefResolver: claimsResolver,
-		ClaimsProjectors: claimsProjectors,
 		ClaimsRollout:    &claimsRollout,
 	})
 	phase1.bootDispatchers = claims.NewServiceDispatcherRegistry()
@@ -2003,6 +2001,20 @@ func waitForBootBleveReady(ctx context.Context, store *knowledge.KnowledgeStore)
 		startupTrace("knowledge_boot_bleve_ready_wait_cancelled", "error", ctx.Err().Error())
 	}
 	return nil
+}
+
+func startClaimsKnowledgeMirrorAfterBoot(phase1 *bootstrapPhase1) {
+	if phase1 == nil || phase1.sessionMgr == nil || phase1.knowledgeBackend == nil {
+		startupTrace("claims_knowledge_mirror_after_boot_unavailable")
+		return
+	}
+	if !phase1.claimsRollout.ClaimsKnowledgeMirrorEnabled() {
+		startupTrace("claims_knowledge_mirror_after_boot_disabled")
+		return
+	}
+	projector := knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend)
+	queued := phase1.sessionMgr.AddClaimsProjector(projector)
+	startupTrace("claims_knowledge_mirror_after_boot_registered", "queued_records", queued)
 }
 
 func startLibrarianKnowledgeSync(phase1 *bootstrapPhase1, phase4 *bootstrapPhase4, initialSync bool) {

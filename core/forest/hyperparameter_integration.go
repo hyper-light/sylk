@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
+
+	"github.com/adalundhe/sylk/core/claims"
 )
 
 // ─── Tuner ↔ MemoryForest integration ────────────────────────────────
@@ -190,8 +193,19 @@ func (m *MemoryForest) RecordAdaptationObservation(ctx context.Context, calErr, 
 		CalibrationError: calErr,
 		RegretFrac:       regret,
 		SampleCount:      samples,
+		Correctness:      clampFinite01(1 - calErr),
+		Safety:           clampFinite01(1 - calErr),
+		Cost:             clampFinite01(1 - regret),
+		Ecology:          clampFinite01(1 - regret),
 		ObservedAt:       time.Now().UTC(),
 	}, againstProposed)
+}
+
+func (m *MemoryForest) ActivateAcceptedPolicyCandidate(ctx context.Context, candidateID, acceptedClaimID string) (*HyperParameters, error) {
+	if m == nil || m.tuner == nil {
+		return nil, fmt.Errorf("memory forest tuner is required")
+	}
+	return m.tuner.ActivateAcceptedPolicyCandidate(ctx, candidateID, acceptedClaimID)
 }
 
 // recordAdaptationObservationsForOutcome computes per-retrieval
@@ -233,12 +247,14 @@ func (m *MemoryForest) recordAdaptationObservationsForOutcome(ctx context.Contex
 	// predicted utility, and the score-inversion bookends needed to
 	// compute regret.
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT e.id,
-		       e.hyperparam_snapshot_id,
-		       e.proposed_hyperparams,
-		       rc_branch.predicted_utility,
-		       (SELECT MIN(rc2.base_score)
-		          FROM forest_retrieval_candidates rc2
+			SELECT e.id,
+			       e.hyperparam_snapshot_id,
+			       e.proposed_hyperparams,
+			       rc_branch.predicted_utility,
+			       e.duration_micros,
+			       e.candidate_count,
+			       (SELECT MIN(rc2.base_score)
+			          FROM forest_retrieval_candidates rc2
 		         WHERE rc2.retrieval_event_id = e.id
 		           AND rc2.returned = 1) AS min_returned_base,
 		       (SELECT MAX(rc3.base_score)
@@ -267,10 +283,12 @@ func (m *MemoryForest) recordAdaptationObservationsForOutcome(ctx context.Contex
 			snapshotID      int64
 			proposedInt     int64
 			predictedUtil   float64
+			durationMicros  int64
+			candidateCount  int64
 			minReturnedBase sql.NullFloat64
 			maxUnreturnedB  sql.NullFloat64
 		)
-		if err := rows.Scan(&eventID, &snapshotID, &proposedInt, &predictedUtil, &minReturnedBase, &maxUnreturnedB); err != nil {
+		if err := rows.Scan(&eventID, &snapshotID, &proposedInt, &predictedUtil, &durationMicros, &candidateCount, &minReturnedBase, &maxUnreturnedB); err != nil {
 			if m.logger != nil {
 				m.logger.Debug("forest: adaptation observation scan failed", "err", err.Error())
 			}
@@ -284,15 +302,111 @@ func (m *MemoryForest) recordAdaptationObservationsForOutcome(ctx context.Contex
 		if maxUnreturnedB.Valid && minReturnedBase.Valid && maxUnreturnedB.Float64 > minReturnedBase.Float64 {
 			regret = 1.0
 		}
+		signals := m.policyFitnessSignalsForRetrieval(ctx, since, durationMicros, candidateCount, obsUtility, calErr, regret)
 		m.tuner.ObserveAndAdapt(ctx, AdaptationObservation{
-			CalibrationError: calErr,
-			RegretFrac:       regret,
-			SampleCount:      1,
-			EvidenceRefs:     []string{"forest_retrieval_event:" + eventID},
-			ObservedAt:       now,
+			CalibrationError:   calErr,
+			RegretFrac:         regret,
+			SampleCount:        1,
+			Correctness:        signals.correctness,
+			Safety:             signals.safety,
+			Cost:               signals.cost,
+			Ecology:            signals.ecology,
+			ValidationPassRate: signals.validationPassRate,
+			ArtifactQuality:    signals.artifactQuality,
+			ContradictionDelta: signals.contradictionDelta,
+			LatencyMicros:      durationMicros,
+			EvidenceRefs:       []string{"forest_retrieval_event:" + eventID},
+			ObservedAt:         now,
 		}, proposedInt != 0)
 	}
 	if err := rows.Err(); err != nil && m.logger != nil {
 		m.logger.Debug("forest: adaptation observation iterate failed", "err", err.Error())
 	}
+}
+
+type policyObservationSignals struct {
+	correctness        float64
+	safety             float64
+	cost               float64
+	ecology            float64
+	validationPassRate float64
+	artifactQuality    float64
+	contradictionDelta float64
+}
+
+func (m *MemoryForest) policyFitnessSignalsForRetrieval(ctx context.Context, since int64, durationMicros, candidateCount int64, observedUtility, calibrationError, regret float64) policyObservationSignals {
+	validationPassRate := m.recentValidationPassRate(ctx, since)
+	artifactQuality := m.recentArtifactQuality(ctx, since)
+	ecology := m.recentEcologyScore(ctx, since, validationPassRate)
+	return policyObservationSignals{
+		correctness:        clampFinite01(observedUtility - calibrationError),
+		safety:             validationPassRate,
+		cost:               latencyCostScore(durationMicros, candidateCount),
+		ecology:            ecology,
+		validationPassRate: validationPassRate,
+		artifactQuality:    artifactQuality,
+		contradictionDelta: clamp(regret-calibrationError, -1, 1),
+	}
+}
+
+func (m *MemoryForest) recentValidationPassRate(ctx context.Context, since int64) float64 {
+	passStatuses := []string{string(claims.ValidationStatusValidated), string(claims.ValidationStatusPassed)}
+	var passed, total int64
+	err := m.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COUNT(*)
+		FROM forest_validations
+		WHERE last_seen_at >= ?
+	`, passStatuses[0], passStatuses[1], since).Scan(&passed, &total)
+	if err != nil || total == 0 {
+		return 0
+	}
+	return clampFinite01(float64(passed) / float64(total))
+}
+
+func (m *MemoryForest) recentArtifactQuality(ctx context.Context, since int64) float64 {
+	var validated, total int64
+	err := m.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN validation_status IN (?, ?) OR status = ? THEN 1 ELSE 0 END), 0),
+			COUNT(*)
+		FROM forest_artifacts
+		WHERE last_seen_at >= ?
+	`, string(claims.ValidationStatusValidated), string(claims.ValidationStatusPassed), string(claims.ArtifactStatusValidated), since).Scan(&validated, &total)
+	if err != nil || total == 0 {
+		return 0
+	}
+	return clampFinite01(float64(validated) / float64(total))
+}
+
+func (m *MemoryForest) recentEcologyScore(ctx context.Context, since int64, fallback float64) float64 {
+	var density, contradiction sql.NullFloat64
+	err := m.db.QueryRowContext(ctx, `
+		SELECT AVG(validation_density), AVG(contradiction_load)
+		FROM forest_cluster_metrics
+		WHERE computed_at >= ?
+	`, since).Scan(&density, &contradiction)
+	if err != nil || !density.Valid {
+		return fallback
+	}
+	return clampFinite01(density.Float64 * (1 - clampFinite01(nullFloat64Value(contradiction))))
+}
+
+func latencyCostScore(durationMicros, candidateCount int64) float64 {
+	if durationMicros <= 0 && candidateCount <= 0 {
+		return 0
+	}
+	latencyBudget := float64(time.Second.Microseconds())
+	candidateBudget := float64(policyCandidatePopulationLimit() * nodeProjectionRetryLimit())
+	latencyScore := 1 / (1 + math.Max(0, float64(durationMicros))/latencyBudget)
+	candidateScore := 1 / (1 + math.Max(0, float64(candidateCount))/candidateBudget)
+	return clampFinite01((latencyScore + candidateScore) / float64(policyTrialArmCount()))
+}
+
+func nullFloat64Value(value sql.NullFloat64) float64 {
+	if !value.Valid {
+		return 0
+	}
+	return value.Float64
 }

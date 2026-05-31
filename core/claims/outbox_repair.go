@@ -117,8 +117,9 @@ func (db *DurableBoard) repairProjectors(names []string) []ClaimsProjector {
 	for _, name := range normalizeProjectorNames(names) {
 		allowed[name] = struct{}{}
 	}
-	out := make([]ClaimsProjector, 0, len(db.projectors))
-	for _, projector := range db.projectors {
+	projectors := db.snapshotProjectors()
+	out := make([]ClaimsProjector, 0, len(projectors))
+	for _, projector := range projectors {
 		if projector == nil {
 			continue
 		}

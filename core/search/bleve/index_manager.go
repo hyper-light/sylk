@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/search/query"
 	blevesearch "github.com/blevesearch/bleve/v2/search"
 	"github.com/blevesearch/bleve/v2/search/highlight/highlighter/ansi"
+	"github.com/blevesearch/bleve/v2/search/query"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/adalundhe/sylk/core/search"
@@ -205,6 +205,11 @@ var (
 	// ErrIndexCorrupted indicates the index is corrupted and needs rebuild.
 	ErrIndexCorrupted = errors.New("index is corrupted")
 
+	// ErrIndexUnavailable indicates an existing-only open could not open an
+	// already-materialized index. Unlike Open, existing-only open never creates
+	// or rebuilds index files.
+	ErrIndexUnavailable = errors.New("index is unavailable")
+
 	// ErrRebuildFailed indicates automatic rebuild of corrupted index failed.
 	ErrRebuildFailed = errors.New("index rebuild failed")
 )
@@ -243,10 +248,10 @@ func (h IndexHealth) String() string {
 
 // IndexHealthResult contains the result of a health check.
 type IndexHealthResult struct {
-	Health       IndexHealth
+	Health        IndexHealth
 	DocumentCount uint64
-	Error        error
-	CheckedAt    time.Time
+	Error         error
+	CheckedAt     time.Time
 }
 
 // =============================================================================
@@ -277,8 +282,8 @@ type IndexManager struct {
 	// Batch commit concurrency limiter (W4P.5)
 	// Prevents goroutine explosion by limiting concurrent batch commits.
 	batchSem       chan struct{}
-	batchSemMu     sync.RWMutex  // Protects batchSem access
-	batchSemClosed atomic.Bool   // Tracks if semaphore is closed
+	batchSemMu     sync.RWMutex // Protects batchSem access
+	batchSemClosed atomic.Bool  // Tracks if semaphore is closed
 }
 
 // NewIndexManager creates a new IndexManager for the given path.
@@ -346,6 +351,35 @@ func (m *IndexManager) Open() error {
 	return nil
 }
 
+// OpenExisting opens an already-materialized Bleve index without creating,
+// deleting, repairing, or rebuilding index files. Startup read paths use this
+// so a missing/corrupt derived index is surfaced to the caller instead of
+// turning UI boot into mutating recovery work.
+func (m *IndexManager) OpenExisting() error {
+	configureAnalysisOnce.Do(configureAnalysisQueue)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.index != nil {
+		return ErrIndexAlreadyOpen
+	}
+	if err := m.openExisting(); err != nil {
+		return err
+	}
+	m.initBatchSemaphore()
+	if err := m.verifyExistingOnOpen(); err != nil {
+		_ = m.index.Close()
+		m.index = nil
+		m.closed = true
+		return err
+	}
+	if m.config.AsyncEnabled {
+		m.initAsyncQueue()
+	}
+	return nil
+}
+
 // verifyOnOpen checks index health after opening and handles corruption.
 // Must be called with write lock held.
 func (m *IndexManager) verifyOnOpen() error {
@@ -370,6 +404,20 @@ func (m *IndexManager) verifyOnOpen() error {
 
 	// Attempt auto-rebuild
 	return m.rebuildLocked()
+}
+
+// verifyExistingOnOpen checks health for an existing-only open without invoking
+// auto-rebuild. The caller explicitly chose a non-mutating path.
+func (m *IndexManager) verifyExistingOnOpen() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result := m.verifyIndexHealth(ctx, m.index)
+	m.updateLastHealth(result)
+	if result.Health != IndexHealthCorrupted {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", ErrIndexCorrupted, result.Error)
 }
 
 // rebuildLocked rebuilds the index. Must be called with write lock held.
@@ -519,6 +567,25 @@ func (m *IndexManager) openOrCreate() error {
 	}
 
 	return m.createNewIndex()
+}
+
+// openExisting opens only the configured path. It never falls back to create.
+// Must be called with write lock held.
+func (m *IndexManager) openExisting() error {
+	var idx bleve.Index
+	var err error
+
+	if kvconfig := m.scorchKVConfig(); kvconfig != nil {
+		idx, err = bleve.OpenUsing(m.config.Path, kvconfig)
+	} else {
+		idx, err = bleve.Open(m.config.Path)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrIndexUnavailable, err)
+	}
+	m.index = idx
+	m.closed = false
+	return nil
 }
 
 // scorchIndexType is the Scorch index type name used by bleve v2.

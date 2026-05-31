@@ -91,14 +91,15 @@ func ensureForestPolicySchema(db *sql.DB) error {
 			policy_id TEXT NOT NULL,
 			trial_id TEXT NOT NULL DEFAULT '',
 			arm TEXT NOT NULL,
-			correctness REAL NOT NULL,
-			safety REAL NOT NULL,
-			cost REAL NOT NULL,
-			ecology REAL NOT NULL,
-			validation_pass_rate REAL NOT NULL,
-			latency_micros INTEGER NOT NULL DEFAULT 0,
-			contradiction_delta REAL NOT NULL DEFAULT 0,
-			sample_count INTEGER NOT NULL,
+				correctness REAL NOT NULL,
+				safety REAL NOT NULL,
+				cost REAL NOT NULL,
+				ecology REAL NOT NULL,
+				validation_pass_rate REAL NOT NULL,
+				artifact_quality REAL NOT NULL DEFAULT 0,
+				latency_micros INTEGER NOT NULL DEFAULT 0,
+				contradiction_delta REAL NOT NULL DEFAULT 0,
+				sample_count INTEGER NOT NULL,
 			evidence_refs TEXT NOT NULL DEFAULT '',
 			observed_at INTEGER NOT NULL,
 			metadata TEXT NOT NULL DEFAULT ''
@@ -108,7 +109,10 @@ func ensureForestPolicySchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_forest_policy_outcomes_policy
 			ON forest_policy_outcomes(policy_id, observed_at DESC)`,
 	}
-	return execForestSchemaStatements(db, stmts)
+	if err := execForestSchemaStatements(db, stmts); err != nil {
+		return err
+	}
+	return addColumnIfMissing(db, "forest_policy_outcomes", "artifact_quality", "REAL NOT NULL DEFAULT 0")
 }
 
 func ensureForestMemeSchema(db *sql.DB) error {

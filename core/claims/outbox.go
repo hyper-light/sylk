@@ -131,6 +131,56 @@ func (o *ClaimsOutbox) InsertMany(records []ClaimsOutboxRecord) error {
 	return nil
 }
 
+// AddProjector registers a projector name for future outbox records and marks
+// every existing record that does not already carry that projector as pending.
+// It intentionally does not append a configuration event: projector wiring is
+// process configuration, while per-record success/failure state is still
+// persisted by the normal projector_status events.
+func (o *ClaimsOutbox) AddProjector(name string) int {
+	if o == nil {
+		return 0
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ensureProjectorNameLocked(name)
+	return o.addProjectorSlotsLocked(name, time.Now().UTC())
+}
+
+func (o *ClaimsOutbox) ensureProjectorNameLocked(name string) {
+	for _, existing := range o.projectors {
+		if existing == name {
+			return
+		}
+	}
+	o.projectors = append(o.projectors, name)
+}
+
+func (o *ClaimsOutbox) addProjectorSlotsLocked(name string, now time.Time) int {
+	updated := 0
+	for _, rec := range o.records {
+		updated += projectorSlotAdded(rec, name, len(o.projectors), now)
+	}
+	return updated
+}
+
+func projectorSlotAdded(rec *ClaimsOutboxRecord, name string, capacity int, now time.Time) int {
+	if rec == nil {
+		return 0
+	}
+	if rec.Projectors == nil {
+		rec.Projectors = make(map[string]OutboxProjectorSlot, capacity)
+	}
+	if _, ok := rec.Projectors[name]; ok {
+		return 0
+	}
+	rec.Projectors[name] = OutboxProjectorSlot{Status: OutboxStatusPending, UpdatedAt: now}
+	return 1
+}
+
 func (o *ClaimsOutbox) Pending(projector string, limit int, now time.Time) []ClaimsOutboxRecord {
 	if o == nil {
 		return nil

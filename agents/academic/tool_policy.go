@@ -20,6 +20,10 @@ func academicVisibleSkillNames() []string {
 		"recall_forward",
 		"inspect_claim_conflicts",
 		"traverse",
+		"post_action",
+		"submit_testaments",
+		"evaluate_validation",
+		"update_claim_progress",
 		"carry_forward",
 	}
 	return fabric.AppendFabricAwarenessSkillNames(base)

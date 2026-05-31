@@ -37,7 +37,7 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*ForestPack
 func (m *MemoryForest) retrieveBranchPackets(ctx context.Context, query Query) ([]*BranchPacket, error) {
 	start := time.Now()
 	auditQuery := query
-	hp, isProposed := m.pinHyperparameterSnapshotForRetrieve()
+	hp, isProposed := m.pinHyperparameterSnapshotForRetrieve(ctx, query)
 	packets, audit, err := m.retrieveWithAudit(ctx, query, start, hp, isProposed)
 	finalizeRetrievalAudit(audit, auditQuery, start, err)
 	m.emitRetrievalAudit(ctx, audit)
@@ -76,7 +76,7 @@ func (m *MemoryForest) RetrieveForest(ctx context.Context, query Query) ([]*Fore
 // active snapshot. Nil-tuner path returns the live (placeholder or
 // captured) snapshot via m.hyperparams() for tests that bypass the
 // tuner.
-func (m *MemoryForest) pinHyperparameterSnapshotForRetrieve() (*HyperParameters, bool) {
+func (m *MemoryForest) pinHyperparameterSnapshotForRetrieve(ctx context.Context, query Query) (*HyperParameters, bool) {
 	if m == nil {
 		return PlaceholderHyperParameters(), false
 	}
@@ -84,11 +84,15 @@ func (m *MemoryForest) pinHyperparameterSnapshotForRetrieve() (*HyperParameters,
 		return m.hyperparams(), false
 	}
 	seed := m.retrievalTrialSeed()
-	hp, isProposed := m.tuner.SnapshotForTrial(seed)
+	hp, isProposed := m.tuner.SnapshotForTrialContext(ctx, retrievalTrialCohortKey(query), seed)
 	if hp == nil {
 		return m.hyperparams(), false
 	}
 	return hp, isProposed
+}
+
+func retrievalTrialCohortKey(query Query) string {
+	return stableID("retrieval_trial", query.SessionID, query.TaskID, query.AgentID, query.AgentType, normalizeText(query.Query))
 }
 
 // retrievalTrialSeed produces a per-call seed for SnapshotForTrial.

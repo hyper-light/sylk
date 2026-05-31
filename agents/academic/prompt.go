@@ -9,10 +9,10 @@ import (
 const DefaultMaxOutputTokens = 16384
 
 var (
-	academicBaseSystem       = prompts.MustLoad("academic", "system")
-	academicFabricAwareness  = prompts.MustLoad("shared", "fabric_awareness")
-	academicClaimsNative     = prompts.MustLoad("shared", "claims_native")
-	academicFabricAdvisory   = prompts.MustLoad("shared", "fabric_knowledge_advisory")
+	academicBaseSystem      = prompts.MustLoad("academic", "system")
+	academicFabricAwareness = prompts.MustLoad("shared", "fabric_awareness")
+	academicClaimsNative    = prompts.MustLoad("shared", "claims_native")
+	academicFabricAdvisory  = prompts.MustLoad("shared", "fabric_knowledge_advisory")
 
 	// DefaultSystemPrompt composes the academic's base persona with the
 	// uniform fabric awareness section + knowledge-agent advisory clause.

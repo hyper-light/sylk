@@ -7084,15 +7084,12 @@ func nonZeroChatTime(t time.Time) time.Time {
 	return t
 }
 
-// isVisibleArtifactKindForChat is the chat panel's defensive copy
-// of the bridge's visible-kind allowlist (ui/bridge/claims.go
-// isVisibleStartedArtifactKind / isVisibleCompletedArtifactKind).
-// Keeping a parallel filter here means a regression upstream that
-// emits llm_started or response_text as a regular artifact event
-// cannot revive the "fake claude-opus-4-6 tool row" bug class.
+// isVisibleArtifactKindForChat is the chat panel's defensive copy of the
+// bridge's tool-row allowlist. Lifecycle deltas drive projections and
+// presentations; they are not themselves user-facing tool rows.
 func isVisibleArtifactKindForChat(kind string) bool {
 	switch kind {
-	case "tool_started", "tool_completed", "artifact_lifecycle", "validation_lifecycle":
+	case "tool_started", "tool_completed":
 		return true
 	}
 	return false
