@@ -192,11 +192,7 @@ func (m *Manager) Create(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("session %q: register claims board: %w", session.ID(), err)
 	}
 
-	shard := m.getShard(session.ID())
-
-	shard.mu.Lock()
-	shard.sessions[session.ID()] = session
-	shard.mu.Unlock()
+	m.addSession(session.ID(), session)
 
 	atomic.AddInt64(&m.totalCreated, 1)
 
@@ -279,6 +275,14 @@ func addProjectorToSession(s *Session, projector claims.ClaimsProjector) int {
 		return 0
 	}
 	return board.AddProjector(projector)
+}
+
+func (m *Manager) attachConfiguredProjectors(session *Session) int {
+	queued := 0
+	for _, projector := range m.rolloutProjectors() {
+		queued += addProjectorToSession(session, projector)
+	}
+	return queued
 }
 
 func (m *Manager) addConfiguredProjector(projector claims.ClaimsProjector, name string) {
@@ -669,6 +673,7 @@ func (m *Manager) addSession(id string, session *Session) {
 	shard.mu.Lock()
 	shard.sessions[id] = session
 	shard.mu.Unlock()
+	m.attachConfiguredProjectors(session)
 }
 
 func (m *Manager) emitRestoreEvent(id string) {
