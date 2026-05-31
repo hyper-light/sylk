@@ -109,13 +109,16 @@ func (m *MemoryForest) loadReturnedCandidateRankings(ctx context.Context, since 
 // MRR).
 func (m *MemoryForest) loadSuccessfulOutcomes(ctx context.Context, since time.Time) (map[outcomeKey]time.Time, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT session_id, branch_id, timestamp, payload
-		FROM   forest_events
-		WHERE  event_type = 'outcome_recorded'
-		  AND  timestamp >= ?
-	`, since.Unix())
+		SELECT l.session_id, l.subject_id, l.occurred_at, p.payload
+		FROM   forest_ledger l
+		JOIN   forest_ledger_payloads p ON p.ledger_id = l.id
+		WHERE  l.source_kind = ?
+		  AND  l.subject_type = 'branch'
+		  AND  l.event_kind = 'outcome_recorded'
+		  AND  l.occurred_at >= ?
+	`, string(LedgerSourceForestEvent), since.Unix())
 	if err != nil {
-		return nil, fmt.Errorf("query outcome events: %w", err)
+		return nil, fmt.Errorf("query outcome ledger events: %w", err)
 	}
 	defer rows.Close()
 	out := make(map[outcomeKey]time.Time)

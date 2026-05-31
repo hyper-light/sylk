@@ -68,7 +68,7 @@ func (m *MemoryForest) labelExamplesForOutcomeWithCounterfactuals(ctx context.Co
 }
 
 // applyExplicitLabel marks training rows for branch B in the current
-// session as having an explicit outcome. label_source ∈ {'',
+// session as having an explicit outcome. label_source ∈ {”,
 // 'counterfactual', 'implicit_negative'} is overwritten to
 // 'explicit'; if it's already 'explicit' we leave it so a re-fired
 // outcome doesn't churn updated_at unnecessarily.
@@ -119,11 +119,11 @@ func (m *MemoryForest) applyExplicitLabel(ctx context.Context, branchID, session
 //
 // SQL strategy:
 //
-//	1. find recent retrievals containing branchID via the candidates
-//	   projection (indexed on branch_id);
-//	2. for each retrieval, UPDATE forest_training_examples rows whose
-//	   retrieval_id matches and whose branch_id != branchID, IF the
-//	   row hasn't been explicitly labeled yet.
+//  1. find recent retrievals containing branchID via the candidates
+//     projection (indexed on branch_id);
+//  2. for each retrieval, UPDATE forest_training_examples rows whose
+//     retrieval_id matches and whose branch_id != branchID, IF the
+//     row hasn't been explicitly labeled yet.
 //
 // The denormalized retrieval_id on forest_training_examples (set
 // at recordRetrievalExamples time) is the join key.
@@ -191,7 +191,6 @@ func invertOutcomeStatus(status OutcomeStatus) OutcomeStatus {
 	}
 	return OutcomeStatusMixed
 }
-
 
 // ────────────────────────────────────────────────────────────────────
 // ε-greedy exploration (Issue #3 mechanism C)
@@ -276,11 +275,9 @@ func (m *MemoryForest) startImplicitNegativeSweeper() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("implicit_negative_sweeper", implicitNegativeSweepBatchSize, func() {
 		m.runImplicitNegativeSweeperLoop()
-	}()
+	})
 }
 
 // runImplicitNegativeSweeperLoop drives the sweep on the configured

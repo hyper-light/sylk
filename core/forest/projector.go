@@ -84,10 +84,10 @@ const (
 // now satisfied; Halt closes ALL pending waiter channels (they then
 // re-check halted state on wake and return the halt error).
 type seqNotifier struct {
-	mu          sync.Mutex
-	currentSeq  int64
-	haltedErr   error
-	waiters     []*seqWaiter
+	mu         sync.Mutex
+	currentSeq int64
+	haltedErr  error
+	waiters    []*seqWaiter
 }
 
 type seqWaiter struct {
@@ -234,11 +234,9 @@ func (m *MemoryForest) startBranchProjector() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("branch_projector", projectorBatchSize, func() {
 		m.runBranchProjectorLoop()
-	}()
+	})
 }
 
 // runBranchProjectorLoop is the projector's outer loop. Acquires the
@@ -486,23 +484,21 @@ func outcomeStatusFromPayload(payload map[string]any) OutcomeStatus {
 	return OutcomeStatusMixed
 }
 
-// loadEventsAfterSeq fetches events with seq strictly greater than
-// `after`, in ascending seq order, up to `limit`.
+// loadEventsAfterSeq fetches branch-compatible events from the canonical
+// forest ledger with seq strictly greater than `after`, in ascending seq
+// order, up to `limit`.
 func (m *MemoryForest) loadEventsAfterSeq(after int64, limit int) ([]Event, error) {
 	rows, err := m.db.QueryContext(m.runCtx, `
-		SELECT s.seq,
-		       e.id, e.session_id, e.task_id, e.agent_id, e.agent_type,
-		       e.event_type, e.family, e.scope, e.root_id, e.branch_id,
-		       e.parent_branch_id, e.intent_id, e.content_id, e.source_id,
-		       e.confidence, e.salience, e.timestamp,
-		       e.title, e.summary, e.provenance_refs,
-		       e.supersedes, e.contradicts, e.related_branch_ids, e.payload
-		FROM   forest_event_seq_log s
-		JOIN   forest_events e ON e.id = s.event_id
-		WHERE  s.seq > ?
-		ORDER BY s.seq ASC
+		SELECT l.seq, l.source_id, l.event_kind, l.session_id, l.task_id,
+		       l.subject_id, l.actor_uid, l.actor_type, l.occurred_at,
+		       p.payload
+		FROM   forest_ledger l
+		JOIN   forest_ledger_payloads p ON p.ledger_id = l.id
+		WHERE  l.source_kind = ?
+		  AND  l.seq > ?
+		ORDER BY l.seq ASC
 		LIMIT  ?
-	`, after, limit)
+	`, string(LedgerSourceForestEvent), after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +506,7 @@ func (m *MemoryForest) loadEventsAfterSeq(after int64, limit int) ([]Event, erro
 
 	var out []Event
 	for rows.Next() {
-		ev, scanErr := scanEventRow(rows)
+		ev, scanErr := scanLedgerEventRow(rows)
 		if scanErr != nil {
 			return nil, scanErr
 		}
@@ -522,63 +518,63 @@ func (m *MemoryForest) loadEventsAfterSeq(after int64, limit int) ([]Event, erro
 	return out, nil
 }
 
-// scanEventRow scans an Event row from the join of forest_event_seq_log
-// and forest_events.
-func scanEventRow(rows *sql.Rows) (Event, error) {
+// scanLedgerEventRow scans an Event from the canonical ledger payload and
+// backfills projection-critical fields from the relational ledger columns.
+func scanLedgerEventRow(rows *sql.Rows) (Event, error) {
 	var (
-		event          Event
-		taskID         sql.NullString
-		parentBranchID sql.NullString
-		intentID       sql.NullString
-		contentID      sql.NullString
-		sourceID       sql.NullString
-		ts             int64
-		provenance     sql.NullString
-		supersedes     sql.NullString
-		contradicts    sql.NullString
-		related        sql.NullString
-		payload        sql.NullString
-		eventType      string
-		family         string
-		scope          string
+		event     Event
+		seq       int64
+		sourceID  string
+		eventKind string
+		sessionID string
+		taskID    string
+		subjectID string
+		actorUID  string
+		actorType string
+		occurred  int64
+		payload   string
 	)
 	err := rows.Scan(
-		&event.Seq,
-		&event.ID, &event.SessionID, &taskID, &event.AgentID, &event.AgentType,
-		&eventType, &family, &scope, &event.RootID, &event.BranchID,
-		&parentBranchID, &intentID, &contentID, &sourceID,
-		&event.Confidence, &event.Salience, &ts,
-		&event.Title, &event.Summary, &provenance,
-		&supersedes, &contradicts, &related, &payload,
+		&seq, &sourceID, &eventKind, &sessionID, &taskID,
+		&subjectID, &actorUID, &actorType, &occurred, &payload,
 	)
 	if err != nil {
-		return event, fmt.Errorf("scan event row: %w", err)
+		return event, fmt.Errorf("scan ledger event row: %w", err)
 	}
-	event.TaskID = taskID.String
-	event.ParentBranchID = parentBranchID.String
-	event.IntentID = intentID.String
-	event.ContentID = contentID.String
-	event.SourceID = sourceID.String
-	event.EventType = EventType(eventType)
-	event.Family = TreeFamily(family)
-	event.Scope = MemoryScope(scope)
-	event.Timestamp = time.Unix(ts, 0).UTC()
-	if provenance.Valid {
-		_ = unmarshalJSON(provenance.String, &event.ProvenanceRefs)
+	if err := unmarshalJSON(payload, &event); err != nil {
+		return event, fmt.Errorf("decode ledger event payload: %w", err)
 	}
-	if supersedes.Valid {
-		_ = unmarshalJSON(supersedes.String, &event.Supersedes)
+	event.Seq = seq
+	if event.ID == "" {
+		event.ID = sourceID
 	}
-	if contradicts.Valid {
-		_ = unmarshalJSON(contradicts.String, &event.Contradicts)
+	if event.SourceID == "" {
+		event.SourceID = sourceID
 	}
-	if related.Valid {
-		_ = unmarshalJSON(related.String, &event.RelatedBranchIDs)
+	if event.EventType == "" {
+		event.EventType = EventType(eventKind)
 	}
-	if payload.Valid {
-		_ = unmarshalJSON(payload.String, &event.Payload)
+	if event.SessionID == "" {
+		event.SessionID = sessionID
 	}
-	return event, nil
+	if event.TaskID == "" {
+		event.TaskID = taskID
+	}
+	if event.BranchID == "" {
+		event.BranchID = subjectID
+	}
+	if event.AgentID == "" {
+		event.AgentID = actorUID
+	}
+	if event.AgentType == "" {
+		event.AgentType = actorType
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Unix(occurred, 0).UTC()
+	}
+	prepared := prepareEvent(&event)
+	prepared.Seq = seq
+	return *prepared, nil
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -830,12 +826,12 @@ func (m *MemoryForest) sleepProjector(d time.Duration) bool {
 // no idle polling. Each projector passes its own wake channel so
 // wakes aren't stolen by sibling projectors.
 //
-// Correctness: notifyProjector() is called on every successful
-// AppendEvent commit (and the equivalent on retrieval-audit append
-// for the retrieval-candidates projector). Because the wake channel
-// is cap-1, multiple events between scans collapse to a single wake
-// — but the next process pass drains everything via
-// loadEventsAfterSeq's seq-ordered query, so no event is lost.
+// Correctness: notifyProjector() is called on every successful AppendEvent
+// canonical-ledger append (and the equivalent on retrieval-audit append for
+// the retrieval-candidates projector). Because the wake channel is cap-1,
+// multiple events between scans collapse to a single wake, but the next process
+// pass drains everything via loadEventsAfterSeq's seq-ordered query, so no
+// event is lost.
 //
 // Robustness: a wake CAN race past a draining channel in pathological
 // multi-process scenarios where two writers commit in tight

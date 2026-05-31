@@ -31,11 +31,9 @@ func (m *MemoryForest) startRetrievalCandidatesProjector() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("retrieval_candidates_projector", retrievalCandidatesBatchSize, func() {
 		m.runRetrievalCandidatesProjectorLoop()
-	}()
+	})
 }
 
 // runRetrievalCandidatesProjectorLoop is the projector's outer loop.

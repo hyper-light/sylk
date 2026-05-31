@@ -218,6 +218,35 @@ func (b *ClaimsBoard) OperationsConfig() ClaimsOperationsConfig {
 	return NormalizeClaimsOperationsConfig(cfg)
 }
 
+type ClaimsBoardWiringSnapshot struct {
+	BoardID             string `json:"board_id,omitempty"`
+	SessionID           string `json:"session_id,omitempty"`
+	HasScope            bool   `json:"has_scope"`
+	HasDeltaBus         bool   `json:"has_delta_bus"`
+	HasAgentRefResolver bool   `json:"has_agent_ref_resolver"`
+	LegacySessionNoWAL  bool   `json:"legacy_session_no_wal"`
+}
+
+func (b *ClaimsBoard) WiringSnapshot() ClaimsBoardWiringSnapshot {
+	if b == nil {
+		return ClaimsBoardWiringSnapshot{}
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	snap := ClaimsBoardWiringSnapshot{
+		BoardID:             b.boardID,
+		SessionID:           b.sessionID,
+		HasScope:            b.scope != nil,
+		HasAgentRefResolver: b.agentRefResolver != nil,
+		LegacySessionNoWAL:  b.legacySessionNoWAL,
+	}
+	if b.amplifier != nil {
+		_, noop := b.amplifier.deltaBus.(NoopDeltaBus)
+		snap.HasDeltaBus = b.amplifier.deltaBus != nil && !noop
+	}
+	return snap
+}
+
 // ParentBoardID returns the parent board's ID (empty for root boards).
 func (b *ClaimsBoard) ParentBoardID() string {
 	return b.parentBoardID

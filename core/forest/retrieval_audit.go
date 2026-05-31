@@ -532,11 +532,9 @@ func (m *MemoryForest) startRetrievalAuditDrainer() {
 		return
 	}
 	m.retrievalAuditQueue = make(chan *RetrievalAuditEvent, retrievalAuditQueueCapacity)
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("retrieval_audit_drainer", retrievalAuditQueueCapacity, func() {
 		m.runRetrievalAuditDrainerLoop()
-	}()
+	})
 }
 
 // runRetrievalAuditDrainerLoop is the drainer's main loop. Pulls
@@ -654,7 +652,6 @@ func (m *MemoryForest) WaitForRetrievalAuditDrain(ctx context.Context, timeout t
 		}
 	}
 }
-
 
 // ────────────────────────────────────────────────────────────────────
 // Helpers

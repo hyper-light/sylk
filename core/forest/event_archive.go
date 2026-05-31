@@ -48,11 +48,9 @@ func (m *MemoryForest) startEventArchivalWorker() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorEventArchivalName, m.eventArchiveBatchSize, func() {
 		m.runEventArchivalLoop()
-	}()
+	})
 }
 
 // runEventArchivalLoop drives the archival worker via the canonical
@@ -132,30 +130,30 @@ func (m *MemoryForest) runEventArchiveCycle(ctx context.Context) (int, error) {
 // during archival. payloadCompressed is computed from payload before
 // the archive INSERT.
 type archivableEvent struct {
-	id               string
-	sessionID        string
-	taskID           sql.NullString
-	agentID          sql.NullString
-	agentType        sql.NullString
-	eventType        string
-	family           string
-	scope            string
-	rootID           string
-	branchID         string
-	parentBranchID   sql.NullString
-	intentID         sql.NullString
-	contentID        sql.NullString
-	sourceID         sql.NullString
-	confidence       float64
-	salience         float64
-	timestamp        int64
-	title            sql.NullString
-	summary          sql.NullString
-	provenanceRefs   sql.NullString
-	supersedes       sql.NullString
-	contradicts      sql.NullString
-	relatedBranches  sql.NullString
-	payload          sql.NullString
+	id              string
+	sessionID       string
+	taskID          sql.NullString
+	agentID         sql.NullString
+	agentType       sql.NullString
+	eventType       string
+	family          string
+	scope           string
+	rootID          string
+	branchID        string
+	parentBranchID  sql.NullString
+	intentID        sql.NullString
+	contentID       sql.NullString
+	sourceID        sql.NullString
+	confidence      float64
+	salience        float64
+	timestamp       int64
+	title           sql.NullString
+	summary         sql.NullString
+	provenanceRefs  sql.NullString
+	supersedes      sql.NullString
+	contradicts     sql.NullString
+	relatedBranches sql.NullString
+	payload         sql.NullString
 }
 
 // loadEventArchiveCandidates selects up to `limit` events older than

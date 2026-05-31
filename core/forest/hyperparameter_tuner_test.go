@@ -170,13 +170,8 @@ func TestHyperParameterFitter_FitFromLedger_SubstrateDebounce(t *testing.T) {
 	t.Parallel()
 	db := newRawTunerDB(t)
 
-	if _, err := db.Exec(`
-		CREATE TABLE forest_events (
-			id        TEXT PRIMARY KEY,
-			timestamp INTEGER NOT NULL
-		)
-	`); err != nil {
-		t.Fatalf("create events table: %v", err)
+	if err := ensurePhase123Schema(db); err != nil {
+		t.Fatalf("ensure phase 1-3 schema: %v", err)
 	}
 
 	// Two bursts of intra-burst gaps: one with median ~150ms, another
@@ -188,17 +183,46 @@ func TestHyperParameterFitter_FitFromLedger_SubstrateDebounce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO forest_events (id, timestamp) VALUES (?, ?)`)
+	stmt, err := tx.Prepare(`
+		INSERT INTO forest_ledger
+			(id, source_kind, source_id, source_key, event_kind, session_id,
+			 subject_type, subject_id, occurred_at, inserted_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
 	if err != nil {
-		t.Fatalf("prepare: %v", err)
+		t.Fatalf("prepare ledger: %v", err)
 	}
 	defer stmt.Close()
+	payloadStmt, err := tx.Prepare(`
+		INSERT INTO forest_ledger_payloads (ledger_id, payload_hash, payload, inserted_at)
+		VALUES (?, ?, ?, ?)
+	`)
+	if err != nil {
+		t.Fatalf("prepare payload: %v", err)
+	}
+	defer payloadStmt.Close()
 	insertBurst := func(start time.Time, gap time.Duration, n int, prefix string) {
 		ts := start
 		for i := 0; i < n; i++ {
 			id := fmt.Sprintf("%s-%d", prefix, i)
-			if _, err := stmt.Exec(id, ts.UnixNano()); err != nil {
-				t.Fatalf("insert: %v", err)
+			event := Event{ID: id, SessionID: "session-fit", BranchID: id, EventType: EventTypeDecisionRecorded, Timestamp: ts}
+			payload := marshalJSON(event)
+			if _, err := stmt.Exec(
+				"ledger-"+id,
+				string(LedgerSourceForestEvent),
+				id,
+				"forest_event:"+id,
+				string(EventTypeDecisionRecorded),
+				"session-fit",
+				"branch",
+				id,
+				ts.Unix(),
+				ts.Unix(),
+			); err != nil {
+				t.Fatalf("insert ledger: %v", err)
+			}
+			if _, err := payloadStmt.Exec("ledger-"+id, stableID("payload", id), payload, ts.Unix()); err != nil {
+				t.Fatalf("insert payload: %v", err)
 			}
 			ts = ts.Add(gap)
 		}

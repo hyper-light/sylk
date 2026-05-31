@@ -1186,12 +1186,17 @@ func (m *MemoryForest) findBranchIDsForContent(ctx context.Context, contentIDs [
 		args = append(args, contentID)
 	}
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT content_id, branch_id
-		FROM forest_events
-		WHERE content_id IN (`+strings.Join(placeholders, ",")+`)
-	`, args...)
+		SELECT r.ref_id, l.subject_id
+		FROM forest_ledger_refs r
+		JOIN forest_ledger l ON l.id = r.ledger_id
+		WHERE l.source_kind = ?
+		  AND l.subject_type = 'branch'
+		  AND r.role = 'content'
+		  AND r.ref_type = 'content'
+		  AND r.ref_id IN (`+strings.Join(placeholders, ",")+`)
+	`, append([]any{string(LedgerSourceForestEvent)}, args...)...)
 	if err != nil {
-		return nil, fmt.Errorf("query forest events by content: %w", err)
+		return nil, fmt.Errorf("query forest ledger refs by content: %w", err)
 	}
 	defer rows.Close()
 
@@ -1208,14 +1213,17 @@ func (m *MemoryForest) findBranchIDsForContent(ctx context.Context, contentIDs [
 
 func (m *MemoryForest) loadBranchEvidencePacket(ctx context.Context, branchID string, limit int, includeCounter bool) ([]PacketEvidence, []PacketEvidence, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT content_id, title, summary, confidence, salience, timestamp, provenance_refs, contradicts, payload
-		FROM forest_events
-		WHERE branch_id = ?
-		ORDER BY timestamp DESC
+		SELECT l.occurred_at, p.payload
+		FROM forest_ledger l
+		JOIN forest_ledger_payloads p ON p.ledger_id = l.id
+		WHERE l.source_kind = ?
+		  AND l.subject_type = 'branch'
+		  AND l.subject_id = ?
+		ORDER BY l.occurred_at DESC, l.seq DESC
 		LIMIT ?
-	`, branchID, limit*3)
+	`, string(LedgerSourceForestEvent), branchID, limit*3)
 	if err != nil {
-		return nil, nil, fmt.Errorf("query branch evidence: %w", err)
+		return nil, nil, fmt.Errorf("query branch evidence ledger: %w", err)
 	}
 	defer rows.Close()
 
@@ -1223,37 +1231,33 @@ func (m *MemoryForest) loadBranchEvidencePacket(ctx context.Context, branchID st
 	counter := make([]PacketEvidence, 0, limit)
 	for rows.Next() {
 		var (
-			contentID      sql.NullString
-			title          sql.NullString
-			summary        sql.NullString
-			confidence     float64
-			salience       float64
-			timestamp      int64
-			provenanceRaw  sql.NullString
-			contradictsRaw sql.NullString
-			payloadRaw     sql.NullString
+			occurredAt int64
+			payloadRaw string
 		)
-		if err := rows.Scan(&contentID, &title, &summary, &confidence, &salience, &timestamp, &provenanceRaw, &contradictsRaw, &payloadRaw); err != nil {
+		if err := rows.Scan(&occurredAt, &payloadRaw); err != nil {
 			return nil, nil, fmt.Errorf("scan branch evidence: %w", err)
+		}
+		var event Event
+		if err := unmarshalJSON(payloadRaw, &event); err != nil {
+			return nil, nil, fmt.Errorf("decode branch evidence event: %w", err)
+		}
+		if event.Timestamp.IsZero() {
+			event.Timestamp = time.Unix(occurredAt, 0).UTC()
 		}
 
 		evidence := PacketEvidence{
-			ContentID:  contentID.String,
-			Summary:    chooseText(summary.String, title.String),
-			Confidence: confidence,
-			Salience:   salience,
-			Timestamp:  time.Unix(timestamp, 0).UTC(),
+			ContentID:      event.ContentID,
+			Summary:        chooseText(event.Summary, event.Title),
+			Confidence:     event.Confidence,
+			Salience:       event.Salience,
+			Timestamp:      event.Timestamp,
+			ProvenanceRefs: append([]string(nil), event.ProvenanceRefs...),
 		}
-		_ = unmarshalJSON(provenanceRaw.String, &evidence.ProvenanceRefs)
-		var payload map[string]any
-		_ = unmarshalJSON(payloadRaw.String, &payload)
-		if raw, ok := payload["content_type"].(string); ok {
+		if raw, ok := event.Payload["content_type"].(string); ok {
 			evidence.ContentType = raw
 		}
 
-		var contradicts []string
-		_ = unmarshalJSON(contradictsRaw.String, &contradicts)
-		if len(contradicts) > 0 && includeCounter {
+		if len(event.Contradicts) > 0 && includeCounter {
 			if len(counter) < limit {
 				counter = append(counter, evidence)
 			}

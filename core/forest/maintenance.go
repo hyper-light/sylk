@@ -37,14 +37,14 @@ const (
 	// Default retention windows: 30d for archive cutoffs (forensic
 	// vs storage trade-off); 64 trace rows per branch (matches the
 	// inline warmth pruner so the background path doesn't fight it).
-	defaultTrainingExamplesRetention      = 30 * 24 * time.Hour
-	defaultTrainingExamplesPruneInterval  = 1 * time.Hour
-	defaultSubstrateStateRetention        = 30 * 24 * time.Hour
-	defaultSubstrateStatePruneInterval    = 6 * time.Hour
-	defaultEventArchiveAge                = 30 * 24 * time.Hour
-	defaultRetrievalEventArchiveAge       = 30 * 24 * time.Hour
-	defaultEventArchiveInterval           = 1 * time.Hour
-	defaultEventArchiveBatchSize          = 1000
+	defaultTrainingExamplesRetention     = 30 * 24 * time.Hour
+	defaultTrainingExamplesPruneInterval = 1 * time.Hour
+	defaultSubstrateStateRetention       = 30 * 24 * time.Hour
+	defaultSubstrateStatePruneInterval   = 6 * time.Hour
+	defaultEventArchiveAge               = 30 * 24 * time.Hour
+	defaultRetrievalEventArchiveAge      = 30 * 24 * time.Hour
+	defaultEventArchiveInterval          = 1 * time.Hour
+	defaultEventArchiveBatchSize         = 1000
 
 	// Issue #7 — substrate-mode A/B + replacement defaults.
 	//
@@ -441,11 +441,9 @@ func resolveRetrievalCooldownPenalty(p float64) float64 {
 
 func (m *MemoryForest) startMaintenance() {
 	m.bootstrapMaintenanceState()
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("maintenance", m.replayBatchSize+m.substrateLimit+m.trainingMaxExamples, func() {
 		m.maintenanceLoop()
-	}()
+	})
 }
 
 func (m *MemoryForest) maintenanceLoop() {

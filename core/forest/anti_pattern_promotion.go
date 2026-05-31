@@ -101,11 +101,9 @@ func (m *MemoryForest) startAntiPatternPromoter() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker("anti_pattern_promoter", antiPatternPromotionBatchSize, func() {
 		m.runAntiPatternPromoterLoop()
-	}()
+	})
 }
 
 // runAntiPatternPromoterLoop drives the scan on the configured

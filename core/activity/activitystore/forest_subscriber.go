@@ -8,13 +8,10 @@ import (
 	"github.com/adalundhe/sylk/core/activity"
 )
 
-// ForestSubscriber is a Memory Forest harvest subscriber. It listens
-// for precedent-quality activities — lifecycle closures (consult
-// responses, challenge resolutions), acceptance events (validations,
-// charter ratifications), knowledge pushes (advisories, narrations,
-// precedent emissions), and the high-signal operational primitives
-// (tool calls, LLM round-trips, forest consults) — and forwards them
-// to a caller-supplied harvest function.
+// ForestSubscriber is a Memory Forest traversal/context subscriber. Claims
+// lifecycle truth is ingested from canonical claims deltas, not Fabric activity
+// payloads. This subscriber forwards only non-authoritative operational and
+// traversal observations that help the forest learn how context was used.
 //
 // The harvest function MUST be non-blocking. The canonical wiring
 // pairs this subscriber with HarvestDispatcher (in this package)
@@ -105,49 +102,32 @@ func (f *ForestSubscriber) Receive(ctx context.Context, a activity.AgentActivity
 	f.harvested.Add(1)
 }
 
-// electCandidate is the single source of truth for forest
-// eligibility. Categories, top to bottom:
-//
-//  1. Explicit precedent and consensus decisions — the original
-//     narrow harvest set. These are terminal, high-confidence
-//     signals.
-//  2. Lifecycle closures (consult_response, challenge_response,
-//     validation outcomes, remediation_resolved) — "what answered
-//     what" is the canonical precedent shape.
-//  3. Acceptance and ratification (plan_ratified, charter_ratified,
-//     advisory_emitted/proactive_advisory, narration_emitted) —
-//     the semantic work an agent committed to.
-//  4. Artifacts and review completions — concrete products the
-//     fabric has witnessed flow through review.
-//  5. Operational primitives that carry learning signal
-//     (tool_call_completed, llm_response_completed, forest_consult
-//     emissions) — when successful, these are "this shape of
-//     request actually worked" precedent.
+// electCandidate is the single source of truth for Fabric-side forest
+// eligibility. It deliberately excludes claims, testament, artifact, and
+// validation lifecycle actions because those are authoritative only through
+// canonical claims deltas.
 func (f *ForestSubscriber) electCandidate(a activity.AgentActivity) (string, bool) {
 	switch a.Action {
-	// ── Category 1: explicit precedent + consensus ──
+	// Explicit operational precedent and consensus decisions.
 	case activity.ActionPrecedentEmitted:
 		return "explicit precedent_emitted", true
 	case activity.ActionDecisionPromoted:
 		if a.Confidence == activity.ConfidenceConsensus {
 			return "decision promoted to consensus", true
 		}
-	case activity.ActionValidationAccepted:
-		return "validation accepted (inspector ratification)", true
 	case activity.ActionCharterRatified:
 		return "charter ratified by architect plan acceptance", true
 
-	// ── Category 2: lifecycle closures ──
+	// Agent collaboration observations. These are context traversal facts,
+	// not claim lifecycle truth.
 	case activity.ActionConsultResponse:
-		return "consult answered — request → answer precedent", true
+		return "consult response observed as fabric traversal", true
 	case activity.ActionChallengeResponse:
-		return "challenge resolved — dispute outcome precedent", true
-	case activity.ActionValidationRejected:
-		return "validation rejected — adversarial precedent", true
+		return "challenge response observed as fabric traversal", true
 	case activity.ActionRemediationResolved:
-		return "remediation resolved — recovery precedent", true
+		return "remediation resolved observation", true
 
-	// ── Category 3: acceptance + ratification + knowledge push ──
+	// Knowledge push and authored strategy observations.
 	case activity.ActionPlanRatified:
 		return "plan ratified — authored strategy precedent", true
 	case activity.ActionDecisionDeclared:
@@ -162,13 +142,7 @@ func (f *ForestSubscriber) electCandidate(a activity.AgentActivity) (string, boo
 	case activity.ActionNarrationEmitted:
 		return "narration — high-level agent activity summary", true
 
-	// ── Category 4: artifacts + review completions ──
-	case activity.ActionArtifactPublished:
-		return "artifact published — concrete work product", true
-	case activity.ActionReviewCompleted:
-		return "review completed — witnessed quality pass", true
-
-	// ── Category 5: operational primitives with learning signal ──
+	// Operational primitives with learning signal.
 	case activity.ActionToolCallCompleted:
 		// Successful tool completions are precedent. Failed ones are
 		// also precedent (failure learning), so both states qualify —
@@ -185,19 +159,7 @@ func (f *ForestSubscriber) electCandidate(a activity.AgentActivity) (string, boo
 		// outcome harvester link consult → outcome.
 		return "forest consult emitted", true
 
-	// ── Category 6: claims board lifecycle ──
-	case activity.ActionClaimAccepted:
-		return "claim accepted — positive precedent", true
-	case activity.ActionClaimRejected:
-		return "claim rejected — anti-precedent", true
-	case activity.ActionTestamentSubmitted:
-		return "testament submitted — evidence precedent", true
-	case activity.ActionClaimValidated:
-		return "claim validated — validation outcome", true
-	case activity.ActionBoardComplete:
-		return "board completed — terminal lifecycle", true
-
-	// ── Category 7: claims-graph traversal precedent ──
+	// Claims graph traversal observation only.
 	case activity.ActionTraversalObserved:
 		return "traversal observed — graph walk precedent", true
 	}

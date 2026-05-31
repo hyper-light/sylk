@@ -43,15 +43,15 @@ const (
 // latency percentiles. One Health() call ≈ a handful of indexed
 // SQL reads — call as often as operator polling cadence demands.
 type HealthSnapshot struct {
-	Status       HealthStatus      `json:"status"`
-	Subsystems   []SubsystemHealth `json:"subsystems"`
-	Schema       SchemaHealth      `json:"schema"`
-	SpotChecks   SpotCheckResults  `json:"spot_checks"`
-	LatencyP50µs int64             `json:"latency_p50_micros"`
-	LatencyP95µs int64             `json:"latency_p95_micros"`
-	LatencyP99µs int64             `json:"latency_p99_micros"`
-	LatencySamples int64           `json:"latency_samples"`
-	GeneratedAt  time.Time         `json:"generated_at"`
+	Status         HealthStatus      `json:"status"`
+	Subsystems     []SubsystemHealth `json:"subsystems"`
+	Schema         SchemaHealth      `json:"schema"`
+	SpotChecks     SpotCheckResults  `json:"spot_checks"`
+	LatencyP50µs   int64             `json:"latency_p50_micros"`
+	LatencyP95µs   int64             `json:"latency_p95_micros"`
+	LatencyP99µs   int64             `json:"latency_p99_micros"`
+	LatencySamples int64             `json:"latency_samples"`
+	GeneratedAt    time.Time         `json:"generated_at"`
 }
 
 // SubsystemHealth is per-subsystem operational state. Most fields
@@ -75,21 +75,21 @@ type SubsystemHealth struct {
 // what the latest forest_schema_versions row records. Mismatch =
 // drift (DB migrated by a different build).
 type SchemaHealth struct {
-	Status        HealthStatus `json:"status"`
-	ExpectedHash  string       `json:"expected_hash"`
-	AppliedHash   string       `json:"applied_hash"`
-	AppliedAt     time.Time    `json:"applied_at,omitempty"`
-	MissingTriggers []string   `json:"missing_triggers,omitempty"`
+	Status          HealthStatus `json:"status"`
+	ExpectedHash    string       `json:"expected_hash"`
+	AppliedHash     string       `json:"applied_hash"`
+	AppliedAt       time.Time    `json:"applied_at,omitempty"`
+	MissingTriggers []string     `json:"missing_triggers,omitempty"`
 }
 
 // SpotCheckResults captures the ledger-vs-projection consistency
 // sample. Mismatched > 0 indicates corrupted projections — operator
 // investigates which branches and re-replays from forest_events.
 type SpotCheckResults struct {
-	Status      HealthStatus      `json:"status"`
-	Sampled     int               `json:"sampled"`
-	Mismatched  int               `json:"mismatched"`
-	Mismatches  []SpotCheckIssue  `json:"mismatches,omitempty"`
+	Status     HealthStatus     `json:"status"`
+	Sampled    int              `json:"sampled"`
+	Mismatched int              `json:"mismatched"`
+	Mismatches []SpotCheckIssue `json:"mismatches,omitempty"`
 }
 
 // SpotCheckIssue is one branch whose persisted counters disagree
@@ -130,7 +130,7 @@ const (
 
 	// healthLatencyDegradeP99 / healthLatencyUnhealthyP99 are absolute
 	// p99 ceilings for the operational tiers.
-	healthLatencyDegradeP99   = 500_000  // 0.5s
+	healthLatencyDegradeP99   = 500_000   // 0.5s
 	healthLatencyUnhealthyP99 = 2_000_000 // 2s
 )
 
@@ -557,11 +557,13 @@ func (m *MemoryForest) spotCheckOneBranch(ctx context.Context, b *spotCheckBranc
 	row := m.db.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(SUM(CASE
-				WHEN event_type NOT IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS support_count,
+				WHEN event_kind NOT IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS support_count,
 			COALESCE(SUM(CASE
-				WHEN event_type = ? THEN 1 ELSE 0 END), 0) AS counter_count
-		FROM   forest_events
-		WHERE  branch_id = ?
+				WHEN event_kind = ? THEN 1 ELSE 0 END), 0) AS counter_count
+		FROM   forest_ledger
+		WHERE  source_kind = ?
+		  AND  subject_type = 'branch'
+		  AND  subject_id = ?
 	`,
 		string(EventTypeContradiction),
 		string(EventTypeEcologyPruned),
@@ -569,6 +571,7 @@ func (m *MemoryForest) spotCheckOneBranch(ctx context.Context, b *spotCheckBranc
 		string(EventTypeReplayPromoted),
 		string(EventTypeReplayConsolidated),
 		string(EventTypeContradiction),
+		string(LedgerSourceForestEvent),
 		b.id,
 	)
 	var derivedSupport, derivedCounter int

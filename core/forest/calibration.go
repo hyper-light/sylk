@@ -64,7 +64,7 @@ func calibrationOutcomeWindowSeconds() int64 {
 // over a window. Read by operators + by the ModelCalibration cache
 // (Phase B.4) to annotate outgoing packets.
 type CalibrationSnapshot struct {
-	Model        string              `json:"model"`         // "booster" | "base_scorer"
+	Model        string              `json:"model"` // "booster" | "base_scorer"
 	ModelVersion int64               `json:"model_version,omitempty"`
 	WindowStart  time.Time           `json:"window_start"`
 	WindowEnd    time.Time           `json:"window_end"`
@@ -159,17 +159,20 @@ func (m *MemoryForest) BaseScoreCalibrationSince(ctx context.Context, since time
 // query doesn't depend on SQLite's json1 extension.
 func (m *MemoryForest) loadBoosterCalibrationSamples(ctx context.Context, since time.Time) ([]calibrationSample, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT rc.predicted_utility, e.payload
+		SELECT rc.predicted_utility, p.payload
 		FROM   forest_retrieval_candidates rc
 		JOIN   forest_retrieval_events re ON re.id = rc.retrieval_event_id
-		JOIN   forest_events e
-		    ON e.session_id = rc.session_id
-		   AND e.branch_id  = rc.branch_id
-		WHERE  e.event_type = 'outcome_recorded'
+		JOIN   forest_ledger e
+		    ON e.session_id    = rc.session_id
+		   AND e.subject_type  = 'branch'
+		   AND e.subject_id    = rc.branch_id
+		   AND e.source_kind   = ?
+		JOIN   forest_ledger_payloads p ON p.ledger_id = e.id
+		WHERE  e.event_kind = 'outcome_recorded'
 		  AND  rc.returned    = 1
 		  AND  re.requested_at >= ?
-		  AND  e.timestamp BETWEEN re.requested_at AND (re.requested_at + ?)
-	`, since.Unix(), calibrationOutcomeWindowSeconds())
+		  AND  e.occurred_at BETWEEN re.requested_at AND (re.requested_at + ?)
+	`, string(LedgerSourceForestEvent), since.Unix(), calibrationOutcomeWindowSeconds())
 	if err != nil {
 		return nil, fmt.Errorf("query booster calibration samples: %w", err)
 	}
@@ -181,17 +184,20 @@ func (m *MemoryForest) loadBoosterCalibrationSamples(ctx context.Context, since 
 // base_score is then sigmoid-transformed before binning.
 func (m *MemoryForest) loadBaseScoreCalibrationSamples(ctx context.Context, since time.Time) ([]calibrationSample, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT rc.base_score, e.payload
+		SELECT rc.base_score, p.payload
 		FROM   forest_retrieval_candidates rc
 		JOIN   forest_retrieval_events re ON re.id = rc.retrieval_event_id
-		JOIN   forest_events e
-		    ON e.session_id = rc.session_id
-		   AND e.branch_id  = rc.branch_id
-		WHERE  e.event_type = 'outcome_recorded'
+		JOIN   forest_ledger e
+		    ON e.session_id    = rc.session_id
+		   AND e.subject_type  = 'branch'
+		   AND e.subject_id    = rc.branch_id
+		   AND e.source_kind   = ?
+		JOIN   forest_ledger_payloads p ON p.ledger_id = e.id
+		WHERE  e.event_kind = 'outcome_recorded'
 		  AND  rc.returned    = 1
 		  AND  re.requested_at >= ?
-		  AND  e.timestamp BETWEEN re.requested_at AND (re.requested_at + ?)
-	`, since.Unix(), calibrationOutcomeWindowSeconds())
+		  AND  e.occurred_at BETWEEN re.requested_at AND (re.requested_at + ?)
+	`, string(LedgerSourceForestEvent), since.Unix(), calibrationOutcomeWindowSeconds())
 	if err != nil {
 		return nil, fmt.Errorf("query base-score calibration samples: %w", err)
 	}
@@ -391,8 +397,8 @@ func areaUnderROC(samples []calibrationSample) float64 {
 		return samples[indexed[a]].prediction < samples[indexed[b]].prediction
 	})
 	var (
-		positives  int
-		negatives  int
+		positives       int
+		negatives       int
 		positiveRankSum float64
 	)
 	// Compute average rank for ties: walk groups of equal prediction

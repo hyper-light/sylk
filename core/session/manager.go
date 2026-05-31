@@ -47,6 +47,7 @@ type Manager struct {
 	// the board's amplifier can publish InboxDeltas to subscriber
 	// inboxes via the underlying event bus.
 	deltaBus claims.DeltaBus
+	agentRefResolver claims.AgentRefResolver
 
 	claimsProjectors []claims.ClaimsProjector
 	claimsRollout    claims.RolloutConfig
@@ -88,6 +89,11 @@ type ManagerConfig struct {
 	// durable session root board in addition to the built-in Fabric
 	// projector. Production wires the committed knowledge mirror here.
 	ClaimsProjectors []claims.ClaimsProjector
+
+	// AgentRefResolver resolves legacy agent relation strings into
+	// canonical participant refs for canonical deltas emitted by every
+	// session root board.
+	AgentRefResolver claims.AgentRefResolver
 
 	// ClaimsRollout gates the durable claims board, projection outbox,
 	// claims knowledge mirror, cross-session recall, and scribe
@@ -131,6 +137,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		handlers:         make(map[uint64]EventHandler),
 		scope:            cfg.Scope,
 		deltaBus:         cfg.DeltaBus,
+		agentRefResolver: cfg.AgentRefResolver,
 		claimsProjectors: append([]claims.ClaimsProjector(nil), cfg.ClaimsProjectors...),
 		claimsRollout:    rollout,
 	}
@@ -226,6 +233,7 @@ func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bo
 		SessionDir:         sessionDir,
 		Scope:              boardScope,
 		DeltaBus:           m.deltaBus,
+		AgentRefResolver:   m.agentRefResolver(),
 		Projectors:         m.rolloutProjectors(),
 		DisableOutbox:      !m.claimsRollout.ClaimsOutbox,
 		LegacySessionNoWAL: legacySessionNoWAL,
@@ -235,6 +243,13 @@ func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bo
 		return nil, fmt.Errorf("session %q: open durable claims board: %w", session.ID(), err)
 	}
 	return board, nil
+}
+
+func (m *Manager) agentRefResolver() claims.AgentRefResolver {
+	if m == nil {
+		return nil
+	}
+	return m.agentRefResolver
 }
 
 func (m *Manager) rolloutProjectors() []claims.ClaimsProjector {

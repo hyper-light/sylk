@@ -1,8 +1,8 @@
 package forest
 
 import (
-	cryptorand "crypto/rand"
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/adalundhe/sylk/core/claims"
 	ctxpkg "github.com/adalundhe/sylk/core/context"
 	"github.com/adalundhe/sylk/core/knowledge/memory"
 )
@@ -262,6 +263,14 @@ type Config struct {
 	// cycle. Limits the per-cycle transaction size.
 	// Default: defaultEventArchiveBatchSize (1000).
 	EventArchiveBatchSize int
+
+	// ClaimsDeltaSubscriber enables claims-native ingestion. When set,
+	// canonical claims deltas are ingested into forest_ledger and
+	// artifact/validation evidence projections. This replaces the legacy
+	// claims activity harvester for claims lifecycle semantics.
+	ClaimsDeltaSubscriber    claims.DeltaSubscriber
+	ClaimsDeltaSessionFilter string
+	DeltaIngestQueueCapacity int
 }
 
 // MemoryForest provides forest projection, retrieval, and learning services.
@@ -280,12 +289,13 @@ type MemoryForest struct {
 	// here via Subscribe; readers go through snapshot.Load() so
 	// runtime adaptation promotions take effect on every existing
 	// hot-path read without explicit invalidation.
-	tuner    *HyperParameterTuner
-	snapshot atomic.Pointer[HyperParameters]
+	tuner               *HyperParameterTuner
+	snapshot            atomic.Pointer[HyperParameters]
 	snapshotUnsubscribe func()
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
+	runtime   *Runtime
 
 	// Tunables migrated to the tuner snapshot:
 	//   replayDelay, substrateDebounce, trainingDebounce →
@@ -313,10 +323,10 @@ type MemoryForest struct {
 	// projector reads first consumes it, leaving the other to wait
 	// out the poll interval. Separate channels means each projector
 	// is notified independently when its source advances.
-	projectorWake               chan struct{} // branch projector wake
-	retrievalCandidatesWake     chan struct{} // retrieval candidates projector wake
-	projectorID                 string
-	synchronousProjection       bool
+	projectorWake           chan struct{} // branch projector wake
+	retrievalCandidatesWake chan struct{} // retrieval candidates projector wake
+	projectorID             string
+	synchronousProjection   bool
 
 	// seqNotify broadcasts projection watermark advances so
 	// WaitForBranchSeq is event-driven (no DB polling). Updated
@@ -346,8 +356,8 @@ type MemoryForest struct {
 
 	// Background pruner — bounds forest_retrieval_candidates growth.
 	// Lease-coordinated, drain-then-sleep, panic-recovered.
-	retrievalCandidatesRetention      time.Duration
-	retrievalCandidatesPruneInterval  time.Duration
+	retrievalCandidatesRetention     time.Duration
+	retrievalCandidatesPruneInterval time.Duration
 
 	// Issue #7 — substrate mode + A/B sampling. The dominant mode
 	// runs unless A/B sampling fires for a given retrieval (sampled
@@ -380,6 +390,7 @@ type MemoryForest struct {
 	baseScoreABRate        float64
 	baseScoreModeRng       *mathrand.Rand
 	baseScoreModeRngMu     sync.Mutex
+	deltaIngestor          *DeltaIngestor
 
 	// Issue #9 — base-score calibration cache. Single atomic-pointer
 	// holder so the Retrieve hot path stamps a recent ECE-derived
@@ -392,16 +403,16 @@ type MemoryForest struct {
 	// forest_projector_state, drain-then-sleep cadence, errors as
 	// artifacts on the lease row. Configurable retention windows +
 	// scan intervals.
-	branchTraceRetentionPerBranch    int
-	branchTracePruneInterval         time.Duration
-	trainingExamplesRetention        time.Duration
-	trainingExamplesPruneInterval    time.Duration
-	substrateStateRetention          time.Duration
-	substrateStatePruneInterval      time.Duration
-	eventArchiveAge                  time.Duration
-	retrievalEventArchiveAge         time.Duration
-	eventArchiveInterval             time.Duration
-	eventArchiveBatchSize            int
+	branchTraceRetentionPerBranch int
+	branchTracePruneInterval      time.Duration
+	trainingExamplesRetention     time.Duration
+	trainingExamplesPruneInterval time.Duration
+	substrateStateRetention       time.Duration
+	substrateStatePruneInterval   time.Duration
+	eventArchiveAge               time.Duration
+	retrievalEventArchiveAge      time.Duration
+	eventArchiveInterval          time.Duration
+	eventArchiveBatchSize         int
 
 	// explorationRng is a *mathrand.Rand seeded at construction.
 	// Guarded by explorationRngMu — Go's math/rand source is not
@@ -455,28 +466,29 @@ func New(cfg Config) (*MemoryForest, error) {
 	_ = hp // kept while migrating fields → snapshot.Load() reads
 
 	service := &MemoryForest{
-		db:                  cfg.DB,
-		contentStore:        cfg.ContentStore,
-		searcher:            cfg.Searcher,
-		logger:              logger,
-		warmth:              newWarmthStore(cfg.DB, cfg.MaxTraces),
-		models:              models,
-		booster:             booster,
-		tuner:               tuner,
-		runCtx:              runCtx,
-		runCancel:           runCancel,
-		replayBatchSize:     resolveForestReplayBatchSize(cfg.ReplayBatchSize),
-		substrateLimit:      resolveForestSubstrateLimit(cfg.SubstrateLimit),
-		trainingMaxExamples: resolveForestTrainingExamples(cfg.TrainingMaxExamples),
-		maintenanceWake:               make(chan struct{}, 1),
-		pendingSubstrate:              make(map[string]scheduledForestWork),
-		projectorWake:                 make(chan struct{}, 1),
-		retrievalCandidatesWake:       make(chan struct{}, 1),
-		projectorID:                   generateProjectorID(),
-		synchronousProjection:         cfg.SynchronousProjection,
-		seqNotify:                     newSeqNotifier(),
-		retrievalAuditIdle:            make(chan struct{}, 1),
-		explorationRng:                newExplorationRng(cfg.ExplorationSeed),
+		db:                               cfg.DB,
+		contentStore:                     cfg.ContentStore,
+		searcher:                         cfg.Searcher,
+		logger:                           logger,
+		warmth:                           newWarmthStore(cfg.DB, cfg.MaxTraces),
+		models:                           models,
+		booster:                          booster,
+		tuner:                            tuner,
+		runCtx:                           runCtx,
+		runCancel:                        runCancel,
+		runtime:                          newRuntime(runCtx, logger),
+		replayBatchSize:                  resolveForestReplayBatchSize(cfg.ReplayBatchSize),
+		substrateLimit:                   resolveForestSubstrateLimit(cfg.SubstrateLimit),
+		trainingMaxExamples:              resolveForestTrainingExamples(cfg.TrainingMaxExamples),
+		maintenanceWake:                  make(chan struct{}, 1),
+		pendingSubstrate:                 make(map[string]scheduledForestWork),
+		projectorWake:                    make(chan struct{}, 1),
+		retrievalCandidatesWake:          make(chan struct{}, 1),
+		projectorID:                      generateProjectorID(),
+		synchronousProjection:            cfg.SynchronousProjection,
+		seqNotify:                        newSeqNotifier(),
+		retrievalAuditIdle:               make(chan struct{}, 1),
+		explorationRng:                   newExplorationRng(cfg.ExplorationSeed),
 		antiPatternFailureThreshold:      resolveAntiPatternFailureThreshold(cfg.AntiPatternFailureThreshold),
 		antiPatternFailureRate:           resolveAntiPatternFailureRate(cfg.AntiPatternFailureRate),
 		antiPatternPromotionInterval:     resolveAntiPatternPromotionInterval(cfg.AntiPatternPromotionInterval),
@@ -527,6 +539,14 @@ func New(cfg Config) (*MemoryForest, error) {
 			"retention", service.retrievalCandidatesRetention.String(),
 			"attribution_window", outcomeAttributionWindow.String(),
 		)
+	}
+
+	if cfg.ClaimsDeltaSubscriber != nil {
+		if _, err := service.MountClaimsDeltaIngestion(cfg.ClaimsDeltaSubscriber, cfg.ClaimsDeltaSessionFilter, cfg.DeltaIngestQueueCapacity); err != nil {
+			runCancel()
+			tuner.Stop()
+			return nil, fmt.Errorf("forest: mount claims delta ingestion: %w", err)
+		}
 	}
 
 	service.startMaintenance()
@@ -617,18 +637,51 @@ func (m *MemoryForest) CloseWithContext(ctx context.Context) error {
 		}
 		close(m.stopCh)
 	})
-	waitDone := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(waitDone)
-	}()
-	select {
-	case <-waitDone:
-		m.closeTuner()
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("forest close: workers did not drain: %w", ctx.Err())
+	if m.runtime != nil {
+		if err := m.runtime.Close(ctx); err != nil {
+			return err
+		}
+	} else {
+		waitDone := make(chan struct{})
+		go func() {
+			m.wg.Wait()
+			close(waitDone)
+		}()
+		select {
+		case <-waitDone:
+		case <-ctx.Done():
+			return fmt.Errorf("forest close: workers did not drain: %w", ctx.Err())
+		}
 	}
+	m.closeTuner()
+	return nil
+}
+
+func (m *MemoryForest) startWorker(name string, queueLimit int, run func()) {
+	if m == nil || run == nil {
+		return
+	}
+	if m.runtime != nil {
+		if err := m.runtime.StartWorker(name, queueLimit, func(context.Context) error {
+			run()
+			return nil
+		}); err != nil {
+			m.logger.Error("forest_runtime_start_failed", "worker", name, "err", err.Error())
+		}
+		return
+	}
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		run()
+	}()
+}
+
+func (m *MemoryForest) RuntimeSnapshot() RuntimeSnapshot {
+	if m == nil || m.runtime == nil {
+		return RuntimeSnapshot{}
+	}
+	return m.runtime.Snapshot()
 }
 
 func normalizeLogger(logger *slog.Logger) *slog.Logger {
@@ -715,26 +768,29 @@ func (m *MemoryForest) RecordOutcome(ctx context.Context, record OutcomeRecord) 
 	return m.AppendEvent(ctx, event)
 }
 
-// AppendEvent records an event in the append-only ledger and assigns
-// it a monotonic sequence. The event is durable on return; projections
-// (Branch, RelayEdges, Canopy, Substrate-dirty, ReplayQueue, warmth,
-// training labels) update asynchronously via the branch projector —
-// or synchronously when Config.SynchronousProjection is set.
+// AppendEvent records a legacy branch-compatible event in the canonical
+// forest ledger and assigns it the ledger's monotonic sequence. The event is
+// durable on return; the branch projector consumes forest_ledger records with
+// source_kind=forest_event_compat until the phase-4 node graph replaces the
+// branch projection entirely.
 //
-// CQRS write path: a single INSERT into forest_events plus a sibling
-// INSERT into forest_event_seq_log for sequencing. No read-modify-
-// write on any projection. Idempotent — re-appending the same event
-// ID is a no-op that returns the canonical seq, so bus duplicates and
-// WAL recovery converge cleanly.
+// Runtime no longer writes forest_events. That table is retained only for
+// archived historical rows and explicit migration fixtures.
 func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	prepared := prepareEvent(event)
-	if err := m.appendEventLedger(ctx, prepared); err != nil {
-		slog.Error("forest_append_event_failed",
+	result, err := m.AppendLedgerRecord(ctx, ledgerRecordFromForestEvent(prepared))
+	if err != nil {
+		slog.Error("forest_append_ledger_record_failed",
 			"event_id", prepared.ID,
 			"branch_id", prepared.BranchID,
 			"err", err.Error(),
 		)
 		return err
+	}
+	prepared.Seq = result.Seq
+	event.Seq = result.Seq
+	if !result.Inserted {
+		return nil
 	}
 	if m.synchronousProjection {
 		if err := m.projectInlineForTests(ctx, prepared); err != nil {
@@ -749,6 +805,51 @@ func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	}
 	m.notifyProjector()
 	return nil
+}
+
+func ledgerRecordFromForestEvent(event *Event) LedgerRecord {
+	actorType := firstNonEmptyString(event.AgentType, event.AgentID, "unknown")
+	return LedgerRecord{
+		ID:          "ledger_" + stableID("forest_event", event.ID),
+		SourceKind:  LedgerSourceForestEvent,
+		SourceID:    event.ID,
+		SourceKey:   "forest_event:" + event.ID,
+		EventKind:   firstNonEmptyString(string(event.EventType), "forest.event"),
+		SessionID:   firstNonEmptyString(event.SessionID, "global"),
+		TaskID:      event.TaskID,
+		SubjectType: "branch",
+		SubjectID:   event.BranchID,
+		Actor:       claims.DegradedAgentRef(actorType, "legacy forest event actor"),
+		OccurredAt:  event.Timestamp,
+		Payload:     event,
+		Refs:        forestEventRefs(event),
+	}
+}
+
+func forestEventRefs(event *Event) []claims.DeltaRef {
+	if event == nil {
+		return nil
+	}
+	refs := make([]claims.DeltaRef, 0, 1+len(event.ProvenanceRefs)+len(event.Supersedes)+len(event.Contradicts))
+	if event.ContentID != "" {
+		refs = append(refs, claims.DeltaRef{Role: "content", Type: "content", ID: event.ContentID})
+	}
+	for _, ref := range event.ProvenanceRefs {
+		if strings.TrimSpace(ref) != "" {
+			refs = append(refs, claims.DeltaRef{Role: "provenance", Type: "external_ref", ID: ref})
+		}
+	}
+	for _, branchID := range event.Supersedes {
+		if strings.TrimSpace(branchID) != "" {
+			refs = append(refs, claims.DeltaRef{Role: "supersedes", Type: "branch", ID: branchID})
+		}
+	}
+	for _, branchID := range event.Contradicts {
+		if strings.TrimSpace(branchID) != "" {
+			refs = append(refs, claims.DeltaRef{Role: "contradicts", Type: "branch", ID: branchID})
+		}
+	}
+	return refs
 }
 
 // projectInlineForTests applies the projection synchronously inside
@@ -783,43 +884,6 @@ func (m *MemoryForest) projectInlineForTests(ctx context.Context, event *Event) 
 		m.seqNotify.Advance(event.Seq)
 	}
 	m.runProjectorPostCommit(event, branch, created, replayDue)
-	return nil
-}
-
-// appendEventLedger writes to forest_events + forest_event_seq_log
-// inside a single transaction. SQLite serializes writers at the file
-// lock and AUTOINCREMENT supplies an atomic monotonic seq, so plain
-// BEGIN DEFERRED is sufficient for correctness:
-//
-//   - Concurrent appends of distinct event IDs each get a unique seq.
-//   - Concurrent appends of the same event ID — whichever transaction
-//     commits first wins; the other sees ON CONFLICT (id) DO NOTHING
-//     on forest_events and falls through to fetch the existing seq.
-//
-// event.Seq is assigned ONLY after Commit succeeds. If Commit fails,
-// the in-memory event keeps its prior Seq (typically zero) so the
-// caller never observes a seq that doesn't correspond to durable
-// state.
-func (m *MemoryForest) appendEventLedger(ctx context.Context, event *Event) error {
-	tx, err := m.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin forest tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	inserted, err := insertEventIfAbsentTx(ctx, tx, event)
-	if err != nil {
-		return err
-	}
-	seq, err := allocateOrFetchEventSeqTx(ctx, tx, event.ID, event.Timestamp, inserted)
-	if err != nil {
-		return err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit forest tx: %w", err)
-	}
-	event.Seq = seq
 	return nil
 }
 
@@ -1234,61 +1298,6 @@ func computeSuccessRate(branch *Branch) float64 {
 		return 0.5
 	}
 	return float64(branch.SuccessCount) / float64(total)
-}
-
-// insertEventIfAbsentTx inserts the event into forest_events. Returns
-// inserted=true when a new row was written; false when the event ID
-// was already present (idempotent replay). Never updates an existing
-// row — forest_events is append-only (MEM-03).
-func insertEventIfAbsentTx(ctx context.Context, tx *sql.Tx, event *Event) (bool, error) {
-	res, err := tx.ExecContext(ctx, `
-		INSERT INTO forest_events
-		(id, session_id, task_id, agent_id, agent_type, event_type, family, scope, root_id, branch_id,
-		 parent_branch_id, intent_id, content_id, source_id, confidence, salience, timestamp,
-		 title, summary, provenance_refs, supersedes, contradicts, related_branch_ids, payload)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (id) DO NOTHING
-	`, event.ID, event.SessionID, nullStringValue(event.TaskID), event.AgentID, event.AgentType, string(event.EventType), string(event.Family),
-		string(event.Scope), event.RootID, event.BranchID, nullStringValue(event.ParentBranchID), nullStringValue(event.IntentID),
-		nullStringValue(event.ContentID), nullStringValue(event.SourceID), event.Confidence, event.Salience,
-		event.Timestamp.Unix(), event.Title, event.Summary, marshalJSON(event.ProvenanceRefs), marshalJSON(event.Supersedes),
-		marshalJSON(event.Contradicts), marshalJSON(event.RelatedBranchIDs), marshalJSON(event.Payload))
-	if err != nil {
-		return false, fmt.Errorf("insert forest event: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("rows affected for forest event insert: %w", err)
-	}
-	return affected == 1, nil
-}
-
-// allocateOrFetchEventSeqTx assigns the monotonic seq for the event.
-// When inserted=true, a new row is appended to forest_event_seq_log
-// (AUTOINCREMENT supplies the seq atomically). When inserted=false
-// (duplicate event), the existing seq is returned. Either way the
-// caller gets the canonical seq for this event.
-func allocateOrFetchEventSeqTx(ctx context.Context, tx *sql.Tx, eventID string, timestamp time.Time, inserted bool) (int64, error) {
-	if inserted {
-		res, err := tx.ExecContext(ctx, `
-			INSERT INTO forest_event_seq_log (event_id, appended_at)
-			VALUES (?, ?)
-		`, eventID, timestamp.Unix())
-		if err != nil {
-			return 0, fmt.Errorf("insert seq log: %w", err)
-		}
-		seq, err := res.LastInsertId()
-		if err != nil {
-			return 0, fmt.Errorf("seq log last insert id: %w", err)
-		}
-		return seq, nil
-	}
-	var seq int64
-	row := tx.QueryRowContext(ctx, `SELECT seq FROM forest_event_seq_log WHERE event_id = ?`, eventID)
-	if err := row.Scan(&seq); err != nil {
-		return 0, fmt.Errorf("fetch existing seq: %w", err)
-	}
-	return seq, nil
 }
 
 func getBranchTx(ctx context.Context, tx *sql.Tx, branchID string) (*Branch, error) {

@@ -37,11 +37,9 @@ func (m *MemoryForest) startSubstrateStatePruner() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorSubstrateStatePrunerName, substrateStatePruneBatchSize, func() {
 		m.runSubstrateStatePrunerLoop()
-	}()
+	})
 }
 
 // runSubstrateStatePrunerLoop drives the pruner via the canonical

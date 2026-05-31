@@ -404,6 +404,7 @@ type bootstrapPhase1 struct {
 	sessionMgr     *session.Manager
 	defaultSession *session.Session
 	bootOps        *boot.OperationsSequencer
+	bootDispatchers *claims.ServiceDispatcherRegistry
 	descriptors    *handoff.DescriptorRegistry
 	budget         *concurrency.GoroutineBudget
 	containerReg   *container.ContainerRegistry
@@ -484,6 +485,40 @@ type bootstrapPhase4 struct {
 type busReadinessPublisher struct {
 	bus       guide.EventBus
 	sessionID func() string
+}
+
+type containerIdentityAgentRefResolver struct {
+	registry *container.AgentIdentityRegistry
+}
+
+func (r containerIdentityAgentRefResolver) ResolveAgentRef(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
+	agentID = strings.TrimSpace(agentID)
+	if r.registry == nil || agentID == "" {
+		return claims.AgentRef{}, false
+	}
+	agentType, ok := r.registry.TypeOf(agentID)
+	if !ok {
+		if canonicalID, found := r.registry.Get(agentID); found {
+			agentType = agentID
+			agentID = canonicalID
+			ok = true
+		}
+	}
+	if !ok {
+		return claims.AgentRef{}, false
+	}
+	labels := map[string]string{}
+	if strings.TrimSpace(sessionID) != "" {
+		labels["session_id"] = strings.TrimSpace(sessionID)
+	}
+	return claims.AgentRef{
+		UID:        agentID,
+		Type:       agentType,
+		Name:       agentType,
+		Category:   string(claims.ParticipantCategoryAgent),
+		Generation: claims.InitialParticipantGeneration,
+		Labels:     labels,
+	}.Normalized(), true
 }
 
 func (p *busReadinessPublisher) PublishKnowledgeReady(event knowledge.ReadinessEvent) {
@@ -751,6 +786,30 @@ func sessionClaimsPath(s *session.Session) string {
 	return s.ClaimsBoard().SessionDir()
 }
 
+func validateBootstrapClaimsWiring(s *session.Session) error {
+	if s == nil {
+		return fmt.Errorf("claims startup wiring: session is nil")
+	}
+	board := s.ClaimsBoard()
+	if board == nil {
+		return fmt.Errorf("claims startup wiring: session %q board is nil", s.ID())
+	}
+	snap := board.WiringSnapshot()
+	if strings.TrimSpace(snap.SessionID) == "" {
+		return fmt.Errorf("claims startup wiring: session %q board has empty session id", s.ID())
+	}
+	if !snap.HasScope {
+		return fmt.Errorf("claims startup wiring: session %q board missing scope", s.ID())
+	}
+	if !snap.HasDeltaBus {
+		return fmt.Errorf("claims startup wiring: session %q board missing delta bus", s.ID())
+	}
+	if !snap.HasAgentRefResolver {
+		return fmt.Errorf("claims startup wiring: session %q board missing agent ref resolver", s.ID())
+	}
+	return nil
+}
+
 func bootstrapPhase1Status(phase1 *bootstrapPhase1) boot.Phase1Status {
 	status := boot.Phase1Status{GuideBusOpened: phase1 != nil && phase1.guideBus != nil}
 	if phase1 == nil || phase1.defaultSession == nil || phase1.defaultSession.ClaimsBoard() == nil {
@@ -901,12 +960,20 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	if claimsRollout.ClaimsKnowledgeMirrorEnabled() {
 		claimsProjectors = append(claimsProjectors, knowledgeruntime.NewClaimsKnowledgeMirror(phase1.knowledgeBackend))
 	}
+	phase1.identityReg = container.NewAgentIdentityRegistryWithUID(phase1.bootIdentity.IdentityRegistryUID, []string{
+		"architect", "engineer", "designer", "inspector", "tester",
+		"inspector-pipeline", "tester-pipeline",
+		"librarian", "archivalist", "academic", "orchestrator",
+	})
+	claimsResolver := containerIdentityAgentRefResolver{registry: phase1.identityReg}
 	phase1.sessionMgr = session.NewManager(session.ManagerConfig{
 		Scope:            phase1.scope,
 		DeltaBus:         claimsDeltaBus,
+		AgentRefResolver: claimsResolver,
 		ClaimsProjectors: claimsProjectors,
 		ClaimsRollout:    &claimsRollout,
 	})
+	phase1.bootDispatchers = claims.NewServiceDispatcherRegistry()
 	phase1.descriptors = handoff.NewDescriptorRegistry()
 
 	// Create the run's default session eagerly so the identity Factory
@@ -919,9 +986,15 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	}
 	phase1.defaultSession = defaultSession
 	_ = phase1.sessionMgr.Switch(defaultSession.ID())
+	if err := validateBootstrapClaimsWiring(defaultSession); err != nil {
+		return phase1, err
+	}
 	bootOps, err := boot.NewOperationsSequencer(boot.OperationsConfig{
-		Board:           defaultSession.ClaimsBoard(),
-		ProcessIdentity: phase1.bootIdentity,
+		Board:                     defaultSession.ClaimsBoard(),
+		ProcessIdentity:           phase1.bootIdentity,
+		ServiceDispatcherRegistry: phase1.bootDispatchers,
+		ServiceSubscriber:         claimsDeltaBus,
+		ServiceScope:              &concurrency.ScopeAdapter{Scope: phase1.scope},
 	})
 	if err != nil {
 		return phase1, fmt.Errorf("claims operations boot sequencer: %w", err)
@@ -1014,11 +1087,6 @@ func buildBootstrapPhase1(ctx context.Context, projectRoot string, start time.Ti
 	phase1.anthropicGateway.SetEventHook(llmEventHook)
 	phase1.openaiGateway.SetEventHook(llmEventHook)
 
-	phase1.identityReg = container.NewAgentIdentityRegistryWithUID(phase1.bootIdentity.IdentityRegistryUID, []string{
-		"architect", "engineer", "designer", "inspector", "tester",
-		"inspector-pipeline", "tester-pipeline",
-		"librarian", "archivalist", "academic", "orchestrator",
-	})
 	planLeaseManager := architect.NewPlanLeaseManager(architect.DefaultLLMRequestTimeout, architect.ReadyPlanMaxAge)
 	phase1.planStore = architect.NewPlanStore(projectRoot, planLeaseManager, slog.Default())
 	phase1.knowledgeStore = knowledge.NewKnowledgeStore(

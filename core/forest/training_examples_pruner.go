@@ -33,11 +33,9 @@ func (m *MemoryForest) startTrainingExamplesPruner() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorTrainingExamplesPrunerName, trainingExamplesPruneBatchSize, func() {
 		m.runTrainingExamplesPrunerLoop()
-	}()
+	})
 }
 
 // runTrainingExamplesPrunerLoop drives the pruner via the canonical

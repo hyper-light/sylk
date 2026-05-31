@@ -215,15 +215,15 @@ var BaseScoreComponentNames = [BaseScoreComponentCount]string{
 // (A/B sample). Multiple models may live at once — exactly one
 // champion + at most one challenger; everything else is historical.
 type BaseScoreModel struct {
-	ID           string                            `json:"id"`
-	Version      int64                             `json:"version"`
-	Weights      [BaseScoreComponentCount]float64  `json:"weights"`
-	Bias         float64                           `json:"bias"`
-	L1Norm       float64                           `json:"l1_norm"`
-	Accuracy     float64                           `json:"accuracy"`
-	TrainingSize int64                             `json:"training_size"`
-	TrainedAt    time.Time                         `json:"trained_at"`
-	Role         BaseScoreRole                     `json:"role,omitempty"`
+	ID           string                           `json:"id"`
+	Version      int64                            `json:"version"`
+	Weights      [BaseScoreComponentCount]float64 `json:"weights"`
+	Bias         float64                          `json:"bias"`
+	L1Norm       float64                          `json:"l1_norm"`
+	Accuracy     float64                          `json:"accuracy"`
+	TrainingSize int64                            `json:"training_size"`
+	TrainedAt    time.Time                        `json:"trained_at"`
+	Role         BaseScoreRole                    `json:"role,omitempty"`
 }
 
 // BaseScoreRole tags a model's serving status.
@@ -384,10 +384,10 @@ type Event struct {
 	RelatedBranchIDs []string       `json:"related_branch_ids,omitempty"`
 	Payload          map[string]any `json:"payload,omitempty"`
 
-	// Seq is the monotonic sequence assigned by forest_event_seq_log
-	// on append. Zero on construction; populated by AppendEvent and
-	// every projector read. Projectors consume events strictly in
-	// Seq order to maintain a deterministic projection.
+	// Seq is the monotonic sequence assigned by forest_ledger on
+	// append. Zero on construction; populated by AppendEvent and every
+	// projector read. Projectors consume events strictly in Seq order to
+	// maintain a deterministic projection.
 	Seq int64 `json:"seq,omitempty"`
 }
 
@@ -401,17 +401,17 @@ type RetrievalAuditEvent struct {
 	Seq int64  `json:"seq,omitempty"`
 
 	// Inputs reconstruct the query exactly.
-	SessionID              string         `json:"session_id"`
-	TaskID                 string         `json:"task_id,omitempty"`
-	AgentID                string         `json:"agent_id,omitempty"`
-	AgentType              string         `json:"agent_type,omitempty"`
-	IntentID               string         `json:"intent_id,omitempty"`
-	Query                  string         `json:"query"`
-	Horizon                CanopyHorizon  `json:"horizon,omitempty"`
-	Families               []TreeFamily   `json:"families,omitempty"`
-	RequestedLimit         int            `json:"requested_limit"`
-	IncludeCounterEvidence bool           `json:"include_counter_evidence"`
-	RequestedAt            time.Time      `json:"requested_at"`
+	SessionID              string        `json:"session_id"`
+	TaskID                 string        `json:"task_id,omitempty"`
+	AgentID                string        `json:"agent_id,omitempty"`
+	AgentType              string        `json:"agent_type,omitempty"`
+	IntentID               string        `json:"intent_id,omitempty"`
+	Query                  string        `json:"query"`
+	Horizon                CanopyHorizon `json:"horizon,omitempty"`
+	Families               []TreeFamily  `json:"families,omitempty"`
+	RequestedLimit         int           `json:"requested_limit"`
+	IncludeCounterEvidence bool          `json:"include_counter_evidence"`
+	RequestedAt            time.Time     `json:"requested_at"`
 
 	// Operational metadata observed during the retrieval call.
 	Duration       time.Duration `json:"duration"`

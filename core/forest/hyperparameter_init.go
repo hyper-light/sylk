@@ -15,9 +15,9 @@ import (
 // signal to fit most of the hyperparameter surface from observed
 // data:
 //
-//   1. forest_event_seq_log + forest_events — when did each event
-//      arrive? Inter-arrival distribution drives the substrate
-//      debounce primitive (we want to coalesce events arriving
+//   1. forest_ledger source_kind=forest_event_compat — when did each
+//      branch-compatible event arrive? Inter-arrival distribution drives the
+//      substrate debounce primitive (we want to coalesce events arriving
 //      within a "burst").
 //
 //   2. forest_training_examples + forest_retrieval_audit — labeled
@@ -180,9 +180,10 @@ func (f *HyperParameterFitter) FitFromLedger(ctx context.Context, logger fitLogg
 // of intra-burst inter-arrival gaps, where bursts are events
 // arriving within substrateBurstWindow of each other.
 //
-// SQL strategy: read recent event timestamps in order, compute
-// successive gaps, partition into bursts (gap > burstWindow starts
-// a new burst), then return the percentile of intra-burst gaps.
+// SQL strategy: read recent canonical ledger event payloads in order, decode
+// timestamps in Go (without SQLite JSON functions), compute successive gaps,
+// partition into bursts (gap > burstWindow starts a new burst), then return
+// the percentile of intra-burst gaps.
 //
 // We bound the lookback to the most recent `recentEventLimit`
 // events to keep the fit responsive to current workload.
@@ -190,12 +191,13 @@ func (f *HyperParameterFitter) fitSubstrateDebounce(ctx context.Context) (time.D
 	const recentEventLimit = 10000
 
 	rows, err := f.db.QueryContext(ctx, `
-		SELECT timestamp
-		FROM forest_events
-		WHERE timestamp IS NOT NULL
-		ORDER BY timestamp DESC
+		SELECT l.occurred_at, p.payload
+		FROM   forest_ledger l
+		JOIN   forest_ledger_payloads p ON p.ledger_id = l.id
+		WHERE  l.source_kind = ?
+		ORDER BY l.seq DESC
 		LIMIT ?
-	`, recentEventLimit)
+	`, string(LedgerSourceForestEvent), recentEventLimit)
 	if err != nil {
 		// Table may not exist on a fresh forest — soft fail.
 		return 0, 0, false, nil
@@ -204,11 +206,12 @@ func (f *HyperParameterFitter) fitSubstrateDebounce(ctx context.Context) (time.D
 
 	timestamps := make([]int64, 0, recentEventLimit)
 	for rows.Next() {
-		var ts int64
-		if err := rows.Scan(&ts); err != nil {
+		var occurredAt int64
+		var payload string
+		if err := rows.Scan(&occurredAt, &payload); err != nil {
 			return 0, 0, false, err
 		}
-		timestamps = append(timestamps, ts)
+		timestamps = append(timestamps, ledgerEventTimestampNanos(occurredAt, payload))
 	}
 	if err := rows.Err(); err != nil {
 		return 0, 0, false, err
@@ -254,6 +257,17 @@ func (f *HyperParameterFitter) fitSubstrateDebounce(ctx context.Context) (time.D
 		debounce = debounceFloor
 	}
 	return debounce, int64(len(gaps)), true, nil
+}
+
+func ledgerEventTimestampNanos(occurredAt int64, payload string) int64 {
+	var event Event
+	if payload != "" {
+		_ = unmarshalJSON(payload, &event)
+	}
+	if !event.Timestamp.IsZero() {
+		return event.Timestamp.UTC().UnixNano()
+	}
+	return time.Unix(occurredAt, 0).UTC().UnixNano()
 }
 
 // fitImplicitNegativeHorizon fits the horizon as the Pth percentile
@@ -373,8 +387,8 @@ func (f *HyperParameterFitter) fitLabelWeightByValidation(ctx context.Context, s
 	// Pull every labeled row in one query (capped at fitTrainingPullCap
 	// to keep boot cost bounded).
 	const fitTrainingPullCap = 50000
-	const valFloor = 200          // need ≥ valFloor explicit rows for stable validation MAE
-	const valFraction = 0.1       // 90/10 train/val split
+	const valFloor = 200        // need ≥ valFloor explicit rows for stable validation MAE
+	const valFraction = 0.1     // 90/10 train/val split
 	const splitSeed = uint64(1) // deterministic split per fit
 
 	rows, err := f.db.QueryContext(ctx, `

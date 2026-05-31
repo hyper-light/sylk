@@ -185,19 +185,22 @@ func (m *MemoryForest) attachSubstrateModeOutcomeCounts(ctx context.Context, sin
 // count stays manageable.
 func (m *MemoryForest) countSubstrateModeOutcomes(ctx context.Context, mode SubstrateMode, since time.Time) (int64, int64, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT e.payload
-		FROM   forest_events e
+		SELECT p.payload
+		FROM   forest_ledger e
+		JOIN   forest_ledger_payloads p ON p.ledger_id = e.id
 		JOIN   forest_retrieval_candidates rc
 		    ON rc.session_id = e.session_id
-		   AND rc.branch_id  = e.branch_id
+		   AND rc.branch_id  = e.subject_id
 		   AND rc.returned   = 1
 		JOIN   forest_retrieval_events re
 		    ON re.id = rc.retrieval_event_id
-		WHERE  e.event_type    = 'outcome_recorded'
+		WHERE  e.source_kind   = ?
+		  AND  e.subject_type  = 'branch'
+		  AND  e.event_kind    = 'outcome_recorded'
 		  AND  re.substrate_mode = ?
 		  AND  re.requested_at >= ?
-		  AND  e.timestamp BETWEEN re.requested_at AND (re.requested_at + ?)
-	`, string(mode), since.Unix(), int64(outcomeAttributionWindow.Seconds()))
+		  AND  e.occurred_at BETWEEN re.requested_at AND (re.requested_at + ?)
+	`, string(LedgerSourceForestEvent), string(mode), since.Unix(), int64(outcomeAttributionWindow.Seconds()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("query substrate mode outcomes: %w", err)
 	}
@@ -226,13 +229,14 @@ func outcomeStatusFromPayloadJSON(raw string) OutcomeStatus {
 		return OutcomeStatusMixed
 	}
 	var parsed struct {
-		Status OutcomeStatus `json:"status"`
+		Status  OutcomeStatus  `json:"status"`
+		Payload map[string]any `json:"payload"`
 	}
 	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
 		return OutcomeStatusMixed
 	}
 	if parsed.Status == "" {
-		return OutcomeStatusMixed
+		return outcomeStatusFromPayload(parsed.Payload)
 	}
 	return parsed.Status
 }

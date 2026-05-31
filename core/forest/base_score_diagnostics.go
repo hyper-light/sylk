@@ -29,9 +29,9 @@ import (
 // so operators can audit "which model is serving traffic?" in one
 // query.
 type BaseScoreModelInfoSnapshot struct {
-	Champion   *BaseScoreModel `json:"champion,omitempty"`
-	Challenger *BaseScoreModel `json:"challenger,omitempty"`
-	UsingHardcodedDefaults bool `json:"using_hardcoded_defaults"`
+	Champion               *BaseScoreModel `json:"champion,omitempty"`
+	Challenger             *BaseScoreModel `json:"challenger,omitempty"`
+	UsingHardcodedDefaults bool            `json:"using_hardcoded_defaults"`
 }
 
 // BaseScoreModelInfo returns the active champion + challenger from
@@ -148,26 +148,29 @@ func (m *MemoryForest) attachBaseScoreVariantOutcomeCounts(ctx context.Context, 
 	return nil
 }
 
-// countBaseScoreVariantOutcomes joins forest_events outcome rows
-// against retrieval candidates produced by retrievals of the given
-// variant/version within the attribution window. Payload status is
-// parsed in Go (no SQLite json1 dependency).
+// countBaseScoreVariantOutcomes joins canonical ledger outcome rows against
+// retrieval candidates produced by retrievals of the given variant/version
+// within the attribution window. Payload status is parsed in Go (no SQLite
+// json1 dependency).
 func (m *MemoryForest) countBaseScoreVariantOutcomes(ctx context.Context, variant BaseScoreVariant, version int64, since time.Time) (int64, int64, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT e.payload
-		FROM   forest_events e
+		SELECT p.payload
+		FROM   forest_ledger e
+		JOIN   forest_ledger_payloads p ON p.ledger_id = e.id
 		JOIN   forest_retrieval_candidates rc
 		    ON rc.session_id = e.session_id
-		   AND rc.branch_id  = e.branch_id
+		   AND rc.branch_id  = e.subject_id
 		   AND rc.returned   = 1
 		JOIN   forest_retrieval_events re
 		    ON re.id = rc.retrieval_event_id
-		WHERE  e.event_type        = 'outcome_recorded'
+		WHERE  e.source_kind       = ?
+		  AND  e.subject_type      = 'branch'
+		  AND  e.event_kind        = 'outcome_recorded'
 		  AND  re.base_score_variant = ?
 		  AND  re.base_score_version = ?
 		  AND  re.requested_at >= ?
-		  AND  e.timestamp BETWEEN re.requested_at AND (re.requested_at + ?)
-	`, string(variant), version, since.Unix(), int64(outcomeAttributionWindow.Seconds()))
+		  AND  e.occurred_at BETWEEN re.requested_at AND (re.requested_at + ?)
+	`, string(LedgerSourceForestEvent), string(variant), version, since.Unix(), int64(outcomeAttributionWindow.Seconds()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("query base-score variant outcomes: %w", err)
 	}
@@ -192,14 +195,14 @@ func (m *MemoryForest) countBaseScoreVariantOutcomes(ctx context.Context, varian
 // operators can detect components that contribute little to ranking
 // (pruning candidates) or that dominate (potentially mis-tuned).
 type ScoreComponentStat struct {
-	Name              string  `json:"name"`
-	Index             int     `json:"index"`
-	HardcodedWeight   float64 `json:"hardcoded_weight"`
-	LearnedWeight     float64 `json:"learned_weight"`
-	MeanContribution  float64 `json:"mean_contribution"`
+	Name               string  `json:"name"`
+	Index              int     `json:"index"`
+	HardcodedWeight    float64 `json:"hardcoded_weight"`
+	LearnedWeight      float64 `json:"learned_weight"`
+	MeanContribution   float64 `json:"mean_contribution"`
 	StddevContribution float64 `json:"stddev_contribution"`
-	SampleCount       int64   `json:"sample_count"`
-	PruningCandidate  bool    `json:"pruning_candidate"`
+	SampleCount        int64   `json:"sample_count"`
+	PruningCandidate   bool    `json:"pruning_candidate"`
 }
 
 // ScoreComponentStatsSince computes per-component contribution
@@ -308,9 +311,9 @@ func (a *componentContributionAccumulator) absorb(blob string, weights [BaseScor
 
 // foldOne updates mean + variance via Welford's recurrence:
 //
-//   delta  = value - mean
-//   mean  += delta / count
-//   m2    += delta * (value - mean_after)
+//	delta  = value - mean
+//	mean  += delta / count
+//	m2    += delta * (value - mean_after)
 func (a *componentContributionAccumulator) foldOne(idx int, value float64) {
 	if idx < 0 || idx >= BaseScoreComponentCount {
 		return

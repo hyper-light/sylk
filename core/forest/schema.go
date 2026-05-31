@@ -253,14 +253,10 @@ func ensureSchema(db *sql.DB) error {
 			ON forest_substrate_frontiers(context_key, frontier_score DESC);
 
 		-- ─────────────────────────────────────────────────────────────────
-		-- CQRS sequencing layer (forest event sourcing).
+		-- Legacy CQRS sequencing layer (historical forest event sourcing).
 		--
-		-- forest_event_seq_log provides monotonic ordering over the
-		-- forest_events ledger. The events table stays append-only
-		-- (MEM-03 trigger forbids in-place updates), so seq lives in
-		-- a sibling table. AUTOINCREMENT supplies atomic seq
-		-- allocation under any concurrent writer; UNIQUE(event_id)
-		-- makes appends idempotent.
+		-- Runtime appends now use forest_ledger. These tables remain for
+		-- historical migration fixtures and archive compatibility only.
 		-- ─────────────────────────────────────────────────────────────────
 		CREATE TABLE IF NOT EXISTS forest_event_seq_log (
 			seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,6 +384,10 @@ func ensureSchema(db *sql.DB) error {
 		return fmt.Errorf("create forest schema: %w", err)
 	}
 
+	if err := ensurePhase123Schema(db); err != nil {
+		return err
+	}
+
 	if err := ensureNodeMemoryColumns(db); err != nil {
 		return err
 	}
@@ -445,18 +445,18 @@ func ensureSchema(db *sql.DB) error {
 //
 // Mapping (audit-driven; see types.go family invariants):
 //
-//   decision     → intent       (a decision is "intent + selected
-//                                branch"; selection denormalized via
-//                                metadata if needed)
-//   preference   → constraint   (already populated severity=soft via
-//                                ensureForestConstraintSeverity)
-//   capability   → intent       (an agent's affordance is "what it
-//                                can pursue"; lift to intent)
-//   opportunity  → intent       (a time-bound capability/intent
-//                                match; encode timing via metadata)
-//   conflict     → antipattern  (the durable negative-evidence
-//                                successor; live conflict already
-//                                encoded by RelayRelationContradicts)
+//	decision     → intent       (a decision is "intent + selected
+//	                             branch"; selection denormalized via
+//	                             metadata if needed)
+//	preference   → constraint   (already populated severity=soft via
+//	                             ensureForestConstraintSeverity)
+//	capability   → intent       (an agent's affordance is "what it
+//	                             can pursue"; lift to intent)
+//	opportunity  → intent       (a time-bound capability/intent
+//	                             match; encode timing via metadata)
+//	conflict     → antipattern  (the durable negative-evidence
+//	                             successor; live conflict already
+//	                             encoded by RelayRelationContradicts)
 //
 // Only forest_branches (the projection) is rewritten — forest_events
 // is the append-only ledger (MEM-03) and rewriting it would violate
@@ -570,6 +570,17 @@ func recordSchemaVersionHash(db *sql.DB) error {
 func expectedSchemaHash() string {
 	tables := []string{
 		"forest_events",
+		"forest_schema_meta",
+		"forest_ledger",
+		"forest_ledger_payloads",
+		"forest_ledger_refs",
+		"forest_ledger_delivery",
+		"forest_projection_offsets",
+		"forest_artifacts",
+		"forest_artifact_edges",
+		"forest_validations",
+		"forest_validation_patterns",
+		"forest_evidence_errors",
 		"forest_branches",
 		"forest_relay_edges",
 		"forest_canopies",
@@ -599,6 +610,14 @@ func expectedSchemaHash() string {
 	triggers := []string{
 		"forest_events_no_update",
 		"forest_events_no_delete",
+		"forest_ledger_no_update",
+		"forest_ledger_no_delete",
+		"forest_ledger_payloads_no_update",
+		"forest_ledger_payloads_no_delete",
+		"forest_ledger_refs_no_update",
+		"forest_ledger_refs_no_delete",
+		"forest_ledger_delivery_no_update",
+		"forest_ledger_delivery_no_delete",
 		"forest_retrieval_events_no_update",
 		"forest_retrieval_events_no_delete",
 		"forest_events_archive_no_update",
@@ -608,6 +627,21 @@ func expectedSchemaHash() string {
 	}
 	indexes := []string{
 		"idx_forest_events_session_time",
+		"idx_forest_ledger_source",
+		"idx_forest_ledger_event",
+		"idx_forest_ledger_session",
+		"idx_forest_ledger_subject",
+		"idx_forest_ledger_refs_lookup",
+		"idx_forest_ledger_delivery_route",
+		"idx_forest_artifacts_claim",
+		"idx_forest_artifacts_testament",
+		"idx_forest_artifacts_status",
+		"idx_forest_artifact_edges_target",
+		"idx_forest_validations_claim",
+		"idx_forest_validations_artifact",
+		"idx_forest_validations_status",
+		"idx_forest_validation_patterns_lookup",
+		"idx_forest_evidence_errors_entity",
 		"idx_forest_events_branch_time",
 		"idx_forest_events_root_time",
 		"idx_forest_events_family",

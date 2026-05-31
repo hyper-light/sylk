@@ -39,11 +39,9 @@ func (m *MemoryForest) startBaseScoreTrainer() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorBaseScoreTrainerName, m.baseScoreTrainBatch, func() {
 		m.runBaseScoreTrainerLoop()
-	}()
+	})
 }
 
 // runBaseScoreTrainerLoop drives training under lease coordination
@@ -366,13 +364,13 @@ func initialTrainingWeights(champion *BaseScoreModel) ([BaseScoreComponentCount]
 // trainBaseScoreSGD runs `epochs` passes of stochastic gradient
 // descent over the supplied examples. Optimizes the logistic loss:
 //
-//   y_pred = σ(w·x + b)
-//   loss   = -y·log(y_pred) - (1-y)·log(1-y_pred)
+//	y_pred = σ(w·x + b)
+//	loss   = -y·log(y_pred) - (1-y)·log(1-y_pred)
 //
 // Per-example update with L1 + L2 regularization:
 //
-//   w_i ← w_i - lr · ((y_pred - y)·x_i  +  λ_L2·w_i  +  λ_L1·sign(w_i))
-//   b   ← b   - lr · (y_pred - y)
+//	w_i ← w_i - lr · ((y_pred - y)·x_i  +  λ_L2·w_i  +  λ_L1·sign(w_i))
+//	b   ← b   - lr · (y_pred - y)
 //
 // After every step weights are clamped to ±maxWeight so a pathological
 // outlier batch can't produce unbounded values. No nil access; no

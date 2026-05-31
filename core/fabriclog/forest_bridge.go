@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"github.com/adalundhe/sylk/core/activity"
 )
@@ -119,7 +120,9 @@ func (b *ForestFabricBridge) handleConsume(record FabricLogRecord) {
 		latencyHuman(record.Consume.LatencyMicros),
 		lensLabelFromRecord(record),
 	)
-	_ = b.harvest(context.Background(), orig, reason)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = b.harvest(ctx, orig, reason)
 	b.consumesForwarded.Add(1)
 }
 
@@ -142,7 +145,9 @@ func (b *ForestFabricBridge) handleResolve(record FabricLogRecord) {
 		record.Resolve.ResolverKind,
 		latencyHuman(record.Resolve.LatencyMicros),
 	)
-	_ = b.harvest(context.Background(), orig, reason)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = b.harvest(ctx, orig, reason)
 	b.resolvesForwarded.Add(1)
 }
 
@@ -156,22 +161,19 @@ func forestEligibleActionKind(kind activity.ActionKind) bool {
 	switch kind {
 	case activity.ActionPrecedentEmitted,
 		activity.ActionDecisionPromoted,
-		activity.ActionValidationAccepted,
 		activity.ActionCharterRatified,
 		activity.ActionConsultResponse,
 		activity.ActionChallengeResponse,
-		activity.ActionValidationRejected,
 		activity.ActionRemediationResolved,
 		activity.ActionPlanRatified,
 		activity.ActionDecisionDeclared,
 		activity.ActionAdvisoryEmitted,
 		activity.ActionProactiveAdvisory,
 		activity.ActionNarrationEmitted,
-		activity.ActionArtifactPublished,
-		activity.ActionReviewCompleted,
 		activity.ActionToolCallCompleted,
 		activity.ActionLLMResponseCompleted,
-		activity.ActionForestConsultEmitted:
+		activity.ActionForestConsultEmitted,
+		activity.ActionTraversalObserved:
 		return true
 	}
 	return false

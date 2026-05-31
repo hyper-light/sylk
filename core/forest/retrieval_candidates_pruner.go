@@ -77,11 +77,9 @@ func (m *MemoryForest) startRetrievalCandidatesPruner() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorRetrievalCandidatesPrunerName, retrievalCandidatesPruneBatchSize, func() {
 		m.runRetrievalCandidatesPrunerLoop()
-	}()
+	})
 }
 
 // runRetrievalCandidatesPrunerLoop runs the pruner under lease

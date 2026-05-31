@@ -31,8 +31,10 @@ func (r *recordingSubscriber) Count() int {
 
 type panickingSubscriber struct{ name string }
 
-func (p *panickingSubscriber) Name() string                              { return p.name }
-func (p *panickingSubscriber) Receive(context.Context, activity.AgentActivity) { panic("subscriber boom") }
+func (p *panickingSubscriber) Name() string { return p.name }
+func (p *panickingSubscriber) Receive(context.Context, activity.AgentActivity) {
+	panic("subscriber boom")
+}
 
 func TestSubscribingSink_FansOutToAllSubscribers(t *testing.T) {
 	col := activity.NewTestCollector()
@@ -191,35 +193,26 @@ func TestForestSubscriber_HarvestesConsensusDecision(t *testing.T) {
 	}
 }
 
-// TestForestSubscriber_HarvestsWidenedAllowlist verifies that the
-// post-Tier-1+2 election covers lifecycle closures, knowledge
-// pushes, artifacts, operational primitives, and forest consult
-// emissions. One test case per widened kind so regressions show up
-// precisely.
+// TestForestSubscriber_HarvestsTraversalAndContextAllowlist verifies that
+// Fabric harvest covers traversal/context observations while excluding claims
+// lifecycle truth, which is now ingested from canonical claims deltas.
 func TestForestSubscriber_HarvestsWidenedAllowlist(t *testing.T) {
 	cases := []struct {
 		name string
 		kind activity.ActionKind
 	}{
-		// Lifecycle closures
 		{"consult_response", activity.ActionConsultResponse},
 		{"challenge_response", activity.ActionChallengeResponse},
-		{"validation_rejected", activity.ActionValidationRejected},
 		{"remediation_resolved", activity.ActionRemediationResolved},
-		// Acceptance + ratification + knowledge push
 		{"plan_ratified", activity.ActionPlanRatified},
 		{"decision_declared", activity.ActionDecisionDeclared},
 		{"advisory_emitted", activity.ActionAdvisoryEmitted},
 		{"proactive_advisory", activity.ActionProactiveAdvisory},
 		{"narration_emitted", activity.ActionNarrationEmitted},
-		// Artifacts + review
-		{"artifact_published", activity.ActionArtifactPublished},
-		{"review_completed", activity.ActionReviewCompleted},
-		// Operational primitives
 		{"tool_call_completed", activity.ActionToolCallCompleted},
 		{"llm_response_completed", activity.ActionLLMResponseCompleted},
-		// Tier 5
 		{"forest_consult_emitted", activity.ActionForestConsultEmitted},
+		{"traversal_observed", activity.ActionTraversalObserved},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -227,6 +220,32 @@ func TestForestSubscriber_HarvestsWidenedAllowlist(t *testing.T) {
 			fs.Receive(context.Background(), sampleActivity(c.kind, "s1", "scope/"))
 			if fs.HarvestedCount() != 1 {
 				t.Fatalf("kind %s not harvested under widened allowlist", c.kind)
+			}
+		})
+	}
+}
+
+func TestForestSubscriber_DoesNotHarvestClaimsLifecycleTruth(t *testing.T) {
+	cases := []activity.ActionKind{
+		activity.ActionClaimAccepted,
+		activity.ActionClaimRejected,
+		activity.ActionTestamentSubmitted,
+		activity.ActionClaimValidated,
+		activity.ActionBoardComplete,
+		activity.ActionValidationAccepted,
+		activity.ActionValidationRejected,
+		activity.ActionArtifactPublished,
+		activity.ActionReviewCompleted,
+	}
+	for _, kind := range cases {
+		t.Run(string(kind), func(t *testing.T) {
+			fs := NewForestSubscriber(func(context.Context, ForestCandidate) error { return nil })
+			fs.Receive(context.Background(), sampleActivity(kind, "s1", "scope/"))
+			if fs.HarvestedCount() != 0 {
+				t.Fatalf("claims lifecycle kind %s should not be fabric-harvested", kind)
+			}
+			if fs.SkippedCount() != 1 {
+				t.Fatalf("skip counter should advance; got %d", fs.SkippedCount())
 			}
 		})
 	}

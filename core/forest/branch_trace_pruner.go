@@ -62,11 +62,9 @@ func (m *MemoryForest) startBranchTracePruner() {
 	if m == nil {
 		return
 	}
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.startWorker(projectorBranchTracePrunerName, m.branchTraceRetentionPerBranch, func() {
 		m.runBranchTracePrunerLoop()
-	}()
+	})
 }
 
 // runBranchTracePrunerLoop drives the pruner via the canonical
