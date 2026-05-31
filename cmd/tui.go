@@ -474,13 +474,36 @@ type bootstrapPhase3 struct {
 }
 
 type bootstrapPhase4 struct {
-	seeds         []ui.AgentSeed
-	modelStore    *agentpkg.AgentModelStore
-	modelSwapper  modelSwapperFunc
-	knowledgeSync *librarian.KnowledgeSyncService
-	phase4Done    chan struct{}
-	supervisorRef atomic.Pointer[handoff.HandoffSupervisor]
-	bootLogger    *agentlog.BootEventLogger
+	seeds                  []ui.AgentSeed
+	modelStore             *agentpkg.AgentModelStore
+	modelSwapper           modelSwapperFunc
+	knowledgeSync          *librarian.KnowledgeSyncService
+	phase4Done             chan struct{}
+	knowledgeBootStart     chan struct{}
+	knowledgeBootStartOnce sync.Once
+	supervisorRef          atomic.Pointer[handoff.HandoffSupervisor]
+	bootLogger             *agentlog.BootEventLogger
+}
+
+func (p *bootstrapPhase4) StartKnowledgeBoot() {
+	if p == nil || p.knowledgeBootStart == nil {
+		return
+	}
+	p.knowledgeBootStartOnce.Do(func() {
+		close(p.knowledgeBootStart)
+	})
+}
+
+func (p *bootstrapPhase4) waitForKnowledgeBootStart(ctx context.Context) bool {
+	if p == nil || p.knowledgeBootStart == nil {
+		return true
+	}
+	select {
+	case <-p.knowledgeBootStart:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // busReadinessPublisher adapts knowledge.ReadinessPublisher to the guide EventBus.
@@ -2232,10 +2255,11 @@ func startBootstrapPhase4(
 	}
 
 	phase4 := &bootstrapPhase4{
-		seeds:        seeds,
-		modelStore:   modelStore,
-		modelSwapper: buildModelSwapper(phase1.containerReg, phase3.activationCtrl, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
-		phase4Done:   make(chan struct{}),
+		seeds:              seeds,
+		modelStore:         modelStore,
+		modelSwapper:       buildModelSwapper(phase1.containerReg, phase3.activationCtrl, phase1.authRegistry, phase1.googleGateway, phase1.anthropicGateway, phase1.openaiGateway),
+		phase4Done:         make(chan struct{}),
+		knowledgeBootStart: make(chan struct{}),
 	}
 	if phase1.bootOps != nil {
 		if _, err := phase1.bootOps.CommitPhase4(phase1.ctx, boot.Phase4Status{
@@ -2356,7 +2380,13 @@ func startBootstrapPhase4(
 		}
 		return nil
 	})
+	// Knowledge boot emits user-visible progress through KnowledgeStore.
+	// Keep these phase-4 workers registered for shutdown accounting, but
+	// release them only after the TUI has attached its progress observer.
 	schedulePhase4Task(phase1.scope, "phase4-knowledge-boot", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
+		if !phase4.waitForKnowledgeBootStart(bgCtx) {
+			return nil
+		}
 		result, err := boot.BootWithConfig(bgCtx, boot.PipelineConfig{
 			ProjectRoot: phase1.projectRoot,
 			Logger:      phase4.bootLogger,
@@ -2390,6 +2420,9 @@ func startBootstrapPhase4(
 		return nil
 	})
 	schedulePhase4Task(phase1.scope, "phase4-bleve-ready", 0, &phase4Remaining, phase4Finish, func(bgCtx context.Context) error {
+		if !phase4.waitForKnowledgeBootStart(bgCtx) {
+			return nil
+		}
 		return waitForBootBleveReady(bgCtx, phase1.knowledgeStore)
 	})
 
@@ -2578,7 +2611,10 @@ func buildBootstrapDeps(
 		},
 		AgentModelStore: phase4.modelStore,
 		KnowledgeStore:  phase1.knowledgeStore,
-		Forest:          phase1.forest,
+		StartKnowledgeBoot: func() {
+			phase4.StartKnowledgeBoot()
+		},
+		Forest: phase1.forest,
 	}
 	if phase1.bootOps != nil {
 		if _, err := phase1.bootOps.CommitPhase6(phase1.ctx, boot.Phase6Status{

@@ -330,6 +330,9 @@ type Deps struct {
 
 	// KnowledgeStore exposes background indexing progress for the status bar.
 	KnowledgeStore *knowledge.KnowledgeStore
+	// StartKnowledgeBoot releases deferred knowledge boot work after UI
+	// progress observers are attached to the running program.
+	StartKnowledgeBoot func()
 
 	// Forest exposes structural memory snapshots for the MEMR view.
 	Forest MemoryViewService
@@ -483,6 +486,9 @@ type AppModel struct {
 	overlay            overlayState
 
 	// Bridges
+	bridgeProgram    bridge.TeaProgram
+	bridgesStarted   bool
+	bridgeStartupErr error
 	accountantBridge *bridge.AccountantBridge
 	sessionBridge    *bridge.SessionBridge
 	lspBridge        *bridge.LSPBridge
@@ -1061,6 +1067,7 @@ var appMsgDispatchRoutes = map[reflect.Type]appMsgDispatchRoute{
 	reflect.TypeFor[msg.QuitConfirmMsg]():      appMsgCmdRoute(func(m *AppModel, _ msg.QuitConfirmMsg) tea.Cmd { return m.handleQuit() }),
 	reflect.TypeFor[msg.TickMsg]():             appMsgCmdRoute((*AppModel).handleTick),
 	reflect.TypeFor[msg.DecorTickMsg]():        appMsgCmdRoute((*AppModel).handleDecorTick),
+	reflect.TypeFor[bridgeReadyMsg]():          appMsgCmdRoute((*AppModel).handleBridgeReady),
 	reflect.TypeFor[msg.MemoryCanvasTickMsg](): appMsgCmdRoute((*AppModel).handleMemoryCanvasTick),
 	reflect.TypeFor[msg.BlinkMsg]():            appMsgCmdRoute((*AppModel).handleBlink),
 	reflect.TypeFor[msg.LSPFlushMsg]():         appMsgCmdRoute((*AppModel).handleLSPFlush),

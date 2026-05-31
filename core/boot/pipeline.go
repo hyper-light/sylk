@@ -169,6 +169,7 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	result.Phases.Setup = time.Since(setupStart)
 	submitBootPhaseTestament(board, "setup", setupClaimID, result.Phases.Setup, nil)
 	p.logBootPhase(agentlog.EventBootSetup, "setup", result.Phases.Setup, nil)
+	p.reportProgress("setup", 1, 6)
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -195,8 +196,6 @@ func (p *Pipeline) Run(ctx context.Context) (*PipelineResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	p.reportProgress("setup", 1, 6)
 
 	// Phase 3: Allocate session + node IDs
 	allocClaimID := postBootPhaseClaim(board, "allocate", 3)

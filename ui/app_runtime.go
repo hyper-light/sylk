@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -322,12 +323,36 @@ func (m *AppModel) codePanelGroup() layout.PanelGroup {
 
 func (m *AppModel) startBridges() tea.Cmd {
 	return func() tea.Msg {
-		return bridgeReadyMsg{}
+		if m.bridgeProgram == nil {
+			return bridgeReadyMsg{Err: errors.New("bridge program not initialized")}
+		}
+		return bridgeReadyMsg{Err: m.StartBridges(m.bridgeProgram)}
 	}
 }
 
 // bridgeReadyMsg is an internal message signaling that bridges should be started.
-type bridgeReadyMsg struct{}
+type bridgeReadyMsg struct {
+	Err error
+}
+
+func (m *AppModel) handleBridgeReady(ready bridgeReadyMsg) tea.Cmd {
+	if ready.Err != nil {
+		m.bridgeStartupErr = ready.Err
+		return tea.Quit
+	}
+	if m.bridgesStarted {
+		return nil
+	}
+	m.bridgesStarted = true
+	if m.deps.StartKnowledgeBoot != nil {
+		m.deps.StartKnowledgeBoot()
+	}
+	seedLiveAgents(m.deps)
+	if m.config.MockMode {
+		seedMockData(m.deps)
+	}
+	return nil
+}
 
 // StartBridges connects all event bridges to the running tea.Program.
 // This must be called after tea.NewProgram is created.
@@ -1422,23 +1447,12 @@ func Run(ctx context.Context, cfg Config, deps Deps) error {
 	)
 
 	adapter := &programAdapter{program: p}
-
-	// Start bridges with the program reference via adapter.
-	if err := app.StartBridges(adapter); err != nil {
-		return err
-	}
-
-	// Register live agents so the agent panel displays them. Must run after
-	// StartBridges so the activity bridge is subscribed to the bus.
-	seedLiveAgents(deps)
-
-	// In mock mode, seed additional demo data. Requests still route through
-	// real Guide/Architect agents via the event bus.
-	if cfg.MockMode {
-		seedMockData(deps)
-	}
+	app.bridgeProgram = adapter
 
 	_, err := p.Run()
+	if app.bridgeStartupErr != nil {
+		err = errors.Join(err, app.bridgeStartupErr)
+	}
 
 	// Restore default signal handling so a second Ctrl+C during shutdown
 	// immediately terminates the process instead of being silently consumed.

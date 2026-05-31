@@ -53,16 +53,6 @@ type BackgroundIndexWaiter interface {
 // background indexer. Set via SetProgressObserver; called from producer goroutines.
 type ProgressObserver func(phase string, current, total int64)
 
-type progressSnapshot struct {
-	phase   string
-	current int64
-	total   int64
-}
-
-func (s progressSnapshot) replay(fn ProgressObserver) {
-	fn(s.phase, s.current, s.total)
-}
-
 // LifecycleEventKind identifies a knowledge lifecycle transition emitted to observers.
 type LifecycleEventKind int
 
@@ -101,8 +91,6 @@ type KnowledgeStore struct {
 	bgWaiter    BackgroundIndexWaiter
 	closeable   io.Closer        // bleve store closer, set by caller
 	progressFn  ProgressObserver // UI callback, guarded by mu
-	progress    progressSnapshot
-	hasProgress bool
 	lifecycleFn LifecycleObserver
 
 	publisher  ReadinessPublisher
@@ -168,19 +156,13 @@ func (ks *KnowledgeStore) BackgroundWaiter() BackgroundIndexWaiter {
 	return ks.bgWaiter
 }
 
-// SetProgressObserver registers a callback for pipeline and indexer progress.
-// Safe to call concurrently; replaces any previously registered observer.
-// The latest retained progress snapshot is replayed immediately so late UI
-// observers still render startup progress emitted before the program existed.
+// SetProgressObserver registers a callback for future pipeline and indexer
+// progress. Safe to call concurrently; replaces any previously registered
+// observer.
 func (ks *KnowledgeStore) SetProgressObserver(fn ProgressObserver) {
 	ks.mu.Lock()
 	ks.progressFn = fn
-	progress := ks.progress
-	replay := ks.hasProgress && fn != nil
 	ks.mu.Unlock()
-	if replay {
-		progress.replay(fn)
-	}
 }
 
 // SetLifecycleObserver registers a callback for repeatable partial/full
@@ -207,14 +189,11 @@ func (ks *KnowledgeStore) SetLifecycleObserver(fn LifecycleObserver) {
 // NotifyProgress stores and forwards a progress event to the registered
 // observer. Safe as a PipelineConfig.OnProgress callback.
 func (ks *KnowledgeStore) NotifyProgress(phase string, current, total int64) {
-	progress := progressSnapshot{phase: phase, current: current, total: total}
 	ks.mu.Lock()
-	ks.progress = progress
-	ks.hasProgress = true
 	fn := ks.progressFn
 	ks.mu.Unlock()
 	if fn != nil {
-		progress.replay(fn)
+		fn(phase, current, total)
 	}
 }
 

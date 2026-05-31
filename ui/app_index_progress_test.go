@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/adalundhe/sylk/core/concurrency"
+	"github.com/adalundhe/sylk/core/events"
 	"github.com/adalundhe/sylk/core/knowledge"
 	knowledgequery "github.com/adalundhe/sylk/core/knowledge/query"
 	"github.com/adalundhe/sylk/ui/msg"
@@ -19,6 +20,10 @@ type recordingTeaProgram struct {
 	msgs []any
 	ch   chan any
 }
+
+type noopActivityPublisher struct{}
+
+func (noopActivityPublisher) PublishActivity(*events.ActivityEvent) error { return nil }
 
 func newRecordingTeaProgram() *recordingTeaProgram {
 	return &recordingTeaProgram{ch: make(chan any, 16)}
@@ -154,15 +159,15 @@ func TestStartIndexProgressObserver_SendsInitialBackgroundIndexPhaseBeforeFirstB
 	}
 }
 
-func TestStartIndexProgressObserver_ReplaysBufferedPipelineProgress(t *testing.T) {
+func TestStartIndexProgressObserver_SendsPipelineProgressAfterObserverAttached(t *testing.T) {
 	ks := knowledge.NewKnowledgeStore(nil, nil)
-	ks.NotifyProgress("ingest", 4, 6)
 
 	scope := newIndexProgressScope(t)
 	app := &AppModel{deps: Deps{KnowledgeStore: ks, Scope: scope}}
 	program := newRecordingTeaProgram()
 
 	app.startIndexProgressObserver(program)
+	ks.NotifyProgress("ingest", 4, 6)
 
 	progress := program.waitForIndexProgress(t, func(progress msg.IndexProgressMsg) bool {
 		return !progress.Done && progress.Phase == int(status.PhaseEmbed)
@@ -209,5 +214,32 @@ func TestStartIndexProgressObserver_TracksReplacementBackgroundWaitersAcrossSync
 	done = program.waitForDoneIndexProgress(t)
 	if !done.Done {
 		t.Fatalf("replacement waiter done progress = %#v, want Done=true", done)
+	}
+}
+
+func TestHandleBridgeReadyStartsKnowledgeBootOnce(t *testing.T) {
+	var starts atomic.Int64
+	app := &AppModel{deps: Deps{
+		ActivityPub: noopActivityPublisher{},
+		StartKnowledgeBoot: func() {
+			starts.Add(1)
+		},
+	}}
+
+	if cmd := app.handleBridgeReady(bridgeReadyMsg{}); cmd != nil {
+		t.Fatal("handleBridgeReady returned unexpected command")
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("knowledge boot starts = %d, want 1", got)
+	}
+	if !app.bridgesStarted {
+		t.Fatal("bridgesStarted = false, want true")
+	}
+
+	if cmd := app.handleBridgeReady(bridgeReadyMsg{}); cmd != nil {
+		t.Fatal("second handleBridgeReady returned unexpected command")
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("knowledge boot starts after duplicate ready = %d, want 1", got)
 	}
 }

@@ -189,57 +189,41 @@ func TestKnowledgeStore_RepeatedPromotionsAreIdempotent(t *testing.T) {
 	}
 }
 
-func TestKnowledgeStore_ReplaysLatestProgressToLateObserver(t *testing.T) {
+func TestKnowledgeStore_SetProgressObserverDoesNotReplaySynchronously(t *testing.T) {
 	ks := NewKnowledgeStore(nil, nil)
 	defer ks.Close()
 
-	ks.NotifyProgress("setup", 1, 6)
 	ks.NotifyProgress("ingest", 4, 6)
 
-	var got []struct {
-		phase   string
-		current int64
-		total   int64
-	}
-	ks.SetProgressObserver(func(phase string, current, total int64) {
-		got = append(got, struct {
-			phase   string
-			current int64
-			total   int64
-		}{phase: phase, current: current, total: total})
+	calls := 0
+	ks.SetProgressObserver(func(string, int64, int64) {
+		calls++
 	})
-
-	if len(got) != 1 {
-		t.Fatalf("replayed progress count = %d, want 1", len(got))
-	}
-	if got[0].phase != "ingest" || got[0].current != 4 || got[0].total != 6 {
-		t.Fatalf("replayed progress = %+v, want ingest 4/6", got[0])
+	if calls != 0 {
+		t.Fatalf("SetProgressObserver replayed %d progress event(s), want 0", calls)
 	}
 
 	ks.NotifyProgress("commit", 5, 6)
-	if len(got) != 2 {
-		t.Fatalf("forwarded progress count = %d, want 2", len(got))
-	}
-	if got[1].phase != "commit" || got[1].current != 5 || got[1].total != 6 {
-		t.Fatalf("forwarded progress = %+v, want commit 5/6", got[1])
+	if calls != 1 {
+		t.Fatalf("future observer calls = %d, want 1", calls)
 	}
 }
 
-func TestKnowledgeStore_ReplaysProgressOutsideMutex(t *testing.T) {
+func TestKnowledgeStore_NotifiesProgressOutsideMutex(t *testing.T) {
 	ks := NewKnowledgeStore(nil, nil)
 	defer ks.Close()
 
-	ks.NotifyProgress("setup", 1, 6)
-	replayed := make(chan struct{})
+	notified := make(chan struct{})
 	ks.SetProgressObserver(func(string, int64, int64) {
 		_ = ks.BackgroundWaiter()
-		close(replayed)
+		close(notified)
 	})
+	ks.NotifyProgress("setup", 1, 6)
 
 	select {
-	case <-replayed:
+	case <-notified:
 	case <-time.After(time.Second):
-		t.Fatal("progress replay callback deadlocked against KnowledgeStore mutex")
+		t.Fatal("progress callback deadlocked against KnowledgeStore mutex")
 	}
 }
 

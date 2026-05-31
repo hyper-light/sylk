@@ -74,6 +74,55 @@ func TestWaitForBootBleveReady_CanceledContextSkipsPromotion(t *testing.T) {
 	}
 }
 
+func TestBootstrapPhase4KnowledgeBootStartIsIdempotent(t *testing.T) {
+	phase4 := &bootstrapPhase4{knowledgeBootStart: make(chan struct{})}
+
+	phase4.StartKnowledgeBoot()
+	phase4.StartKnowledgeBoot()
+
+	select {
+	case <-phase4.knowledgeBootStart:
+	case <-time.After(time.Second):
+		t.Fatal("knowledge boot start channel was not closed")
+	}
+}
+
+func TestBootstrapPhase4WaitForKnowledgeBootStart(t *testing.T) {
+	phase4 := &bootstrapPhase4{knowledgeBootStart: make(chan struct{})}
+	started := make(chan bool, 1)
+
+	go func() {
+		started <- phase4.waitForKnowledgeBootStart(context.Background())
+	}()
+
+	select {
+	case <-started:
+		t.Fatal("waitForKnowledgeBootStart returned before start signal")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	phase4.StartKnowledgeBoot()
+
+	select {
+	case ok := <-started:
+		if !ok {
+			t.Fatal("waitForKnowledgeBootStart returned false after start signal")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitForKnowledgeBootStart did not return after start signal")
+	}
+}
+
+func TestBootstrapPhase4WaitForKnowledgeBootStartCanceled(t *testing.T) {
+	phase4 := &bootstrapPhase4{knowledgeBootStart: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if phase4.waitForKnowledgeBootStart(ctx) {
+		t.Fatal("waitForKnowledgeBootStart returned true after context cancellation")
+	}
+}
+
 func TestValidateBootstrapClaimsWiringRejectsMissingRuntimeDependencies(t *testing.T) {
 	s := session.NewSession(session.Config{ID: "bad-claims-wiring", Name: "bad"})
 	s.SetClaimsBoard(claims.NewClaimsBoard(claims.ClaimsBoardConfig{
