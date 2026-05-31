@@ -152,10 +152,33 @@ func (m *mockForest) Retrieve(_ context.Context, _ forest.Query) ([]*forest.Bran
 	return cloneBranchPackets(m.retrieveResult), nil
 }
 
+func (m *mockForest) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
+	packets, err := m.Retrieve(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return mockForestPacketsFromBranches(packets), nil
+}
+
+func (m *mockForest) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	cursor := &forest.ForestCursor{ID: "scribe-cursor", SessionID: input.SessionID, TaskID: input.TaskID}
+	for _, packet := range input.Packets {
+		if packet == nil {
+			continue
+		}
+		cursor.ActiveNodeIDs = append(cursor.ActiveNodeIDs, packet.Node.ID)
+	}
+	return cursor, nil
+}
+
 func (m *mockForest) PredictNextBranches(_ context.Context, _ forest.Query) ([]*forest.BranchPacket, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return cloneBranchPackets(m.predictResult), nil
+}
+
+func (m *mockForest) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
+	return nil
 }
 
 func (m *mockForest) RecordOutcome(_ context.Context, record forest.OutcomeRecord) error {
@@ -163,6 +186,34 @@ func (m *mockForest) RecordOutcome(_ context.Context, record forest.OutcomeRecor
 	defer m.mu.Unlock()
 	m.outcomes = append(m.outcomes, record)
 	return nil
+}
+
+func mockForestPacketsFromBranches(packets []*forest.BranchPacket) []*forest.ForestPacket {
+	out := make([]*forest.ForestPacket, 0, len(packets))
+	for _, packet := range packets {
+		if packet == nil || packet.Branch == nil {
+			continue
+		}
+		out = append(out, &forest.ForestPacket{
+			Node: forest.ForestNode{
+				ID:            packet.Branch.ID,
+				Kind:          forest.ForestNodeClaim,
+				Title:         packet.Branch.Title,
+				Summary:       packet.Branch.Summary,
+				EvidenceGrade: forest.EvidenceGradeObserved,
+				Confidence:    packet.Branch.Confidence,
+			},
+			Evidence: []forest.ForestEvidence{{
+				RefType: "node",
+				RefID:   packet.Branch.ID,
+				NodeID:  packet.Branch.ID,
+				Grade:   forest.EvidenceGradeObserved,
+				Summary: packet.Branch.Summary,
+			}},
+			Score: 1,
+		})
+	}
+	return out
 }
 
 // MEM-01: MemoryForestService widened with family projections. Scribe

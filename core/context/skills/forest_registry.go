@@ -62,9 +62,7 @@ func registerGenericForestSkills(registry *skills.Registry, deps *RetrievalDepen
 		NewForestReviewSkill("forest.review_contradiction", "Review contradiction evidence and quarantine state for a claim, artifact, or cluster.", deps),
 		NewForestReviewSkill("forest.review_bridge", "Review bridge-node risk and cross-cluster evidence before a context crossing.", deps),
 		NewForestReviewSkill("forest.review_skill_candidate", "Review skill-candidate evidence, validation needs, and quarantine state.", deps),
-		NewForestRecordOutcomeSkill(deps).WithName("forest.record_outcome"),
-		NewForestSkill(deps),
-		NewForestRecordOutcomeSkill(deps),
+		NewForestRecordOutcomeNamedSkill("forest.record_outcome", deps),
 	} {
 		if err := registry.Register(skill); err != nil {
 			return fmt.Errorf("failed to register %s: %w", skill.Name, err)

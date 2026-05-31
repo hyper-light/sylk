@@ -37,15 +37,6 @@ type ForestPreload struct {
 	Projection *forest.ForestRoleProjection
 	Cursor     *forest.ForestCursor
 	Packets    []*forest.ForestPacket
-
-	Intents       *forest.IntentProjection
-	Constraints   *forest.ConstraintProjection
-	Evidence      *forest.EvidenceProjection
-	Decisions     *forest.DecisionProjection
-	Outcomes      *forest.OutcomeProjection
-	Preferences   *forest.PreferenceProjection
-	Capabilities  *forest.CapabilityProjection
-	Opportunities *forest.OpportunityProjection
 }
 
 // PreloadFor assembles a phase-9 role projection from ForestPacket and
@@ -60,14 +51,11 @@ func PreloadFor(
 	if svc == nil {
 		return nil, nil
 	}
-	role := strings.ToLower(strings.TrimSpace(input.AgentType))
+	role := normalizedForestPreloadRole(input.AgentType)
 	if !forestPreloadRoleSupported(role) {
 		return nil, nil
 	}
 	limit := input.Limit
-	if limit <= 0 {
-		limit = preloadBucketMax
-	}
 	packets, err := svc.RetrieveForest(ctx, forest.Query{
 		Query:                  input.Query,
 		SessionID:              input.SessionID,
@@ -85,9 +73,9 @@ func PreloadFor(
 	cursor, err := svc.CreateForestCursor(ctx, forest.ForestCursorInput{
 		SessionID: input.SessionID,
 		TaskID:    input.TaskID,
-		AgentID:  input.AgentID,
-		Packets:  packets,
-		Limit:    limit,
+		AgentID:   input.AgentID,
+		Packets:   packets,
+		Limit:     limit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("preload create forest cursor: %w", err)
@@ -100,7 +88,7 @@ func PreloadFor(
 }
 
 func forestPreloadRoleSupported(role string) bool {
-	switch strings.ToLower(strings.TrimSpace(role)) {
+	switch normalizedForestPreloadRole(role) {
 	case "architect", "engineer", "tester", "guardian", "inspector", "librarian", "academic", "designer", "orchestrator", "scribe", "archivalist", "guide":
 		return true
 	default:
@@ -108,96 +96,18 @@ func forestPreloadRoleSupported(role string) bool {
 	}
 }
 
-func legacyPreloadFor(
-	ctx context.Context,
-	svc MemoryForestService,
-	input ForestPreloadInput,
-) (*ForestPreload, error) {
-	projInput := forest.ProjectionInput{
-		Query:     input.Query,
-		SessionID: input.SessionID,
-		TaskID:    input.TaskID,
-		AgentID:   input.AgentID,
-		AgentType: input.AgentType,
-		IntentID:  input.IntentID,
-		Horizon:   input.Horizon,
-		Limit:     input.Limit,
-	}
-	switch strings.ToLower(strings.TrimSpace(input.AgentType)) {
-	case "architect":
-		return preloadArchitect(ctx, svc, projInput)
-	case "librarian":
-		return preloadLibrarian(ctx, svc, projInput)
-	case "academic":
-		return preloadAcademic(ctx, svc, projInput)
+func normalizedForestPreloadRole(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch {
+	case strings.HasPrefix(role, "scribe"):
+		return "scribe"
+	case role == "inspector-pipeline":
+		return "inspector"
+	case role == "tester-pipeline":
+		return "tester"
 	default:
-		return nil, nil
+		return role
 	}
-}
-
-// preloadArchitect pulls Intent + Constraint + Decision. The architect
-// is a planner: it needs the current intent envelope (what does the
-// user want), the constraint set (what are we forbidden from doing),
-// and the decision lineage (what has already been tried / chosen /
-// rejected). Evidence is intentionally left out here — it is the
-// Academic's lane, and the architect should source factual claims via
-// consultation rather than inline prompt.
-func preloadArchitect(ctx context.Context, p MemoryForestService, in forest.ProjectionInput) (*ForestPreload, error) {
-	intents, err := p.ProjectIntent(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload architect intents: %w", err)
-	}
-	constraints, err := p.ProjectConstraints(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload architect constraints: %w", err)
-	}
-	decisions, err := p.ProjectDecisions(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload architect decisions: %w", err)
-	}
-	return &ForestPreload{Intents: intents, Constraints: constraints, Decisions: decisions}, nil
-}
-
-// preloadLibrarian pulls Preference + Capability + Intent. The
-// librarian acts on behalf of the user's preferences (explanation
-// style, risk tolerance) and needs to know which retrieval / reading
-// strategies have worked before (capabilities). Intent is included so
-// it can bias lexical/semantic search toward the active goal.
-func preloadLibrarian(ctx context.Context, p MemoryForestService, in forest.ProjectionInput) (*ForestPreload, error) {
-	preferences, err := p.ProjectPreferences(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload librarian preferences: %w", err)
-	}
-	capabilities, err := p.ProjectCapabilities(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload librarian capabilities: %w", err)
-	}
-	intents, err := p.ProjectIntent(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload librarian intents: %w", err)
-	}
-	return &ForestPreload{Preferences: preferences, Capabilities: capabilities, Intents: intents}, nil
-}
-
-// preloadAcademic pulls Evidence + Outcome + Intent. The academic is
-// the epistemic anchor of the fabric: it needs the current evidence
-// graph (what do we already know), past outcomes (what have we
-// validated or contradicted), and the active intent (so its
-// hypotheses aim at the current question, not an abstract survey).
-func preloadAcademic(ctx context.Context, p MemoryForestService, in forest.ProjectionInput) (*ForestPreload, error) {
-	evidence, err := p.ProjectEvidence(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload academic evidence: %w", err)
-	}
-	outcomes, err := p.ProjectOutcomes(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload academic outcomes: %w", err)
-	}
-	intents, err := p.ProjectIntent(ctx, in)
-	if err != nil {
-		return nil, fmt.Errorf("preload academic intents: %w", err)
-	}
-	return &ForestPreload{Evidence: evidence, Outcomes: outcomes, Intents: intents}, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -219,19 +129,10 @@ func (p *ForestPreload) Render() string {
 	if p.IsEmpty() {
 		return ""
 	}
-	if p.Projection != nil && strings.TrimSpace(p.Projection.Text) != "" {
+	if p.Projection != nil {
 		return p.Projection.Text
 	}
-	var b strings.Builder
-	b.WriteString("MEMORY CONTEXT (pre-LLM forest preload):\n")
-	renderIntent(&b, p.Intents)
-	renderConstraints(&b, p.Constraints)
-	renderDecisions(&b, p.Decisions)
-	renderEvidence(&b, p.Evidence)
-	renderOutcomes(&b, p.Outcomes)
-	renderPreferences(&b, p.Preferences)
-	renderCapabilities(&b, p.Capabilities)
-	return b.String()
+	return ""
 }
 
 // IsEmpty reports whether the preload carries any usable content. A
@@ -241,137 +142,8 @@ func (p *ForestPreload) IsEmpty() bool {
 	if p == nil {
 		return true
 	}
-	if p.Projection != nil && p.Projection.NoProjectionReason == "" {
+	if p.Projection != nil && strings.TrimSpace(p.Projection.Text) != "" {
 		return false
 	}
-	return intentEmpty(p.Intents) &&
-		constraintEmpty(p.Constraints) &&
-		decisionEmpty(p.Decisions) &&
-		evidenceEmpty(p.Evidence) &&
-		outcomeEmpty(p.Outcomes) &&
-		preferenceEmpty(p.Preferences) &&
-		capabilityEmpty(p.Capabilities)
-}
-
-const preloadBucketMax = 5
-
-func renderIntent(b *strings.Builder, p *forest.IntentProjection) {
-	if intentEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Active intents:")
-	if p.PrimaryIntent != "" {
-		fmt.Fprintf(b, " primary=%q", p.PrimaryIntent)
-	}
-	writeBranchSummaries(b, p.Active, preloadBucketMax)
-}
-
-func renderConstraints(b *strings.Builder, p *forest.ConstraintProjection) {
-	if constraintEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Enforced constraints:")
-	writeBranchSummaries(b, p.Enforced, preloadBucketMax)
-}
-
-func renderDecisions(b *strings.Builder, p *forest.DecisionProjection) {
-	if decisionEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Chosen decisions:")
-	writeBranchSummaries(b, p.Chosen, preloadBucketMax)
-}
-
-func renderEvidence(b *strings.Builder, p *forest.EvidenceProjection) {
-	if evidenceEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Current evidence:")
-	writeBranchSummaries(b, p.Current, preloadBucketMax)
-}
-
-func renderOutcomes(b *strings.Builder, p *forest.OutcomeProjection) {
-	if outcomeEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Validated outcomes:")
-	writeBranchSummaries(b, p.Successes, preloadBucketMax)
-}
-
-func renderPreferences(b *strings.Builder, p *forest.PreferenceProjection) {
-	if preferenceEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Active preferences:")
-	writeBranchSummaries(b, p.Active, preloadBucketMax)
-}
-
-func renderCapabilities(b *strings.Builder, p *forest.CapabilityProjection) {
-	if capabilityEmpty(p) {
-		return
-	}
-	b.WriteString("\n- Proven capabilities:")
-	writeBranchSummaries(b, p.Proven, preloadBucketMax)
-}
-
-func writeBranchSummaries(b *strings.Builder, packets []forest.BranchPacket, max int) {
-	if len(packets) == 0 {
-		b.WriteString(" (none)")
-		return
-	}
-	for i, packet := range packets {
-		if i >= max {
-			fmt.Fprintf(b, "\n  …+%d more", len(packets)-max)
-			return
-		}
-		summary := packetSummary(&packet)
-		if summary == "" {
-			continue
-		}
-		fmt.Fprintf(b, "\n  • %s", summary)
-	}
-}
-
-func packetSummary(p *forest.BranchPacket) string {
-	if p == nil || p.Branch == nil {
-		return ""
-	}
-	title := strings.TrimSpace(p.Branch.Title)
-	summary := strings.TrimSpace(p.Branch.Summary)
-	switch {
-	case title != "" && summary != "":
-		return title + " — " + summary
-	case title != "":
-		return title
-	default:
-		return summary
-	}
-}
-
-func intentEmpty(p *forest.IntentProjection) bool {
-	return p == nil || (len(p.Active) == 0 && p.PrimaryIntent == "")
-}
-
-func constraintEmpty(p *forest.ConstraintProjection) bool {
-	return p == nil || len(p.Enforced) == 0
-}
-
-func decisionEmpty(p *forest.DecisionProjection) bool {
-	return p == nil || len(p.Chosen) == 0
-}
-
-func evidenceEmpty(p *forest.EvidenceProjection) bool {
-	return p == nil || len(p.Current) == 0
-}
-
-func outcomeEmpty(p *forest.OutcomeProjection) bool {
-	return p == nil || len(p.Successes) == 0
-}
-
-func preferenceEmpty(p *forest.PreferenceProjection) bool {
-	return p == nil || len(p.Active) == 0
-}
-
-func capabilityEmpty(p *forest.CapabilityProjection) bool {
-	return p == nil || len(p.Proven) == 0
+	return true
 }

@@ -11,10 +11,13 @@ import (
 )
 
 type mockForestService struct {
-	resolveIntent func(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
-	retrieve      func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
-	predict       func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
-	recordOutcome func(ctx context.Context, record forest.OutcomeRecord) error
+	resolveIntent  func(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
+	retrieve       func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
+	retrieveForest func(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
+	predict        func(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
+	createCursor   func(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
+	proposeClaim   func(ctx context.Context, proposal forest.ForestClaimProposal) error
+	recordOutcome  func(ctx context.Context, record forest.OutcomeRecord) error
 }
 
 func (m *mockForestService) ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error) {
@@ -31,6 +34,47 @@ func (m *mockForestService) Retrieve(ctx context.Context, query forest.Query) ([
 	return nil, nil
 }
 
+func (m *mockForestService) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
+	if m.retrieveForest != nil {
+		return m.retrieveForest(ctx, query)
+	}
+	var packets []*forest.BranchPacket
+	var err error
+	switch {
+	case m.retrieve != nil:
+		packets, err = m.retrieve(ctx, query)
+	case m.predict != nil:
+		packets, err = m.predict(ctx, query)
+	default:
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return forestPacketsFromBranchPackets(packets), nil
+}
+
+func (m *mockForestService) CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	if m.createCursor != nil {
+		return m.createCursor(ctx, input)
+	}
+	cursor := &forest.ForestCursor{ID: "cursor-test", SessionID: input.SessionID, TaskID: input.TaskID}
+	for _, packet := range input.Packets {
+		if packet == nil {
+			continue
+		}
+		cursor.ActiveNodeIDs = append(cursor.ActiveNodeIDs, packet.Node.ID)
+	}
+	return cursor, nil
+}
+
+func (m *mockForestService) ProposeForestClaim(ctx context.Context, proposal forest.ForestClaimProposal) error {
+	if m.proposeClaim != nil {
+		return m.proposeClaim(ctx, proposal)
+	}
+	return nil
+}
+
 func (m *mockForestService) PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
 	if m.predict != nil {
 		return m.predict(ctx, query)
@@ -43,6 +87,51 @@ func (m *mockForestService) RecordOutcome(ctx context.Context, record forest.Out
 		return m.recordOutcome(ctx, record)
 	}
 	return nil
+}
+
+func forestPacketsFromBranchPackets(packets []*forest.BranchPacket) []*forest.ForestPacket {
+	out := make([]*forest.ForestPacket, 0, len(packets))
+	for _, packet := range packets {
+		if packet == nil || packet.Branch == nil {
+			continue
+		}
+		nodeID := packet.Branch.ID
+		summary := packet.Branch.Summary
+		out = append(out, &forest.ForestPacket{
+			Node: forest.ForestNode{
+				ID:            nodeID,
+				Kind:          testNodeKindForFamily(packet.Branch.Family),
+				Title:         packet.Branch.Title,
+				Summary:       summary,
+				EvidenceGrade: forest.EvidenceGradeObserved,
+				Confidence:    packet.Branch.Confidence,
+			},
+			Evidence: []forest.ForestEvidence{{
+				RefType: "node",
+				RefID:   nodeID,
+				NodeID:  nodeID,
+				Grade:   forest.EvidenceGradeObserved,
+				Summary: summary,
+			}},
+			Score: 1,
+		})
+	}
+	return out
+}
+
+func testNodeKindForFamily(family forest.TreeFamily) forest.ForestNodeKind {
+	switch family {
+	case forest.TreeFamilyConstraint:
+		return forest.ForestNodeKind("Constraint")
+	case forest.TreeFamilyEvidence:
+		return forest.ForestNodeKind("Evidence")
+	case forest.TreeFamilyOutcome:
+		return forest.ForestNodeKind("Outcome")
+	case forest.TreeFamilyAntiPattern:
+		return forest.ForestNodeKind("AntiPattern")
+	default:
+		return forest.ForestNodeKind("Intent")
+	}
 }
 
 func TestForestResolveIntentSkill(t *testing.T) {
@@ -236,6 +325,87 @@ func TestForestRecordOutcomeSkill(t *testing.T) {
 	}
 }
 
+func TestPhase9ForestAgencySkillsUsePacketsCursorsAndProposalArtifacts(t *testing.T) {
+	packet := &forest.ForestPacket{
+		Node: forest.ForestNode{
+			ID:            "node-agency",
+			Kind:          forest.ForestNodeClaim,
+			Summary:       "agency packet",
+			EvidenceGrade: forest.EvidenceGradeObserved,
+		},
+		Evidence: []forest.ForestEvidence{{
+			RefType: "artifact",
+			RefID:   "artifact-agency",
+			NodeID:  "node-agency",
+			Grade:   forest.EvidenceGradeObserved,
+		}},
+		ValidationNeed: 1,
+		ProposedClaims: []forest.ForestClaimProposalTemplate{{
+			ProposalID:   "proposal-template",
+			Summary:      "Add validation for agency packet",
+			EvidenceRefs: []string{"artifact:artifact-agency"},
+		}},
+		Score: 1,
+	}
+	var proposed forest.ForestClaimProposal
+	deps := &RetrievalDependencies{
+		Forest: &mockForestService{
+			retrieveForest: func(_ context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
+				if !query.IncludeCounterEvidence {
+					t.Fatal("agency evidence skills must include counter-evidence for review")
+				}
+				return []*forest.ForestPacket{packet}, nil
+			},
+			createCursor: func(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+				if len(input.Packets) != 1 {
+					t.Fatalf("cursor input packet count = %d, want 1", len(input.Packets))
+				}
+				return &forest.ForestCursor{ID: "cursor-agency", ActiveNodeIDs: []string{"node-agency"}}, nil
+			},
+			proposeClaim: func(_ context.Context, proposal forest.ForestClaimProposal) error {
+				proposed = proposal
+				return nil
+			},
+		},
+	}
+
+	retrieved, err := NewForestRetrieveEvidenceSkill(deps).Handler(context.Background(), mustJSON(t, ForestRecallInput{Query: "agency", IncludeCounterEvidence: true}))
+	if err != nil {
+		t.Fatalf("retrieve evidence: %v", err)
+	}
+	retrieveOutput := retrieved.(*ForestRecallOutput)
+	if len(retrieveOutput.Packets) != 1 || retrieveOutput.Cursor == nil || retrieveOutput.Cursor.ID != "cursor-agency" {
+		t.Fatalf("retrieve evidence output missing packet/cursor: %+v", retrieveOutput)
+	}
+
+	suggested, err := NewForestSuggestValidationsSkill(deps).Handler(context.Background(), mustJSON(t, ForestRecallInput{Query: "agency"}))
+	if err != nil {
+		t.Fatalf("suggest validations: %v", err)
+	}
+	suggestions := suggested.(*ForestValidationSuggestionOutput)
+	if len(suggestions.ValidationNeeds) == 0 || len(suggestions.ProposedClaims) == 0 {
+		t.Fatalf("validation suggestions missing needs/proposals: %+v", suggestions)
+	}
+
+	if _, err := NewForestProposeClaimSkill(deps).Handler(context.Background(), mustJSON(t, ForestProposalInput{
+		Summary:      "install skill from generated proposal",
+		EvidenceRefs: []string{"artifact:artifact-agency"},
+	})); err == nil {
+		t.Fatal("privileged generated-skill proposal was accepted")
+	}
+	if _, err := NewForestProposeClaimSkill(deps).Handler(context.Background(), mustJSON(t, ForestProposalInput{
+		Summary:      "Validate packet before adoption",
+		ClusterID:    "cluster-agency",
+		Dimension:    "validation",
+		EvidenceRefs: []string{"artifact:artifact-agency"},
+	})); err != nil {
+		t.Fatalf("propose claim: %v", err)
+	}
+	if proposed.ID == "" || proposed.Summary != "Validate packet before adoption" || len(proposed.EvidenceRefs) != 1 {
+		t.Fatalf("proposal not passed to forest service with evidence: %+v", proposed)
+	}
+}
+
 func TestForestResolveIntentSkillDefaultsScopeFromContext(t *testing.T) {
 	t.Parallel()
 
@@ -259,4 +429,13 @@ func TestForestResolveIntentSkillDefaultsScopeFromContext(t *testing.T) {
 	if _, err := skill.Handler(ctx, input); err != nil {
 		t.Fatalf("handler error: %v", err)
 	}
+}
+
+func mustJSON(t testing.TB, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
+	}
+	return data
 }

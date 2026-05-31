@@ -28,18 +28,8 @@ type MemoryForestService interface {
 	ResolveIntent(ctx context.Context, input forest.ResolveIntentInput) (*forest.IntentResolution, error)
 	RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
 	CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
-	Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
-	PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
+	ProposeForestClaim(ctx context.Context, proposal forest.ForestClaimProposal) error
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error
-
-	ProjectIntent(ctx context.Context, input forest.ProjectionInput) (*forest.IntentProjection, error)
-	ProjectConstraints(ctx context.Context, input forest.ProjectionInput) (*forest.ConstraintProjection, error)
-	ProjectEvidence(ctx context.Context, input forest.ProjectionInput) (*forest.EvidenceProjection, error)
-	ProjectDecisions(ctx context.Context, input forest.ProjectionInput) (*forest.DecisionProjection, error)
-	ProjectOutcomes(ctx context.Context, input forest.ProjectionInput) (*forest.OutcomeProjection, error)
-	ProjectPreferences(ctx context.Context, input forest.ProjectionInput) (*forest.PreferenceProjection, error)
-	ProjectCapabilities(ctx context.Context, input forest.ProjectionInput) (*forest.CapabilityProjection, error)
-	ProjectOpportunities(ctx context.Context, input forest.ProjectionInput) (*forest.OpportunityProjection, error)
 }
 
 type ForestOutcomeClassification struct {
@@ -587,9 +577,9 @@ func extractTrackedForestBranchIDs(result any) []string {
 	case contextskills.ForestRoleOutput:
 		return branchIDsFromForestRoleOutput(&value)
 	case *contextskills.ForestRecallOutput:
-		return dedupeBranchIDs(branchIDsFromPackets(value.Packets))
+		return dedupeBranchIDs(branchIDsFromForestPackets(value.Packets))
 	case contextskills.ForestRecallOutput:
-		return dedupeBranchIDs(branchIDsFromPackets(value.Packets))
+		return dedupeBranchIDs(branchIDsFromForestPackets(value.Packets))
 	case *forest.IntentResolution:
 		return dedupeBranchIDs(branchIDsFromIntentResolution(value))
 	case forest.IntentResolution:
@@ -603,7 +593,7 @@ func branchIDsFromForestRoleOutput(output *contextskills.ForestRoleOutput) []str
 	if output == nil {
 		return nil
 	}
-	ids := branchIDsFromPackets(output.Packets)
+	ids := branchIDsFromForestPackets(output.Packets)
 	ids = append(ids, branchIDsFromIntentResolution(output.Intent)...)
 	return dedupeBranchIDs(ids)
 }
@@ -635,6 +625,17 @@ func branchIDsFromPackets(packets []*forest.BranchPacket) []string {
 			continue
 		}
 		ids = append(ids, branchIDFromPacket(*packet))
+	}
+	return dedupeBranchIDs(ids)
+}
+
+func branchIDsFromForestPackets(packets []*forest.ForestPacket) []string {
+	ids := make([]string, 0, len(packets))
+	for _, packet := range packets {
+		if packet == nil {
+			continue
+		}
+		ids = append(ids, packet.Node.ID)
 	}
 	return dedupeBranchIDs(ids)
 }

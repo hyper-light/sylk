@@ -38,7 +38,7 @@ func ensureForestSchemaMeta(db *sql.DB) error {
 		return err
 	}
 	if exists {
-		return verifyForestSchemaMeta(db)
+		return upgradeForestSchemaMetaIfSupported(db)
 	}
 	if _, err := db.Exec(`
 		INSERT INTO forest_schema_meta
@@ -47,6 +47,44 @@ func ensureForestSchemaMeta(db *sql.DB) error {
 			('active', ?, ?, ?, ?, ?, ?)
 	`, forestSchemaVersionPhase123, forestSchemaReplacesVersion, forestProjectionVersionPhase123, forestSchemaMigrationPhase123, expectedSchemaHash(), time.Now().UTC().Unix()); err != nil {
 		return fmt.Errorf("record forest_schema_meta: %w", err)
+	}
+	return verifyForestSchemaMeta(db)
+}
+
+func upgradeForestSchemaMetaIfSupported(db *sql.DB) error {
+	row := db.QueryRow(`
+		SELECT schema_version, replaces_version, projection_version, migration_id, code_version
+		FROM forest_schema_meta
+		WHERE meta_key = 'active'
+	`)
+	var schemaVersion, replacesVersion int
+	var projectionVersion, migrationID, codeVersion string
+	if err := row.Scan(&schemaVersion, &replacesVersion, &projectionVersion, &migrationID, &codeVersion); err != nil {
+		return fmt.Errorf("read forest_schema_meta: %w", err)
+	}
+	if schemaVersion == forestSchemaVersionPhase123 {
+		return verifyForestSchemaMeta(db)
+	}
+	if schemaVersion > forestSchemaVersionPhase123 {
+		return fmt.Errorf("unsupported future forest schema version %d", schemaVersion)
+	}
+	if replacesVersion != forestSchemaReplacesVersion {
+		return fmt.Errorf("unsupported forest replaces_version %d", replacesVersion)
+	}
+	if strings.TrimSpace(projectionVersion) == "" || strings.TrimSpace(migrationID) == "" || strings.TrimSpace(codeVersion) == "" {
+		return fmt.Errorf("unsupported incomplete forest schema meta")
+	}
+	if _, err := db.Exec(`
+		UPDATE forest_schema_meta
+		SET schema_version = ?,
+			replaces_version = ?,
+			projection_version = ?,
+			migration_id = ?,
+			code_version = ?,
+			applied_at = ?
+		WHERE meta_key = 'active'
+	`, forestSchemaVersionPhase123, forestSchemaReplacesVersion, forestProjectionVersionPhase123, forestSchemaMigrationPhase123, expectedSchemaHash(), time.Now().UTC().Unix()); err != nil {
+		return fmt.Errorf("upgrade forest_schema_meta: %w", err)
 	}
 	return verifyForestSchemaMeta(db)
 }

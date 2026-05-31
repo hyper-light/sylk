@@ -359,10 +359,13 @@ func GetAllAdaptiveRetrievalSkillNames() []string {
 		"retrieve_context",
 		"search_history",
 		"promote_to_hot",
-		// forest_resolve_intent + forest_recall + recall_recent +
-		// forest_predict_next_branches collapsed into forest(op=…).
-		"forest",
-		"forest_record_outcome",
+		"forest.retrieve_evidence",
+		"forest.suggest_validations",
+		"forest.propose_claim",
+		"forest.review_contradiction",
+		"forest.review_bridge",
+		"forest.review_skill_candidate",
+		"forest.record_outcome",
 
 		// Librarian skills
 		"librarian_search_codebase",

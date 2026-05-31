@@ -21,8 +21,20 @@ func (s *testMemoryForestService) Retrieve(context.Context, forest.Query) ([]*fo
 	return nil, nil
 }
 
+func (s *testMemoryForestService) RetrieveForest(context.Context, forest.Query) ([]*forest.ForestPacket, error) {
+	return nil, nil
+}
+
+func (s *testMemoryForestService) CreateForestCursor(context.Context, forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	return nil, nil
+}
+
 func (s *testMemoryForestService) PredictNextBranches(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
 	return nil, nil
+}
+
+func (s *testMemoryForestService) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
+	return nil
 }
 
 func (s *testMemoryForestService) RecordOutcome(_ context.Context, record forest.OutcomeRecord) error {

@@ -1312,7 +1312,8 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 
 	var toEmit []any
 	b.mu.Lock()
-	if existing := b.claimMeta[c.ID]; existing.ClaimID != "" && b.resolver.CycleForClaim(c.ID) != "" {
+	existing := b.claimMeta[c.ID]
+	if existing.ClaimID != "" && b.resolver.CycleForClaim(c.ID) != "" {
 		if isPeerActionType(existing.ActionType) && strings.TrimSpace(b.claimToPeerRow[c.ID]) == "" {
 			meta := b.metaForClaimLocked(c.ID)
 			if m := b.claimPeerInteractionMsgLocked(sessionID, c.ID, meta, "pending", "", "", "", c.Sequence, "", nonZeroTime(c.Created)); m != nil {
@@ -1370,6 +1371,7 @@ func (b *ClaimsBridge) handleClaimCreated(sessionID string, c *claims.Claim) {
 		SuppressChat:              suppressChat,
 		UIState:                   uiState,
 	}
+	meta = mergeExistingParticipantMetadata(meta, existing)
 	b.claimMeta[c.ID] = meta
 
 	if outcome.PredecessorClosed != nil {
@@ -2408,6 +2410,19 @@ func withIssuerParticipant(meta claimMeta, ref participantDisplayRef) claimMeta 
 	meta.IssuerParticipantUID = firstNonBlank(meta.IssuerParticipantUID, ref.UID, meta.IssuerAgentID)
 	meta.IssuerParticipantCategory = firstNonBlank(meta.IssuerParticipantCategory, ref.Category)
 	meta.IssuerParticipantRoute = firstNonBlank(meta.IssuerParticipantRoute, ref.Route, meta.IssuerAgentID)
+	return meta
+}
+
+func mergeExistingParticipantMetadata(meta, existing claimMeta) claimMeta {
+	meta.OwnerParticipantUID = firstNonBlank(existing.OwnerParticipantUID, meta.OwnerParticipantUID)
+	meta.OwnerParticipantCategory = firstNonBlank(existing.OwnerParticipantCategory, meta.OwnerParticipantCategory)
+	meta.OwnerParticipantRoute = firstNonBlank(existing.OwnerParticipantRoute, meta.OwnerParticipantRoute)
+	meta.TargetParticipantUID = firstNonBlank(existing.TargetParticipantUID, meta.TargetParticipantUID)
+	meta.TargetParticipantCategory = firstNonBlank(existing.TargetParticipantCategory, meta.TargetParticipantCategory)
+	meta.TargetParticipantRoute = firstNonBlank(existing.TargetParticipantRoute, meta.TargetParticipantRoute)
+	meta.IssuerParticipantUID = firstNonBlank(existing.IssuerParticipantUID, meta.IssuerParticipantUID)
+	meta.IssuerParticipantCategory = firstNonBlank(existing.IssuerParticipantCategory, meta.IssuerParticipantCategory)
+	meta.IssuerParticipantRoute = firstNonBlank(existing.IssuerParticipantRoute, meta.IssuerParticipantRoute)
 	return meta
 }
 

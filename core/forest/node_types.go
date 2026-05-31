@@ -126,12 +126,12 @@ type ForestPacket struct {
 }
 
 type ForestPath struct {
-	PathID      string         `json:"path_id"`
-	NodeIDs     []string       `json:"node_ids"`
-	EdgeIDs     []string       `json:"edge_ids"`
+	PathID      string           `json:"path_id"`
+	NodeIDs     []string         `json:"node_ids"`
+	EdgeIDs     []string         `json:"edge_ids"`
 	Kinds       []ForestEdgeKind `json:"kinds"`
-	Weight      float64        `json:"weight"`
-	Explanation string         `json:"explanation"`
+	Weight      float64          `json:"weight"`
+	Explanation string           `json:"explanation"`
 }
 
 type ForestEvidence struct {
@@ -144,7 +144,7 @@ type ForestEvidence struct {
 	Grade        EvidenceGrade `json:"grade"`
 	Summary      string        `json:"summary"`
 	Confidence   float64       `json:"confidence"`
-	Counter       bool          `json:"counter"`
+	Counter      bool          `json:"counter"`
 }
 
 type ForestPOI struct {
@@ -168,11 +168,11 @@ type ForestBridgeRisk struct {
 }
 
 type ForestQuarantine struct {
-	Quarantined     bool     `json:"quarantined"`
-	Factor          float64  `json:"factor"`
-	Corruption      float64  `json:"corruption"`
+	Quarantined      bool     `json:"quarantined"`
+	Factor           float64  `json:"factor"`
+	Corruption       float64  `json:"corruption"`
 	Immunity         float64  `json:"immunity"`
-	Dimensions      []string `json:"dimensions,omitempty"`
+	Dimensions       []string `json:"dimensions,omitempty"`
 	EvidenceRefs     []string `json:"evidence_refs,omitempty"`
 	RecoveryRequired bool     `json:"recovery_required"`
 }
@@ -188,19 +188,19 @@ type ForestClaimProposalTemplate struct {
 }
 
 type ForestCursor struct {
-	ID               string    `json:"id"`
-	SessionID        string    `json:"session_id,omitempty"`
-	TaskID           string    `json:"task_id,omitempty"`
-	AgentID          string    `json:"agent_id,omitempty"`
-	TurnID           string    `json:"turn_id,omitempty"`
-	ActiveClusterIDs []string  `json:"active_cluster_ids,omitempty"`
-	ActiveNodeIDs    []string  `json:"active_node_ids,omitempty"`
-	POIRefs          []string  `json:"poi_refs,omitempty"`
-	BridgeRefs       []string  `json:"bridge_refs,omitempty"`
-	RiskFlags        []string  `json:"risk_flags,omitempty"`
-	NoCursorReason   string    `json:"no_cursor_reason,omitempty"`
-	PolicyVersion    string    `json:"policy_version"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID               string         `json:"id"`
+	SessionID        string         `json:"session_id,omitempty"`
+	TaskID           string         `json:"task_id,omitempty"`
+	AgentID          string         `json:"agent_id,omitempty"`
+	TurnID           string         `json:"turn_id,omitempty"`
+	ActiveClusterIDs []string       `json:"active_cluster_ids,omitempty"`
+	ActiveNodeIDs    []string       `json:"active_node_ids,omitempty"`
+	POIRefs          []string       `json:"poi_refs,omitempty"`
+	BridgeRefs       []string       `json:"bridge_refs,omitempty"`
+	RiskFlags        []string       `json:"risk_flags,omitempty"`
+	NoCursorReason   string         `json:"no_cursor_reason,omitempty"`
+	PolicyVersion    string         `json:"policy_version"`
+	CreatedAt        time.Time      `json:"created_at"`
 	Metadata         map[string]any `json:"metadata,omitempty"`
 }
 

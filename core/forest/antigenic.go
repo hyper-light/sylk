@@ -61,6 +61,12 @@ func (m *MemoryForest) ProposeForestClaim(ctx context.Context, proposal ForestCl
 	if proposal.ID == "" {
 		return fmt.Errorf("forest claim proposal id is required")
 	}
+	if proposal.Summary == "" {
+		return fmt.Errorf("forest claim proposal summary is required")
+	}
+	if len(proposal.EvidenceRefs) == 0 {
+		return fmt.Errorf("forest claim proposal requires evidence refs")
+	}
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin forest claim proposal tx: %w", err)
@@ -458,35 +464,89 @@ type outbreakCandidate struct {
 
 func (m *MemoryForest) loadOutbreakCandidates(ctx context.Context, limit int) ([]outbreakCandidate, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT scope_id, dimension, SUM(magnitude), COUNT(*), MAX(recorded_at), GROUP_CONCAT(evidence_refs)
+		SELECT scope_id, dimension, magnitude, quarantine_factor, recorded_at, evidence_refs
 		FROM forest_antigenic_vectors
 		WHERE scope_type = 'cluster' AND policy_version = ?
-		GROUP BY scope_id, dimension
-		ORDER BY MAX(recorded_at) DESC
+		ORDER BY recorded_at DESC
 		LIMIT ?
 	`, antigenicPolicyVersion, limit*len(defaultEcologyPolicy().Channels))
 	if err != nil {
 		return nil, fmt.Errorf("query outbreak candidates: %w", err)
 	}
 	defer rows.Close()
-	candidates := make([]outbreakCandidate, 0, limit)
-	for rows.Next() {
-		candidate, err := m.scanOutbreakCandidate(ctx, rows)
-		if err != nil {
-			return nil, err
+	grouped, err := scanOutbreakCandidateDeltas(rows, time.Now().UTC().Unix())
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := m.hydrateOutbreakCandidates(ctx, grouped)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].SourceSeq == candidates[j].SourceSeq {
+			return candidates[i].Corruption > candidates[j].Corruption
 		}
-		candidates = append(candidates, candidate)
+		return candidates[i].SourceSeq > candidates[j].SourceSeq
+	})
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
 	}
 	return candidates, rows.Err()
 }
 
-func (m *MemoryForest) scanOutbreakCandidate(ctx context.Context, rows interface{ Scan(dest ...any) error }) (outbreakCandidate, error) {
-	var refs string
-	candidate := outbreakCandidate{}
-	if err := rows.Scan(&candidate.ClusterID, &candidate.Dimension, &candidate.Corruption, &candidate.EvidenceCount, &candidate.SourceSeq, &refs); err != nil {
-		return outbreakCandidate{}, fmt.Errorf("scan outbreak candidate: %w", err)
+func scanOutbreakCandidateDeltas(rows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}, now int64) (map[string]outbreakCandidate, error) {
+	grouped := make(map[string]outbreakCandidate)
+	for rows.Next() {
+		if err := appendOutbreakCandidateDelta(rows, grouped, now); err != nil {
+			return nil, err
+		}
 	}
-	candidate.EvidenceRefs = decodeStringList(refs)
+	return grouped, rows.Err()
+}
+
+func appendOutbreakCandidateDelta(rows interface{ Scan(dest ...any) error }, grouped map[string]outbreakCandidate, now int64) error {
+	var refs string
+	var magnitude, factor float64
+	candidate := outbreakCandidate{}
+	if err := rows.Scan(&candidate.ClusterID, &candidate.Dimension, &magnitude, &factor, &candidate.SourceSeq, &refs); err != nil {
+		return fmt.Errorf("scan outbreak candidate: %w", err)
+	}
+	key := outbreakCandidateKey(candidate.ClusterID, candidate.Dimension)
+	existing := grouped[key]
+	existing.ClusterID = candidate.ClusterID
+	existing.Dimension = candidate.Dimension
+	existing.Corruption = clampFinite01(existing.Corruption + decayedVectorContribution(magnitude, factor, candidate.SourceSeq, now))
+	existing.EvidenceCount++
+	if candidate.SourceSeq > existing.SourceSeq {
+		existing.SourceSeq = candidate.SourceSeq
+	}
+	existing.EvidenceRefs = append(existing.EvidenceRefs, decodeStringList(refs)...)
+	grouped[key] = existing
+	return nil
+}
+
+func outbreakCandidateKey(clusterID, dimension string) string {
+	return strings.TrimSpace(clusterID) + "\x00" + strings.TrimSpace(dimension)
+}
+
+func (m *MemoryForest) hydrateOutbreakCandidates(ctx context.Context, grouped map[string]outbreakCandidate) ([]outbreakCandidate, error) {
+	candidates := make([]outbreakCandidate, 0, len(grouped))
+	for _, candidate := range grouped {
+		hydrated, err := m.hydrateOutbreakCandidate(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, hydrated)
+	}
+	return candidates, nil
+}
+
+func (m *MemoryForest) hydrateOutbreakCandidate(ctx context.Context, candidate outbreakCandidate) (outbreakCandidate, error) {
+	candidate.EvidenceRefs = dedupeStrings(candidate.EvidenceRefs)
 	immunity, counterRefs, err := m.clusterImmunityForDimension(ctx, candidate.ClusterID, candidate.Dimension)
 	if err != nil {
 		return outbreakCandidate{}, err
@@ -503,7 +563,7 @@ func (m *MemoryForest) scanOutbreakCandidate(ctx context.Context, rows interface
 
 func (m *MemoryForest) clusterImmunityForDimension(ctx context.Context, clusterID, dimension string) (float64, []string, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT magnitude, evidence_refs
+		SELECT magnitude, recorded_at, evidence_refs
 		FROM forest_immunity_vectors
 		WHERE scope_type = 'cluster' AND scope_id = ? AND policy_version = ?
 	`, clusterID, antigenicPolicyVersion)
@@ -513,13 +573,15 @@ func (m *MemoryForest) clusterImmunityForDimension(ctx context.Context, clusterI
 	defer rows.Close()
 	var total float64
 	var refs []string
+	now := time.Now().UTC().Unix()
 	for rows.Next() {
 		var magnitude float64
+		var recordedAt int64
 		var encoded string
-		if err := rows.Scan(&magnitude, &encoded); err != nil {
+		if err := rows.Scan(&magnitude, &recordedAt, &encoded); err != nil {
 			return 0, nil, fmt.Errorf("scan outbreak immunity: %w", err)
 		}
-		total += immunityRelevance(dimension) * clampFinite01(magnitude)
+		total += immunityRelevance(dimension) * decayedVectorContribution(magnitude, 1, recordedAt, now)
 		refs = append(refs, decodeStringList(encoded)...)
 	}
 	return clampFinite01(total), dedupeStrings(refs), rows.Err()
@@ -530,6 +592,25 @@ func immunityRelevance(corruptionDimension string) float64 {
 		return 1
 	}
 	return 1 / float64(nodeProjectionRetryLimit())
+}
+
+func decayedVectorContribution(magnitude, factor float64, recordedAt, now int64) float64 {
+	return clampFinite01(magnitude) * clampFinite01(factor) * vectorDecayWeight(recordedAt, now)
+}
+
+func vectorDecayWeight(recordedAt, now int64) float64 {
+	if recordedAt <= 0 || now <= recordedAt {
+		return 1
+	}
+	retention := activationHistoryRetentionBuckets(defaultEcologyPolicy())
+	if retention <= 0 {
+		return 1
+	}
+	age := activationBucket(now) - activationBucket(recordedAt)
+	if age <= 0 {
+		return 1
+	}
+	return clampFinite01(1 / (1 + float64(age)/float64(retention)))
 }
 
 func (m *MemoryForest) clusterHasBridgeRisk(ctx context.Context, clusterID string) (bool, error) {
@@ -553,6 +634,10 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 		return OutbreakMaintenanceResult{}, nil
 	}
 	proposal := claimProposalForOutbreak(candidate)
+	alreadyProposed, err := m.outbreakProposalAlreadyOpen(ctx, candidate, proposal)
+	if err != nil {
+		return OutbreakMaintenanceResult{}, err
+	}
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
 		return OutbreakMaintenanceResult{}, fmt.Errorf("begin outbreak tx: %w", err)
@@ -570,7 +655,7 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 	if err := tx.Commit(); err != nil {
 		return OutbreakMaintenanceResult{}, fmt.Errorf("commit outbreak tx: %w", err)
 	}
-	if status == OutbreakStatusProposed && m.proposalSink != nil {
+	if status == OutbreakStatusProposed && !alreadyProposed && m.proposalSink != nil {
 		if err := m.proposalSink.ProposeClaim(ctx, proposal); err != nil {
 			return OutbreakMaintenanceResult{}, fmt.Errorf("emit remediation proposal: %w", err)
 		}
@@ -578,7 +663,26 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 	if status == OutbreakStatusSuperseded {
 		return OutbreakMaintenanceResult{OutbreaksUpdated: 1, Superseded: 1}, nil
 	}
+	if alreadyProposed {
+		return OutbreakMaintenanceResult{OutbreaksUpdated: 1}, nil
+	}
 	return OutbreakMaintenanceResult{OutbreaksUpdated: 1, ProposalsEmitted: 1}, nil
+}
+
+func (m *MemoryForest) outbreakProposalAlreadyOpen(ctx context.Context, candidate outbreakCandidate, proposal ForestClaimProposal) (bool, error) {
+	if proposal.ID == "" {
+		return false, nil
+	}
+	var count int
+	if err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_outbreaks
+		WHERE cluster_id = ? AND dimension = ? AND policy_version = ?
+		  AND status = ? AND proposed_claim_id = ?
+	`, candidate.ClusterID, candidate.Dimension, antigenicPolicyVersion, OutbreakStatusProposed, proposal.ID).Scan(&count); err != nil {
+		return false, fmt.Errorf("check existing outbreak proposal: %w", err)
+	}
+	return count > 0, nil
 }
 
 func outbreakResolved(candidate outbreakCandidate) bool {
@@ -623,11 +727,33 @@ func upsertOutbreakTx(ctx context.Context, tx *sql.Tx, outbreakID, status string
 			metadata = excluded.metadata
 	`, outbreakID, candidate.ClusterID, candidate.Dimension, outbreakGrowthRate(candidate), encodeStringList(candidate.EvidenceRefs),
 		encodeStringList(candidate.CounterEvidenceRefs), status, proposal.ID, boolInt(proposal.GuardianReviewRequired),
-		candidate.SourceSeq, antigenicPolicyVersion, now, now, marshalJSON(candidate))
+		candidate.SourceSeq, antigenicPolicyVersion, now, now, marshalJSON(outbreakMetadata(candidate, status)))
 	if err != nil {
 		return fmt.Errorf("upsert outbreak: %w", err)
 	}
 	return nil
+}
+
+func outbreakMetadata(candidate outbreakCandidate, status string) map[string]any {
+	metadata := map[string]any{
+		"candidate": candidate,
+		"reason":    outbreakStatusReason(candidate, status),
+	}
+	return metadata
+}
+
+func outbreakStatusReason(candidate outbreakCandidate, status string) string {
+	switch status {
+	case OutbreakStatusSuperseded:
+		return "immunity_recovered_before_dispatch"
+	case OutbreakStatusProposed:
+		if candidate.BridgeSevere {
+			return "bridge_or_cross_cluster_outbreak_requires_guardian_review"
+		}
+		return "corruption_exceeds_immunity_threshold"
+	default:
+		return "outbreak_state_updated"
+	}
 }
 
 func outbreakGrowthRate(candidate outbreakCandidate) float64 {

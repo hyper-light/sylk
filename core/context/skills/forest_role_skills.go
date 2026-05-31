@@ -29,10 +29,12 @@ type ForestRoleInput struct {
 
 // ForestRoleOutput packages intent and retrieval results for role-specific skills.
 type ForestRoleOutput struct {
-	Role    string                   `json:"role"`
-	Intent  *forest.IntentResolution `json:"intent,omitempty"`
-	Packets []*forest.BranchPacket   `json:"packets,omitempty"`
-	Focus   []string                 `json:"focus,omitempty"`
+	Role       string                       `json:"role"`
+	Intent     *forest.IntentResolution     `json:"intent,omitempty"`
+	Packets    []*forest.ForestPacket       `json:"packets,omitempty"`
+	Cursor     *forest.ForestCursor         `json:"cursor,omitempty"`
+	Projection *forest.ForestRoleProjection `json:"projection,omitempty"`
+	Focus      []string                     `json:"focus,omitempty"`
 	// ConsultActivityID is the fabric activity ID emitted by the
 	// handler when the consult ran. Populated on every successful
 	// return. Downstream activity emissions that want to declare
@@ -637,7 +639,8 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 
 		var (
 			intent   *forest.IntentResolution
-			packets  []*forest.BranchPacket
+			packets  []*forest.ForestPacket
+			cursor   *forest.ForestCursor
 			firstErr error
 			mu       sync.Mutex
 			wg       sync.WaitGroup
@@ -657,21 +660,31 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 		}()
 		go func() {
 			defer wg.Done()
-			var packetsErr error
-			if spec.Predict {
-				packets, packetsErr = deps.Forest.PredictNextBranches(ctx, query)
-			} else {
-				packets, packetsErr = deps.Forest.Retrieve(ctx, query)
+			retrieved, packetsErr := deps.Forest.RetrieveForest(ctx, query)
+			if packetsErr == nil {
+				cursor, packetsErr = deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
+					SessionID: query.SessionID,
+					TaskID:    query.TaskID,
+					AgentID:   query.AgentID,
+					Packets:   retrieved,
+					Limit:     query.Limit,
+				})
 			}
 			mu.Lock()
 			defer mu.Unlock()
 			if packetsErr != nil && firstErr == nil {
 				firstErr = packetsErr
+				return
 			}
+			packets = retrieved
 		}()
 		wg.Wait()
 		if firstErr != nil {
 			return nil, firstErr
+		}
+		projection, err := forest.BuildRoleForestProjection(spec.Domain, packets, cursor, query.Limit)
+		if err != nil {
+			return nil, err
 		}
 
 		// Tier 5: emit ActionForestConsultEmitted so downstream
@@ -684,6 +697,8 @@ func NewRoleForestConsultSkill(deps *RetrievalDependencies, role string, specs [
 			Role:              spec.Domain,
 			Intent:            intent,
 			Packets:           packets,
+			Cursor:            cursor,
+			Projection:        projection,
 			Focus:             buildRoleForestFocus(intent, packets),
 			ConsultActivityID: consultID,
 		}, nil
@@ -764,7 +779,8 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 
 		var (
 			intent   *forest.IntentResolution
-			packets  []*forest.BranchPacket
+			packets  []*forest.ForestPacket
+			cursor   *forest.ForestCursor
 			firstErr error
 			mu       sync.Mutex
 			wg       sync.WaitGroup
@@ -784,21 +800,31 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 		}()
 		go func() {
 			defer wg.Done()
-			var packetsErr error
-			if spec.Predict {
-				packets, packetsErr = deps.Forest.PredictNextBranches(ctx, query)
-			} else {
-				packets, packetsErr = deps.Forest.Retrieve(ctx, query)
+			retrieved, packetsErr := deps.Forest.RetrieveForest(ctx, query)
+			if packetsErr == nil {
+				cursor, packetsErr = deps.Forest.CreateForestCursor(ctx, forest.ForestCursorInput{
+					SessionID: query.SessionID,
+					TaskID:    query.TaskID,
+					AgentID:   query.AgentID,
+					Packets:   retrieved,
+					Limit:     query.Limit,
+				})
 			}
 			mu.Lock()
 			defer mu.Unlock()
 			if packetsErr != nil && firstErr == nil {
 				firstErr = packetsErr
+				return
 			}
+			packets = retrieved
 		}()
 		wg.Wait()
 		if firstErr != nil {
 			return nil, firstErr
+		}
+		projection, err := forest.BuildRoleForestProjection(spec.Domain, packets, cursor, query.Limit)
+		if err != nil {
+			return nil, err
 		}
 
 		// Tier 5: forest consult emission for causation threading.
@@ -811,6 +837,8 @@ func NewRoleForestSkill(deps *RetrievalDependencies, spec forestRoleSkillSpec) *
 			Role:              spec.Domain,
 			Intent:            intent,
 			Packets:           packets,
+			Cursor:            cursor,
+			Projection:        projection,
 			Focus:             buildRoleForestFocus(intent, packets),
 			ConsultActivityID: consultID,
 		}, nil
@@ -845,7 +873,7 @@ func emitForestConsultActivity(
 	purpose string,
 	query forest.Query,
 	intent *forest.IntentResolution,
-	packets []*forest.BranchPacket,
+	packets []*forest.ForestPacket,
 ) string {
 	actorID := strings.TrimSpace(query.AgentID)
 	if actorID == "" {
@@ -856,12 +884,12 @@ func emitForestConsultActivity(
 		AgentType: spec.Domain,
 	}
 
-	branchIDs := make([]string, 0, len(packets))
+	nodeIDs := make([]string, 0, len(packets))
 	for _, p := range packets {
-		if p == nil || p.Branch == nil {
+		if p == nil || p.Node.ID == "" {
 			continue
 		}
-		branchIDs = append(branchIDs, p.Branch.ID)
+		nodeIDs = append(nodeIDs, p.Node.ID)
 	}
 
 	payload := map[string]any{
@@ -869,7 +897,8 @@ func emitForestConsultActivity(
 		"query":      query.Query,
 		"horizon":    query.Horizon,
 		"limit":      query.Limit,
-		"branch_ids": branchIDs,
+		"branch_ids": nodeIDs,
+		"node_ids":   nodeIDs,
 	}
 	if intent != nil {
 		if intent.PrimaryIntent != "" {
@@ -949,7 +978,7 @@ func resolveRoleCounterEvidence(input *bool, fallback bool) bool {
 	return fallback
 }
 
-func buildRoleForestFocus(intent *forest.IntentResolution, packets []*forest.BranchPacket) []string {
+func buildRoleForestFocus(intent *forest.IntentResolution, packets []*forest.ForestPacket) []string {
 	seen := map[string]struct{}{}
 	focus := make([]string, 0, 5)
 	add := func(value string) {
@@ -974,14 +1003,12 @@ func buildRoleForestFocus(intent *forest.IntentResolution, packets []*forest.Bra
 		}
 	}
 	if len(packets) > 0 {
-		if packets[0].Branch != nil {
-			add("Top branch: " + packets[0].Branch.Summary)
+		add("Top node: " + firstNonEmpty(packets[0].Node.Summary, packets[0].Node.Title))
+		if len(packets[0].CounterEvidence) > 0 {
+			add("Watch for: " + packets[0].CounterEvidence[0].Summary)
 		}
-		if len(packets[0].Conflicts) > 0 {
-			add("Watch for: " + packets[0].Conflicts[0].Summary)
-		}
-		if len(packets[0].NextActions) > 0 {
-			add("Next action: " + packets[0].NextActions[0].Description)
+		if len(packets[0].ProposedClaims) > 0 {
+			add("Proposed claim: " + packets[0].ProposedClaims[0].Summary)
 		}
 	}
 	if len(focus) > 5 {

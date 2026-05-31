@@ -21,6 +21,8 @@ type fakeProjector struct {
 	preferences  *forest.PreferenceProjection
 	capabilities *forest.CapabilityProjection
 	opportunity  *forest.OpportunityProjection
+	packets      []*forest.ForestPacket
+	cursor       *forest.ForestCursor
 
 	calledIntent       bool
 	calledConstraint   bool
@@ -29,6 +31,8 @@ type fakeProjector struct {
 	calledOutcomes     bool
 	calledPreferences  bool
 	calledCapabilities bool
+	calledRetrieve     bool
+	calledCursor       bool
 }
 
 func (f *fakeProjector) ResolveIntent(context.Context, forest.ResolveIntentInput) (*forest.IntentResolution, error) {
@@ -37,8 +41,36 @@ func (f *fakeProjector) ResolveIntent(context.Context, forest.ResolveIntentInput
 func (f *fakeProjector) Retrieve(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
 	return nil, nil
 }
+func (f *fakeProjector) RetrieveForest(_ context.Context, _ forest.Query) ([]*forest.ForestPacket, error) {
+	f.calledRetrieve = true
+	if f.packets != nil {
+		return f.packets, nil
+	}
+	return []*forest.ForestPacket{{
+		Node: forest.ForestNode{
+			ID:            "node-1",
+			Kind:          forest.ForestNodeClaim,
+			Summary:       "Use the validated forest projection path",
+			EvidenceGrade: forest.EvidenceGradeObserved,
+			Confidence:    1,
+		},
+		Evidence: []forest.ForestEvidence{{RefType: "node", RefID: "node-1", NodeID: "node-1", Grade: forest.EvidenceGradeObserved}},
+		Score:    1,
+	}}, nil
+}
+func (f *fakeProjector) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	f.calledCursor = true
+	if f.cursor != nil {
+		return f.cursor, nil
+	}
+	cursor := &forest.ForestCursor{ID: "cursor-1", SessionID: input.SessionID, ActiveNodeIDs: []string{"node-1"}}
+	return cursor, nil
+}
 func (f *fakeProjector) PredictNextBranches(context.Context, forest.Query) ([]*forest.BranchPacket, error) {
 	return nil, nil
+}
+func (f *fakeProjector) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
+	return nil
 }
 func (f *fakeProjector) RecordOutcome(context.Context, forest.OutcomeRecord) error {
 	return nil
@@ -76,62 +108,62 @@ func (f *fakeProjector) ProjectOpportunities(_ context.Context, _ forest.Project
 	return f.opportunity, nil
 }
 
-// TestPreloadFor_ArchitectPullsIntentConstraintDecision locks the
-// architect's projection lane: memory context should carry the intent
-// envelope, the enforced constraints, and chosen decisions — nothing
-// else. A regression here (e.g. Architect suddenly pulling Evidence)
-// would bloat the planner prompt with Academic-lane content and
-// muddle ranking.
 func TestPreloadFor_ArchitectPullsIntentConstraintDecision(t *testing.T) {
 	f := &fakeProjector{}
-	_, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "architect"})
+	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "architect"})
 	if err != nil {
 		t.Fatalf("preload err: %v", err)
 	}
-	if !f.calledIntent || !f.calledConstraint || !f.calledDecisions {
-		t.Errorf("architect lane missed a projection: intent=%v constraint=%v decisions=%v",
-			f.calledIntent, f.calledConstraint, f.calledDecisions)
+	if got == nil || got.Projection == nil || got.Projection.Role != "architect" {
+		t.Fatalf("architect preload projection = %#v", got)
 	}
-	if f.calledEvidence || f.calledOutcomes || f.calledPreferences || f.calledCapabilities {
-		t.Errorf("architect lane leaked: evidence=%v outcomes=%v prefs=%v caps=%v",
-			f.calledEvidence, f.calledOutcomes, f.calledPreferences, f.calledCapabilities)
+	if !f.calledRetrieve || !f.calledCursor {
+		t.Fatalf("architect preload did not use forest packet cursor path: retrieve=%v cursor=%v", f.calledRetrieve, f.calledCursor)
+	}
+	if f.calledIntent || f.calledConstraint || f.calledDecisions || f.calledEvidence {
+		t.Fatalf("architect preload used legacy projections")
 	}
 }
 
-// TestPreloadFor_LibrarianPullsPreferenceCapabilityIntent — preference
-// and capability are the two librarian-lane signals, intent grounds the
-// retrieval.
 func TestPreloadFor_LibrarianPullsPreferenceCapabilityIntent(t *testing.T) {
 	f := &fakeProjector{}
-	_, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "librarian"})
+	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "librarian"})
 	if err != nil {
 		t.Fatalf("preload err: %v", err)
 	}
-	if !f.calledPreferences || !f.calledCapabilities || !f.calledIntent {
-		t.Errorf("librarian lane missed: prefs=%v caps=%v intent=%v",
-			f.calledPreferences, f.calledCapabilities, f.calledIntent)
-	}
-	if f.calledConstraint || f.calledDecisions || f.calledEvidence || f.calledOutcomes {
-		t.Errorf("librarian lane leaked: constraint=%v decisions=%v evidence=%v outcomes=%v",
-			f.calledConstraint, f.calledDecisions, f.calledEvidence, f.calledOutcomes)
+	if got == nil || got.Projection == nil || got.Projection.Role != "librarian" {
+		t.Fatalf("librarian preload projection = %#v", got)
 	}
 }
 
-// TestPreloadFor_AcademicPullsEvidenceOutcomeIntent — academic owns
-// the epistemic lane.
 func TestPreloadFor_AcademicPullsEvidenceOutcomeIntent(t *testing.T) {
 	f := &fakeProjector{}
-	_, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "academic"})
+	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "academic"})
 	if err != nil {
 		t.Fatalf("preload err: %v", err)
 	}
-	if !f.calledEvidence || !f.calledOutcomes || !f.calledIntent {
-		t.Errorf("academic lane missed: evidence=%v outcomes=%v intent=%v",
-			f.calledEvidence, f.calledOutcomes, f.calledIntent)
+	if got == nil || got.Projection == nil || got.Projection.Role != "academic" {
+		t.Fatalf("academic preload projection = %#v", got)
 	}
-	if f.calledConstraint || f.calledDecisions || f.calledPreferences || f.calledCapabilities {
-		t.Errorf("academic lane leaked: constraint=%v decisions=%v prefs=%v caps=%v",
-			f.calledConstraint, f.calledDecisions, f.calledPreferences, f.calledCapabilities)
+}
+
+func TestPreloadFor_AllEmergentAgencyRolesReceivePacketProjection(t *testing.T) {
+	roles := []string{"architect", "engineer", "tester", "guardian", "inspector", "librarian", "academic", "designer", "orchestrator", "scribe", "scribe-engineer", "archivalist", "guide"}
+	for _, role := range roles {
+		t.Run(role, func(t *testing.T) {
+			f := &fakeProjector{}
+			got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: role, Query: role + " work"})
+			if err != nil {
+				t.Fatalf("preload err: %v", err)
+			}
+			if got == nil || got.Projection == nil || got.Cursor == nil || len(got.Packets) == 0 {
+				t.Fatalf("role %s missing projection/cursor/packets: %+v", role, got)
+			}
+			rendered := got.Render()
+			if !strings.Contains(rendered, "cursor=") || !strings.Contains(rendered, "evidence_refs:") {
+				t.Fatalf("role %s render missing cursor/evidence refs: %q", role, rendered)
+			}
+		})
 	}
 }
 
@@ -141,7 +173,7 @@ func TestPreloadFor_AcademicPullsEvidenceOutcomeIntent(t *testing.T) {
 // "no preload" rather than dispatching every family.
 func TestPreloadFor_UnknownAgentReturnsNil(t *testing.T) {
 	f := &fakeProjector{}
-	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "scribe"})
+	got, err := PreloadFor(context.Background(), f, ForestPreloadInput{AgentType: "unknown-agent"})
 	if err != nil {
 		t.Fatalf("preload err: %v", err)
 	}
@@ -171,39 +203,24 @@ func TestPreloadFor_NilServiceReturnsNil(t *testing.T) {
 // here mean the system prompt carries noise ("- Chosen decisions:
 // (none)") instead of the intended terse preload.
 func TestForestPreload_RenderIncludesOnlyPopulatedBuckets(t *testing.T) {
-	packet := func(title, summary string) forest.BranchPacket {
-		return forest.BranchPacket{Branch: &forest.Branch{Title: title, Summary: summary}}
-	}
 	preload := &ForestPreload{
-		Intents: &forest.IntentProjection{
-			PrimaryIntent: "ship the thing",
-			Active:        []forest.BranchPacket{packet("t1", "goal one"), packet("t2", "goal two")},
+		Projection: &forest.ForestRoleProjection{
+			Role:         "engineer",
+			EvidenceRefs: []string{"node:node-1"},
+			RiskFlags:    []string{"context.under_review"},
+			Text:         "Memory Forest projection role=engineer\nevidence_refs: node:node-1\nrisk_flags: context.under_review",
 		},
-		Constraints: &forest.ConstraintProjection{
-			Enforced: []forest.BranchPacket{packet("c1", "no panics")},
-		},
-		// Evidence present but empty — must not render.
-		Evidence: &forest.EvidenceProjection{},
 	}
 
 	rendered := preload.Render()
 	if rendered == "" {
 		t.Fatal("Render() returned empty for non-empty preload")
 	}
-	if !strings.Contains(rendered, "MEMORY CONTEXT") {
-		t.Errorf("missing header: %q", rendered)
+	if !strings.Contains(rendered, "Memory Forest projection role=engineer") {
+		t.Errorf("missing projection header: %q", rendered)
 	}
-	if !strings.Contains(rendered, `primary="ship the thing"`) {
-		t.Errorf("primary intent missing from render: %q", rendered)
-	}
-	if !strings.Contains(rendered, "t1 — goal one") {
-		t.Errorf("active intent summary missing: %q", rendered)
-	}
-	if !strings.Contains(rendered, "c1 — no panics") {
-		t.Errorf("enforced constraint missing: %q", rendered)
-	}
-	if strings.Contains(rendered, "Current evidence") {
-		t.Errorf("empty Evidence bucket rendered anyway: %q", rendered)
+	if !strings.Contains(rendered, "evidence_refs: node:node-1") || !strings.Contains(rendered, "risk_flags: context.under_review") {
+		t.Errorf("projection evidence/risk missing: %q", rendered)
 	}
 }
 
@@ -214,15 +231,7 @@ func TestForestPreload_IsEmpty_NilAndHollowAreBothEmpty(t *testing.T) {
 	if !(*ForestPreload)(nil).IsEmpty() {
 		t.Error("nil preload reports non-empty")
 	}
-	hollow := &ForestPreload{
-		Intents:      &forest.IntentProjection{},
-		Constraints:  &forest.ConstraintProjection{},
-		Decisions:    &forest.DecisionProjection{},
-		Evidence:     &forest.EvidenceProjection{},
-		Outcomes:     &forest.OutcomeProjection{},
-		Preferences:  &forest.PreferenceProjection{},
-		Capabilities: &forest.CapabilityProjection{},
-	}
+	hollow := &ForestPreload{Projection: &forest.ForestRoleProjection{}}
 	if !hollow.IsEmpty() {
 		t.Error("hollow preload reports non-empty")
 	}
@@ -236,13 +245,24 @@ func TestForestPreload_IsEmpty_NilAndHollowAreBothEmpty(t *testing.T) {
 // plus a "+N more" footer, not the full 12 — otherwise long memory
 // tails crowd out real instructions.
 func TestForestPreload_RenderTruncatesLongLists(t *testing.T) {
-	var active []forest.BranchPacket
+	var packets []*forest.ForestPacket
 	for i := 0; i < 12; i++ {
-		active = append(active, forest.BranchPacket{Branch: &forest.Branch{Title: "t", Summary: "s"}})
+		node := forest.ForestNode{ID: "node-" + string(rune('a'+i)), Kind: forest.ForestNodeClaim, Summary: "s", EvidenceGrade: forest.EvidenceGradeObserved}
+		packets = append(packets, &forest.ForestPacket{
+			Node:     node,
+			Evidence: []forest.ForestEvidence{{RefType: "node", RefID: node.ID, NodeID: node.ID, Grade: forest.EvidenceGradeObserved}},
+			Score:    float64(i + 1),
+		})
 	}
-	preload := &ForestPreload{Intents: &forest.IntentProjection{Active: active}}
-	rendered := preload.Render()
-	if !strings.Contains(rendered, "…+7 more") {
-		t.Errorf("truncation footer missing for 12-item list: %q", rendered)
+	projection, err := forest.BuildRoleForestProjection("engineer", packets, &forest.ForestCursor{ID: "cursor-budget"}, 5)
+	if err != nil {
+		t.Fatalf("build projection: %v", err)
+	}
+	preload := &ForestPreload{Projection: projection}
+	if len(projection.Packets) != 5 {
+		t.Fatalf("projection packet count = %d, want 5", len(projection.Packets))
+	}
+	if !strings.Contains(preload.Render(), "cursor=cursor-budget") {
+		t.Errorf("projection render missing cursor: %q", preload.Render())
 	}
 }

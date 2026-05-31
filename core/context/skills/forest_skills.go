@@ -19,8 +19,6 @@ type ForestService interface {
 	RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error)
 	CreateForestCursor(ctx context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error)
 	ProposeForestClaim(ctx context.Context, proposal forest.ForestClaimProposal) error
-	Retrieve(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
-	PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error)
 	RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error
 }
 
@@ -89,14 +87,14 @@ type ForestProposalInput struct {
 }
 
 type ForestValidationSuggestionOutput struct {
-	Packets         []*forest.ForestPacket                 `json:"packets"`
-	Cursor          *forest.ForestCursor                   `json:"cursor,omitempty"`
-	ValidationNeeds []string                               `json:"validation_needs,omitempty"`
-	ProposedClaims  []forest.ForestClaimProposalTemplate   `json:"proposed_claims,omitempty"`
+	Packets         []*forest.ForestPacket               `json:"packets"`
+	Cursor          *forest.ForestCursor                 `json:"cursor,omitempty"`
+	ValidationNeeds []string                             `json:"validation_needs,omitempty"`
+	ProposedClaims  []forest.ForestClaimProposalTemplate `json:"proposed_claims,omitempty"`
 }
 
 type ForestProposalOutput struct {
-	Proposed bool                  `json:"proposed"`
+	Proposed bool                       `json:"proposed"`
 	Proposal forest.ForestClaimProposal `json:"proposal"`
 }
 
@@ -240,6 +238,10 @@ func NewForestProposeClaimSkill(deps *RetrievalDependencies) *skills.Skill {
 			return ForestProposalOutput{Proposed: true, Proposal: proposal}, nil
 		}).
 		Build()
+}
+
+func NewForestRecordOutcomeNamedSkill(name string, deps *RetrievalDependencies) *skills.Skill {
+	return newForestRecordOutcomeSkill(name, deps)
 }
 
 func NewForestReviewSkill(name, description string, deps *RetrievalDependencies) *skills.Skill {
@@ -434,7 +436,11 @@ func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
 
 // NewForestRecordOutcomeSkill creates the forest_record_outcome skill.
 func NewForestRecordOutcomeSkill(deps *RetrievalDependencies) *skills.Skill {
-	return skills.NewSkill("forest_record_outcome").
+	return newForestRecordOutcomeSkill("forest_record_outcome", deps)
+}
+
+func newForestRecordOutcomeSkill(name string, deps *RetrievalDependencies) *skills.Skill {
+	return skills.NewSkill(name).
 		Description("Record explicit outcome feedback for a branch so the forest can reconsolidate and learn from the result.").
 		Domain(RetrievalDomain).
 		Keywords("outcome", "feedback", "learn", "reconsolidate", "forest").

@@ -76,6 +76,25 @@ func (m *captureArchitectForest) Retrieve(ctx context.Context, query forest.Quer
 	return nil, nil
 }
 
+func (m *captureArchitectForest) RetrieveForest(ctx context.Context, query forest.Query) ([]*forest.ForestPacket, error) {
+	packets, err := m.Retrieve(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return captureForestPacketsFromBranches(packets), nil
+}
+
+func (m *captureArchitectForest) CreateForestCursor(_ context.Context, input forest.ForestCursorInput) (*forest.ForestCursor, error) {
+	cursor := &forest.ForestCursor{ID: "architect-cursor", SessionID: input.SessionID, TaskID: input.TaskID}
+	for _, packet := range input.Packets {
+		if packet == nil {
+			continue
+		}
+		cursor.ActiveNodeIDs = append(cursor.ActiveNodeIDs, packet.Node.ID)
+	}
+	return cursor, nil
+}
+
 func (m *captureArchitectForest) PredictNextBranches(ctx context.Context, query forest.Query) ([]*forest.BranchPacket, error) {
 	if m.predict != nil {
 		return m.predict(ctx, query)
@@ -83,11 +102,43 @@ func (m *captureArchitectForest) PredictNextBranches(ctx context.Context, query 
 	return nil, nil
 }
 
+func (m *captureArchitectForest) ProposeForestClaim(context.Context, forest.ForestClaimProposal) error {
+	return nil
+}
+
 func (m *captureArchitectForest) RecordOutcome(ctx context.Context, record forest.OutcomeRecord) error {
 	if m.recordOutcome != nil {
 		return m.recordOutcome(ctx, record)
 	}
 	return nil
+}
+
+func captureForestPacketsFromBranches(packets []*forest.BranchPacket) []*forest.ForestPacket {
+	out := make([]*forest.ForestPacket, 0, len(packets))
+	for _, packet := range packets {
+		if packet == nil || packet.Branch == nil {
+			continue
+		}
+		out = append(out, &forest.ForestPacket{
+			Node: forest.ForestNode{
+				ID:            packet.Branch.ID,
+				Kind:          forest.ForestNodeClaim,
+				Title:         packet.Branch.Title,
+				Summary:       packet.Branch.Summary,
+				EvidenceGrade: forest.EvidenceGradeObserved,
+				Confidence:    packet.Branch.Confidence,
+			},
+			Evidence: []forest.ForestEvidence{{
+				RefType: "node",
+				RefID:   packet.Branch.ID,
+				NodeID:  packet.Branch.ID,
+				Grade:   forest.EvidenceGradeObserved,
+				Summary: packet.Branch.Summary,
+			}},
+			Score: 1,
+		})
+	}
+	return out
 }
 
 // MEM-01: family projection stubs. This capture double doesn't assert

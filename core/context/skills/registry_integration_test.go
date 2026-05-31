@@ -253,8 +253,8 @@ func TestRegisterSkillsForAgent_Engineer(t *testing.T) {
 	if registry.Get("retrieve_context") == nil {
 		t.Error("engineer should receive universal skills")
 	}
-	if registry.Get("forest") == nil {
-		t.Error("engineer should receive consolidated forest query skill")
+	if registry.Get("forest.retrieve_evidence") == nil {
+		t.Error("engineer should receive forest evidence skill")
 	}
 	if registry.Get("engineer_forest_consult") == nil {
 		t.Error("engineer should receive collapsed engineer_forest_consult skill")
@@ -277,8 +277,8 @@ func TestRegisterSkillsForAgent_Guardian(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest") == nil {
-		t.Error("guardian should receive consolidated forest query skill")
+	if registry.Get("forest.review_bridge") == nil {
+		t.Error("guardian should receive bridge review skill")
 	}
 	if registry.Get("guardian_forest_consult") == nil {
 		t.Error("guardian should receive collapsed guardian_forest_consult skill")
@@ -298,8 +298,8 @@ func TestRegisterSkillsForAgent_Scribe(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest") == nil {
-		t.Error("scribe agents should receive consolidated forest query skill")
+	if registry.Get("forest.retrieve_evidence") == nil {
+		t.Error("scribe agents should receive forest evidence skill")
 	}
 	if registry.Get("scribe_forest_consult") == nil {
 		t.Error("scribe agents should receive collapsed scribe_forest_consult skill")
@@ -319,8 +319,8 @@ func TestRegisterSkillsForAgent_Architect(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest") == nil {
-		t.Error("architect should receive consolidated forest query skill")
+	if registry.Get("forest.suggest_validations") == nil {
+		t.Error("architect should receive validation suggestion skill")
 	}
 	if registry.Get("architect_forest_consult") == nil {
 		t.Error("architect should receive collapsed architect_forest_consult skill")
@@ -341,8 +341,8 @@ func TestRegisterSkillsForAgent_Inspector(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest") == nil {
-		t.Error("inspector should receive consolidated forest query skill")
+	if registry.Get("forest.review_contradiction") == nil {
+		t.Error("inspector should receive contradiction review skill")
 	}
 	if registry.Get("inspector_forest_consult") == nil {
 		t.Error("inspector should receive collapsed inspector_forest_consult skill")
@@ -366,8 +366,8 @@ func TestRegisterSkillsForAgent_Tester(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	if registry.Get("forest") == nil {
-		t.Error("tester should receive consolidated forest query skill")
+	if registry.Get("forest.suggest_validations") == nil {
+		t.Error("tester should receive validation suggestion skill")
 	}
 	if registry.Get("tester_forest_consult") == nil {
 		t.Error("tester should receive collapsed tester_forest_consult skill")
@@ -545,9 +545,7 @@ func TestGetAllAdaptiveRetrievalSkillNames(t *testing.T) {
 
 	names := GetAllAdaptiveRetrievalSkillNames()
 
-	// 23 after collapsing forest_resolve_intent + forest_recall +
-	// recall_recent + forest_predict_next_branches into forest(op=…).
-	expected := 23 + len(roleForestSkillNames())
+	expected := 28 + len(roleForestSkillNames())
 	if len(names) != expected {
 		t.Errorf("GetAllAdaptiveRetrievalSkillNames() returned %d names, want %d",
 			len(names), expected)
@@ -571,8 +569,7 @@ func TestIsAdaptiveRetrievalSkill(t *testing.T) {
 		expected bool
 	}{
 		{"retrieve_context", true},
-		// forest_recall + recall_recent collapsed into forest(op=…).
-		{"forest", true},
+		{"forest.retrieve_evidence", true},
 		{"librarian_search_codebase", true},
 		{"archivalist_search_sessions", true},
 		{"academic_search_research", true},

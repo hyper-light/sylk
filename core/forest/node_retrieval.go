@@ -178,7 +178,7 @@ func scanForestPacketBase(rows interface {
 				"suppression":       suppression,
 			},
 		},
-		Score: total,
+		Score:         total,
 		PolicyVersion: ecologyPolicyVersion,
 	}, nil
 }
@@ -552,10 +552,10 @@ func (m *MemoryForest) quarantineForNode(ctx context.Context, nodeID string) (Fo
 		Quarantined:      factor >= threshold,
 		Factor:           factor,
 		Corruption:       clampFinite01(corruption),
-		Immunity:          clampFinite01(immunity),
+		Immunity:         clampFinite01(immunity),
 		Dimensions:       dimensions,
-		EvidenceRefs:      dedupeStrings(append(refs, recoveryRefs...)),
-		RecoveryRequired:  factor >= threshold && immunity == 0,
+		EvidenceRefs:     dedupeStrings(append(refs, recoveryRefs...)),
+		RecoveryRequired: factor >= threshold && immunity == 0,
 	}, nil
 }
 
@@ -564,7 +564,7 @@ func (m *MemoryForest) vectorAggregate(ctx context.Context, table, factorColumn,
 		return 0, nil, nil, fmt.Errorf("unknown vector table %s.%s", table, factorColumn)
 	}
 	rows, err := m.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT dimension, magnitude, %s, evidence_refs
+		SELECT dimension, magnitude, %s, recorded_at, evidence_refs
 		FROM %s
 		WHERE scope_type = ? AND scope_id = ? AND policy_version = ?
 	`, factorColumn, table), scopeType, scopeID, antigenicPolicyVersion)
@@ -575,13 +575,15 @@ func (m *MemoryForest) vectorAggregate(ctx context.Context, table, factorColumn,
 	total := 0.0
 	var dimensions []string
 	var refs []string
+	now := time.Now().UTC().Unix()
 	for rows.Next() {
 		var dimension, encodedRefs string
+		var recordedAt int64
 		var magnitude, factor float64
-		if err := rows.Scan(&dimension, &magnitude, &factor, &encodedRefs); err != nil {
+		if err := rows.Scan(&dimension, &magnitude, &factor, &recordedAt, &encodedRefs); err != nil {
 			return 0, nil, nil, fmt.Errorf("scan vector aggregate: %w", err)
 		}
-		total += clampFinite01(magnitude) * clampFinite01(factor)
+		total += decayedVectorContribution(magnitude, factor, recordedAt, now)
 		dimensions = append(dimensions, dimension)
 		refs = append(refs, decodeStringList(encodedRefs)...)
 	}
