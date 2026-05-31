@@ -37,6 +37,46 @@ func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotCreateMissingBl
 	}
 }
 
+func TestCommittedKnowledgeBackend_RefreshExistingFromDiskDoesNotBuildMissingMetadata(t *testing.T) {
+	projectRoot := t.TempDir()
+	sd := sylkdir.New(projectRoot)
+	if err := sd.Init(); err != nil {
+		t.Fatalf("init sylkdir: %v", err)
+	}
+	gm := sylkdir.NewGlobalMetaFromSylkDir(sd)
+	if err := gm.Load(); err != nil {
+		t.Fatalf("load global meta: %v", err)
+	}
+	bleveStore := sylkdir.NewGlobalVersionBleveStore(sd, gm.GetHead())
+	if err := bleveStore.OpenHead(); err != nil {
+		t.Fatalf("open head bleve: %v", err)
+	}
+	if err := bleveStore.CloseAll(); err != nil {
+		t.Fatalf("close head bleve: %v", err)
+	}
+
+	metaPath := filepath.Join(sd.GlobalDataPath(), "committed_metadata.bolt")
+	if _, err := os.Stat(metaPath); err == nil {
+		t.Fatalf("test setup unexpectedly created %s", metaPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat missing metadata: %v", err)
+	}
+
+	backend := NewCommittedKnowledgeBackend(projectRoot, nil)
+	defer backend.Close()
+	if err := backend.RefreshExistingFromDisk(context.Background()); err != nil {
+		t.Fatalf("RefreshExistingFromDisk: %v", err)
+	}
+	if _, err := os.Stat(metaPath); err == nil {
+		t.Fatalf("RefreshExistingFromDisk created metadata cache at %s", metaPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat missing metadata after refresh: %v", err)
+	}
+	if _, err := backend.Search(context.Background(), &search.SearchRequest{Query: "anything", Limit: 1}); err != nil {
+		t.Fatalf("Search after metadata-degraded refresh: %v", err)
+	}
+}
+
 func TestCommittedKnowledgeBackend_UpsertTextDocument(t *testing.T) {
 	projectRoot := t.TempDir()
 	if err := sylkdir.New(projectRoot).Init(); err != nil {

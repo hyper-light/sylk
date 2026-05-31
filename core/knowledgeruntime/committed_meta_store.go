@@ -3,6 +3,7 @@ package knowledgeruntime
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,6 +41,7 @@ type committedMetaStore struct {
 	dbPath string
 	db     *bolt.DB
 	cache  *lru.Cache[string, *committedPathMeta]
+	shared bool
 }
 
 // sharedCommittedMetaStores is the process-wide registry guaranteeing
@@ -142,9 +144,48 @@ func newCommittedMetaStore(dbPath string) (*committedMetaStore, error) {
 		dbPath: canonical,
 		db:     db,
 		cache:  cache,
+		shared: true,
 	}
 	sharedCommittedMetaStores[canonical] = &sharedCommittedMetaStore{store: store, refCount: 1}
 	return store, nil
+}
+
+func newExistingCommittedMetaStore(dbPath string) (*committedMetaStore, error) {
+	canonical := canonicalCommittedMetaPath(dbPath)
+
+	sharedCommittedMetaStoresMu.Lock()
+	if entry, ok := sharedCommittedMetaStores[canonical]; ok {
+		entry.refCount++
+		sharedCommittedMetaStoresMu.Unlock()
+		return entry.store, nil
+	}
+	sharedCommittedMetaStoresMu.Unlock()
+
+	if _, err := os.Stat(canonical); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, ErrCommittedMetadataUnavailable
+		}
+		return nil, fmt.Errorf("%w: stat committed meta: %v", ErrCommittedMetadataUnavailable, err)
+	}
+	db, err := bolt.Open(canonical, 0o444, &bolt.Options{
+		ReadOnly: true,
+		Timeout:  committedMetaPersistTimeout,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: open committed meta readonly: %v", ErrCommittedMetadataUnavailable, err)
+	}
+
+	cache, err := lru.New[string, *committedPathMeta](committedMetaCacheSize)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("committed meta: lru: %w", err)
+	}
+
+	return &committedMetaStore{
+		dbPath: canonical,
+		db:     db,
+		cache:  cache,
+	}, nil
 }
 
 // canonicalCommittedMetaPath returns a stable absolute symlink-resolved
@@ -176,11 +217,14 @@ func (s *committedMetaStore) Close() error {
 	if s == nil {
 		return nil
 	}
+	if !s.shared {
+		return s.shutdown()
+	}
 	sharedCommittedMetaStoresMu.Lock()
 	entry, ok := sharedCommittedMetaStores[s.dbPath]
 	if !ok {
 		sharedCommittedMetaStoresMu.Unlock()
-		return nil
+		return s.shutdown()
 	}
 	entry.refCount--
 	if entry.refCount > 0 {

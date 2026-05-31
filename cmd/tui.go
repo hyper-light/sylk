@@ -2483,8 +2483,8 @@ func startBootstrapPhase4(
 			return
 		}
 		slog.Info("bootstrap phase 4 background complete", "elapsed", time.Since(phase4Start))
-		phase4.StartKnowledgeSyncAfterBoot(phase1)
 		close(phase4.phase4Done)
+		phase4.StartKnowledgeSyncAfterBoot(phase1)
 	}
 
 	const phase4ActivationTimeout = 45 * time.Second
@@ -2588,6 +2588,7 @@ func startBootstrapPhase4(
 			finishKnowledgeProgress(phase1, "backend_missing")
 			return nil
 		}
+		startupTrace("knowledge_boot_backend_refresh_start")
 		if refreshErr := backend.RefreshExistingFromDisk(bgCtx); refreshErr != nil {
 			startupTrace("knowledge_boot_backend_refresh_error", "error", refreshErr.Error())
 			slog.Warn("knowledge backend refresh failed (non-critical)", "error", refreshErr)
@@ -2597,11 +2598,15 @@ func startBootstrapPhase4(
 			}
 			return nil
 		}
+		startupTrace("knowledge_boot_backend_refresh_done")
 		startupTrace("knowledge_boot_promote_partial_start")
 		phase1.knowledgeStore.PromotePartial(query.NewBleveSearcher(backend), nil, backend)
 		startupTrace("knowledge_boot_promote_partial_done")
 		phase1.knowledgeStore.PromoteFull()
 		finishKnowledgeProgress(phase1, "readonly_ready")
+		if bgCtx.Err() == nil {
+			phase4.RequestKnowledgeSyncInitialRun()
+		}
 		startupTrace("knowledge_boot_readonly_done")
 		return nil
 	})

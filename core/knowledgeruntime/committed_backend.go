@@ -39,6 +39,10 @@ const embedderIdleTTL = 5 * time.Minute
 // is requested before the committed backend has been initialized.
 var ErrCommittedBackendUnavailable = errors.New("committed knowledge backend is unavailable")
 
+// ErrCommittedMetadataUnavailable is returned by startup-only read paths when
+// the derived committed metadata cache is not already materialized.
+var ErrCommittedMetadataUnavailable = errors.New("committed knowledge metadata is unavailable")
+
 // TextDocumentIngestRequest describes a deterministic text document mutation
 // into the committed-global document and knowledge stores.
 type TextDocumentIngestRequest struct {
@@ -842,11 +846,8 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 	}
 	bleveStore.SetHead(head)
 
-	// Open the persistent metadata store. Lives at
-	// {globalDataPath}/committed_metadata.bolt and is rewritten in
-	// full on each refresh — single file, mmap-backed, OS page-cached.
 	metaStorePath := filepath.Join(sd.GlobalDataPath(), "committed_metadata.bolt")
-	metaStore, err := newCommittedMetaStore(metaStorePath)
+	index, metaStore, err := b.buildMetadataIndex(ctx, head, nodeStore, edgeStore, metaStorePath, existingOnly)
 	if err != nil {
 		_ = nodeStore.Close()
 		_ = edgeStore.Close()
@@ -855,18 +856,6 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 			_ = bleveStore.CloseAll()
 		}
 		return nil, fmt.Errorf("committed backend: open meta store: %w", err)
-	}
-
-	index, err := buildCommittedMetadataIndex(ctx, head, nodeStore, edgeStore, metaStore)
-	if err != nil {
-		_ = nodeStore.Close()
-		_ = edgeStore.Close()
-		_ = docStore.Close()
-		_ = metaStore.Close()
-		if attachedBleve == nil {
-			_ = bleveStore.CloseAll()
-		}
-		return nil, err
 	}
 
 	return &committedKnowledgeState{
@@ -879,6 +868,52 @@ func (b *CommittedKnowledgeBackend) buildState(ctx context.Context, attachedBlev
 		externalBleve: externalBleve,
 		index:         index,
 	}, nil
+}
+
+func (b *CommittedKnowledgeBackend) buildMetadataIndex(
+	ctx context.Context,
+	head sylkdir.SemanticVersion,
+	nodeStore *sylkdir.GlobalVersionNodeStore,
+	edgeStore *sylkdir.GlobalVersionEdgeStore,
+	metaStorePath string,
+	existingOnly bool,
+) (*committedMetadataIndex, *committedMetaStore, error) {
+	if existingOnly {
+		return b.existingMetadataIndex(head, metaStorePath)
+	}
+
+	// Open the persistent metadata store. Lives at
+	// {globalDataPath}/committed_metadata.bolt and is rewritten in
+	// full on each refresh — single file, mmap-backed, OS page-cached.
+	metaStore, err := newCommittedMetaStore(metaStorePath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	index, err := buildCommittedMetadataIndex(ctx, head, nodeStore, edgeStore, metaStore)
+	if err != nil {
+		_ = metaStore.Close()
+		return nil, nil, err
+	}
+	return index, metaStore, nil
+}
+
+func (b *CommittedKnowledgeBackend) existingMetadataIndex(head sylkdir.SemanticVersion, metaStorePath string) (*committedMetadataIndex, *committedMetaStore, error) {
+	metaStore, err := newExistingCommittedMetaStore(metaStorePath)
+	if errors.Is(err, ErrCommittedMetadataUnavailable) {
+		b.logger.Warn("committed backend: metadata cache unavailable during read-only startup; continuing without enrichment", "error", err)
+		return &committedMetadataIndex{}, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	version, ok := metaStore.BuiltVersion()
+	if !ok || version != head.String() {
+		_ = metaStore.Close()
+		b.logger.Warn("committed backend: metadata cache stale during read-only startup; continuing without enrichment", "built_version", version, "head", head.String())
+		return &committedMetadataIndex{}, nil, nil
+	}
+	return &committedMetadataIndex{store: metaStore}, metaStore, nil
 }
 
 // incrementalMaxPathFraction is the upper bound on the affected-path
