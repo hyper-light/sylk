@@ -46,7 +46,7 @@ type Manager struct {
 	// deltaBus is wired into every session's root claims board so
 	// the board's amplifier can publish InboxDeltas to subscriber
 	// inboxes via the underlying event bus.
-	deltaBus claims.DeltaBus
+	deltaBus         claims.DeltaBus
 	agentRefResolver claims.AgentRefResolver
 
 	claimsProjectors []claims.ClaimsProjector
@@ -233,7 +233,7 @@ func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bo
 		SessionDir:         sessionDir,
 		Scope:              boardScope,
 		DeltaBus:           m.deltaBus,
-		AgentRefResolver:   m.agentRefResolver(),
+		AgentRefResolver:   m.agentRefResolver,
 		Projectors:         m.rolloutProjectors(),
 		DisableOutbox:      !m.claimsRollout.ClaimsOutbox,
 		LegacySessionNoWAL: legacySessionNoWAL,
@@ -243,13 +243,6 @@ func (m *Manager) openSessionClaimsBoard(session *Session, legacySessionNoWAL bo
 		return nil, fmt.Errorf("session %q: open durable claims board: %w", session.ID(), err)
 	}
 	return board, nil
-}
-
-func (m *Manager) agentRefResolver() claims.AgentRefResolver {
-	if m == nil {
-		return nil
-	}
-	return m.agentRefResolver
 }
 
 func (m *Manager) rolloutProjectors() []claims.ClaimsProjector {
