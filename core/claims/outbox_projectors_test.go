@@ -280,11 +280,17 @@ func (p *failingProjector) Project(_ context.Context, record *ClaimsOutboxRecord
 }
 
 type blockingProjector struct {
+	name    string
 	started chan struct{}
 	release chan struct{}
 }
 
-func (p *blockingProjector) Name() string { return "blocking" }
+func (p *blockingProjector) Name() string {
+	if strings.TrimSpace(p.name) != "" {
+		return p.name
+	}
+	return "blocking"
+}
 
 func (p *blockingProjector) Project(ctx context.Context, _ *ClaimsOutboxRecord, _ *ClaimsBoard) error {
 	select {
@@ -480,7 +486,6 @@ func TestDurableBoard_ProjectionWorkerDoesNotBlockMutation(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	defer close(projector.release)
 	db, err := OpenDurableBoard(ClaimsBoardConfig{
 		BoardID:    "board-1",
 		SessionID:  "session-1",
@@ -495,6 +500,7 @@ func TestDurableBoard_ProjectionWorkerDoesNotBlockMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	defer close(projector.release)
 	done := make(chan error, 1)
 	go func() {
 		done <- db.Board().PostAction(context.Background(), Action{AgentID: "architect", Type: ActionTypeTask}, []Claim{testClaim("claim-1", "Plan work")})
@@ -512,6 +518,41 @@ func TestDurableBoard_ProjectionWorkerDoesNotBlockMutation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("projector worker did not start")
 	}
+}
+
+func TestDurableBoard_CanonicalProjectionContinuesWhenKnowledgeProjectorBlocks(t *testing.T) {
+	projector := &blockingProjector{
+		name:    ProjectorKnowledge,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	bus := newCaptureBus()
+	db, err := OpenDurableBoard(ClaimsBoardConfig{
+		BoardID:    "board-1",
+		SessionID:  "session-1",
+		TaskID:     "task-1",
+		SessionDir: filepath.Join(t.TempDir(), "session-1"),
+		Scope:      goroutineScope{},
+		DeltaBus:   bus,
+		Projectors: []ClaimsProjector{
+			projector,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	defer close(projector.release)
+
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "guide", Type: ActionTypeTask}, []Claim{directedClaimForOutboxIsolation("claim-1")}); err != nil {
+		t.Fatal(err)
+	}
+	waitForProjectorStart(t, projector.started)
+
+	if err := db.Board().PostAction(context.Background(), Action{AgentID: "guide", Type: ActionTypeTask}, []Claim{directedClaimForOutboxIsolation("claim-2")}); err != nil {
+		t.Fatal(err)
+	}
+	waitForPublishedClaimAction(t, bus, "claim-2", DeltaActionClaimPosted)
 }
 
 func TestDurableBoard_ProjectionFailureCreatesErrorArtifact(t *testing.T) {
@@ -848,4 +889,46 @@ func projectionArtifactExists(board *ClaimsBoard, kind string) bool {
 		}
 	}
 	return false
+}
+
+func directedClaimForOutboxIsolation(id string) Claim {
+	return Claim{
+		ID:    id,
+		Title: "Route work",
+		Relations: []Relation{
+			{Related: "guide", RelatedType: RelatedTypeAgent, Relationship: RelationshipIssuer},
+			{Related: "architect", RelatedType: RelatedTypeAgent, Relationship: RelationshipSubject},
+		},
+	}
+}
+
+func waitForProjectorStart(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	wait := DefaultClaimsOperationsConfig().Budgets.AuditDeadline
+	select {
+	case <-started:
+	case <-time.After(wait):
+		t.Fatalf("projector did not start within %s", wait)
+	}
+}
+
+func waitForPublishedClaimAction(t *testing.T, bus *captureBus, claimID string, action DeltaAction) {
+	t.Helper()
+	wait := DefaultClaimsOperationsConfig().Budgets.AuditDeadline
+	poll := wait / time.Duration(DefaultClaimsOperationsConfig().Budgets.OutboxProjectionBatchLimit)
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	deadline := time.After(wait)
+	for {
+		for _, published := range bus.Published() {
+			if published.delta.DeltaKind() == string(action) && deltaClaimID(published.delta) == claimID {
+				return
+			}
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline:
+			t.Fatalf("claim %s action %s was not published within %s", claimID, action, wait)
+		}
+	}
 }

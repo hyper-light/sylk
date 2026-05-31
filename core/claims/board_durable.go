@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -106,7 +105,8 @@ type DurableBoard struct {
 	healthMu      sync.Mutex
 	healthHistory []ProjectionHealthSnapshot
 
-	projectionScheduled atomic.Bool
+	projectionMu        sync.Mutex
+	projectionScheduled map[string]bool
 }
 
 func OpenDurableBoard(cfg ClaimsBoardConfig) (*DurableBoard, error) {
@@ -382,27 +382,74 @@ func (db *DurableBoard) appendCommittedEvent(kind, agentID string, payload any, 
 	return nil
 }
 
-func (db *DurableBoard) projectOutbox(ctx context.Context) {
+func (db *DurableBoard) projectOutbox(_ context.Context) {
 	if db == nil || db.outbox == nil || len(db.projectors) == 0 || db.board == nil {
 		return
 	}
 	if db.board.scope == nil {
 		return
 	}
-	if !db.outbox.HasPending(projectorNames(db.projectors), time.Now().UTC()) {
+	now := time.Now().UTC()
+	for _, projector := range db.projectors {
+		if projector == nil {
+			continue
+		}
+		name := strings.TrimSpace(projector.Name())
+		if name == "" || !db.outbox.HasPending([]string{name}, now) {
+			continue
+		}
+		db.scheduleOutboxProjector(projector)
+	}
+}
+
+func (db *DurableBoard) scheduleOutboxProjector(projector ClaimsProjector) {
+	if db == nil || db.board == nil || db.board.scope == nil || projector == nil {
 		return
 	}
-	if !db.projectionScheduled.CompareAndSwap(false, true) {
+	name := strings.TrimSpace(projector.Name())
+	if name == "" || !db.markProjectionScheduled(name) {
 		return
 	}
-	if err := db.board.scope.Go("claims_outbox_project", db.operations.Budgets.AuditDeadline, func(runCtx context.Context) error {
-		defer db.projectionScheduled.Store(false)
-		db.DrainOutbox(runCtx, db.operations.Budgets.OutboxProjectionBatchLimit)
+	if err := db.board.scope.Go(outboxProjectorWorkerDescription(name), db.operations.Budgets.AuditDeadline, func(runCtx context.Context) error {
+		db.DrainOutboxProjector(runCtx, name, db.operations.Budgets.OutboxProjectionBatchLimit)
+		db.clearProjectionScheduled(name)
+		if runCtx.Err() == nil && db.outbox != nil && db.outbox.HasPending([]string{name}, time.Now().UTC()) {
+			db.scheduleOutboxProjector(projector)
+		}
 		return nil
 	}); err != nil {
-		db.projectionScheduled.Store(false)
+		db.clearProjectionScheduled(name)
 		db.board.RecordNotificationError("claims outbox projector dispatch: " + err.Error())
 	}
+}
+
+func (db *DurableBoard) markProjectionScheduled(name string) bool {
+	db.projectionMu.Lock()
+	defer db.projectionMu.Unlock()
+	if db.projectionScheduled == nil {
+		db.projectionScheduled = make(map[string]bool)
+	}
+	if db.projectionScheduled[name] {
+		return false
+	}
+	db.projectionScheduled[name] = true
+	return true
+}
+
+func (db *DurableBoard) clearProjectionScheduled(name string) {
+	db.projectionMu.Lock()
+	defer db.projectionMu.Unlock()
+	if db.projectionScheduled != nil {
+		delete(db.projectionScheduled, name)
+	}
+}
+
+func outboxProjectorWorkerDescription(name string) string {
+	name = strings.NewReplacer(" ", "_", "/", "_", "\\", "_", "\x1f", "_").Replace(strings.TrimSpace(name))
+	if name == "" {
+		return "claims_outbox_project"
+	}
+	return "claims_outbox_project_" + name
 }
 
 // DrainOutbox synchronously projects pending outbox records. Production
@@ -413,6 +460,33 @@ func (db *DurableBoard) DrainOutbox(ctx context.Context, limit int) int {
 		return 0
 	}
 	return db.outbox.ProjectPending(ctx, db.board, db.projectors, limit)
+}
+
+// DrainOutboxProjector synchronously projects pending records for one
+// projector. Live session boards schedule projectors independently so a slow
+// knowledge mirror cannot block canonical claim delivery.
+func (db *DurableBoard) DrainOutboxProjector(ctx context.Context, name string, limit int) int {
+	if db == nil || db.outbox == nil || db.board == nil {
+		return 0
+	}
+	projector := db.projectorByName(name)
+	if projector == nil {
+		return 0
+	}
+	return db.outbox.ProjectPending(ctx, db.board, []ClaimsProjector{projector}, limit)
+}
+
+func (db *DurableBoard) projectorByName(name string) ClaimsProjector {
+	name = strings.TrimSpace(name)
+	if db == nil || name == "" {
+		return nil
+	}
+	for _, projector := range db.projectors {
+		if projector != nil && projector.Name() == name {
+			return projector
+		}
+	}
+	return nil
 }
 
 func (db *DurableBoard) hasProjector(name string) bool {
