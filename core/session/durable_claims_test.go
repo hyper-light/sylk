@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/adalundhe/sylk/core/claims"
+	"github.com/adalundhe/sylk/core/concurrency"
 	"github.com/adalundhe/sylk/core/session"
 )
 
@@ -21,6 +23,23 @@ func (p *countingProjector) Project(_ context.Context, _ *claims.ClaimsOutboxRec
 	p.count.Add(1)
 	return nil
 }
+
+type sessionTestDeltaBus struct{}
+
+func (sessionTestDeltaBus) PublishDelta(context.Context, string, claims.Delta) error {
+	return nil
+}
+
+func (sessionTestDeltaBus) SubscribeDelta(pattern string, _ claims.DeltaHandler) (claims.DeltaSubscription, error) {
+	return sessionTestSubscription{topic: pattern}, nil
+}
+
+type sessionTestSubscription struct {
+	topic string
+}
+
+func (s sessionTestSubscription) Topic() string      { return s.topic }
+func (s sessionTestSubscription) Unsubscribe() error { return nil }
 
 func TestManager_CreateWiresDurableSessionBoard(t *testing.T) {
 	root := t.TempDir()
@@ -143,5 +162,43 @@ func TestFeatureFlags_ProjectorsDisabled(t *testing.T) {
 	}
 	if !claims.DurableBoardWALExists(filepath.Join(root, "board-only-session"), "session-board-only-session") {
 		t.Fatal("claims WAL missing after disabling projectors")
+	}
+}
+
+func TestManager_CreateWiresClaimsOperationsRuntimeDependencies(t *testing.T) {
+	ctx := context.Background()
+	scope := concurrency.NewGoroutineScope(ctx, "session-test", nil)
+	t.Cleanup(func() { _ = scope.Shutdown(time.Millisecond, time.Millisecond) })
+	resolver := claims.AgentRefResolverFunc(func(_ context.Context, sessionID, agentID string) (claims.AgentRef, bool) {
+		return claims.AgentRef{
+			UID:        agentID + "-uid",
+			Type:       agentID,
+			Name:       agentID,
+			Category:   string(claims.ParticipantCategoryAgent),
+			Generation: claims.InitialParticipantGeneration,
+			Labels:     map[string]string{"session_id": sessionID},
+		}.Normalized(), true
+	})
+	mgr := session.NewManager(session.ManagerConfig{
+		Scope:            scope,
+		DeltaBus:         sessionTestDeltaBus{},
+		AgentRefResolver: resolver,
+	})
+	s, err := mgr.Create(ctx, session.Config{
+		ID:                 "runtime-wired-session",
+		Name:               "runtime-wired-session",
+		PersistenceEnabled: true,
+		PersistencePath:    t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mgr.Close(s.ID()) })
+	snap := s.ClaimsBoard().WiringSnapshot()
+	if !snap.HasScope || !snap.HasDeltaBus || !snap.HasAgentRefResolver {
+		t.Fatalf("claims board wiring = %+v, want scope, delta bus, and agent ref resolver", snap)
+	}
+	if snap.SessionID != s.ID() {
+		t.Fatalf("snapshot session id = %q, want %q", snap.SessionID, s.ID())
 	}
 }

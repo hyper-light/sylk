@@ -167,6 +167,8 @@ const (
 	shutdownHard  = 75 * time.Millisecond
 )
 
+const claimsStartupRecoveryActorID = "sys:claims_recovery"
+
 // shutdownTimeout is the overall ceiling on the cleanup function.
 // Derived from: 200ms supervisor + max(per-subsystem budget) for the
 // parallel-close phase (containers at 1500ms is the slowest; every
@@ -395,29 +397,29 @@ type bootstrapPhase1 struct {
 	projectRoot string
 	start       time.Time
 
-	bootIdentity   boot.ProcessIdentity
-	phase0Board    *claims.ClaimsBoard
-	scope          *concurrency.GoroutineScope
-	guideBus       guide.EventBus
-	activityPub    events.ActivityPublisher
-	streamMgr      *guide.StreamManager
-	sessionMgr     *session.Manager
-	defaultSession *session.Session
-	bootOps        *boot.OperationsSequencer
+	bootIdentity    boot.ProcessIdentity
+	phase0Board     *claims.ClaimsBoard
+	scope           *concurrency.GoroutineScope
+	guideBus        guide.EventBus
+	activityPub     events.ActivityPublisher
+	streamMgr       *guide.StreamManager
+	sessionMgr      *session.Manager
+	defaultSession  *session.Session
+	bootOps         *boot.OperationsSequencer
 	bootDispatchers *claims.ServiceDispatcherRegistry
-	descriptors    *handoff.DescriptorRegistry
-	budget         *concurrency.GoroutineBudget
-	containerReg   *container.ContainerRegistry
-	creatorReg     *container.AgentCreatorRegistry
-	serviceReg     *network.ServiceRegistry
-	specReg        *container.AgentSpecRegistry
-	quota          *container.ResourceQuota
-	hookMut        *lifecycleHookMutator
-	probeFact      *probeFactoryHolder
-	runtime        *container.DefaultRuntime
-	namespace      *network.NetworkNamespace
-	daemonCtrl     *daemon.DaemonSetController
-	daemonSpecMap  map[string]container.ContainerSpec
+	descriptors     *handoff.DescriptorRegistry
+	budget          *concurrency.GoroutineBudget
+	containerReg    *container.ContainerRegistry
+	creatorReg      *container.AgentCreatorRegistry
+	serviceReg      *network.ServiceRegistry
+	specReg         *container.AgentSpecRegistry
+	quota           *container.ResourceQuota
+	hookMut         *lifecycleHookMutator
+	probeFact       *probeFactoryHolder
+	runtime         *container.DefaultRuntime
+	namespace       *network.NetworkNamespace
+	daemonCtrl      *daemon.DaemonSetController
+	daemonSpecMap   map[string]container.ContainerSpec
 
 	authRegistry *credentials.AuthRegistry
 	guideCfg     providers.GoogleConfig
@@ -1537,10 +1539,75 @@ func wireBootstrapPhase3(phase1 *bootstrapPhase1, phase2 bootstrapPhase2) (boots
 		}); err != nil {
 			return bootstrapPhase3{}, fmt.Errorf("claims operations phase 3: %w", err)
 		}
+		if err := recoverBootstrapClaimsWork(phase1); err != nil {
+			return bootstrapPhase3{}, fmt.Errorf("claims operations recovery: %w", err)
+		}
 	}
 
 	slog.Info("bootstrap phase 3 complete", "elapsed", time.Since(phase3Start))
 	return phase3, nil
+}
+
+func recoverBootstrapClaimsWork(phase1 *bootstrapPhase1) error {
+	board := bootstrapClaimsBoard(phase1)
+	if board == nil {
+		return nil
+	}
+	participants := serviceRecoveryParticipants(phase1.bootDispatchers, board.SessionID())
+	result, err := claims.RecoverServiceWork(phase1.ctx, claims.ServiceRecoveryOptions{
+		Board:        board,
+		Dispatchers:  phase1.bootDispatchers,
+		Participants: participants,
+		ActorID:      claimsStartupRecoveryActorID,
+	})
+	logBootstrapClaimsRecovery(result, err)
+	return err
+}
+
+func bootstrapClaimsBoard(phase1 *bootstrapPhase1) *claims.ClaimsBoard {
+	if phase1 == nil || phase1.defaultSession == nil {
+		return nil
+	}
+	return phase1.defaultSession.ClaimsBoard()
+}
+
+func serviceRecoveryParticipants(registry *claims.ServiceDispatcherRegistry, sessionID string) []claims.ParticipantRegistration {
+	if registry == nil {
+		return nil
+	}
+	snapshot := registry.Snapshot(sessionID)
+	participants := make([]claims.ParticipantRegistration, 0, len(snapshot.Dispatchers))
+	for _, dispatcher := range snapshot.Dispatchers {
+		if dispatcher.Participant.Validate() == nil {
+			participants = append(participants, dispatcher.Participant)
+		}
+	}
+	return participants
+}
+
+func logBootstrapClaimsRecovery(result claims.ServiceRecoveryResult, err error) {
+	if err != nil {
+		slog.Warn("claims startup recovery failed", "error", err)
+		return
+	}
+	if claimsRecoveryNoop(result) {
+		return
+	}
+	slog.Info("claims startup recovery complete",
+		"scanned", result.Scanned,
+		"redispatched", result.Redispatched,
+		"failed", result.Failed,
+		"validation_scanned", result.ValidationScanned,
+		"validation_redispatched", result.ValidationRedispatched,
+		"validation_failed", result.ValidationFailed,
+		"continuations_recovered", result.ContinuationsRecovered,
+		"bounded", result.Bounded)
+}
+
+func claimsRecoveryNoop(result claims.ServiceRecoveryResult) bool {
+	return result.Scanned == 0 &&
+		result.ValidationScanned == 0 &&
+		result.ContinuationsRecovered == 0
 }
 
 func schedulePhase4Task(
