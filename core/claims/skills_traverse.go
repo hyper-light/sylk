@@ -67,8 +67,8 @@ func TraverseSkill(bp BoardProvider) *skills.Skill {
 
 // emitTraversalObserved publishes an ActionTraversalObserved Fabric
 // activity capturing the (start_node, edge_filter, depth, count)
-// tuple. The forest claims-harvester consumes these as graph-walk
-// precedent — over time the forest can learn which traversals at
+// tuple. The forest fabric observer consumes these as graph-walk
+// context — over time the forest can learn which traversals at
 // which start kinds yield useful downstream context. Best-effort:
 // activity.Append is non-blocking by design and emission failure
 // must not affect the returned traversal result.

@@ -129,8 +129,8 @@ var ErrHarvestDispatcherStopped = errors.New("harvest dispatcher stopped")
 // for the derived defaults; override only when a specific anchor
 // changes (e.g. very high event rate).
 //
-// inner is the synchronous HarvestFunc the dispatcher wraps —
-// typically (*forest.ClaimsHarvester).Harvest.
+// inner is the synchronous HarvestFunc the dispatcher wraps, typically
+// (*forest.FabricContextObserver).Observe.
 func NewHarvestDispatcher(inner HarvestFunc, cfg HarvestDispatcherConfig) *HarvestDispatcher {
 	if cfg.Workers <= 0 || cfg.QueueCapacity <= 0 || cfg.DedupeCapacity <= 0 || cfg.WorkTimeout <= 0 {
 		defaults := DefaultHarvestDispatcherConfig()
@@ -165,7 +165,7 @@ func NewHarvestDispatcher(inner HarvestFunc, cfg HarvestDispatcherConfig) *Harve
 }
 
 // Harvest matches the HarvestFunc signature so the dispatcher can be
-// passed directly to SetForestHarvester. Non-blocking: enqueues the
+// passed directly to the forest fabric observer registrar. Non-blocking: enqueues the
 // candidate or increments the drop counter on overflow / dedupe / stop.
 //
 // The error return is reserved for a stopped dispatcher; queue overflow

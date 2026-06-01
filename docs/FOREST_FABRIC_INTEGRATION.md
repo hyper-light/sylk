@@ -6,7 +6,9 @@ This integration closes that gap across five tiers, all landed together.
 
 ## Architecture
 
-The forest has two sources of harvest candidates now, not one:
+The forest has two sources of fabric context observations now, not one. Claim,
+testament, artifact, and validation lifecycle truth does not use this path; it
+enters through canonical claims deltas and the append-only `forest_ledger`.
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -29,11 +31,11 @@ The forest has two sources of harvest candidates now, not one:
        └──────────────┬──────────────────────────────────┘
                       ▼
           ┌────────────────────┐
-          │ forest harvest fn  │  (eventually: forest.service.AppendEvent)
+          │ fabric observer fn │  (context/traversal ledger records only)
           └────────────────────┘
 ```
 
-Both feeds converge on the same `HarvestFunc` signature so forest persistence code doesn't need to know which source dispatched a candidate.
+Both feeds converge on the same `HarvestFunc` signature so fabric observation code doesn't need to know which source dispatched a candidate. The registered forest function is a `FabricContextObserver`, not a claims lifecycle harvester.
 
 ## The five tiers
 

@@ -30,10 +30,10 @@ type forestHarvesterHolder struct {
 	fn activitystore.HarvestFunc
 }
 
-// installedForestHarvester holds the real harvest function. Initially nil
-// (harvest just logs). Set via SetForestHarvester once the Memory Forest
-// is constructed, avoiding a dependency cycle between fabric install and
-// forest construction.
+// installedForestHarvester holds the real fabric observation function.
+// Initially nil (observation just logs). Set via SetForestHarvester once
+// the Memory Forest is constructed, avoiding a dependency cycle between
+// fabric install and forest construction.
 var installedForestHarvester atomic.Pointer[forestHarvesterHolder]
 
 // SetForestHarvester atomically registers a real harvest function. Once
@@ -92,7 +92,7 @@ func installActivityFabric(store *Store, sessionID string, sd *sylkdir.SylkDir) 
 		slog.Warn("fabric: bleve subscriber unavailable", "error", err)
 	}
 
-	// Forest subscriber: delegates to the real ClaimsHarvester when
+	// Forest subscriber: delegates to the real fabric observer when
 	// registered via SetForestHarvester, otherwise logs candidates.
 	harvestFn := func(ctx context.Context, a activity.AgentActivity, reason string) error {
 		if h := installedForestHarvester.Load(); h != nil {

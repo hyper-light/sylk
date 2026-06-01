@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"runtime/debug"
 	"time"
 
 	"github.com/adalundhe/sylk/core/agents/identity"
@@ -20,6 +18,14 @@ import (
 // loudly rather than silently attributing the call to the wrong
 // bucket.
 var ErrDispatchIdentityMissing = errors.New("gateway: dispatch context missing identity or task")
+
+var (
+	ErrGatewayProviderUnavailable = errors.New("gateway: provider unavailable")
+	ErrGatewayRequestNil          = errors.New("gateway: request is nil")
+	ErrGatewayNilResponse         = errors.New("gateway: provider returned nil response")
+	ErrGatewayNilStream           = errors.New("gateway: provider returned nil stream")
+	ErrGatewayStreamHandlerNil    = errors.New("gateway: stream handler is nil")
+)
 
 // ProviderWrapper re-applies gateway admission control to a fresh provider.
 // Agents store this callback and invoke it after credential refresh so the
@@ -49,16 +55,52 @@ var (
 
 // --- Passthrough methods (no admission required) ---
 
-func (p *GatewayProvider) Name() string                           { return p.inner.Name() }
-func (p *GatewayProvider) SupportedModels() []providers.ModelInfo { return p.inner.SupportedModels() }
-func (p *GatewayProvider) CountTokens(msgs []providers.Message) (int, error) {
-	return p.inner.CountTokens(msgs)
+func (p *GatewayProvider) Name() string {
+	inner, err := p.requireInner()
+	if err != nil {
+		return ""
+	}
+	return inner.Name()
 }
-func (p *GatewayProvider) MaxContextTokens(model string) int     { return p.inner.MaxContextTokens(model) }
-func (p *GatewayProvider) HealthCheck(ctx context.Context) error { return p.inner.HealthCheck(ctx) }
+
+func (p *GatewayProvider) SupportedModels() []providers.ModelInfo {
+	inner, err := p.requireInner()
+	if err != nil {
+		return nil
+	}
+	return inner.SupportedModels()
+}
+
+func (p *GatewayProvider) CountTokens(msgs []providers.Message) (int, error) {
+	inner, err := p.requireInner()
+	if err != nil {
+		return 0, err
+	}
+	return inner.CountTokens(msgs)
+}
+
+func (p *GatewayProvider) MaxContextTokens(model string) int {
+	inner, err := p.requireInner()
+	if err != nil {
+		return 0
+	}
+	return inner.MaxContextTokens(model)
+}
+
+func (p *GatewayProvider) HealthCheck(ctx context.Context) error {
+	inner, err := p.requireInner()
+	if err != nil {
+		return err
+	}
+	return inner.HealthCheck(ctx)
+}
 
 func (p *GatewayProvider) RequestTimeout() time.Duration {
-	if reporter, ok := p.inner.(interface{ RequestTimeout() time.Duration }); ok {
+	inner, err := p.requireInner()
+	if err != nil {
+		return 0
+	}
+	if reporter, ok := inner.(interface{ RequestTimeout() time.Duration }); ok {
 		return reporter.RequestTimeout()
 	}
 	return 0
@@ -68,6 +110,10 @@ func (p *GatewayProvider) RequestTimeout() time.Duration {
 
 // Complete performs a non-streaming completion through the gateway.
 func (p *GatewayProvider) Complete(ctx context.Context, req *providers.CompletionRequest) (*providers.CompletionResponse, error) {
+	gw, inner, err := p.requireDispatchableProvider(req)
+	if err != nil {
+		return nil, err
+	}
 	id, task, err := requireDispatch(ctx)
 	if err != nil {
 		return nil, err
@@ -75,42 +121,45 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 	model := identity.ModelID(req.Model)
 
 	admitStart := time.Now()
-	p.gateway.logger.Info("DEBUG: gateway_admit_start",
-		"gateway", p.gateway.config.Name,
+	gw.logger.Info("DEBUG: gateway_admit_start",
+		"gateway", gw.config.Name,
 		"priority", p.priority,
-		"inflight", p.gateway.inflight.Load(),
-		"max_inflight", p.gateway.maxInflight,
+		"inflight", gw.inflight.Load(),
+		"max_inflight", gw.maxInflight,
 		"model", req.Model,
 		"agent", id.Panel(),
 		"task", string(task.UID()),
 		"skip_skills", req.SkipProviderSkills)
-	if err := p.gateway.Admit(ctx, p.priority); err != nil {
-		p.gateway.logger.Info("DEBUG: gateway_admit_failed",
-			"gateway", p.gateway.config.Name,
+	if err := gw.Admit(ctx, p.priority); err != nil {
+		gw.logger.Info("DEBUG: gateway_admit_failed",
+			"gateway", gw.config.Name,
 			"elapsed_ms", time.Since(admitStart).Milliseconds(),
 			"error", err)
 		return nil, err
 	}
-	p.gateway.logger.Info("DEBUG: gateway_admit_ok",
-		"gateway", p.gateway.config.Name,
+	gw.logger.Info("DEBUG: gateway_admit_ok",
+		"gateway", gw.config.Name,
 		"elapsed_ms", time.Since(admitStart).Milliseconds())
 
-	if hook := p.gateway.eventHook; hook != nil {
+	if hook := gw.eventHook; hook != nil {
 		hook.OnRequest(ctx, id, task, model)
 	}
 
 	ctx = p.injectRetryObserver(ctx)
 	completeStart := time.Now()
-	resp, err := p.inner.Complete(ctx, req)
+	resp, err := inner.Complete(ctx, req)
+	if err == nil && resp == nil {
+		err = ErrGatewayNilResponse
+	}
 	elapsed := time.Since(completeStart)
-	p.gateway.logger.Info("DEBUG: gateway_complete_done",
-		"gateway", p.gateway.config.Name,
+	gw.logger.Info("DEBUG: gateway_complete_done",
+		"gateway", gw.config.Name,
 		"elapsed_ms", elapsed.Milliseconds(),
 		"error", err)
-	p.gateway.Release(err)
+	gw.Release(err)
 	p.detect429(err)
 
-	if hook := p.gateway.eventHook; hook != nil {
+	if hook := gw.eventHook; hook != nil {
 		if err != nil {
 			hook.OnError(ctx, id, task, model, err, elapsed)
 		} else {
@@ -124,27 +173,34 @@ func (p *GatewayProvider) Complete(ctx context.Context, req *providers.Completio
 // Stream performs a channel-based streaming completion through the gateway.
 // The concurrency slot is held until the returned channel is drained.
 func (p *GatewayProvider) Stream(ctx context.Context, req *providers.CompletionRequest) (<-chan *providers.StreamChunk, error) {
+	gw, inner, err := p.requireDispatchableProvider(req)
+	if err != nil {
+		return nil, err
+	}
 	id, task, err := requireDispatch(ctx)
 	if err != nil {
 		return nil, err
 	}
 	model := identity.ModelID(req.Model)
 
-	if err := p.gateway.Admit(ctx, p.priority); err != nil {
+	if err := gw.Admit(ctx, p.priority); err != nil {
 		return nil, err
 	}
 
-	if hook := p.gateway.eventHook; hook != nil {
+	if hook := gw.eventHook; hook != nil {
 		hook.OnRequest(ctx, id, task, model)
 	}
 
 	ctx = p.injectRetryObserver(ctx)
 	streamStart := time.Now()
-	ch, err := p.inner.Stream(ctx, req)
+	ch, err := inner.Stream(ctx, req)
+	if err == nil && ch == nil {
+		err = ErrGatewayNilStream
+	}
 	if err != nil {
-		p.gateway.Release(err)
+		gw.Release(err)
 		p.detect429(err)
-		if hook := p.gateway.eventHook; hook != nil {
+		if hook := gw.eventHook; hook != nil {
 			hook.OnError(ctx, id, task, model, err, time.Since(streamStart))
 		}
 		return nil, err
@@ -152,17 +208,14 @@ func (p *GatewayProvider) Stream(ctx context.Context, req *providers.CompletionR
 
 	// Wrap the channel to release the slot when the source closes. The
 	// forwarder runs in a goroutine tracked by ProviderGateway.streamWG so
-	// Stop() can wait for it to drain. Panics are recovered in-place —
-	// otherwise an inner provider panic would strand the consumer on a
-	// never-closed output channel and the gateway slot would never release.
+	// Stop() can wait for it to drain.
 	out := make(chan *providers.StreamChunk, cap(ch))
-	p.gateway.streamWG.Add(1)
-	go p.runStreamForwarder(ch, out, p.gateway.eventHook, id, task, model, streamStart)
+	gw.streamWG.Add(1)
+	go p.runStreamForwarder(ch, out, gw.eventHook, id, task, model, streamStart)
 	return out, nil
 }
 
-// runStreamForwarder wraps forwardStreamChunks with WaitGroup tracking and
-// panic recovery.
+// runStreamForwarder wraps forwardStreamChunks with WaitGroup tracking.
 func (p *GatewayProvider) runStreamForwarder(
 	src <-chan *providers.StreamChunk,
 	dst chan<- *providers.StreamChunk,
@@ -173,32 +226,20 @@ func (p *GatewayProvider) runStreamForwarder(
 	streamStart time.Time,
 ) {
 	defer p.gateway.streamWG.Done()
-	defer func() {
-		if r := recover(); r != nil {
-			slog.Default().Error("gateway stream forwarder: panic recovered",
-				"gateway", p.gateway.config.Name,
-				"model", string(model),
-				"agent", id.Panel(),
-				"task", string(task.UID()),
-				"panic", r,
-				"stack", string(debug.Stack()))
-			safeClose(dst)
-			p.gateway.Release(nil)
-		}
-	}()
 	p.forwardStreamChunks(src, dst, hook, id, task, model, streamStart)
-}
-
-// safeClose closes a channel at most once, ignoring a close-of-closed panic.
-func safeClose(ch chan<- *providers.StreamChunk) {
-	defer func() { _ = recover() }()
-	close(ch)
 }
 
 // StreamWithHandler performs a handler-based streaming completion through the
 // gateway. Requires the inner provider to implement StreamHandlerProvider.
 func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.StreamRequest, handler providers.StreamHandler) error {
-	shp, ok := p.inner.(providers.StreamHandlerProvider)
+	gw, inner, err := p.requireDispatchableProvider(req)
+	if err != nil {
+		return err
+	}
+	if handler == nil {
+		return ErrGatewayStreamHandlerNil
+	}
+	shp, ok := inner.(providers.StreamHandlerProvider)
 	if !ok {
 		return providers.WrapError(providers.ProviderTypeGoogle, "stream_with_handler",
 			providers.ErrModelNotSupported)
@@ -210,11 +251,11 @@ func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.
 	}
 	model := identity.ModelID(req.Model)
 
-	if err := p.gateway.Admit(ctx, p.priority); err != nil {
+	if err := gw.Admit(ctx, p.priority); err != nil {
 		return err
 	}
 
-	hook := p.gateway.eventHook
+	hook := gw.eventHook
 	if hook != nil {
 		hook.OnRequest(ctx, id, task, model)
 	}
@@ -223,7 +264,7 @@ func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.
 	streamStart := time.Now()
 	wrappedHandler := p.wrapStreamHandler(handler, hook, ctx, id, task, model, streamStart)
 	err = shp.StreamWithHandler(ctx, req, wrappedHandler)
-	p.gateway.Release(err)
+	gw.Release(err)
 	p.detect429(err)
 
 	if err != nil && hook != nil {
@@ -235,6 +276,9 @@ func (p *GatewayProvider) StreamWithHandler(ctx context.Context, req *providers.
 
 // Inner returns the underlying provider for type-specific access.
 func (p *GatewayProvider) Inner() providers.ProviderAdapter {
+	if p == nil {
+		return nil
+	}
 	return p.inner
 }
 
@@ -260,8 +304,10 @@ func (p *GatewayProvider) GatewayCapacity() CapacitySnapshot {
 func (p *GatewayProvider) injectRetryObserver(ctx context.Context) context.Context {
 	existing := providers.RetryObserverFromContext(ctx)
 	gatewayObs := func(event providers.RetryEvent) {
-		if retryAfter, ok := is429Error(event.Err); ok {
-			p.gateway.Record429(retryAfter)
+		if p != nil && p.gateway != nil {
+			if retryAfter, ok := is429Error(event.Err); ok {
+				p.gateway.Record429(retryAfter)
+			}
 		}
 		if existing != nil {
 			existing(event)
@@ -270,14 +316,38 @@ func (p *GatewayProvider) injectRetryObserver(ctx context.Context) context.Conte
 	return providers.WithRetryObserver(ctx, gatewayObs)
 }
 
-// detect429 checks a final error for 429 status and records it.
-func (p *GatewayProvider) detect429(err error) {
-	if err == nil {
+func (p *GatewayProvider) requireInner() (providers.ProviderAdapter, error) {
+	if p == nil || p.inner == nil {
+		return nil, ErrGatewayProviderUnavailable
+	}
+	return p.inner, nil
+}
+
+func (p *GatewayProvider) requireDispatchableProvider(req *providers.CompletionRequest) (*ProviderGateway, providers.ProviderAdapter, error) {
+	if p == nil || p.gateway == nil || p.inner == nil {
+		return nil, nil, ErrGatewayProviderUnavailable
+	}
+	if req == nil {
+		return nil, nil, ErrGatewayRequestNil
+	}
+	return p.gateway, p.inner, nil
+}
+
+func (p *GatewayProvider) record429(err error) {
+	if p == nil || p.gateway == nil {
 		return
 	}
 	if retryAfter, ok := is429Error(err); ok {
 		p.gateway.Record429(retryAfter)
 	}
+}
+
+// detect429 checks a final error for 429 status and records it.
+func (p *GatewayProvider) detect429(err error) {
+	if err == nil {
+		return
+	}
+	p.record429(err)
 }
 
 // forwardStreamChunks drains src into dst, releases the gateway slot, and

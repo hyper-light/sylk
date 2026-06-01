@@ -601,6 +601,44 @@ func TestProxy_Complete_429Detection(t *testing.T) {
 	}
 }
 
+func TestProxy_CompleteRejectsNilRequest(t *testing.T) {
+	gw := NewProviderGateway(fastConfig(), nil)
+	defer gw.Stop()
+
+	proxy := gw.WrapProvider(&mockProvider{}, PriorityExecution)
+	resp, err := proxy.Complete(dispatchCtx(), nil)
+	if !errors.Is(err, ErrGatewayRequestNil) {
+		t.Fatalf("Complete nil request error = %v, want %v", err, ErrGatewayRequestNil)
+	}
+	if resp != nil {
+		t.Fatalf("Complete nil request response = %#v, want nil", resp)
+	}
+	if snap := gw.Metrics(); snap.Admitted != 0 || snap.Inflight != 0 {
+		t.Fatalf("nil request should not admit: %+v", snap)
+	}
+}
+
+func TestProxy_CompleteRejectsNilResponse(t *testing.T) {
+	gw := NewProviderGateway(fastConfig(), nil)
+	defer gw.Stop()
+
+	proxy := gw.WrapProvider(&mockProvider{
+		completeFn: func(_ context.Context, _ *providers.CompletionRequest) (*providers.CompletionResponse, error) {
+			return nil, nil
+		},
+	}, PriorityExecution)
+	resp, err := proxy.Complete(dispatchCtx(), &providers.CompletionRequest{Model: "m"})
+	if !errors.Is(err, ErrGatewayNilResponse) {
+		t.Fatalf("Complete nil response error = %v, want %v", err, ErrGatewayNilResponse)
+	}
+	if resp != nil {
+		t.Fatalf("Complete nil response = %#v, want nil", resp)
+	}
+	if snap := gw.Metrics(); snap.Admitted != 1 || snap.Completed != 1 || snap.Inflight != 0 {
+		t.Fatalf("nil response should release admitted slot: %+v", snap)
+	}
+}
+
 func TestProxy_StreamWithHandler(t *testing.T) {
 	gw := NewProviderGateway(fastConfig(), nil)
 	defer gw.Stop()
@@ -627,6 +665,20 @@ func TestProxy_StreamWithHandler(t *testing.T) {
 	snap := gw.Metrics()
 	if snap.Admitted != 1 || snap.Completed != 1 {
 		t.Fatalf("metrics mismatch: admitted=%d completed=%d", snap.Admitted, snap.Completed)
+	}
+}
+
+func TestProxy_StreamWithHandlerRejectsNilHandler(t *testing.T) {
+	gw := NewProviderGateway(fastConfig(), nil)
+	defer gw.Stop()
+
+	proxy := gw.WrapProvider(&mockProvider{}, PriorityExecution)
+	err := proxy.StreamWithHandler(dispatchCtx(), &providers.StreamRequest{Model: "m"}, nil)
+	if !errors.Is(err, ErrGatewayStreamHandlerNil) {
+		t.Fatalf("StreamWithHandler nil handler error = %v, want %v", err, ErrGatewayStreamHandlerNil)
+	}
+	if snap := gw.Metrics(); snap.Admitted != 0 || snap.Inflight != 0 {
+		t.Fatalf("nil handler should not admit: %+v", snap)
 	}
 }
 
@@ -664,6 +716,27 @@ func TestProxy_Stream(t *testing.T) {
 	snap := gw.Metrics()
 	if snap.Completed != 1 {
 		t.Fatalf("expected 1 completed, got %d", snap.Completed)
+	}
+}
+
+func TestProxy_StreamRejectsNilStream(t *testing.T) {
+	gw := NewProviderGateway(fastConfig(), nil)
+	defer gw.Stop()
+
+	proxy := gw.WrapProvider(&mockProvider{
+		streamFn: func(_ context.Context, _ *providers.CompletionRequest) (<-chan *providers.StreamChunk, error) {
+			return nil, nil
+		},
+	}, PriorityExecution)
+	ch, err := proxy.Stream(dispatchCtx(), &providers.CompletionRequest{Model: "m"})
+	if !errors.Is(err, ErrGatewayNilStream) {
+		t.Fatalf("Stream nil channel error = %v, want %v", err, ErrGatewayNilStream)
+	}
+	if ch != nil {
+		t.Fatalf("Stream nil channel result = %#v, want nil", ch)
+	}
+	if snap := gw.Metrics(); snap.Admitted != 1 || snap.Completed != 1 || snap.Inflight != 0 {
+		t.Fatalf("nil stream should release admitted slot: %+v", snap)
 	}
 }
 

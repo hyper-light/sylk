@@ -30,26 +30,45 @@ func (panicProviderGatewayAdapter) MaxContextTokens(string) int { return 0 }
 
 func (panicProviderGatewayAdapter) HealthCheck(context.Context) error { return nil }
 
-func TestProviderGatewayExecutionBackendRecoversProviderPanic(t *testing.T) {
-	backend := newProviderGatewayExecutionBackend(panicProviderGatewayAdapter{}, &Request{
-		Model:    "panic-model",
+type nilResponseProviderGatewayAdapter struct{}
+
+func (nilResponseProviderGatewayAdapter) Name() string { return "nil-response-provider" }
+
+func (nilResponseProviderGatewayAdapter) SupportedModels() []ModelInfo { return nil }
+
+func (nilResponseProviderGatewayAdapter) Complete(context.Context, *CompletionRequest) (*CompletionResponse, error) {
+	return nil, nil
+}
+
+func (nilResponseProviderGatewayAdapter) Stream(context.Context, *CompletionRequest) (<-chan *StreamChunk, error) {
+	return nil, nil
+}
+
+func (nilResponseProviderGatewayAdapter) CountTokens([]Message) (int, error) {
+	return 0, nil
+}
+
+func (nilResponseProviderGatewayAdapter) MaxContextTokens(string) int { return 0 }
+
+func (nilResponseProviderGatewayAdapter) HealthCheck(context.Context) error { return nil }
+
+func TestProviderGatewayExecutionBackendReturnsNilResponseAsArtifactError(t *testing.T) {
+	backend := newProviderGatewayExecutionBackend(nilResponseProviderGatewayAdapter{}, &Request{
+		Model:    "nil-response-model",
 		Messages: []Message{{Role: "user", Content: "hello"}},
 	})
 	data, err := backend.HandleProviderGatewayCall(context.Background(), claims.ProviderGatewayCallRequest{
 		Requested: claims.ProviderGatewayCallArtifactData{Operation: claims.ProviderGatewayToolComplete},
 	})
-	if err == nil {
-		t.Fatal("expected provider panic to return an error")
+	if err != nil {
+		t.Fatalf("HandleProviderGatewayCall returned err = %v, want artifact error only", err)
 	}
-	if !strings.Contains(err.Error(), "provider gateway backend panic") {
-		t.Fatalf("error = %q, want provider gateway backend panic", err.Error())
-	}
-	if !strings.Contains(data.Error, "provider gateway backend panic") {
-		t.Fatalf("data.Error = %q, want provider gateway backend panic", data.Error)
+	if !strings.Contains(data.Error, "provider returned nil response") {
+		t.Fatalf("data.Error = %q, want provider returned nil response", data.Error)
 	}
 	saved, resp := backend.Result()
 	if resp != nil {
-		t.Fatalf("panic result response = %#v, want nil", resp)
+		t.Fatalf("nil response result = %#v, want nil", resp)
 	}
 	if saved.Error != data.Error {
 		t.Fatalf("saved error = %q, want %q", saved.Error, data.Error)

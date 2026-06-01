@@ -436,6 +436,8 @@ type MemoryForest struct {
 	explorationRng   *mathrand.Rand
 	explorationRngMu sync.Mutex
 
+	governanceMu sync.Mutex
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	wg       sync.WaitGroup

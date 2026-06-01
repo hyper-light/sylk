@@ -2,14 +2,18 @@
 
 ## Goal
 
-Sylk needs a predictive `Memory Forest` that helps every agent maximize user intent, not merely answer the literal prompt. The forest is a multi-tree, multi-timescale memory system that:
+This document is the implementation-facing Memory Forest guide. The active
+architecture is `docs/EMERGENT_FOREST.md`; older branch-family language is
+historical unless it is explicitly marked as migration or archive behavior.
+
+Sylk needs a predictive `Memory Forest` that helps every agent maximize user intent, not merely answer the literal prompt. The forest is a multi-channel, multi-timescale memory system that:
 
 - preserves immutable evidence
-- projects that evidence into typed trees specialized by intent facet
-- maintains active canopies for the current user, session, and project
-- learns cross-tree associations that improve future retrieval and planning
-- returns agent-ready `BranchPacket`s instead of loose search hits
-- uses memory to safely exceed user intent on quality without silently exceeding scope
+- projects that evidence into typed interaction nodes, paths, clusters, artifacts, validations, quarantine state, policies, memes, and generated-skill proposals
+- maintains cursor-aware active context for the current user, session, project, and agent role
+- learns graph, substrate, policy, and memetic associations that improve future retrieval and planning
+- returns agent-ready `ForestPacket`s instead of loose search hits or branch packets
+- uses memory to safely exceed user intent on quality without silently exceeding scope or authority
 
 The primary output of the system is:
 
@@ -23,14 +27,14 @@ The primary output of the system is:
   Hypotheses, decisions, summaries, abstractions, and preferences are derived projections, never destructive rewrites.
 - `Intent is first-class`
   Retrieval is conditioned on active intent and active branch state before generic lexical or semantic similarity.
-- `Multi-tree beats single-tree`
-  Different trees specialize in different facets of user intent and collaborate through relays.
+- `Multi-channel beats single-store`
+  Different evidence channels specialize in different facets of user intent and collaborate through node paths, clusters, substrate fields, and bridge-risk signals.
 - `Fast episodic + slow semantic`
   The system follows complementary learning systems rather than flattening all memory into one store.
 - `Agent usability matters`
-  Agents do not query raw graph primitives by default. They consume skills that return branch packets with provenance, confidence, conflicts, and next actions.
-- `Fail open`
-  If any forest subsystem degrades, Sylk falls back to today’s content and hybrid retrieval paths without losing evidence.
+  Agents do not query raw graph primitives by default. They consume skills that return `ForestPacket`s with provenance, confidence, conflicts, quarantine, validations, artifacts, cursor updates, and next actions.
+- `Trusted changes fail closed`
+  Policy promotion, quarantine, pruning, remediation, cluster speciation, and generated-skill promotion require proposal artifacts, validation evidence, and accepted claims or scoped guardian approvals.
 
 ## Forest Layers
 
@@ -585,7 +589,7 @@ The architecture admits multiple projectors over the same event log, each mainta
 - `substrate` projector: rebuilds substrate state on dirty session events
 - `canopy` projector: maintains active root sets per horizon
 - `retrieval-cache` projector: precomputes top-K retrievals for hot intents
-- `claims-harvester` projector: bridges to the bus-published claims deltas (per `docs/CLAIMS_BUS.md`)
+- `claims-delta` projector: consumes canonical claims deltas from the board and writes append-only forest ledger records
 
 Each runs as an independent tracked goroutine with its own lease entry. The branch projector is the first; others are additive.
 
@@ -643,26 +647,28 @@ Core event types include:
 - ecology pruning
 - ecology regrowth
 
-## Branch Packets
+## Forest Packets
 
-Agents should retrieve `BranchPacket`s, not raw hits.
+Agents should retrieve `ForestPacket`s, not raw hits or historical branch packets.
 
 Each packet includes:
 
-- branch identity
-- tree family and scope
+- node identity
+- cluster, path, and cursor context
 - title and summary
 - support evidence
 - counterevidence
 - provenance
 - confidence
+- artifact and validation records
+- quarantine and bridge-risk state
 - predicted utility
 - scope risk
 - conflicts
 - suggested next actions
 - scoring breakdown
 
-Branch packets are the primary retrieval product for:
+Forest packets are the primary retrieval product for:
 
 - Academic
 - Librarian
@@ -680,21 +686,21 @@ The system should answer:
 
 1. what is the active intent frontier
 2. what constraints and preferences govern it
-3. which branches already exist around it
+3. which nodes, paths, clusters, artifacts, validations, and memes already exist around it
 4. which evidence best reduces uncertainty or advances completion
-5. which next branches are likely to create value without violating scope
+5. which adjacent packets are likely to create value without violating scope or authority
 
 ### Retrieval Steps
 
 1. resolve the canopy
-2. gather candidate branches across trees
+2. gather candidate nodes and paths across graph channels
 3. gather supporting evidence from indexed content
-4. spread activation over relays
-5. score branch candidates
+4. spread activation over graph edges, substrate fields, and cluster topology
+5. score packet candidates
 6. build normalized float32 feature vectors for each candidate
 7. apply the learned reranker to top candidate packets
-8. hydrate top candidates into branch packets
-9. reinforce returned packets in the warmth layer
+8. hydrate top candidates into `ForestPacket`s
+9. reinforce returned packets through retrieval accounting and cursor propagation
 
 ### Scoring Features
 

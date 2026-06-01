@@ -2140,8 +2140,57 @@ func TestBridgeIntegration_PromptOpensCycleForSubject(t *testing.T) {
 	}
 }
 
-func TestBridgeIntegration_GuideClassificationClaimIsHiddenFromUserSurfaces(t *testing.T) {
-	_, board, prog, cleanup := setupBridgeOnSession(t, "sess-guide-classify-panel-only")
+func TestBridgeIntegration_GuideRoutedWorkTaskOpensCycleForSubject(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "sess-routed-work-subject")
+	defer cleanup()
+
+	if err := board.PostAction(context.Background(),
+		claims.Action{AgentID: "guide", Type: claims.ActionTypeTask},
+		[]claims.Claim{{
+			Title:      "Let's create a toy python hello world cli app.",
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+				{Related: "<nil>", RelatedType: claims.RelatedTypeClaim, Relationship: claims.RelationshipCausedBy},
+			},
+			Tags: []string{"routed_work"},
+			Validations: []*claims.Validation{{
+				ID:          "receipt",
+				Description: "target responds",
+				QualityBar:  "response received",
+				Type:        claims.ValidationTypeReceipt,
+				Required:    true,
+			}},
+		}},
+	); err != nil {
+		t.Fatalf("PostAction routed work: %v", err)
+	}
+	drainBridge(t, prog, "guide routed work to architect")
+
+	var sawArchitectActive, sawGuideActive bool
+	for _, m := range prog.Snapshot() {
+		s, ok := m.(msg.ClaimsAgentStatusMsg)
+		if !ok {
+			continue
+		}
+		if s.Active && s.AgentID == "architect" {
+			sawArchitectActive = true
+		}
+		if s.Active && s.AgentID == "guide" {
+			sawGuideActive = true
+		}
+	}
+	if !sawArchitectActive {
+		t.Fatal("expected routed_work task to open an architect cycle")
+	}
+	if sawGuideActive {
+		t.Fatal("guide-issued routed_work task must be owned by the subject, not guide")
+	}
+}
+
+func TestBridgeIntegration_GuideClassificationClaimIsVisibleToUserSurfaces(t *testing.T) {
+	_, board, prog, cleanup := setupBridgeOnSession(t, "sess-guide-classify-visible")
 	defer cleanup()
 
 	if err := board.PostAction(context.Background(),
@@ -2152,6 +2201,7 @@ func TestBridgeIntegration_GuideClassificationClaimIsHiddenFromUserSurfaces(t *t
 			Context:    "Classifying request",
 			Relations: []claims.Relation{
 				{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
 			},
 			Tags: []string{
 				claimTagGuideClassification,
@@ -2170,17 +2220,17 @@ func TestBridgeIntegration_GuideClassificationClaimIsHiddenFromUserSurfaces(t *t
 	}
 	drainBridge(t, prog, "guide classification open")
 
+	var sawGuideActive bool
 	for _, m := range prog.Snapshot() {
 		switch typed := m.(type) {
 		case msg.ClaimsAgentStatusMsg:
-			if typed.CycleID == claimID {
-				t.Fatalf("guide classification claim opened a visible cycle: %+v", typed)
-			}
-		case msg.ClaimContextMsg:
-			if typed.ClaimID == claimID {
-				t.Fatalf("guide classification claim emitted visible context: %+v", typed)
+			if typed.Active && typed.AgentID == "guide" && typed.CycleID == claimID && typed.State == "classifying" {
+				sawGuideActive = true
 			}
 		}
+	}
+	if !sawGuideActive {
+		t.Fatal("guide classification claim should open a visible guide cycle")
 	}
 
 	if err := board.SetClaimContext(context.Background(), claimID, "Request forwarded"); err != nil {
@@ -2188,10 +2238,14 @@ func TestBridgeIntegration_GuideClassificationClaimIsHiddenFromUserSurfaces(t *t
 	}
 	drainBridge(t, prog, "guide classification forwarded context")
 
+	var sawForwarded bool
 	for _, m := range prog.Snapshot() {
-		if c, ok := m.(msg.ClaimContextMsg); ok && c.ClaimID == claimID {
-			t.Fatalf("guide classification context must stay hidden: %+v", c)
+		if c, ok := m.(msg.ClaimContextMsg); ok && c.ClaimID == claimID && c.Context == "Request forwarded" && c.State == "routing" {
+			sawForwarded = true
 		}
+	}
+	if !sawForwarded {
+		t.Fatal("guide classification forwarded context should stay visible and enter routing state")
 	}
 }
 

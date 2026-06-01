@@ -1135,8 +1135,15 @@ func metadataString(metadata map[string]any, key string) string {
 	if len(metadata) == 0 {
 		return ""
 	}
-	value, _ := metadata[key]
-	return strings.TrimSpace(fmt.Sprint(value))
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	trimmed := strings.TrimSpace(fmt.Sprint(value))
+	if trimmed == "<nil>" {
+		return ""
+	}
+	return trimmed
 }
 
 func firstNonEmptyString(values ...string) string {

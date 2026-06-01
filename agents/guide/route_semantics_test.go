@@ -136,6 +136,9 @@ func TestPostRoutedWorkClaimUsesLifecycleAndDoesNotUsePromptSuppressionTag(t *te
 	if got := claims.SubjectAgentID(claim.Relations); got != "architect" {
 		t.Fatalf("subject = %q, want architect", got)
 	}
+	if claims.HasRelation(claim.Relations, claims.RelationshipCausedBy, "<nil>") {
+		t.Fatalf("routed work claim must not carry placeholder caused_by relation: %+v", claim.Relations)
+	}
 	for _, tag := range claim.Tags {
 		if tag == "user_prompt" {
 			t.Fatal("routed work claims must not carry user_prompt; target inbox would suppress them")

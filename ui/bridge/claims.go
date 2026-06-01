@@ -2627,6 +2627,9 @@ func cycleOwnerForClaim(c *claims.Claim) string {
 	}
 	issuer := strings.TrimSpace(claims.IssuerAgentID(c.Relations))
 	subject := strings.TrimSpace(claims.SubjectAgentID(c.Relations))
+	if isGuideIssuedRoutedWorkClaim(c, issuer, subject) {
+		return subject
+	}
 	switch c.ActionType {
 	case claims.ActionTypePrompt, claims.ActionTypeHandoff:
 		return firstNonBlank(subject, issuer)
@@ -2635,11 +2638,28 @@ func cycleOwnerForClaim(c *claims.Claim) string {
 	}
 }
 
+func isGuideIssuedRoutedWorkClaim(c *claims.Claim, issuer, subject string) bool {
+	return c != nil &&
+		strings.TrimSpace(issuer) == "guide" &&
+		strings.TrimSpace(subject) != "" &&
+		claimHasTag(c, "routed_work")
+}
+
 func relationID(relations []claims.Relation, relationship string) string {
 	if r := claims.FindRelation(relations, relationship); r != nil {
-		return strings.TrimSpace(r.Related)
+		return normalizedRelationID(r.Related)
 	}
 	return ""
+}
+
+func normalizedRelationID(value string) string {
+	trimmed := strings.TrimSpace(value)
+	switch trimmed {
+	case "", "<nil>", "nil", "null":
+		return ""
+	default:
+		return trimmed
+	}
 }
 
 func artifactChildClaimID(art *claims.Artifact) string {
@@ -2735,8 +2755,7 @@ func claimHiddenFromUserSurfaces(c *claims.Claim) bool {
 	if c == nil {
 		return false
 	}
-	return claimHasTag(c, claimTagGuideClassification) ||
-		claims.IsSystemInternalAction(c.ActionType) ||
+	return claims.IsSystemInternalAction(c.ActionType) ||
 		claimTargetsActivationService(c) ||
 		claimTargetsInfrastructureService(c)
 }

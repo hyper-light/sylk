@@ -52,8 +52,13 @@ type ForestClaimProposal struct {
 	SourceOutbreakID       string   `json:"source_outbreak_id"`
 }
 
-type ClaimProposalSink interface {
+//go:generate mockery --name=ForestProposalSink --inpackage --output=. --filename=mock_forest_proposal_sink_test.go --outpkg=forest
+type ForestProposalSink interface {
 	ProposeClaim(ctx context.Context, proposal ForestClaimProposal) error
+}
+
+type ClaimProposalSink interface {
+	ForestProposalSink
 }
 
 func (m *MemoryForest) ProposeForestClaim(ctx context.Context, proposal ForestClaimProposal) error {

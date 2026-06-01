@@ -253,7 +253,7 @@ func TestPhase12SkillCandidateAllowsPermissionExpansionOnlyWithAcceptedClaim(t *
 	defer db.Close()
 	permissionClaimID := "skill-permission-claim"
 	appendAcceptedClaimDelta(t, forest, permissionClaimID)
-	candidate, err := forest.ProposeGeneratedSkillCandidate(context.Background(), SkillCandidateInput{
+	input := SkillCandidateInput{
 		Name:                      "Network Evidence Reader",
 		RoleScope:                 "guardian",
 		Trigger:                   "validated external evidence replay requested",
@@ -261,8 +261,13 @@ func TestPhase12SkillCandidateAllowsPermissionExpansionOnlyWithAcceptedClaim(t *
 		SourceValidationRefs:      []string{"validation:external-evidence"},
 		RequestedPermissions:      []string{"network"},
 		ExplicitPermissionClaimID: permissionClaimID,
+		PermissionApprovalActor:   "guardian",
 		PromotionRationale:        "Read externally referenced evidence only when a validated replay request requires it.",
-	})
+		PermissionApprovalExpires: time.Now().UTC().Add(time.Hour),
+	}
+	predicted, _ := buildSkillCandidate(input)
+	input.PermissionApprovalScope = []string{SkillCandidatePermissionScope(predicted.CandidateID)}
+	candidate, err := forest.ProposeGeneratedSkillCandidate(context.Background(), input)
 	if err != nil {
 		t.Fatalf("propose permission-backed skill: %v", err)
 	}

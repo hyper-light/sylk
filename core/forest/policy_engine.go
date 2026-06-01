@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/adalundhe/sylk/core/claims"
 )
 
 const (
@@ -31,6 +29,7 @@ const (
 	PolicyRollbackUsePreviousActive = "rollback_to_previous_active_policy"
 )
 
+//go:generate mockery --name=PolicyOutcomeSource --inpackage --output=. --filename=mock_policy_outcome_source_test.go --outpkg=forest
 type PolicyOutcomeSource interface {
 	PolicyOutcomes(ctx context.Context, candidateID string, limit int) ([]PolicyOutcome, error)
 }
@@ -690,6 +689,9 @@ func (e *ForestPolicyEngine) ProposeCandidatePromotion(ctx context.Context, cand
 		return err
 	}
 	if candidate.Status != PolicyCandidateStatusTrialing {
+		if candidate.Status == PolicyCandidateStatusProposed {
+			return e.ensureExistingPolicyPromotionProposal(ctx, candidate, fitness)
+		}
 		return fmt.Errorf("policy candidate %s status %s is not proposal-ready", candidate.ID, candidate.Status)
 	}
 	if !fitness.PromotionAllowed {
@@ -806,6 +808,9 @@ func (e *ForestPolicyEngine) markPolicyCandidateRejected(ctx context.Context, ca
 }
 
 func (e *ForestPolicyEngine) commitPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
+	if err := ensureForestGovernanceSchema(e.db); err != nil {
+		return err
+	}
 	tx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin policy promotion proposal: %w", err)
@@ -817,10 +822,34 @@ func (e *ForestPolicyEngine) commitPolicyPromotionProposal(ctx context.Context, 
 	if err := e.upsertPolicyPromotionArtifactTx(ctx, tx, candidate, fitness, "proposed", "requires_validation", ""); err != nil {
 		return err
 	}
+	if _, err := insertGovernanceProposalTx(ctx, tx, policyPromotionGovernanceProposal(candidate, fitness, ForestProposalStatusProposed, "")); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit policy promotion proposal: %w", err)
 	}
 	return e.emitPolicyPromotionProposal(ctx, candidate, fitness)
+}
+
+func (e *ForestPolicyEngine) ensureExistingPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
+	if len(fitness.EvidenceRefs) == 0 {
+		fitness.EvidenceRefs = candidate.ValidationEvidenceRefs
+	}
+	if len(fitness.EvidenceRefs) == 0 {
+		return fmt.Errorf("policy candidate %s proposed without validation evidence", candidate.ID)
+	}
+	if err := ensureForestGovernanceSchema(e.db); err != nil {
+		return err
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin existing policy promotion proposal: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := insertGovernanceProposalTx(ctx, tx, policyPromotionGovernanceProposal(candidate, fitness, ForestProposalStatusProposed, "")); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func updatePolicyPromotionProposalRows(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness) error {
@@ -872,6 +901,9 @@ func (e *ForestPolicyEngine) commitPolicyActivation(ctx context.Context, candida
 	if err := e.upsertPolicyPromotionArtifactTx(ctx, tx, candidate, fitness, "accepted", "validated", acceptedClaimID); err != nil {
 		return err
 	}
+	if err := updateGovernanceProposalStatusTx(ctx, tx, policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs), ForestProposalStatusAccepted, acceptedClaimID); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit accepted policy activation: %w", err)
 	}
@@ -882,7 +914,7 @@ func (e *ForestPolicyEngine) upsertPolicyPromotionArtifactTx(ctx context.Context
 	if ok, err := e.tableExistsTx(ctx, tx, "forest_artifacts"); err != nil || !ok {
 		return err
 	}
-	artifactID := stableID(PolicyPromotionArtifactKind, candidate.ID, encodeStringList(fitness.EvidenceRefs))
+	artifactID := policyPromotionArtifactID(candidate.ID, fitness.EvidenceRefs)
 	now := time.Now().UTC().Unix()
 	metadata := map[string]any{
 		"candidate":       candidate,
@@ -931,26 +963,46 @@ func tableExistsTx(ctx context.Context, tx *sql.Tx, table string) (bool, error) 
 }
 
 func (e *ForestPolicyEngine) acceptedForestClaimExists(ctx context.Context, claimID string) (bool, error) {
-	claimID = strings.TrimSpace(claimID)
-	if claimID == "" {
-		return false, nil
-	}
-	var count int
-	err := e.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM forest_ledger
-		WHERE subject_type = ?
-		  AND subject_id = ?
-		  AND event_kind = ?
-	`, claims.RelatedTypeClaim, claimID, string(claims.DeltaActionClaimSatisfied)).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("check accepted forest claim: %w", err)
-	}
-	return count > 0, nil
+	return acceptedForestClaimExists(ctx, e.db, claimID)
 }
 
 func policyPromotionProposalID(candidateID string, refs []string) string {
 	return "forest_policy_promotion:" + stableID(strings.TrimSpace(candidateID), encodeStringList(refs))
+}
+
+func policyPromotionArtifactID(candidateID string, refs []string) string {
+	return stableID(PolicyPromotionArtifactKind, strings.TrimSpace(candidateID), encodeStringList(refs))
+}
+
+func policyPromotionGovernanceProposal(candidate *PolicyCandidate, fitness PolicyFitness, status, acceptedClaimID string) ForestGovernanceProposal {
+	now := time.Now().UTC()
+	proposalID := policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs)
+	metadata := map[string]any{
+		"candidate_id":       candidate.ID,
+		"fitness":            fitness,
+		"rollback_policy":    PolicyRollbackUsePreviousActive,
+		"summary":            "Promote validated forest policy candidate " + candidate.ID,
+		"accepted_claim_id":  strings.TrimSpace(acceptedClaimID),
+		"validation_refs":    fitness.EvidenceRefs,
+		"parent_policy_id":   candidate.ParentPolicyID,
+		"candidate_version":  candidate.Version,
+		"governance_version": forestProjectionVersionPhase131415,
+	}
+	return ForestGovernanceProposal{
+		ProposalID:             proposalID,
+		Kind:                   ForestProposalKindPolicyPromotion,
+		SubjectType:            "forest_policy",
+		SubjectID:              candidate.ID,
+		Status:                 status,
+		ClaimID:                proposalID,
+		ArtifactID:             policyPromotionArtifactID(candidate.ID, fitness.EvidenceRefs),
+		EvidenceRefs:           dedupeStrings(fitness.EvidenceRefs),
+		RollbackPath:           PolicyRollbackUsePreviousActive,
+		GuardianReviewRequired: true,
+		Metadata:               metadata,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
 }
 
 func (e *ForestPolicyEngine) emitPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {

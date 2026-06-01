@@ -9,8 +9,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/adalundhe/sylk/core/claims"
 )
 
 const (
@@ -27,6 +25,7 @@ const (
 	SkillValidationStatusFailed = "failed"
 )
 
+//go:generate mockery --name=SkillArtifactWriter --inpackage --output=. --filename=mock_skill_artifact_writer_test.go --outpkg=forest
 type SkillArtifactWriter interface {
 	WriteSkillCandidate(ctx context.Context, candidate GeneratedSkillCandidate, files []SkillCandidateFile) error
 }
@@ -43,6 +42,9 @@ type SkillCandidateInput struct {
 	RequestedPermissions      []string
 	ExistingSkillNames        []string
 	ExplicitPermissionClaimID string
+	PermissionApprovalActor   string
+	PermissionApprovalScope   []string
+	PermissionApprovalExpires time.Time
 	PromotionRationale        string
 }
 
@@ -90,6 +92,9 @@ func (m *MemoryForest) ProposeGeneratedSkillCandidate(ctx context.Context, input
 	if err := ensureForestSkillFoundrySchema(m.db); err != nil {
 		return nil, err
 	}
+	if err := ensureForestGovernanceSchema(m.db); err != nil {
+		return nil, err
+	}
 	candidate, files := buildSkillCandidate(input)
 	if err := m.applySkillCandidateGuards(ctx, &candidate, input); err != nil {
 		if persistErr := m.persistSkillCandidate(ctx, candidate, files); persistErr != nil {
@@ -131,7 +136,7 @@ func buildSkillCandidate(input SkillCandidateInput) (GeneratedSkillCandidate, []
 		SourceClaimIDs:            dedupeStrings(input.SourceClaimIDs),
 		SourceValidationRefs:      dedupeStrings(input.SourceValidationRefs),
 		RejectedVariantIDs:        dedupeStrings(input.RejectedVariantIDs),
-		PermissionDiff:            dedupeStrings(input.RequestedPermissions),
+		PermissionDiff:            AuthorityDiffFromPermissions(input.RequestedPermissions).Raw,
 		ExplicitPermissionClaimID: strings.TrimSpace(input.ExplicitPermissionClaimID),
 		PromotionRationale:        strings.TrimSpace(input.PromotionRationale),
 		GuardianReviewRequired:    true,
@@ -152,22 +157,14 @@ func (m *MemoryForest) applySkillCandidateGuards(ctx context.Context, candidate 
 		markSkillCandidateStatus(candidate, SkillCandidateStatusDuplicate, "existing_skill_name")
 		return fmt.Errorf("generated skill candidate duplicates existing skill %q", candidate.Name)
 	}
-	if len(candidate.PermissionDiff) > 0 && candidate.ExplicitPermissionClaimID == "" {
-		markSkillCandidateRejected(candidate, "permission expansion requires explicit approval claim")
-		return fmt.Errorf("permission expansion requires explicit approval claim")
-	}
-	if len(candidate.PermissionDiff) > 0 {
-		accepted, err := m.acceptedForestClaimExists(ctx, candidate.ExplicitPermissionClaimID)
-		if err != nil {
-			return err
-		}
-		if !accepted {
-			markSkillCandidateRejected(candidate, "permission expansion claim is not accepted")
-			return fmt.Errorf("permission expansion claim %s is not accepted", candidate.ExplicitPermissionClaimID)
-		}
+	if err := m.enforceSkillAuthorityBoundary(ctx, candidate, input); err != nil {
+		markSkillCandidateRejected(candidate, err.Error())
+		_ = m.recordGovernanceNegativeEvidence(ctx, SkillCandidateArtifactType, candidate.CandidateID, err.Error(), candidate.SourceValidationRefs, "")
+		return err
 	}
 	if containsSelfActivationRequest(candidate) {
 		markSkillCandidateRejected(candidate, "skill candidate cannot activate or install itself")
+		_ = m.recordGovernanceNegativeEvidence(ctx, SkillCandidateArtifactType, candidate.CandidateID, "skill candidate cannot activate or install itself", candidate.SourceValidationRefs, "")
 		return fmt.Errorf("skill candidate cannot activate or install itself")
 	}
 	suppressed, memeID, err := m.ActiveNegativeMemeSuppresses(ctx, candidate.Name+" "+candidate.Trigger+" "+candidate.PromotionRationale)
@@ -179,6 +176,27 @@ func (m *MemoryForest) applySkillCandidateGuards(ctx context.Context, candidate 
 		return fmt.Errorf("skill candidate suppressed by negative meme %s", memeID)
 	}
 	return nil
+}
+
+func (m *MemoryForest) enforceSkillAuthorityBoundary(ctx context.Context, candidate *GeneratedSkillCandidate, input SkillCandidateInput) error {
+	diff := AuthorityDiffFromPermissions(input.RequestedPermissions)
+	subject := SkillCandidatePermissionScope(candidate.CandidateID)
+	approval := ForestAuthorityApproval{
+		ClaimID:        candidate.ExplicitPermissionClaimID,
+		Actor:          input.PermissionApprovalActor,
+		Scope:          input.PermissionApprovalScope,
+		ExpiresAt:      input.PermissionApprovalExpires,
+		PermissionDiff: diff,
+		Metadata: map[string]any{
+			"candidate_id": candidate.CandidateID,
+			"role_scope":   candidate.RoleScope,
+		},
+	}
+	return m.RequireAuthorityBoundary(ctx, subject, diff, approval)
+}
+
+func SkillCandidatePermissionScope(candidateID string) string {
+	return "generated_skill_candidate:" + strings.TrimSpace(candidateID)
 }
 
 func validateSkillCandidateInput(candidate GeneratedSkillCandidate) error {
@@ -318,6 +336,7 @@ func skillCandidateSafetyCase(candidate GeneratedSkillCandidate) string {
 		"# Safety Case",
 		"",
 		"This generated skill candidate is inert until guardian-approved activation.",
+		"Architecture refs: docs/EMERGENT_FOREST.md, docs/MEMORY_FOREST.md",
 		"Permission diff: " + encodeStringList(candidate.PermissionDiff),
 		"Explicit permission claim: " + candidate.ExplicitPermissionClaimID,
 	}
@@ -335,6 +354,11 @@ func (m *MemoryForest) persistSkillCandidate(ctx context.Context, candidate Gene
 	}
 	if err := m.upsertSkillCandidateArtifactTx(ctx, tx, candidate); err != nil {
 		return err
+	}
+	if candidate.Status == SkillCandidateStatusProposed {
+		if _, err := insertGovernanceProposalTx(ctx, tx, skillCandidateGovernanceProposal(candidate)); err != nil {
+			return err
+		}
 	}
 	for _, file := range files {
 		if err := upsertSkillCandidateFileTx(ctx, tx, candidate.CandidateID, file); err != nil {
@@ -498,6 +522,35 @@ func generatedSkillCandidateClaims(candidate GeneratedSkillCandidate) []ForestCl
 
 func generatedSkillUtilityClaimID(candidate GeneratedSkillCandidate) string {
 	return generatedSkillClaimID(candidate, "generated_skill_utility")
+}
+
+func skillCandidatePromotionProposalID(candidateID string) string {
+	return "skill_candidate_promotion:" + stableID(strings.TrimSpace(candidateID))
+}
+
+func skillCandidateGovernanceProposal(candidate GeneratedSkillCandidate) ForestGovernanceProposal {
+	now := time.Now().UTC()
+	return ForestGovernanceProposal{
+		ProposalID:             governedProposalID(SkillCandidateArtifactType, "skill_foundry", candidate.CandidateID, candidate.SourceValidationRefs),
+		Kind:                   ForestProposalKindSkillCandidate,
+		SubjectType:            "skill_foundry",
+		SubjectID:              candidate.CandidateID,
+		Status:                 ForestProposalStatusProposed,
+		ClaimID:                generatedSkillUtilityClaimID(candidate),
+		ArtifactID:             skillCandidateArtifactID(candidate.CandidateID),
+		EvidenceRefs:           dedupeStrings(candidate.SourceValidationRefs),
+		RollbackPath:           "delete_inert_generated_skill_candidate_artifacts",
+		GuardianReviewRequired: true,
+		PermissionDiff:         AuthorityDiffFromPermissions(candidate.PermissionDiff),
+		ApprovalClaimID:        candidate.ExplicitPermissionClaimID,
+		Metadata: map[string]any{
+			"candidate_id":  candidate.CandidateID,
+			"summary":       "Generated skill candidate proposed: " + candidate.Name,
+			"proposal_only": true,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
 }
 
 func generatedSkillClaimID(candidate GeneratedSkillCandidate, dimension string) string {
@@ -696,11 +749,27 @@ func (m *MemoryForest) PromoteSkillCandidate(ctx context.Context, candidateID st
 	if !passed {
 		return fmt.Errorf("skill candidate %s has not passed required validations", candidate.CandidateID)
 	}
+	proposalID := skillCandidatePromotionProposalID(candidate.CandidateID)
+	if _, err := m.ProposeGovernedForestChange(ctx, ForestGovernedChange{
+		Kind:                   SkillCandidateArtifactType,
+		SubjectType:            "skill_foundry",
+		SubjectID:              candidate.CandidateID,
+		Summary:                "Generated skill candidate promotion proposed: " + candidate.Name,
+		EvidenceRefs:           candidate.SourceValidationRefs,
+		RollbackPath:           "keep_generated_skill_candidate_inert",
+		GuardianReviewRequired: true,
+		Metadata: map[string]any{
+			"promotion_proposal_id": proposalID,
+			"status":                SkillCandidateStatusPromotionProposed,
+		},
+	}); err != nil {
+		return err
+	}
 	if err := m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusPromotionProposed); err != nil {
 		return err
 	}
 	return m.ProposeForestClaim(ctx, ForestClaimProposal{
-		ID:                     "skill_candidate_promotion:" + stableID(candidate.CandidateID),
+		ID:                     proposalID,
 		ClusterID:              "skill_foundry",
 		Dimension:              "skill_candidate_promotion",
 		Summary:                "Generated skill candidate promotion proposed: " + candidate.Name,
@@ -724,6 +793,9 @@ func (m *MemoryForest) AcceptSkillCandidatePromotion(ctx context.Context, candid
 	if !accepted {
 		return fmt.Errorf("accepted skill promotion claim %s not found", acceptedClaimID)
 	}
+	if err := m.AcceptGovernanceProposal(ctx, governedProposalID(SkillCandidateArtifactType, "skill_foundry", candidate.CandidateID, candidate.SourceValidationRefs), acceptedClaimID); err != nil {
+		return err
+	}
 	return m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusAcceptedPendingActivation)
 }
 
@@ -735,22 +807,7 @@ func (m *MemoryForest) acceptedForestClaimExists(ctx context.Context, claimID st
 	if m == nil || m.db == nil {
 		return false, fmt.Errorf("memory forest is required")
 	}
-	claimID = strings.TrimSpace(claimID)
-	if claimID == "" {
-		return false, nil
-	}
-	var count int
-	err := m.db.QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM forest_ledger
-		WHERE subject_type = ?
-		  AND subject_id = ?
-		  AND event_kind = ?
-	`, claims.RelatedTypeClaim, claimID, string(claims.DeltaActionClaimSatisfied)).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("check accepted forest claim: %w", err)
-	}
-	return count > 0, nil
+	return acceptedForestClaimExists(ctx, m.db, claimID)
 }
 
 func (m *MemoryForest) skillCandidateValidationGate(ctx context.Context, candidateID string) (bool, error) {

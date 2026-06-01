@@ -337,6 +337,24 @@ packages:
       NeighborIndex:
         config:
           mockname: "MockNeighborIndex"
+      TextSearcher:
+        config:
+          mockname: "MockTextSearcher"
+      ForestProposalSink:
+        config:
+          mockname: "MockForestProposalSink"
+      SkillArtifactWriter:
+        config:
+          mockname: "MockSkillArtifactWriter"
+      PolicyOutcomeSource:
+        config:
+          mockname: "MockPolicyOutcomeSource"
+      AgentTurnProvider:
+        config:
+          mockname: "MockAgentTurnProvider"
+      GuardianApprover:
+        config:
+          mockname: "MockGuardianApprover"
 
   github.com/adalundhe/sylk/ui/bridge:
     config:
