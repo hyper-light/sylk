@@ -97,6 +97,13 @@ func (p *instrumentedProvider) Stream(ctx context.Context, req *CompletionReques
 		span.End()
 		return nil, err
 	}
+	if resp == nil {
+		err := errors.New("provider gateway returned nil streaming response")
+		span.EndWithError(err)
+		recordLLMDispatchEnd(ctx, p.wrapped.Name(), req, "stream", trace, nil, err)
+		span.End()
+		return nil, err
+	}
 	chunks := providerGatewayStreamChunks(resp)
 	out := make(chan *StreamChunk, len(chunks))
 	for _, chunk := range chunks {
