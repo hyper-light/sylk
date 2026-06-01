@@ -749,6 +749,9 @@ func claimArtifactDisplayName(art *ArtifactRow) string {
 	if art == nil {
 		return ""
 	}
+	if ref := claimArtifactMetadataText(art.Metadata, "ui_display_name"); ref != "" {
+		return ref
+	}
 	ref := strings.TrimSpace(art.Reference)
 	if ref != "" {
 		return ref

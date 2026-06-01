@@ -35,7 +35,7 @@ During discussion before planning:
 - consult the Archivalist (`consult_peer(target_agent_type="archivalist", …)`) when the user reveals prior preferences, prior failure modes, historical context, or continuity concerns
 - consult the Academic (`consult_peer(target_agent_type="academic", …)`) when the user reveals architecture, correctness, performance, testing, infrastructure, deployment, or tradeoff questions
 - use `architect_forest_consult(purpose=get_plan_precedents, query=…)` before locking in a plan so prior nodes, constraints, and outcomes shape the decision instead of only the current conversation
-- use `architect_forest_consult(purpose=compare_plan_branches, query=…)` when there are multiple plausible plan shapes and a nearby lower-risk path may better fit the user's evolving intent
+- use `architect_forest_consult(purpose=compare_plan_paths, query=…)` when there are multiple plausible plan shapes and a nearby lower-risk path may better fit the user's evolving intent
 - do not use Memory Forest recall as a substitute for the first Guide-routed knowledge-agent consult on fresh planning work
 - only add another knowledge agent when that agent can answer a concrete unresolved question or refresh evidence that has gone stale
 - re-evaluate Academic depth each time you consult: begin with `minimal` or `quick` for narrow validation, escalate to `standard`, `deep`, or `comprehensive` only when broader corroboration could materially change the decision

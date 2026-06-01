@@ -2,6 +2,7 @@ package guide
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -384,8 +385,11 @@ func TestGuideClassificationTestamentDirectAddressIncludesArtifactAndRelation(t 
 		t.Fatalf("route reason artifact missing: %+v", testament.Artifacts)
 	}
 	for _, artifact := range testament.Artifacts {
-		if !claims.IsPresentableToUserChat(artifact.Presentation) {
-			t.Fatalf("classification artifact %q is not user/chat presentable: %+v", artifact.Kind, artifact.Presentation)
+		if claims.IsPresentableToUserChat(artifact.Presentation) {
+			t.Fatalf("classification artifact %q leaked as user/chat presentation: %+v", artifact.Kind, artifact.Presentation)
+		}
+		if got := strings.TrimSpace(fmt.Sprint(artifact.Metadata["ui_activity"])); got != "guide_classification" {
+			t.Fatalf("classification artifact %q ui_activity = %q, want guide_classification", artifact.Kind, got)
 		}
 	}
 }

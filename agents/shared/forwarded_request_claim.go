@@ -84,7 +84,7 @@ func BeginForwardedRequestAccumulator(
 		ctx = claims.WithParentClaimID(ctx, claimID)
 	}
 
-	acc := claims.NewTestamentAccumulator(agentID, sessionID)
+	acc := claims.NewTestamentAccumulator(agentID, sessionID).WithBoard(board)
 	if claimID != "" {
 		acc.WithClaimID(claimID)
 	}
@@ -357,7 +357,7 @@ func BeginForwardedRequestAccumulatorWithOpts(
 		ctx = claims.WithParentClaimID(ctx, claimID)
 	}
 
-	acc := claims.NewTestamentAccumulator(agentID, sessionID)
+	acc := claims.NewTestamentAccumulator(agentID, sessionID).WithBoard(board)
 	if claimID != "" {
 		acc.WithClaimID(claimID)
 		acc.WithResponseClaimID(claimID)

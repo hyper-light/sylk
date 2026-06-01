@@ -344,9 +344,9 @@ type MemoryForest struct {
 	projectorID             string
 	synchronousProjection   bool
 
-	// seqNotify broadcasts projection watermark advances so
-	// WaitForBranchSeq is event-driven (no DB polling). Updated
-	// after every successful apply; Halt fires on projector failure.
+	// seqNotify broadcasts node-projection watermark advances for archived
+	// compatibility waiters. Updated after every successful apply; Halt fires
+	// on projector failure.
 	seqNotify *seqNotifier
 
 	// retrievalAuditQueue + drainer — async path for retrieval audit
@@ -542,8 +542,8 @@ func New(cfg Config) (*MemoryForest, error) {
 	service.registerRuntimeQueue("node_projector_wake", cap(service.projectorWake))
 	service.registerRuntimeQueue("retrieval_candidates_wake", cap(service.retrievalCandidatesWake))
 	service.registerRuntimeQueue("retrieval_audit_idle", cap(service.retrievalAuditIdle))
-	if err := service.runtime.RegisterLease(projectorBranchName, service.projectorID); err != nil {
-		service.logger.Error("forest_runtime_lease_register_failed", "lease", projectorBranchName, "err", err.Error())
+	if err := service.runtime.RegisterLease(projectorNodeGraphName, service.projectorID); err != nil {
+		service.logger.Error("forest_runtime_lease_register_failed", "lease", projectorNodeGraphName, "err", err.Error())
 	}
 
 	// Subscribe to tuner promotions so runtime adaptation
@@ -581,22 +581,16 @@ func New(cfg Config) (*MemoryForest, error) {
 		service.startMaintenance()
 	}
 	if !service.synchronousProjection && !cfg.DisableBackgroundWorkers {
-		// Async-only goroutines: node projector,
-		// retrieval-candidates projector, audit drainer,
-		// implicit-negative sweeper, AntiPattern promoter, and
-		// storage pruners. Tests using SynchronousProjection=true
-		// write compatibility branch projections inline but still rely on the
-		// maintenance worker for replay, substrate, and training
-		// schedules.
+		// Async-only goroutines: node projector, retrieval-candidates
+		// projector, audit drainer, implicit-negative sweeper, and
+		// storage pruners.
 		service.startNodeProjector()
 		service.startRetrievalCandidatesProjector()
 		service.startRetrievalAuditDrainer()
 		service.startImplicitNegativeSweeper()
-		service.startAntiPatternPromoter()
 		service.startRetrievalCandidatesPruner()
 		service.startBaseScoreTrainer()
-		// Issue #10 — storage growth + archival workers.
-		service.startBranchTracePruner()
+		// Storage growth + archival workers.
 		service.startTrainingExamplesPruner()
 		service.startSubstrateStatePruner()
 		service.startEventArchivalWorker()
@@ -854,14 +848,11 @@ func (m *MemoryForest) getForestNode(ctx context.Context, nodeID string) (*Fores
 	return &node, nil
 }
 
-// AppendEvent records a legacy branch-compatible event in the canonical
-// forest ledger and assigns it the ledger's monotonic sequence. The event is
-// durable on return; the branch projector consumes forest_ledger records with
-// source_kind=forest_event_compat until the phase-4 node graph replaces the
-// branch projection entirely.
-//
-// Runtime no longer writes forest_events. That table is retained only for
-// archived historical rows and explicit migration fixtures.
+// AppendEvent imports a historical forest event into the canonical forest
+// ledger and assigns it the ledger's monotonic sequence. The event is durable
+// on return and is projected through the node graph. Runtime no longer writes
+// forest_events; that table is retained only for archived historical rows and
+// explicit migration fixtures.
 func (m *MemoryForest) AppendEvent(ctx context.Context, event *Event) error {
 	prepared := prepareEvent(event)
 	result, err := m.AppendLedgerRecord(ctx, ledgerRecordFromForestEvent(prepared))
@@ -941,42 +932,14 @@ func forestEventRefs(event *Event) []claims.DeltaRef {
 	return refs
 }
 
-// projectInlineForTests applies the projection synchronously inside
-// AppendEvent. Used only when Config.SynchronousProjection is true.
-// Mirrors the apply step the branch projector would run, including
-// the watermark update on forest_projector_state and seq-notifier
-// advance so WaitForBranchSeq callers wake correctly even in sync
-// mode (relevant when test code dispatches across goroutines).
+// projectInlineForTests is retained only for archived branch-projection tests.
+// Active synchronous projection runs projectNodeGraphThroughSeq from
+// AppendEvent.
 func (m *MemoryForest) projectInlineForTests(ctx context.Context, event *Event) error {
-	if err := m.ensureProjectorRow(projectorBranchName); err != nil {
-		return err
-	}
-
-	tx, err := m.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin inline projection tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	branch, created, replayDue, applyErr := m.projectBranchTx(ctx, tx, event)
-	if applyErr != nil {
-		return applyErr
-	}
-	if err := setProjectorWatermarkTx(ctx, tx, projectorBranchName, event.Seq, event.Timestamp); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit inline projection tx: %w", err)
-	}
-
-	if m.seqNotify != nil {
-		m.seqNotify.Advance(event.Seq)
-	}
-	m.runProjectorPostCommit(event, branch, created, replayDue)
-	return nil
+	return fmt.Errorf("legacy branch inline projection is removed; use projectNodeGraphThroughSeq")
 }
 
-// notifyProjector signals the branch projector that new work is
+// notifyProjector signals the node projector that new work is
 // available. Non-blocking — the wake channel is buffered to size 1,
 // so a pending wake collapses with subsequent ones.
 func (m *MemoryForest) notifyProjector() {

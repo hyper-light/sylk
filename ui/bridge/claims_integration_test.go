@@ -2240,12 +2240,61 @@ func TestBridgeIntegration_GuideClassificationClaimIsVisibleToUserSurfaces(t *te
 
 	var sawForwarded bool
 	for _, m := range prog.Snapshot() {
-		if c, ok := m.(msg.ClaimContextMsg); ok && c.ClaimID == claimID && c.Context == "Request forwarded" && c.State == "routing" {
+		if c, ok := m.(msg.ClaimContextMsg); ok && c.ClaimID == claimID && c.Context == "Request forwarded" && c.State == "" {
 			sawForwarded = true
 		}
 	}
 	if !sawForwarded {
-		t.Fatal("guide classification forwarded context should stay visible and enter routing state")
+		t.Fatal("guide classification forwarded context should stay visible without bridge-inferred lifecycle state")
+	}
+
+	guideArtifact := claims.Artifact{
+		ClaimID:      claimID,
+		AgentID:      "guide",
+		ArtifactName: "guide.route.duration_ms",
+		Kind:         "duration_ms",
+		Reference:    "6734",
+		Metadata: map[string]any{
+			"ui_activity":     "guide_classification",
+			"ui_display_name": "duration_ms",
+			"args_summary":    "artifact generated",
+		},
+	}
+	if err := claims.SetArtifactData(&guideArtifact, claims.PresentationEvidenceArtifactData{
+		Kind:      "guide_classification",
+		Reference: "6734",
+		Title:     "duration_ms",
+	}); err != nil {
+		t.Fatalf("SetArtifactData: %v", err)
+	}
+	artifact, err := board.GenerateArtifact(context.Background(), guideArtifact, "guide", claims.ArtifactLifecycleOptions{Reason: "route evidence generated"})
+	if err != nil {
+		t.Fatalf("GenerateArtifact: %v", err)
+	}
+	drainBridge(t, prog, "guide classification artifact")
+
+	var sawArtifactRow, sawArtifactCompletion bool
+	for _, m := range prog.Snapshot() {
+		switch typed := m.(type) {
+		case msg.ClaimArtifactAddedMsg:
+			if typed.ArtifactID == artifact.ID && typed.Kind == "duration_ms" {
+				sawArtifactRow = true
+			}
+		case msg.ClaimArtifactCompletedMsg:
+			if typed.StartArtifactID == artifact.ID && typed.Outcome == "success" {
+				sawArtifactCompletion = true
+			}
+		case msg.ClaimPresentationMsg:
+			if typed.SourceID == artifact.ID {
+				t.Fatalf("guide classification evidence rendered as presentation: %+v", typed)
+			}
+		}
+	}
+	if !sawArtifactRow {
+		t.Fatal("guide classification artifact should render as an artifact row")
+	}
+	if !sawArtifactCompletion {
+		t.Fatal("guide classification artifact should complete immediately and not hold the guide cycle open")
 	}
 }
 

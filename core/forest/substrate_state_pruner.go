@@ -11,14 +11,14 @@ import (
 // Issue #10 Phase A.3 — substrate state pruner
 // ────────────────────────────────────────────────────────────────────
 //
-// Substrate state (forest_substrate_state, _frontiers, _edges,
-// _sessions) accumulates per (session_id, branch_id). Long-running
+// Substrate state (forest_substrate_field, _frontiers, resource and
+// activation rows) accumulates per session and node. Long-running
 // deployments collect rows for sessions that are no longer active.
 // This pruner identifies sessions whose latest event is older than
 // the retention window and drops their substrate footprint in one
 // transaction.
 //
-// "Inactive session" detection: query forest_branches grouped by
+// "Inactive session" detection: query forest_nodes grouped by
 // session_id, find max(updated_at). Sessions whose max is older
 // than the cutoff are eligible.
 
@@ -86,20 +86,20 @@ func (m *MemoryForest) runSubstrateStatePruneOnce(ctx context.Context) (int, err
 
 // findInactiveSubstrateSessions returns up to `limit` session_ids
 // whose substrate footprint is eligible for pruning. A session is
-// inactive when its latest forest_branches.updated_at is older than
+// inactive when its latest forest_nodes.last_seen_at is older than
 // the retention cutoff (or when no branches reference the session
 // at all but substrate state still exists for it).
 //
 // LEFT JOIN handles the "orphan substrate session" case: rows in
-// forest_substrate_sessions whose session_id has no branches.
+// forest_substrate_sessions whose session_id has no nodes.
 func (m *MemoryForest) findInactiveSubstrateSessions(ctx context.Context, limit int) ([]string, error) {
 	cutoff := timeNowSecondsMinus(m.substrateStateRetention)
 	rows, err := m.db.QueryContext(ctx, `
 		SELECT s.session_id
 		FROM   forest_substrate_sessions s
-		LEFT JOIN forest_branches b ON b.session_id = s.session_id
+		LEFT JOIN forest_nodes n ON n.session_id = s.session_id
 		GROUP BY s.session_id
-		HAVING COALESCE(MAX(b.updated_at), 0) < ?
+		HAVING COALESCE(MAX(n.last_seen_at), 0) < ?
 		LIMIT  ?
 	`, cutoff, limit)
 	if err != nil {

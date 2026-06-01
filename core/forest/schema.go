@@ -50,62 +50,6 @@ func ensureSchema(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_forest_events_content
 			ON forest_events(content_id);
 
-		CREATE TABLE IF NOT EXISTS forest_branches (
-			id TEXT PRIMARY KEY,
-			root_id TEXT NOT NULL,
-			parent_id TEXT,
-			family TEXT NOT NULL,
-			scope TEXT NOT NULL,
-			state TEXT NOT NULL,
-			session_id TEXT NOT NULL,
-			task_id TEXT,
-			agent_id TEXT,
-			agent_type TEXT,
-			intent_id TEXT,
-			title TEXT NOT NULL,
-			summary TEXT NOT NULL,
-			confidence REAL NOT NULL,
-			salience REAL NOT NULL,
-			utility REAL NOT NULL,
-			success_rate REAL NOT NULL,
-			scope_risk REAL NOT NULL,
-			conflict_score REAL NOT NULL,
-			support_count INTEGER NOT NULL,
-			counter_count INTEGER NOT NULL,
-			success_count INTEGER NOT NULL,
-			failure_count INTEGER NOT NULL,
-			access_count INTEGER NOT NULL,
-			last_accessed_at INTEGER NOT NULL DEFAULT 0,
-			created_at INTEGER NOT NULL,
-			updated_at INTEGER NOT NULL,
-			metadata TEXT
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_forest_branches_session
-			ON forest_branches(session_id, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_forest_branches_root
-			ON forest_branches(root_id, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_forest_branches_family
-			ON forest_branches(family, scope, updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_forest_branches_state
-			ON forest_branches(state, updated_at DESC);
-
-		CREATE TABLE IF NOT EXISTS forest_relay_edges (
-			source_branch_id TEXT NOT NULL,
-			target_branch_id TEXT NOT NULL,
-			relation TEXT NOT NULL,
-			weight REAL NOT NULL,
-			cofire_count INTEGER NOT NULL,
-			last_reinforced_at INTEGER NOT NULL,
-			metadata TEXT,
-			PRIMARY KEY (source_branch_id, target_branch_id, relation)
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_forest_relays_source
-			ON forest_relay_edges(source_branch_id, weight DESC);
-		CREATE INDEX IF NOT EXISTS idx_forest_relays_target
-			ON forest_relay_edges(target_branch_id, weight DESC);
-
 		CREATE TABLE IF NOT EXISTS forest_canopies (
 			canopy_key TEXT PRIMARY KEY,
 			session_id TEXT,
@@ -437,11 +381,10 @@ func ensureSchema(db *sql.DB) error {
 	return nil
 }
 
-// ensureForestFamilyMigration is the Phase 3 of Issue #11 one-shot
-// data migration that rewrites legacy family values to the collapsed
-// taxonomy. Idempotent: every UPDATE is conditional on the row still
-// using the old value, so re-running on an already-migrated DB is a
-// no-op.
+// ensureForestFamilyMigration is a historical archive migration for imported
+// databases that still contain the pre-node projection table. Fresh phase-15
+// databases do not create that table, so this is a no-op unless an older DB is
+// attached for migration.
 //
 // Mapping (audit-driven; see types.go family invariants):
 //
@@ -458,17 +401,16 @@ func ensureSchema(db *sql.DB) error {
 //	                             successor; live conflict already
 //	                             encoded by RelayRelationContradicts)
 //
-// Only forest_branches (the projection) is rewritten — forest_events
-// is the append-only ledger (MEM-03) and rewriting it would violate
-// the append-only trigger. Old events keep their historical family
-// values; the projector applies canonicalizeFamily before writing
-// each event to the projection (see projectBranchTx) so a from-scratch
-// projection rebuild lands canonical families even when replaying
-// pre-migration ledger rows.
-//
-// Operations are wrapped in a single transaction so a partial failure
-// rolls back the entire migration.
+// Operations are wrapped in a single transaction so a partial archive import
+// failure rolls back the entire migration.
 func ensureForestFamilyMigration(db *sql.DB) error {
+	exists, err := tableExists(db, "forest_branches")
+	if err != nil {
+		return fmt.Errorf("inspect forest_branches migration archive table: %w", err)
+	}
+	if !exists {
+		return nil
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin family migration tx: %w", err)
@@ -499,15 +441,16 @@ func ensureForestFamilyMigration(db *sql.DB) error {
 	return nil
 }
 
-// ensureForestConstraintSeverity populates constraint_severity for
-// any branch with family='preference' (legacy TreeFamilyPreference).
-// Idempotent: only updates rows where severity is still empty so
-// re-running on an already-migrated DB is a no-op.
-//
-// Phase 1 of Issue #11 keeps the family value as 'preference' so
-// existing readers continue to work; Phase 3 rewrites the family
-// itself in a separate migration step.
+// ensureForestConstraintSeverity backfills historical archive rows imported
+// from databases that still contained the pre-node preference taxonomy.
 func ensureForestConstraintSeverity(db *sql.DB) error {
+	exists, err := tableExists(db, "forest_branches")
+	if err != nil {
+		return fmt.Errorf("inspect forest_branches constraint archive table: %w", err)
+	}
+	if !exists {
+		return nil
+	}
 	if _, err := db.Exec(`
 		UPDATE forest_branches
 		SET    constraint_severity = ?
@@ -618,8 +561,6 @@ func expectedSchemaHash() string {
 		"forest_governance_quarantine",
 		"forest_migration_slices",
 		"forest_legacy_archives",
-		"forest_branches",
-		"forest_relay_edges",
 		"forest_canopies",
 		"forest_event_seq_log",
 		"forest_branch_traces",
@@ -735,13 +676,6 @@ func expectedSchemaHash() string {
 		"idx_forest_events_family",
 		"idx_forest_events_content",
 		"idx_forest_events_task_time",
-		"idx_forest_branches_session",
-		"idx_forest_branches_root",
-		"idx_forest_branches_family",
-		"idx_forest_branches_state",
-		"idx_forest_branches_task",
-		"idx_forest_relays_source",
-		"idx_forest_relays_target",
 		"idx_forest_canopies_session",
 		"idx_forest_canopies_task",
 		"idx_forest_replay_ready",
@@ -806,8 +740,6 @@ func ensureForestProjectorColumns(db *sql.DB) error {
 		column string
 		decl   string
 	}{
-		{"forest_branches", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
-		{"forest_relay_edges", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
 		{"forest_canopies", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
 		{"forest_substrate_sessions", "last_applied_seq", "INTEGER NOT NULL DEFAULT 0"},
 		// Issue #3 — selection-bias-fix columns.
@@ -837,11 +769,6 @@ func ensureForestProjectorColumns(db *sql.DB) error {
 		// values reference forest_base_score_models.version.
 		{"forest_retrieval_events", "base_score_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"forest_retrieval_events", "base_score_variant", "TEXT NOT NULL DEFAULT ''"},
-		// Issue #11 Phase 1 — Constraint vs Preference distinction is
-		// now encoded by this column rather than two TreeFamily values.
-		// Empty string = not applicable (non-Constraint family); 'hard'
-		// or 'soft' for Constraint family rows.
-		{"forest_branches", "constraint_severity", "TEXT NOT NULL DEFAULT ''"},
 		// Hyperparameter A/B capture — the snapshot id used to score
 		// this retrieval, plus a flag indicating it was the proposed
 		// (challenger) snapshot rather than the active one. Default 0
@@ -1205,9 +1132,6 @@ func ensureForestTaskColumns(db *sql.DB) error {
 		"forest_events": {
 			"task_id": "ALTER TABLE forest_events ADD COLUMN task_id TEXT",
 		},
-		"forest_branches": {
-			"task_id": "ALTER TABLE forest_branches ADD COLUMN task_id TEXT",
-		},
 		"forest_canopies": {
 			"task_id": "ALTER TABLE forest_canopies ADD COLUMN task_id TEXT",
 		},
@@ -1237,8 +1161,6 @@ func ensureForestTaskColumns(db *sql.DB) error {
 	indexes := []string{
 		`CREATE INDEX IF NOT EXISTS idx_forest_events_task_time
 			ON forest_events(session_id, task_id, timestamp DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_forest_branches_task
-			ON forest_branches(session_id, task_id, updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_forest_canopies_task
 			ON forest_canopies(session_id, task_id, horizon, updated_at DESC)`,
 	}

@@ -259,13 +259,7 @@ func TestPhase456RetrieveUsesNodesWithoutBranches(t *testing.T) {
 	if len(packets) != 1 || packets[0].Node.ID != nodes[0].ID {
 		t.Fatalf("packets = %+v, want node-backed packet for %s", packets, nodes[0].ID)
 	}
-	var branchRows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_branches`).Scan(&branchRows); err != nil {
-		t.Fatalf("count branches: %v", err)
-	}
-	if branchRows != 0 {
-		t.Fatalf("branch rows = %d, want node retrieval without branches", branchRows)
-	}
+	assertTableAbsent(t, db, "forest_branches")
 }
 
 func TestPhase456ProductionAppendEventProjectsNodesWithoutBranches(t *testing.T) {
@@ -290,15 +284,13 @@ func TestPhase456ProductionAppendEventProjectsNodesWithoutBranches(t *testing.T)
 	if err != nil {
 		t.Fatalf("append event: %v", err)
 	}
-	var nodeRows, branchRows int
+	var nodeRows int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_nodes WHERE session_id = ?`, "session-phase456-production").Scan(&nodeRows); err != nil {
 		t.Fatalf("count nodes: %v", err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_branches`).Scan(&branchRows); err != nil {
-		t.Fatalf("count branches: %v", err)
-	}
-	if nodeRows == 0 || branchRows != 0 {
-		t.Fatalf("nodeRows=%d branchRows=%d, want node projection without branch writes", nodeRows, branchRows)
+	assertTableAbsent(t, db, "forest_branches")
+	if nodeRows == 0 {
+		t.Fatalf("nodeRows=%d, want node projection without branch writes", nodeRows)
 	}
 	packets, err := forest.Retrieve(context.Background(), Query{SessionID: "session-phase456-production", Query: "production node", Limit: 2})
 	if err != nil {

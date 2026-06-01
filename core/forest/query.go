@@ -17,31 +17,11 @@ func (m *MemoryForest) Retrieve(ctx context.Context, query Query) ([]*ForestPack
 	return m.RetrieveForest(ctx, query)
 }
 
-// retrieveBranchPackets is the private branch-scoring pipeline retained for
-// internal branch-table maintenance diagnostics. Agent-facing retrieval is
-// ForestPacket-only.
-//
-// Emits a retrieval audit event after returning to the caller — the
-// audit captures the full ranked candidate set (not just top-K) so
-// counterfactual training can label every candidate against later
-// outcome events. Audit emission is best-effort; failure logs but
-// never affects the retrieval result.
-//
-// At entry the per-call HyperParameters snapshot is pinned via the
-// tuner's A/B trial sampler — every helper invoked downstream reads
-// from this same snapshot, so a snapshot replacement mid-retrieval
-// can't produce a Frankenscore that mixes active + proposed values.
-// The pinned snapshot id and proposed-arm flag are stamped onto the
-// audit row so outcome-driven adaptation can attribute the
-// observation back to the correct A/B arm.
+// retrieveBranchPackets is retained only so archived in-package legacy tests
+// fail closed if they are accidentally re-enabled. Active retrieval is
+// ForestPacket-only via RetrieveForest.
 func (m *MemoryForest) retrieveBranchPackets(ctx context.Context, query Query) ([]*BranchPacket, error) {
-	start := time.Now()
-	auditQuery := query
-	hp, isProposed := m.pinHyperparameterSnapshotForRetrieve(ctx, query)
-	packets, audit, err := m.retrieveWithAudit(ctx, query, start, hp, isProposed)
-	finalizeRetrievalAudit(audit, auditQuery, start, err)
-	m.emitRetrievalAudit(ctx, audit)
-	return packets, err
+	return nil, fmt.Errorf("legacy BranchPacket retrieval is removed; use RetrieveForest")
 }
 
 // RetrieveForest is the phase-8 primary retrieval path. It returns node,
@@ -699,18 +679,18 @@ func predictedRiskOrZero(p *LearnedPrediction) float64 {
 	return p.Risk
 }
 
-// currentBranchProjectionSeq reads the current branch projector
-// watermark for audit replayability. Returns 0 if unavailable
-// (synchronous-projection mode, schema not yet migrated).
+// currentBranchProjectionSeq reads the current node-graph projection watermark
+// for archived branch-audit compatibility. Active ForestPacket retrieval uses
+// the node graph directly; this returns 0 if the offset is unavailable.
 func (m *MemoryForest) currentBranchProjectionSeq(ctx context.Context) int64 {
 	if m == nil || m.db == nil {
 		return 0
 	}
 	row := m.db.QueryRowContext(ctx, `
-		SELECT last_applied_seq
-		FROM   forest_projector_state
-		WHERE  projector_name = ?
-	`, projectorBranchName)
+		SELECT last_seq
+		FROM   forest_projection_offsets
+		WHERE  projection_name = ?
+	`, projectorNodeGraphName)
 	var seq int64
 	if err := row.Scan(&seq); err != nil {
 		return 0
@@ -745,10 +725,14 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 		IntentID:  query.IntentID,
 		Horizon:   query.Horizon,
 		Limit:     maxInt(query.Limit, 8),
-		Families: []TreeFamily{
-			TreeFamilyIntent,
-			TreeFamilyConstraint,
-			TreeFamilyOutcome,
+		Kinds: []ForestNodeKind{
+			ForestNodeClaim,
+			ForestNodeInteraction,
+			ForestNodePolicyTrial,
+			ForestNodeSkillCandidate,
+			ForestNodeValidation,
+			ForestNodeOutcome,
+			ForestNodeRemediation,
 		},
 		IncludeCounterEvidence: true,
 	})
@@ -764,34 +748,35 @@ func (m *MemoryForest) ResolveIntent(ctx context.Context, input ResolveIntentInp
 		if packet == nil {
 			continue
 		}
-		switch treeFamilyForNodeKind(packet.Node.Kind) {
-		case TreeFamilyIntent:
+		switch packet.Node.Kind {
+		case ForestNodeClaim, ForestNodeInteraction, ForestNodePolicyTrial, ForestNodeSkillCandidate:
 			resolution.IntentNodes = append(resolution.IntentNodes, packet)
 			if resolution.PrimaryIntent == "" {
 				resolution.PrimaryIntent = firstNonEmptyString(packet.Node.Summary, packet.Node.Title)
 			}
-		case TreeFamilyConstraint:
+		case ForestNodeValidation:
 			resolution.Constraints = append(resolution.Constraints, packet)
-		case TreeFamilyOutcome:
+		case ForestNodeOutcome, ForestNodeRemediation:
 			resolution.OutcomeHints = append(resolution.OutcomeHints, packet)
 		}
 	}
 	return resolution, nil
 }
 
-// PredictNextBranches retrieves low-risk adjacent-value ForestPackets.
-func (m *MemoryForest) PredictNextBranches(ctx context.Context, query Query) ([]*ForestPacket, error) {
+// PredictNextPackets retrieves low-risk adjacent-value ForestPackets.
+func (m *MemoryForest) PredictNextPackets(ctx context.Context, query Query) ([]*ForestPacket, error) {
 	var err error
 	query, err = normalizeQuery(query)
 	if err != nil {
 		return nil, err
 	}
-	// Issue #11 Phase 3: Opportunity, Capability, Decision merged
-	// into Intent. PredictNextBranches now scans the consolidated
-	// Intent + Outcome surface to find adjacent-value branches.
-	query.Families = []TreeFamily{
-		TreeFamilyIntent,
-		TreeFamilyOutcome,
+	query.Kinds = []ForestNodeKind{
+		ForestNodeClaim,
+		ForestNodeInteraction,
+		ForestNodePolicyTrial,
+		ForestNodeSkillCandidate,
+		ForestNodeOutcome,
+		ForestNodeRemediation,
 	}
 	query.IncludeCounterEvidence = true
 	return m.RetrieveForest(ctx, query)
@@ -825,18 +810,52 @@ func normalizeQuery(query Query) (Query, error) {
 	if query.Horizon == CanopyHorizonTask && query.TaskID == "" {
 		return query, fmt.Errorf("task_id is required when horizon is task")
 	}
-	if len(query.Families) == 0 {
-		query.Families = defaultFamilies()
-	} else {
-		// Canonicalize legacy family filters so callers using
-		// TreeFamilyDecision/Preference/Capability/Opportunity/Conflict
-		// retrieve from the consolidated families they were merged
-		// into. Deprecated families never surface as branch.Family
-		// post-migration, so without this rewrite the filter would
-		// match nothing.
+	query.Kinds = normalizeQueryNodeKinds(query.Kinds, query.Families)
+	if len(query.Families) > 0 {
 		query.Families = canonicalizeFamilies(query.Families)
 	}
 	return query, nil
+}
+
+func normalizeQueryNodeKinds(kinds []ForestNodeKind, families []TreeFamily) []ForestNodeKind {
+	if len(kinds) == 0 {
+		kinds = nodeKindsForFamilies(families)
+	}
+	if len(kinds) == 0 {
+		kinds = defaultForestNodeKinds()
+	}
+	seen := make(map[ForestNodeKind]struct{}, len(kinds))
+	out := make([]ForestNodeKind, 0, len(kinds))
+	for _, kind := range kinds {
+		kind = ForestNodeKind(strings.TrimSpace(string(kind)))
+		if kind == "" {
+			continue
+		}
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		out = append(out, kind)
+	}
+	return out
+}
+
+func defaultForestNodeKinds() []ForestNodeKind {
+	return []ForestNodeKind{
+		ForestNodeClaim,
+		ForestNodeArtifact,
+		ForestNodeValidation,
+		ForestNodeInteraction,
+		ForestNodeContradiction,
+		ForestNodePolicyTrial,
+		ForestNodeSkillCandidate,
+		ForestNodeTestament,
+		ForestNodeContent,
+		ForestNodeOutcome,
+		ForestNodeAgent,
+		ForestNodeMaintenance,
+		ForestNodeRemediation,
+	}
 }
 
 func (m *MemoryForest) loadCandidateBranches(ctx context.Context, query Query) ([]*Branch, map[string]float64, error) {

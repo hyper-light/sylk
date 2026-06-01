@@ -58,6 +58,7 @@ type claimContextEvent struct {
 	ClaimID           string
 	AgentID           string
 	Context           string
+	State             string
 	ContextTransition int64
 }
 
@@ -98,7 +99,6 @@ type ClaimsBridge struct {
 	presentationDiagnostics   map[string]struct{}
 	completedStartedArtifacts map[string]struct{}
 	claimToPeerRow            map[string]string
-	latestStateByClaim        map[string]string
 
 	lastAccepted int
 	lastTotal    int
@@ -144,7 +144,6 @@ func NewClaimsBridge(
 		presentationDiagnostics:   make(map[string]struct{}),
 		completedStartedArtifacts: make(map[string]struct{}),
 		claimToPeerRow:            make(map[string]string),
-		latestStateByClaim:        make(map[string]string),
 		outbox:                    make(chan any, claimsBridgeBuffer),
 		done:                      make(chan struct{}),
 	}
@@ -272,7 +271,6 @@ func (b *ClaimsBridge) resetSessionStateLocked() {
 	b.presentationDiagnostics = make(map[string]struct{})
 	b.completedStartedArtifacts = make(map[string]struct{})
 	b.claimToPeerRow = make(map[string]string)
-	b.latestStateByClaim = make(map[string]string)
 	b.lastAccepted = 0
 	b.lastTotal = 0
 }
@@ -645,12 +643,14 @@ func (b *ClaimsBridge) handleCanonicalClaimsEntry(sessionID string, board *claim
 		claims.DeltaActionClaimTestamentAcknowledged,
 		claims.DeltaActionClaimValidating:
 		b.emitPeerInteractionForDelta(sessionID, claimID, "pending", canonicalClaimLifecycleDisplayMessage(delta), delta)
-		b.handleClaimContext(sessionID, claimContextEvent{
-			ClaimID:           claimID,
-			AgentID:           delta.Actor.RouteKey(),
-			Context:           canonicalClaimLifecycleDisplayMessage(delta),
-			ContextTransition: canonicalProgressTransition(delta),
-		})
+		if delta.Action == claims.DeltaActionClaimProgressed && canonicalProgressMessage(delta) != "" {
+			b.handleClaimContext(sessionID, claimContextEvent{
+				ClaimID:           claimID,
+				AgentID:           delta.Actor.RouteKey(),
+				Context:           canonicalProgressMessage(delta),
+				ContextTransition: canonicalProgressTransition(delta),
+			})
+		}
 	}
 }
 
@@ -1518,7 +1518,7 @@ func (b *ClaimsBridge) handleClaimContext(sessionID string, event claimContextEv
 		return
 	}
 	if meta.CycleID != "" {
-		state := firstNonBlank(b.latestStateByClaim[claimID], claimContextUIState(meta, event.Context))
+		state := strings.TrimSpace(event.State)
 		actor := claimContextActor(meta, event.AgentID)
 		parentRowID := b.parentRowIDForClaimLocked(claimID)
 		out = &msg.ClaimContextMsg{
@@ -1603,6 +1603,14 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 	if sessionID == "" {
 		sessionID = activeSession
 	}
+	b.debug("artifact_sink_received",
+		"session_id", sessionID,
+		"active_session", activeSession,
+		"claim_id", claimID,
+		"agent_id", agentID,
+		"artifact_id", strings.TrimSpace(artifact.ID),
+		"kind", strings.TrimSpace(artifact.Kind),
+	)
 	b.ensureClaimRegisteredFromProjection(sessionID, claimID)
 
 	b.mu.Lock()
@@ -1654,6 +1662,8 @@ func (b *ClaimsBridge) OnArtifactAdded(claimID, agentID, sessionID string, artif
 		if m := b.claimResponseTextMsgLocked(sessionID, claimID, art); m != nil {
 			out = append(out, *m)
 		}
+	case isGuideClassificationArtifact(art):
+		out = append(out, b.routeInstantEvidenceArtifactLocked(sessionID, claimID, art)...)
 	case presentationErr != nil:
 		b.recordPresentationInvalidLocked("artifact", strings.TrimSpace(art.ID), art.Presentation, "invalid_presentation", presentationErr.Error())
 		if diagnostic, fallback := b.presentationDiagnosticForArtifactLocked(sessionID, claimID, art, "invalid_presentation", "invalid presentation metadata"); diagnostic != nil {
@@ -1741,6 +1751,49 @@ func (b *ClaimsBridge) routeStartedArtifactLocked(sessionID, claimID string, art
 		return nil
 	}
 	return b.claimArtifactAddedMsgLocked(sessionID, claimID, art, cycle)
+}
+
+func (b *ClaimsBridge) routeInstantEvidenceArtifactLocked(sessionID, claimID string, art *claims.Artifact) []any {
+	artifactID := strings.TrimSpace(art.ID)
+	if artifactID == "" {
+		return nil
+	}
+	if _, emitted := b.emittedStartedArtifacts[artifactID]; emitted {
+		return nil
+	}
+	cycleID := b.resolver.CycleForClaim(claimID)
+	if cycleID == "" {
+		b.debug("instant_artifact_drop_no_cycle",
+			"session_id", sessionID,
+			"claim_id", claimID,
+			"artifact_id", artifactID,
+			"kind", art.Kind,
+		)
+		return nil
+	}
+	cycle := &cycleState{
+		CycleID:           cycleID,
+		OwnerAgentID:      b.resolver.OwnerForClaim(claimID),
+		openClaims:        map[string]struct{}{},
+		inFlightArtifacts: map[string]struct{}{},
+	}
+	added := b.claimArtifactAddedMsgLocked(sessionID, claimID, art, cycle)
+	if added == nil {
+		return nil
+	}
+	b.completedStartedArtifacts[artifactID] = struct{}{}
+	return []any{
+		*added,
+		msg.ClaimArtifactCompletedMsg{
+			StartArtifactID: artifactID,
+			CycleID:         cycleID,
+			Outcome:         "success",
+			Summary:         firstNonBlank(claimMetadataString(art.Metadata, "args_summary"), strings.TrimSpace(art.Reference), "artifact generated"),
+			Metadata:        cloneMetadata(art.Metadata),
+			CompletedAt:     nonZeroTime(art.Created),
+			SuppressChat:    added.SuppressChat,
+		},
+	}
 }
 
 func (b *ClaimsBridge) claimArtifactAddedMsgLocked(sessionID, claimID string, art *claims.Artifact, cycle *cycleState) *msg.ClaimArtifactAddedMsg {
@@ -1834,9 +1887,6 @@ func (b *ClaimsBridge) handleAgentStateArtifactLocked(sessionID, claimID string,
 		claimID = artClaimID
 	}
 	state := claimMetadataString(art.Metadata, "state")
-	if state != "" {
-		b.latestStateByClaim[claimID] = state
-	}
 	detail := strings.TrimSpace(art.Reference)
 	if detail == "" {
 		return nil
@@ -2449,6 +2499,10 @@ func (b *ClaimsBridge) replayProjection(sessionID string, proj *claims.ClaimsBoa
 				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 				continue
 			}
+			if isGuideClassificationArtifact(art) {
+				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
+				continue
+			}
 			if claims.IsPresentableToUserChat(art.Presentation) && !isPresentationLifecycleArtifactKind(art.Kind) {
 				b.OnArtifactAdded(claimID, t.AgentID, sessionID, art)
 				continue
@@ -2713,6 +2767,7 @@ const (
 	claimTagGuideClassification = "ui:guide_classification"
 	claimTagAgentPanelOnly      = "ui_surface:agent_panel"
 	claimUIStateHiddenSystem    = "hidden_system"
+	artifactUIActivityGuide     = "guide_classification"
 )
 
 func hiddenSystemClaimMeta(sessionID string, c *claims.Claim, issuer, subject, owner string, issuerRef, subjectRef, ownerRef participantDisplayRef) claimMeta {
@@ -2861,21 +2916,6 @@ func claimPanelReason(c *claims.Claim) string {
 	return strings.TrimSpace(c.Title)
 }
 
-func claimContextUIState(meta claimMeta, context string) string {
-	if meta.OwnerAgentID != "guide" || meta.UIState != "classifying" {
-		return meta.UIState
-	}
-	lower := strings.ToLower(strings.TrimSpace(context))
-	switch {
-	case strings.Contains(lower, "request forwarded"), strings.Contains(lower, "routing to "):
-		return "routing"
-	case strings.Contains(lower, "failed"), strings.Contains(lower, "error"):
-		return "errored"
-	default:
-		return firstNonBlank(meta.UIState, "classifying")
-	}
-}
-
 func claimContextActor(meta claimMeta, fallback string) string {
 	fallback = strings.TrimSpace(fallback)
 	switch claims.ActionType(strings.TrimSpace(meta.ActionType)) {
@@ -2914,6 +2954,9 @@ func shouldProjectArtifactFromLifecycle(art *claims.Artifact) bool {
 	if art == nil {
 		return false
 	}
+	if isGuideClassificationArtifact(art) {
+		return true
+	}
 	if claims.IsPresentableToUserChat(art.Presentation) && !isPresentationLifecycleArtifactKind(art.Kind) {
 		return true
 	}
@@ -2921,6 +2964,13 @@ func shouldProjectArtifactFromLifecycle(art *claims.Artifact) bool {
 		return true
 	}
 	return art.Kind == claims.ArtifactKindAgentState || art.Kind == claims.ArtifactKindResponseText
+}
+
+func isGuideClassificationArtifact(art *claims.Artifact) bool {
+	if art == nil {
+		return false
+	}
+	return claimMetadataString(art.Metadata, "ui_activity") == artifactUIActivityGuide
 }
 
 func isVisibleStartedArtifactKind(kind string) bool {

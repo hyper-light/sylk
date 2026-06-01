@@ -69,7 +69,7 @@ Tool completions emit `ActionToolCallCompleted` from `emitToolCompleteRecord` at
 - **fabric_consume** — when an activity is read via a lens, the bridge looks up the original activity in the logger's recent-publish cache. If eligible, it forwards the original to the forest harvest with a reason that captures who read it, via which lens, and with what publish→consume latency.
 - **fabric_resolve** — when an activity resolves another, the bridge forwards the RESOLVED activity (if eligible) so the forest sees reinforced evidence that the prior commitment actually closed out.
 
-Two feeds into the forest means the same activity can be harvested multiple times (once from the publish chokepoint, again from consume/resolve). The forest's own dedup / salience gardening treats this as corroborating evidence rather than duplication — recurring references raise a branch's hotness.
+Two feeds into the forest means the same activity can be observed multiple times (once from the publish chokepoint, again from consume/resolve). The forest's own dedup / salience gardening treats this as corroborating evidence rather than duplication; recurring references raise the projected node and path salience.
 
 The bridge is wired in `agents/orchestrator/fabric_install.go` alongside the existing ForestSubscriber.
 
@@ -77,7 +77,7 @@ The bridge is wired in `agents/orchestrator/fabric_install.go` alongside the exi
 
 New ActionKind: `ActionForestConsultEmitted` at Medium resolution.
 
-The `*_forest_consult` skill handler (`core/context/skills/forest_role_skills.go:emitForestConsultActivity`) emits one of these activities per consult, carrying purpose, query, returned branch IDs, and intent metadata. The activity ID is returned in `ForestRoleOutput.ConsultActivityID` so callers can explicitly thread it.
+The `*_forest_consult` skill handler (`core/context/skills/forest_role_skills.go:emitForestConsultActivity`) emits one of these activities per consult, carrying purpose, query, returned node IDs, cursor context, and intent metadata. The activity ID is returned in `ForestRoleOutput.ConsultActivityID` so callers can explicitly thread it.
 
 Linkage to subsequent outcomes works by a **process-wide tracker** (`core/activity/consult_link.go`):
 
@@ -109,5 +109,5 @@ The linkage is **best-effort, not strict**:
 
 ## Storage impact
 
-- Forest ledger grows roughly **5–8×** its pre-change size at Coarse due to the widened allowlist and the Tier 3 tool/LLM emissions. The forest's own gardening layer decides which branches stay hot vs age out, so this is a one-time corpus expansion, not unbounded growth.
+- Forest ledger grows roughly **5–8×** its pre-change size at Coarse due to the widened allowlist and the Tier 3 tool/LLM emissions. The forest's own gardening layer decides which nodes, paths, policies, and memes stay hot vs age out, so this is a one-time corpus expansion, not unbounded growth.
 - Fabric SQLite sizes are unchanged — Resolution tiers weren't modified. The forest harvest copies activities into its own persistent store rather than keeping references to fabric rows, so the forest remains self-contained even when fabric ages out Fine-tier activities.

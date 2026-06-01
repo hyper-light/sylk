@@ -10,7 +10,7 @@ import (
 	"github.com/adalundhe/sylk/core/versioning"
 )
 
-func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
+func TestRoleForestSkillEngineerImplementationNode(t *testing.T) {
 	t.Parallel()
 
 	deps := &RetrievalDependencies{
@@ -29,13 +29,8 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 				if query.AgentType != AgentTypeEngineer {
 					t.Fatalf("retrieve agent_type = %q, want %q", query.AgentType, AgentTypeEngineer)
 				}
-				// Issue #11 Phase 3: engineer's plan-precedent surface
-				// dropped explicit Capability — agent affordances roll up
-				// into Intent, alongside Decision (also collapsed). The
-				// canonical engineer query must still constrain to the
-				// merged Intent + Constraint axis.
-				if !hasFamily(query.Families, forest.TreeFamilyIntent) || !hasFamily(query.Families, forest.TreeFamilyConstraint) {
-					t.Fatalf("unexpected families: %#v", query.Families)
+				if !hasKind(query.Kinds, forest.ForestNodeClaim) || !hasKind(query.Kinds, forest.ForestNodeValidation) {
+					t.Fatalf("unexpected kinds: %#v", query.Kinds)
 				}
 				if !query.IncludeCounterEvidence {
 					t.Fatal("expected counter evidence enabled")
@@ -52,7 +47,7 @@ func TestRoleForestSkillEngineerImplementationBranch(t *testing.T) {
 		},
 	}
 
-	skill := NewRoleForestSkill(deps, findRoleForestSpec(t, "engineer_forest_select_implementation_branch"))
+	skill := NewRoleForestSkill(deps, findRoleForestSpec(t, "engineer_forest_select_implementation_node"))
 	input, _ := json.Marshal(ForestRoleInput{Query: "implement safer retries"})
 	result, err := skill.Handler(context.Background(), input)
 	if err != nil {
@@ -265,9 +260,9 @@ func findRoleForestSpec(t *testing.T, name string) forestRoleSkillSpec {
 	return forestRoleSkillSpec{}
 }
 
-func hasFamily(families []forest.TreeFamily, target forest.TreeFamily) bool {
-	for _, family := range families {
-		if family == target {
+func hasKind(kinds []forest.ForestNodeKind, target forest.ForestNodeKind) bool {
+	for _, kind := range kinds {
+		if kind == target {
 			return true
 		}
 	}

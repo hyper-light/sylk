@@ -756,12 +756,15 @@ func (p *BranchPacket) HasUnresolvedConflicts() bool {
 
 // Query configures a forest retrieval request.
 type Query struct {
-	Query                  string        `json:"query"`
-	SessionID              string        `json:"session_id,omitempty"`
-	TaskID                 string        `json:"task_id,omitempty"`
-	AgentID                string        `json:"agent_id,omitempty"`
-	AgentType              string        `json:"agent_type,omitempty"`
-	IntentID               string        `json:"intent_id,omitempty"`
+	Query     string           `json:"query"`
+	SessionID string           `json:"session_id,omitempty"`
+	TaskID    string           `json:"task_id,omitempty"`
+	AgentID   string           `json:"agent_id,omitempty"`
+	AgentType string           `json:"agent_type,omitempty"`
+	IntentID  string           `json:"intent_id,omitempty"`
+	Kinds     []ForestNodeKind `json:"kinds,omitempty"`
+	// Families is accepted only as a historical decoder for imported callers.
+	// Active retrieval and role skills operate on ForestNodeKind values.
 	Families               []TreeFamily  `json:"families,omitempty"`
 	Horizon                CanopyHorizon `json:"horizon,omitempty"`
 	Limit                  int           `json:"limit,omitempty"`

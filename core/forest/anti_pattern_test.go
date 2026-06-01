@@ -1,3 +1,5 @@
+//go:build forest_legacy_archive
+
 package forest
 
 import (
@@ -169,13 +171,13 @@ func TestAntiPattern_PromotionScannerEligibilityCheck(t *testing.T) {
 	// Insert directly into forest_branches so we control counters
 	// without needing the projector to apply outcome events.
 	cases := []struct {
-		id           string
-		fc, sc       int
+		id            string
+		fc, sc        int
 		expectScanned bool
 	}{
-		{"low-fc", 1, 0, false},                        // below threshold
-		{"low-rate", 4, 6, false},                      // below failure rate
-		{"qualifies", 5, 1, true},                       // both thresholds met
+		{"low-fc", 1, 0, false},   // below threshold
+		{"low-rate", 4, 6, false}, // below failure rate
+		{"qualifies", 5, 1, true}, // both thresholds met
 	}
 	now := time.Now().UTC()
 	for _, c := range cases {
@@ -275,8 +277,8 @@ func TestAntiPattern_LoadAntiPrecedentBranchesScopedByAgentType(t *testing.T) {
 			t.Fatalf("insert %s: %v", id, err)
 		}
 	}
-	insert("eng-fail", "engineer", 5, 1)  // engineer-scoped, failed
-	insert("global-fail", "", 5, 1)        // global, failed
+	insert("eng-fail", "engineer", 5, 1)      // engineer-scoped, failed
+	insert("global-fail", "", 5, 1)           // global, failed
 	insert("designer-fail", "designer", 5, 1) // wrong agent type
 
 	branches, err := forest.loadAntiPrecedentBranches(ctx, Query{

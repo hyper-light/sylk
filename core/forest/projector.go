@@ -222,23 +222,9 @@ func generateProjectorID() string {
 	return "forest-projector-" + uuid.NewString()
 }
 
-// startBranchProjector launches the single tracked goroutine that
-// drives the branch projector. Registered on the forest's wait group
-// so Close() drains cleanly.
-//
-// The goroutine is panic-recovered: a panic anywhere inside the
-// projector's call tree is caught, logged with stack, and persisted
-// on forest_projector_state.last_error with health_status='halted'.
-// Operator can introspect via ProjectorStatus and resume manually.
+// startBranchProjector is an archived compatibility hook. Phase 15 removed the
+// branch projector runtime; active startup calls startNodeProjector instead.
 func (m *MemoryForest) startBranchProjector() {
-	if m == nil {
-		return
-	}
-	m.registerRuntimeTicker("branch_projector_lease_renewal", projectorRenewInterval)
-	m.startWorker("branch_projector", projectorBatchSize, func(context.Context) error {
-		m.runBranchProjectorLoop()
-		return nil
-	})
 }
 
 // runBranchProjectorLoop is the projector's outer loop. Acquires the
@@ -979,9 +965,9 @@ func unixOrZero(ts int64) time.Time {
 // Read-your-writes
 // ────────────────────────────────────────────────────────────────────
 
-// WaitForBranchSeq blocks until the branch projector has applied
-// events through `seq`. Used by tests and any caller that needs
-// strict read-after-write semantics on the branch projection.
+// WaitForBranchSeq blocks until the node projection has applied events through
+// `seq`. It is retained for historical callers; new code should wait on
+// ForestPacket retrieval/read-your-writes APIs.
 //
 // Event-driven via the seq notifier — no polling. The projector
 // closes the waiter's done channel the moment it commits an apply
@@ -1008,7 +994,7 @@ func (m *MemoryForest) WaitForBranchSeq(ctx context.Context, seq int64, timeout 
 	// Fast path: already past the target.
 	current, halted := m.seqNotify.snapshot()
 	if halted != nil {
-		return fmt.Errorf("branch projector halted: %w", halted)
+		return fmt.Errorf("forest node projector halted: %w", halted)
 	}
 	if current >= seq {
 		return nil

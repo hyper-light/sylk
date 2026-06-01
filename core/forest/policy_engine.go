@@ -828,7 +828,8 @@ func (e *ForestPolicyEngine) commitPolicyPromotionProposal(ctx context.Context, 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit policy promotion proposal: %w", err)
 	}
-	return e.emitPolicyPromotionProposal(ctx, candidate, fitness)
+	proposal := policyPromotionGovernanceProposal(candidate, fitness, ForestProposalStatusProposed, "")
+	return emitGovernanceProposalClaimWithProposal(ctx, e.db, e.proposalSink, proposal, policyPromotionClaimProposal(candidate, fitness))
 }
 
 func (e *ForestPolicyEngine) ensureExistingPolicyPromotionProposal(ctx context.Context, candidate *PolicyCandidate, fitness PolicyFitness) error {
@@ -846,10 +847,14 @@ func (e *ForestPolicyEngine) ensureExistingPolicyPromotionProposal(ctx context.C
 		return fmt.Errorf("begin existing policy promotion proposal: %w", err)
 	}
 	defer tx.Rollback()
-	if _, err := insertGovernanceProposalTx(ctx, tx, policyPromotionGovernanceProposal(candidate, fitness, ForestProposalStatusProposed, "")); err != nil {
+	proposal := policyPromotionGovernanceProposal(candidate, fitness, ForestProposalStatusProposed, "")
+	if _, err := insertGovernanceProposalTx(ctx, tx, proposal); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return emitGovernanceProposalClaimWithProposal(ctx, e.db, e.proposalSink, proposal, policyPromotionClaimProposal(candidate, fitness))
 }
 
 func updatePolicyPromotionProposalRows(ctx context.Context, tx *sql.Tx, candidate *PolicyCandidate, fitness PolicyFitness) error {
@@ -1009,7 +1014,14 @@ func (e *ForestPolicyEngine) emitPolicyPromotionProposal(ctx context.Context, ca
 	if e.proposalSink == nil {
 		return nil
 	}
-	proposal := ForestClaimProposal{
+	if err := e.proposalSink.ProposeClaim(ctx, policyPromotionClaimProposal(candidate, fitness)); err != nil {
+		return fmt.Errorf("emit policy promotion proposal: %w", err)
+	}
+	return nil
+}
+
+func policyPromotionClaimProposal(candidate *PolicyCandidate, fitness PolicyFitness) ForestClaimProposal {
+	return ForestClaimProposal{
 		ID:                     policyPromotionProposalID(candidate.ID, fitness.EvidenceRefs),
 		ClusterID:              "forest_policy",
 		Dimension:              PolicyPromotionDimension,
@@ -1017,10 +1029,6 @@ func (e *ForestPolicyEngine) emitPolicyPromotionProposal(ctx context.Context, ca
 		EvidenceRefs:           fitness.EvidenceRefs,
 		GuardianReviewRequired: true,
 	}
-	if err := e.proposalSink.ProposeClaim(ctx, proposal); err != nil {
-		return fmt.Errorf("emit policy promotion proposal: %w", err)
-	}
-	return nil
 }
 
 func maxInt64(a, b int64) int64 {

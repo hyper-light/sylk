@@ -81,7 +81,7 @@ func TestDefaultSystemPrompt_IncludesDiscussionTimeConsultationGuidance(t *testi
 		"Re-evaluate Academic research depth continuously based on the user's latest input",
 		"Do not treat the Academic as a rare keyword-triggered escalation.",
 		"`architect_forest_consult(purpose=get_plan_precedents, query=…)`",
-		"`architect_forest_consult(purpose=compare_plan_branches, query=…)`",
+		"`architect_forest_consult(purpose=compare_plan_paths, query=…)`",
 		"During discussion before planning:",
 		"start with the most relevant knowledge agent and the narrowest question that can materially reduce the next uncertainty",
 		"do not wait for keywords like \"research\" or \"benchmark\" to consult the Academic",

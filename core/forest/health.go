@@ -82,9 +82,9 @@ type SchemaHealth struct {
 	MissingTriggers []string     `json:"missing_triggers,omitempty"`
 }
 
-// SpotCheckResults captures the ledger-vs-projection consistency
-// sample. Mismatched > 0 indicates corrupted projections — operator
-// investigates which branches and re-replays from forest_events.
+// SpotCheckResults captures the ledger-vs-node-projection consistency
+// sample. Mismatched > 0 indicates corrupted node projections; the
+// operator investigates the listed nodes and replays from forest_ledger.
 type SpotCheckResults struct {
 	Status     HealthStatus     `json:"status"`
 	Sampled    int              `json:"sampled"`
@@ -92,11 +92,12 @@ type SpotCheckResults struct {
 	Mismatches []SpotCheckIssue `json:"mismatches,omitempty"`
 }
 
-// SpotCheckIssue is one branch whose persisted counters disagree
-// with what we re-derive from forest_events. The Detail field
-// names which counter mismatched.
+// SpotCheckIssue is one node whose persisted projection metadata is
+// malformed or disconnected from its forest_ledger source. BranchID is
+// retained only for historical JSON decoders; active spot checks fill NodeID.
 type SpotCheckIssue struct {
-	BranchID string `json:"branch_id"`
+	BranchID string `json:"branch_id,omitempty"`
+	NodeID   string `json:"node_id,omitempty"`
 	Detail   string `json:"detail"`
 }
 
@@ -211,9 +212,7 @@ func classifyProjectorStatus(healthCol string, lastErrorAt time.Time, now time.T
 func (m *MemoryForest) probeAllSubsystems(ctx context.Context) []SubsystemHealth {
 	now := time.Now().UTC()
 	leaseSubsystems := []string{
-		projectorBranchName,
 		projectorRetrievalCandidatesName,
-		projectorAntiPatternName,
 		projectorRetrievalCandidatesPrunerName,
 		projectorBaseScoreTrainerName,
 	}
@@ -549,25 +548,24 @@ func (m *MemoryForest) findMissingTriggers(ctx context.Context) ([]string, error
 // Spot checks (ledger ↔ projection consistency)
 // ────────────────────────────────────────────────────────────────────
 
-// runSpotChecks samples up to `sampleSize` branches uniformly at
-// random and re-derives their counters from forest_events. Mismatches
-// indicate projection corruption (a branch projector applied an
-// event but didn't update one of the projected counters; or the
-// projection was hand-edited).
+// runSpotChecks samples up to `sampleSize` forest nodes uniformly at
+// random and verifies the node projection is structurally valid and,
+// for ledger-derived nodes, still linked to its source ledger row.
+// Mismatches indicate projection corruption or a partial migration.
 func (m *MemoryForest) runSpotChecks(ctx context.Context, sampleSize int) SpotCheckResults {
 	if sampleSize <= 0 {
 		sampleSize = healthSpotCheckSize
 	}
-	branches, err := m.sampleBranchesForSpotCheck(ctx, sampleSize)
+	nodes, err := m.sampleNodesForSpotCheck(ctx, sampleSize)
 	if err != nil {
 		return SpotCheckResults{Status: HealthStatusDegraded}
 	}
 	out := SpotCheckResults{
 		Status:  HealthStatusOK,
-		Sampled: len(branches),
+		Sampled: len(nodes),
 	}
-	for i := range branches {
-		issue, ok := m.spotCheckOneBranch(ctx, &branches[i])
+	for i := range nodes {
+		issue, ok := m.spotCheckOneNode(ctx, &nodes[i])
 		if !ok {
 			continue
 		}
@@ -590,103 +588,86 @@ func (m *MemoryForest) runSpotChecks(ctx context.Context, sampleSize int) SpotCh
 	return out
 }
 
-// spotCheckBranch is the trimmed projection of a sampled branch
-// that the spot-checker compares against re-derived counters.
-type spotCheckBranch struct {
-	id           string
-	supportCount int
-	counterCount int
+// spotCheckNode is the trimmed projection of a sampled node used by
+// the health checker.
+type spotCheckNode struct {
+	id              string
+	kind            ForestNodeKind
+	sourceKind      string
+	sourcePartition string
+	sourceKey       string
+	sourceSeq       int64
+	evidenceGrade   EvidenceGrade
 }
 
-// sampleBranchesForSpotCheck picks `n` random non-superseded branches.
+// sampleNodesForSpotCheck picks `n` random projected nodes.
 // Uses ORDER BY RANDOM() + LIMIT — fine for `n` in the tens, far
 // below SQLite's threshold for that pattern's cost.
-func (m *MemoryForest) sampleBranchesForSpotCheck(ctx context.Context, n int) ([]spotCheckBranch, error) {
+func (m *MemoryForest) sampleNodesForSpotCheck(ctx context.Context, n int) ([]spotCheckNode, error) {
 	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, support_count, counter_count
-		FROM   forest_branches
-		WHERE  state != ?
+		SELECT node_id, node_kind, source_kind, source_partition,
+		       source_key, source_seq, evidence_grade
+		FROM   forest_nodes
 		ORDER BY RANDOM()
 		LIMIT  ?
-	`, string(BranchStateSuperseded), n)
+	`, n)
 	if err != nil {
-		return nil, fmt.Errorf("sample branches: %w", err)
+		return nil, fmt.Errorf("sample forest nodes: %w", err)
 	}
 	defer rows.Close()
-	var out []spotCheckBranch
+	var out []spotCheckNode
 	for rows.Next() {
-		var b spotCheckBranch
-		if err := rows.Scan(&b.id, &b.supportCount, &b.counterCount); err != nil {
-			return nil, fmt.Errorf("scan sample branch: %w", err)
+		var n spotCheckNode
+		if err := rows.Scan(&n.id, &n.kind, &n.sourceKind, &n.sourcePartition, &n.sourceKey, &n.sourceSeq, &n.evidenceGrade); err != nil {
+			return nil, fmt.Errorf("scan sample forest node: %w", err)
 		}
-		out = append(out, b)
+		out = append(out, n)
 	}
 	return out, rows.Err()
 }
 
-// spotCheckOneBranch re-derives expected support_count + counter_count
-// from forest_events and compares them to the persisted projection.
-// Returns (issue, true) if either counter mismatches; (zero, false)
-// otherwise.
-//
-// support_count derivation: every event_type other than five
-// non-incrementing cases (contradiction, ecology_pruned,
-// ecology_regrown, replay_promoted, replay_consolidated) increments
-// support in the branch projector. The replay event types mutate
-// scope + utility but deliberately do NOT touch the support
-// counter (see service.go applyEvent — replay cases skip the
-// SupportCount++ that the default branch performs).
-//
-// counter_count derivation: contradiction events only.
-//
-// success_count / failure_count are not spot-checked here because
-// they require parsing the outcome payload's status field, which
-// involves either json1 (a SQLite extension we don't depend on) or
-// per-row Go-side decode (more I/O than the spot-check budget). A
-// later phase can extend the spot-check to those columns once we
-// have a payload parser surface.
-func (m *MemoryForest) spotCheckOneBranch(ctx context.Context, b *spotCheckBranch) (SpotCheckIssue, bool) {
-	row := m.db.QueryRowContext(ctx, `
-		SELECT
-			COALESCE(SUM(CASE
-				WHEN event_kind NOT IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS support_count,
-			COALESCE(SUM(CASE
-				WHEN event_kind = ? THEN 1 ELSE 0 END), 0) AS counter_count
-		FROM   forest_ledger
-		WHERE  source_kind = ?
-		  AND  subject_type = 'branch'
-		  AND  subject_id = ?
-	`,
-		string(EventTypeContradiction),
-		string(EventTypeEcologyPruned),
-		string(EventTypeEcologyRegrown),
-		string(EventTypeReplayPromoted),
-		string(EventTypeReplayConsolidated),
-		string(EventTypeContradiction),
-		string(LedgerSourceForestEvent),
-		b.id,
-	)
-	var derivedSupport, derivedCounter int
-	if err := row.Scan(&derivedSupport, &derivedCounter); err != nil {
-		// Read failure → undeterminable for this branch. Don't
-		// flag as mismatch; the next spot-check sample will pick
-		// up other branches.
-		return SpotCheckIssue{}, false
+// spotCheckOneNode validates one node's ontology fields and ledger source
+// linkage. Rows inserted as deterministic test fixtures use source_kind
+// "test"; they are still ontology-checked but do not require a ledger row.
+func (m *MemoryForest) spotCheckOneNode(ctx context.Context, n *spotCheckNode) (SpotCheckIssue, bool) {
+	mismatches := make([]string, 0, 3)
+	if err := validateForestNodeKind(n.kind); err != nil {
+		mismatches = append(mismatches, "node_kind: "+err.Error())
 	}
-	mismatches := make([]string, 0, 2)
-	if derivedSupport != b.supportCount {
-		mismatches = append(mismatches, fmt.Sprintf("support_count: persisted=%d derived=%d", b.supportCount, derivedSupport))
+	if n.evidenceGrade != normalizeEvidenceGrade(n.evidenceGrade) {
+		mismatches = append(mismatches, fmt.Sprintf("evidence_grade: invalid=%q", n.evidenceGrade))
 	}
-	if derivedCounter != b.counterCount {
-		mismatches = append(mismatches, fmt.Sprintf("counter_count: persisted=%d derived=%d", b.counterCount, derivedCounter))
+	if n.requiresLedgerSourceCheck() && !m.nodeSourceLedgerRowExists(ctx, n) {
+		mismatches = append(mismatches, "ledger_source: missing source row")
 	}
 	if len(mismatches) == 0 {
 		return SpotCheckIssue{}, false
 	}
 	return SpotCheckIssue{
-		BranchID: b.id,
-		Detail:   strings.Join(mismatches, "; "),
+		NodeID: n.id,
+		Detail: strings.Join(mismatches, "; "),
 	}, true
+}
+
+func (n spotCheckNode) requiresLedgerSourceCheck() bool {
+	return n.sourceSeq > 0 &&
+		strings.TrimSpace(n.sourceKind) != "" &&
+		strings.TrimSpace(n.sourceKind) != "test" &&
+		strings.TrimSpace(n.sourcePartition) != "" &&
+		strings.TrimSpace(n.sourceKey) != ""
+}
+
+func (m *MemoryForest) nodeSourceLedgerRowExists(ctx context.Context, n *spotCheckNode) bool {
+	var count int
+	err := m.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM forest_ledger
+		WHERE source_kind = ?
+		  AND source_partition = ?
+		  AND source_key = ?
+		  AND seq = ?
+	`, n.sourceKind, n.sourcePartition, n.sourceKey, n.sourceSeq).Scan(&count)
+	return err == nil && count > 0
 }
 
 // ────────────────────────────────────────────────────────────────────

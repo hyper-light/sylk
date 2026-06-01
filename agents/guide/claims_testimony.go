@@ -723,12 +723,10 @@ func guideArtifact(sessionID, kind, reference string) *claims.Artifact {
 
 func guideClassificationArtifact(sessionID, kind, reference string) *claims.Artifact {
 	artifact := guideArtifact(sessionID, kind, reference)
-	artifact.Presentation = &claims.Presentation{
-		Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
-		Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
-		Format:    claims.PresentationFormatText,
-		Title:     strings.TrimSpace(kind),
-		Placement: claims.PresentationPlacementInline,
+	artifact.Metadata = map[string]any{
+		"ui_activity":     "guide_classification",
+		"ui_display_name": strings.TrimSpace(kind),
+		"args_summary":    "artifact generated",
 	}
 	return artifact
 }

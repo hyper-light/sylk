@@ -6880,7 +6880,7 @@ func (m *Model) handleClaimArtifactAdded(ev msg.ClaimArtifactAddedMsg) tea.Cmd {
 	// the visible artifact stream (UI_DESIGN.md §2.4). If anything
 	// upstream regresses and these leak through anyway, never let
 	// them become rows here either.
-	if !isVisibleArtifactKindForChat(ev.Kind) {
+	if !isVisibleArtifactForChat(ev) {
 		return nil
 	}
 	agentID := ev.AgentID
@@ -7093,6 +7093,13 @@ func isVisibleArtifactKindForChat(kind string) bool {
 		return true
 	}
 	return false
+}
+
+func isVisibleArtifactForChat(ev msg.ClaimArtifactAddedMsg) bool {
+	if isVisibleArtifactKindForChat(ev.Kind) {
+		return true
+	}
+	return claimArtifactMetadataText(ev.Metadata, "ui_activity") == "guide_classification"
 }
 
 // handleTestamentContext updates an in-flight testament row's

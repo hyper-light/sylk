@@ -3,6 +3,7 @@ package forest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,102 @@ func TestPhase13GovernedProposalClaimBackedIdempotentAndRejectsToNegativeEvidenc
 	assertGovernanceProposal(t, db, first.ProposalID, ForestProposalStatusRejected, PolicyRollbackUsePreviousActive)
 	assertGovernanceQuarantine(t, db, input.SubjectType, input.SubjectID)
 	assertNegativeMemeForSubject(t, db, input.SubjectID)
+}
+
+func TestPhase13GovernedProposalClaimEmissionRetriesAfterSinkFailure(t *testing.T) {
+	sink := newMockForestProposalSink(t)
+	forest, db := newTestForestWithConfig(t, Config{DisableBackgroundWorkers: true, ClaimProposalSink: sink})
+	defer forest.Close()
+	defer db.Close()
+
+	input := ForestGovernedChange{
+		Kind:                   ForestProposalKindRemediation,
+		SubjectType:            "forest_outbreak",
+		SubjectID:              "outbreak-retry",
+		Summary:                "Retry remediation proposal after transient sink failure",
+		EvidenceRefs:           []string{"validation:outbreak-retry"},
+		RollbackPath:           "close_retry_remediation_without_activation",
+		GuardianReviewRequired: true,
+	}
+	sink.On("ProposeClaim", mock.Anything, mock.AnythingOfType("forest.ForestClaimProposal")).
+		Return(errors.New("sink temporarily unavailable")).
+		Once()
+
+	_, err := forest.ProposeGovernedForestChange(context.Background(), input)
+	if err == nil || !strings.Contains(err.Error(), "sink temporarily unavailable") {
+		t.Fatalf("first proposal error = %v", err)
+	}
+	proposalID := governedProposalID(input.Kind, input.SubjectType, input.SubjectID, input.EvidenceRefs)
+	var emittedAt int64
+	var emitError string
+	if err := db.QueryRow(`SELECT claim_emitted_at, claim_emit_error FROM forest_governance_proposals WHERE proposal_id = ?`, proposalID).Scan(&emittedAt, &emitError); err != nil {
+		t.Fatalf("query failed proposal emission state: %v", err)
+	}
+	if emittedAt != 0 || !strings.Contains(emitError, "sink temporarily unavailable") {
+		t.Fatalf("emission state after failure = emitted %d err %q", emittedAt, emitError)
+	}
+
+	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
+		return proposal.ID == proposalID && proposal.Dimension == input.Kind
+	})).Return(nil).Once()
+	retried, err := forest.ProposeGovernedForestChange(context.Background(), input)
+	if err != nil {
+		t.Fatalf("retry proposal: %v", err)
+	}
+	if retried.ClaimEmittedAt.IsZero() || retried.ClaimEmitError != "" {
+		t.Fatalf("retried emission state = %#v", retried)
+	}
+}
+
+func TestPhase13OutbreakRemediationCreatesGovernanceProposalAndClaim(t *testing.T) {
+	sink := newMockForestProposalSink(t)
+	forest, db := newTestForestWithConfig(t, Config{DisableBackgroundWorkers: true, ClaimProposalSink: sink})
+	defer forest.Close()
+	defer db.Close()
+
+	refs := make([]string, 0, nodeProjectionRetryLimit())
+	for idx := range nodeProjectionRetryLimit() {
+		refs = append(refs, fmt.Sprintf("validation:outbreak:%d", idx))
+	}
+	candidate := outbreakCandidate{
+		ClusterID:           "cluster-outbreak-governed",
+		Dimension:           CorruptionContradiction,
+		Corruption:          1,
+		Immunity:            0,
+		EvidenceCount:       len(refs),
+		EvidenceRefs:        refs,
+		CounterEvidenceRefs: []string{"claim:counter-outbreak"},
+		SourceSeq:           int64(nodeProjectionRetryLimit()),
+		BridgeSevere:        true,
+	}
+	expectedClaim := claimProposalForOutbreak(candidate)
+	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
+		return proposal.ID == expectedClaim.ID &&
+			proposal.Dimension == expectedClaim.Dimension &&
+			proposal.SourceOutbreakID == expectedClaim.SourceOutbreakID &&
+			proposal.GuardianReviewRequired
+	})).Return(nil).Once()
+
+	result, err := forest.upsertOutbreak(context.Background(), candidate)
+	if err != nil {
+		t.Fatalf("upsert outbreak: %v", err)
+	}
+	if result.ProposalsEmitted != 1 || result.OutbreaksUpdated != 1 {
+		t.Fatalf("outbreak result = %+v", result)
+	}
+	proposalID := governedProposalID(ForestProposalKindRemediation, "forest_outbreak", expectedClaim.SourceOutbreakID, expectedClaim.EvidenceRefs)
+	var kind, rollback string
+	var emittedAt int64
+	if err := db.QueryRow(`
+		SELECT proposal_kind, rollback_path, claim_emitted_at
+		FROM forest_governance_proposals
+		WHERE proposal_id = ?
+	`, proposalID).Scan(&kind, &rollback, &emittedAt); err != nil {
+		t.Fatalf("query outbreak governance proposal: %v", err)
+	}
+	if kind != ForestProposalKindRemediation || rollback == "" || emittedAt == 0 {
+		t.Fatalf("outbreak governance proposal = kind %q rollback %q emitted %d", kind, rollback, emittedAt)
+	}
 }
 
 func TestPhase13GovernedProposalRequiresValidationEvidence(t *testing.T) {
@@ -279,7 +376,7 @@ func TestPhase15ForestPacketRetrievalDoesNotWriteLegacyTables(t *testing.T) {
 		Grade:   EvidenceGradeValidated,
 		Seq:     int64(nodeProjectionRetryLimit()),
 	})
-	before := countRows(t, db, "forest_branches")
+	assertTableAbsent(t, db, "forest_branches")
 	packets, err := forest.Retrieve(context.Background(), Query{SessionID: "phase15-session", Query: "phase15", Limit: nodeProjectionRetryLimit()})
 	if err != nil {
 		t.Fatalf("retrieve forest packets: %v", err)
@@ -287,10 +384,7 @@ func TestPhase15ForestPacketRetrievalDoesNotWriteLegacyTables(t *testing.T) {
 	if len(packets) == 0 {
 		t.Fatal("expected forest packet retrieval")
 	}
-	after := countRows(t, db, "forest_branches")
-	if after != before {
-		t.Fatalf("forest_branches changed from %d to %d during ForestPacket retrieval", before, after)
-	}
+	assertTableAbsent(t, db, "forest_branches")
 }
 
 func TestPhase15DocsAndSkillProposalCiteActiveArchitecture(t *testing.T) {
@@ -409,6 +503,17 @@ func countRows(t testing.TB, db *sql.DB, table string) int {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return count
+}
+
+func assertTableAbsent(t testing.TB, db *sql.DB, table string) {
+	t.Helper()
+	exists, err := tableExists(db, table)
+	if err != nil {
+		t.Fatalf("inspect %s: %v", table, err)
+	}
+	if exists {
+		t.Fatalf("%s exists in active phase 15 schema", table)
+	}
 }
 
 func repositoryRoot(t testing.TB) string {

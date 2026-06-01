@@ -52,6 +52,8 @@ func ensureForestGovernanceSchema(db *sql.DB) error {
 			guardian_review_required INTEGER NOT NULL DEFAULT 0,
 			permission_diff TEXT NOT NULL DEFAULT '',
 			approval_claim_id TEXT NOT NULL DEFAULT '',
+			claim_emitted_at INTEGER NOT NULL DEFAULT 0,
+			claim_emit_error TEXT NOT NULL DEFAULT '',
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL,
 			metadata TEXT NOT NULL DEFAULT '',
@@ -87,7 +89,21 @@ func ensureForestGovernanceSchema(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_forest_governance_quarantine_subject
 			ON forest_governance_quarantine(subject_type, subject_id, created_at DESC)`,
 	}
-	return execForestSchemaStatements(db, stmts)
+	if err := execForestSchemaStatements(db, stmts); err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		decl string
+	}{
+		{name: "claim_emitted_at", decl: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "claim_emit_error", decl: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := addColumnIfMissing(db, "forest_governance_proposals", column.name, column.decl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func ensureForestRolloutSchema(db *sql.DB) error {

@@ -656,13 +656,23 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 		if err := upsertOutbreakProposalArtifactTx(ctx, tx, outbreakID, proposal, candidate); err != nil {
 			return OutbreakMaintenanceResult{}, err
 		}
+		governanceProposal := outbreakGovernanceProposal(outbreakID, proposal, candidate)
+		if _, err := insertGovernanceProposalTx(ctx, tx, governanceProposal); err != nil {
+			return OutbreakMaintenanceResult{}, err
+		}
+		if err := upsertGovernanceProposalArtifactTx(ctx, tx, governanceProposal); err != nil {
+			return OutbreakMaintenanceResult{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return OutbreakMaintenanceResult{}, fmt.Errorf("commit outbreak tx: %w", err)
 	}
-	if status == OutbreakStatusProposed && !alreadyProposed && m.proposalSink != nil {
-		if err := m.proposalSink.ProposeClaim(ctx, proposal); err != nil {
-			return OutbreakMaintenanceResult{}, fmt.Errorf("emit remediation proposal: %w", err)
+	emitted := false
+	if status == OutbreakStatusProposed {
+		var err error
+		emitted, err = m.emitOutbreakGovernanceClaim(ctx, outbreakID, proposal)
+		if err != nil {
+			return OutbreakMaintenanceResult{}, err
 		}
 	}
 	if status == OutbreakStatusProposed && proposal.GuardianReviewRequired {
@@ -673,10 +683,57 @@ func (m *MemoryForest) upsertOutbreak(ctx context.Context, candidate outbreakCan
 	if status == OutbreakStatusSuperseded {
 		return OutbreakMaintenanceResult{OutbreaksUpdated: 1, Superseded: 1}, nil
 	}
-	if alreadyProposed {
+	if alreadyProposed && !emitted {
 		return OutbreakMaintenanceResult{OutbreaksUpdated: 1}, nil
 	}
 	return OutbreakMaintenanceResult{OutbreaksUpdated: 1, ProposalsEmitted: 1}, nil
+}
+
+func outbreakGovernanceProposal(outbreakID string, proposal ForestClaimProposal, candidate outbreakCandidate) ForestGovernanceProposal {
+	now := time.Now().UTC()
+	return ForestGovernanceProposal{
+		ProposalID:             governedProposalID(ForestProposalKindRemediation, "forest_outbreak", outbreakID, proposal.EvidenceRefs),
+		Kind:                   ForestProposalKindRemediation,
+		SubjectType:            "forest_outbreak",
+		SubjectID:              outbreakID,
+		Status:                 ForestProposalStatusProposed,
+		ClaimID:                proposal.ID,
+		ArtifactID:             stableID("forest_governance_artifact", ForestProposalKindRemediation, outbreakID),
+		EvidenceRefs:           dedupeStrings(proposal.EvidenceRefs),
+		RollbackPath:           "close_remediation_without_runtime_state_change",
+		GuardianReviewRequired: proposal.GuardianReviewRequired,
+		Metadata: map[string]any{
+			"summary":               proposal.Summary,
+			"cluster_id":            candidate.ClusterID,
+			"dimension":             candidate.Dimension,
+			"counter_evidence_refs": dedupeStrings(proposal.CounterEvidenceRefs),
+			"outbreak_id":           outbreakID,
+		},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func (m *MemoryForest) emitOutbreakGovernanceClaim(ctx context.Context, outbreakID string, proposal ForestClaimProposal) (bool, error) {
+	if m.proposalSink == nil {
+		return false, nil
+	}
+	proposalID := governedProposalID(ForestProposalKindRemediation, "forest_outbreak", outbreakID, proposal.EvidenceRefs)
+	emitted, err := governanceProposalClaimAlreadyEmitted(ctx, m.db, proposalID)
+	if err != nil {
+		return false, err
+	}
+	if emitted {
+		return false, nil
+	}
+	if err := m.proposalSink.ProposeClaim(ctx, proposal); err != nil {
+		_ = markGovernanceProposalClaimEmissionError(ctx, m.db, proposalID, err)
+		return false, fmt.Errorf("emit remediation proposal: %w", err)
+	}
+	if err := markGovernanceProposalClaimEmitted(ctx, m.db, proposalID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (m *MemoryForest) emitGuardianOutbreakReview(ctx context.Context, proposal ForestClaimProposal) error {

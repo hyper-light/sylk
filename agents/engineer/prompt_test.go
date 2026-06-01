@@ -81,7 +81,7 @@ func TestDefaultEngineerSystemPrompt_UsesCurrentSkillNames(t *testing.T) {
 		// refactor and replaced with consult_peer + target_agent_type.
 		"consult_peer",
 		"target_agent_type",
-		"`engineer_forest_consult(purpose=select_implementation_branch, query=…)`",
+		"`engineer_forest_consult(purpose=select_implementation_node, query=…)`",
 		"`engineer_forest_consult(purpose=get_failure_precedents, query=…)`",
 		"`audit`",
 		"`bash`",

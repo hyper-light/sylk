@@ -152,6 +152,47 @@ func TestBeginForwardedRequestAccumulatorWithOpts_ParentFromOpts(t *testing.T) {
 	}
 }
 
+func TestBeginForwardedRequestAccumulator_BindsSessionBoard(t *testing.T) {
+	registry := claims.DefaultSessionBoardRegistry()
+	board := claims.NewClaimsBoard(claims.ClaimsBoardConfig{
+		BoardID:    "test-board-forwarded-bind",
+		PipelineID: "p",
+		TaskID:     "t",
+		SessionID:  "ses-forwarded-bind",
+	})
+	if err := registry.Register("ses-forwarded-bind", board); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	t.Cleanup(func() { registry.Remove("ses-forwarded-bind") })
+
+	ctx, flush := BeginForwardedRequestAccumulator(context.Background(), "engineer", "ses-forwarded-bind", "corr-bind", nil)
+	defer flush()
+	acc := claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		t.Fatal("expected accumulator on forwarded request context")
+	}
+	if got := acc.Board(); got != board {
+		t.Fatalf("accumulator board = %p, want registered session board %p", got, board)
+	}
+
+	ctx, flush, err := BeginForwardedRequestAccumulatorWithOpts(
+		context.Background(),
+		"engineer", "ses-forwarded-bind", "corr-bind", nil,
+		ForwardedRequestCycleOpts{ParentClaimID: "claim-bind"},
+	)
+	if err != nil {
+		t.Fatalf("BeginForwardedRequestAccumulatorWithOpts: %v", err)
+	}
+	defer flush()
+	acc = claims.AccumulatorFromContext(ctx)
+	if acc == nil {
+		t.Fatal("expected accumulator on opts request context")
+	}
+	if got := acc.Board(); got != board {
+		t.Fatalf("opts accumulator board = %p, want registered session board %p", got, board)
+	}
+}
+
 func TestBeginForwardedRequestAccumulatorWithOpts_HandoffRejection(t *testing.T) {
 	// Set up a board where the predecessor's owner has open work, so
 	// HandoffEligible will reject.

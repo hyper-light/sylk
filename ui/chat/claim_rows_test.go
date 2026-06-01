@@ -163,6 +163,45 @@ func TestClaimsNative_LifecycleArtifactRowsAreIgnored(t *testing.T) {
 	}
 }
 
+func TestClaimsNative_GuideClassificationArtifactsRenderAsEvidenceRows(t *testing.T) {
+	m := newChatForClaimsTest(t)
+
+	m.Update(msg.ClaimArtifactAddedMsg{
+		ArtifactID:     "art-route-duration",
+		CycleID:        "cycle-guide",
+		ClaimID:        "claim-guide",
+		OwnerAgentID:   "guide",
+		OwnerAgentType: "guide",
+		AgentID:        "guide",
+		Kind:           "duration_ms",
+		Reference:      "6734",
+		Metadata: map[string]any{
+			"ui_activity":     "guide_classification",
+			"ui_display_name": "duration_ms",
+			"args_summary":    "artifact generated",
+		},
+		CreatedAt: time.Now(),
+	})
+
+	row := m.ArtifactRowByID("art-route-duration")
+	if row == nil {
+		t.Fatal("guide classification artifact did not create an evidence row")
+	}
+	if row.ArgsSummary != "artifact generated" {
+		t.Fatalf("row.ArgsSummary = %q, want artifact generated", row.ArgsSummary)
+	}
+	entry := m.history.Get(m.historyIndexForCorrelation("cycle-guide"))
+	if entry == nil || len(entry.ToolCalls) != 1 {
+		t.Fatalf("guide entry/tool calls = %+v, want one evidence row", entry)
+	}
+	if entry.ToolCalls[0].ToolName != "duration_ms" {
+		t.Fatalf("ToolName = %q, want duration_ms", entry.ToolCalls[0].ToolName)
+	}
+	if entry.ToolCalls[0].ArgsSummary != "artifact generated" {
+		t.Fatalf("ArgsSummary = %q, want artifact generated", entry.ToolCalls[0].ArgsSummary)
+	}
+}
+
 func TestClaimsNative_ToolArtifactCompletionUsesOutputMetadata(t *testing.T) {
 	m := newChatForClaimsTest(t)
 

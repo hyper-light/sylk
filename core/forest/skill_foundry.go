@@ -19,7 +19,8 @@ const (
 	SkillCandidateStatusAcceptedPendingActivation = "accepted_pending_activation"
 	SkillCandidateStatusDuplicate                 = "duplicate"
 
-	SkillCandidateArtifactType = "generated_skill_candidate"
+	SkillCandidateArtifactType         = "generated_skill_candidate"
+	SkillCandidatePromotionSubjectType = "skill_foundry_promotion"
 
 	SkillValidationStatusPassed = "passed"
 	SkillValidationStatusFailed = "failed"
@@ -752,7 +753,7 @@ func (m *MemoryForest) PromoteSkillCandidate(ctx context.Context, candidateID st
 	proposalID := skillCandidatePromotionProposalID(candidate.CandidateID)
 	if _, err := m.ProposeGovernedForestChange(ctx, ForestGovernedChange{
 		Kind:                   SkillCandidateArtifactType,
-		SubjectType:            "skill_foundry",
+		SubjectType:            SkillCandidatePromotionSubjectType,
 		SubjectID:              candidate.CandidateID,
 		Summary:                "Generated skill candidate promotion proposed: " + candidate.Name,
 		EvidenceRefs:           candidate.SourceValidationRefs,
@@ -768,14 +769,7 @@ func (m *MemoryForest) PromoteSkillCandidate(ctx context.Context, candidateID st
 	if err := m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusPromotionProposed); err != nil {
 		return err
 	}
-	return m.ProposeForestClaim(ctx, ForestClaimProposal{
-		ID:                     proposalID,
-		ClusterID:              "skill_foundry",
-		Dimension:              "skill_candidate_promotion",
-		Summary:                "Generated skill candidate promotion proposed: " + candidate.Name,
-		EvidenceRefs:           candidate.SourceValidationRefs,
-		GuardianReviewRequired: true,
-	})
+	return nil
 }
 
 func (m *MemoryForest) AcceptSkillCandidatePromotion(ctx context.Context, candidateID, acceptedClaimID string) error {
@@ -793,7 +787,7 @@ func (m *MemoryForest) AcceptSkillCandidatePromotion(ctx context.Context, candid
 	if !accepted {
 		return fmt.Errorf("accepted skill promotion claim %s not found", acceptedClaimID)
 	}
-	if err := m.AcceptGovernanceProposal(ctx, governedProposalID(SkillCandidateArtifactType, "skill_foundry", candidate.CandidateID, candidate.SourceValidationRefs), acceptedClaimID); err != nil {
+	if err := m.AcceptGovernanceProposal(ctx, governedProposalID(SkillCandidateArtifactType, SkillCandidatePromotionSubjectType, candidate.CandidateID, candidate.SourceValidationRefs), acceptedClaimID); err != nil {
 		return err
 	}
 	return m.updateSkillCandidateStatus(ctx, candidate.CandidateID, SkillCandidateStatusAcceptedPendingActivation)

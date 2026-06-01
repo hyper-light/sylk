@@ -144,12 +144,12 @@ func TestAppendEventUsesCanonicalLedgerWithoutForestEventsWrite(t *testing.T) {
 	if legacyRows != 0 {
 		t.Fatalf("forest_events rows = %d, want 0", legacyRows)
 	}
-	var branchRows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM forest_branches WHERE id = ?`, event.BranchID).Scan(&branchRows); err != nil {
-		t.Fatalf("count removed branch projection rows: %v", err)
+	exists, err := tableExists(db, "forest_branches")
+	if err != nil {
+		t.Fatalf("inspect removed branch projection table: %v", err)
 	}
-	if branchRows != 0 {
-		t.Fatalf("forest_branches rows = %d, want 0 after branch projector removal", branchRows)
+	if exists {
+		t.Fatalf("forest_branches table exists after branch projector removal")
 	}
 }
 

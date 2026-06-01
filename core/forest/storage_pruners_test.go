@@ -1,3 +1,5 @@
+//go:build forest_legacy_archive
+
 package forest
 
 import (

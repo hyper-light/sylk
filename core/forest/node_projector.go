@@ -86,7 +86,7 @@ func (m *MemoryForest) runNodeProjectorLoop(ctx context.Context) {
 				if _, err := m.runClusterMaintenance(ctx, m.substrateLimit); err != nil {
 					m.logger.Warn("forest_cluster_maintenance_failed", "err", err.Error())
 				}
-				if _, err := m.runSubstrateMaintenance(ctx, m.substrateLimit); err != nil {
+				if _, err := m.refreshSubstrateChannelState(ctx, "", m.substrateLimit); err != nil {
 					m.logger.Warn("forest_ecological_substrate_failed", "err", err.Error())
 				}
 				if _, err := m.runAntigenicMaintenance(ctx, m.substrateLimit); err != nil {

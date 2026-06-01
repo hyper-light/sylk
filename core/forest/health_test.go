@@ -208,27 +208,20 @@ func TestHealth_MissingTriggersDetected(t *testing.T) {
 }
 
 func TestHealth_SpotCheckDetectsCorruption(t *testing.T) {
-	t.Skip("legacy branch projection spot-check removed; node projection health is validated by phase 7-9 tests")
 	forest, db := newTestForest(t)
 	ctx := context.Background()
 
-	// Seed a branch through the normal append path so its
-	// support_count is correct.
-	event := &Event{
-		SessionID: "sess-spot",
-		BranchID:  "branch-spot",
-		AgentID:   "engineer", AgentType: "engineer",
-		EventType: EventTypeDecisionRecorded,
-		Family:    TreeFamilyDecision,
-		Title:     "spot",
-	}
-	if err := forest.AppendEvent(ctx, event); err != nil {
-		t.Fatal(err)
-	}
+	node := insertPhase789Node(t, db, phase789NodeSpec{
+		ID:      "node-spot",
+		Session: "sess-spot",
+		Kind:    ForestNodeClaim,
+		Grade:   EvidenceGradeValidated,
+		Seq:     1,
+	})
 
-	// Deliberately corrupt the projection: set support_count to a
-	// value that doesn't match the ledger.
-	if _, err := db.Exec(`UPDATE forest_branches SET support_count = 999 WHERE id = ?`, "branch-spot"); err != nil {
+	// Deliberately corrupt the projection with a grade that the node
+	// normalizer would never write.
+	if _, err := db.Exec(`UPDATE forest_nodes SET evidence_grade = 'not-a-grade' WHERE node_id = ?`, node.ID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,17 +229,17 @@ func TestHealth_SpotCheckDetectsCorruption(t *testing.T) {
 	if got.Mismatched == 0 {
 		t.Errorf("expected mismatch; sampled=%d mismatched=0", got.Sampled)
 	}
-	hasOurBranch := false
+	hasOurNode := false
 	for _, m := range got.Mismatches {
-		if m.BranchID == "branch-spot" {
-			hasOurBranch = true
-			if !strings.Contains(m.Detail, "support_count") {
-				t.Errorf("expected support_count in detail; got %q", m.Detail)
+		if m.NodeID == node.ID {
+			hasOurNode = true
+			if !strings.Contains(m.Detail, "evidence_grade") {
+				t.Errorf("expected evidence_grade in detail; got %q", m.Detail)
 			}
 		}
 	}
-	if !hasOurBranch {
-		t.Errorf("our corrupted branch not in mismatches list: %+v", got.Mismatches)
+	if !hasOurNode {
+		t.Errorf("our corrupted node not in mismatches list: %+v", got.Mismatches)
 	}
 }
 
@@ -259,51 +252,28 @@ func TestHealth_StatusSeverityOrder(t *testing.T) {
 	}
 }
 
-// TestHealth_SpotCheckIgnoresReplayEvents is a regression test:
-// EventTypeReplayPromoted and EventTypeReplayConsolidated do NOT
-// increment SupportCount in the branch projector. The spot-check
-// SQL must exclude them from its support_count re-derivation, or
-// every branch with replay events triggers a false-positive
-// mismatch.
-func TestHealth_SpotCheckIgnoresReplayEvents(t *testing.T) {
+func TestHealth_SpotCheckAcceptsFixtureNodesWithoutLedgerSource(t *testing.T) {
 	forest, db := newTestForest(t)
 	ctx := context.Background()
 
-	// Seed one decision (support_count == 1).
-	if err := forest.AppendEvent(ctx, &Event{
-		SessionID: "sess-replay",
-		BranchID:  "branch-replay",
-		AgentID:   "engineer", AgentType: "engineer",
-		EventType: EventTypeDecisionRecorded,
-		Family:    TreeFamilyDecision,
-		Title:     "decision",
-	}); err != nil {
-		t.Fatal(err)
+	node := insertPhase789Node(t, db, phase789NodeSpec{
+		ID:      "node-fixture",
+		Session: "sess-fixture",
+		Kind:    ForestNodeValidation,
+		Grade:   EvidenceGradeValidated,
+		Seq:     1,
+	})
+	spotNode := spotCheckNode{
+		id:              node.ID,
+		kind:            node.Kind,
+		sourceKind:      node.SourceKind,
+		sourcePartition: node.SourcePartition,
+		sourceKey:       node.SourceKey,
+		sourceSeq:       node.SourceSeq,
+		evidenceGrade:   node.EvidenceGrade,
 	}
-
-	// Inject a replay-promoted event directly into forest_events
-	// (the test forest's projector applies events in-line). The
-	// branch's support_count should remain 1; spot-check should not
-	// flag a mismatch.
-	now := time.Now().UTC().Unix()
-	if _, err := db.Exec(`
-		INSERT INTO forest_events
-		(id, session_id, event_type, family, scope, root_id, branch_id,
-		 confidence, salience, timestamp, title)
-		VALUES ('replay-evt', 'sess-replay', ?, ?, 'episodic', 'r', 'branch-replay',
-		        0.5, 0.5, ?, 'replay')
-	`, string(EventTypeReplayPromoted), string(TreeFamilyDecision), now); err != nil {
-		t.Fatal(err)
-	}
-
-	// Run the spot-check on this exact branch.
-	branch := spotCheckBranch{
-		id:           "branch-replay",
-		supportCount: 1, // 1 decision; replay doesn't increment
-		counterCount: 0,
-	}
-	_, mismatch := forest.spotCheckOneBranch(ctx, &branch)
+	_, mismatch := forest.spotCheckOneNode(ctx, &spotNode)
 	if mismatch {
-		t.Errorf("replay event should not produce a mismatch; got mismatch")
+		t.Errorf("fixture node should not require a forest_ledger source row")
 	}
 }

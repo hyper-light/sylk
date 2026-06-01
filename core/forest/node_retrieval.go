@@ -126,7 +126,7 @@ func forestPacketCandidateWhere(query Query) (string, []any) {
 	scopeClause, scopeArgs := forestPacketScopeClause(query)
 	clauses = append(clauses, scopeClause)
 	args = append(args, scopeArgs...)
-	if kinds := nodeKindsForFamilies(query.Families); len(kinds) > 0 {
+	if kinds := query.Kinds; len(kinds) > 0 {
 		placeholders := make([]string, 0, len(kinds))
 		for _, kind := range kinds {
 			placeholders = append(placeholders, "?")

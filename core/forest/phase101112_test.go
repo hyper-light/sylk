@@ -188,10 +188,10 @@ func TestPhase12SkillCandidateProposalValidationPromotionIsInert(t *testing.T) {
 		return len(files) >= policyRequiredSignalCount()
 	})).Return(nil).Once()
 	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
-		return strings.HasPrefix(proposal.Dimension, "generated_skill_")
+		return strings.HasPrefix(proposal.Dimension, "generated_skill_") && proposal.Dimension != SkillCandidateArtifactType
 	})).Return(nil).Times(len(generatedSkillCandidateClaims(GeneratedSkillCandidate{})))
 	sink.On("ProposeClaim", mock.Anything, mock.MatchedBy(func(proposal ForestClaimProposal) bool {
-		return proposal.Dimension == "skill_candidate_promotion"
+		return proposal.Dimension == SkillCandidateArtifactType && proposal.ClusterID == SkillCandidatePromotionSubjectType
 	})).Return(nil).Once()
 
 	candidate, err := forest.ProposeGeneratedSkillCandidate(context.Background(), SkillCandidateInput{

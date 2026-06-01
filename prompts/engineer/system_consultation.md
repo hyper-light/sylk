@@ -9,7 +9,7 @@
 
 - **Archivalist:** Query for historical context on why decisions were made. Useful when modifying existing code.
 - **Librarian / Archivalist / Academic (during implementation):** Re-consult when you discover new uncertainty, new evidence, or a changed approach that materially alters the unresolved question.
-- **Memory Forest:** Use `engineer_forest_consult(purpose=select_implementation_branch, query=…)` to recall internal implementation precedent before choosing a code path, and use `engineer_forest_consult(purpose=get_failure_precedents, query=…)` whenever regression or failure history could change what you build.
+- **Memory Forest:** Use `engineer_forest_consult(purpose=select_implementation_node, query=…)` to recall internal implementation precedent before choosing a code path, and use `engineer_forest_consult(purpose=get_failure_precedents, query=…)` whenever regression or failure history could change what you build.
 
 ## Consultation Protocol
 

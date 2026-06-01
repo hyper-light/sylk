@@ -269,7 +269,7 @@ func NewForestResolveIntentSkill(deps *RetrievalDependencies) *skills.Skill {
 			string(forest.CanopyHorizonUser),
 			string(forest.CanopyHorizonProject),
 		}, false).
-		IntParam("limit", "Maximum number of supporting branches to inspect", false).
+		IntParam("limit", "Maximum number of supporting packets to inspect", false).
 		Handler(func(ctx context.Context, input json.RawMessage) (any, error) {
 			if deps == nil || deps.Forest == nil {
 				return nil, fmt.Errorf("forest is not configured")
@@ -374,10 +374,9 @@ func NewRecallRecentSkill(deps *RetrievalDependencies) *skills.Skill {
 		Build()
 }
 
-// NewForestPredictNextSkill creates the forest_predict_next_branches
-// compatibility skill over ForestPacket retrieval.
+// NewForestPredictNextSkill creates the ForestPacket-native prediction skill.
 func NewForestPredictNextSkill(deps *RetrievalDependencies) *skills.Skill {
-	return skills.NewSkill("forest_predict_next_branches").
+	return skills.NewSkill("forest_predict_next_packets").
 		Description("Retrieve low-risk adjacent ForestPackets that could safely improve the current work beyond literal prompt compliance.").
 		Domain(RetrievalDomain).
 		Keywords("predict", "next", "opportunity", "adjacent value", "forest").
@@ -665,19 +664,6 @@ func resolveForestSkillHorizon(raw, sessionID, taskID string) (forest.CanopyHori
 		return forest.CanopyHorizonProject, nil
 	default:
 		return "", fmt.Errorf("invalid horizon %q", raw)
-	}
-}
-
-func recallRecentFamilies() []forest.TreeFamily {
-	// Post-Phase-3 canonical taxonomy: Intent absorbs Decision +
-	// Capability + Opportunity; Constraint absorbs Preference;
-	// AntiPattern absorbs Conflict.
-	return []forest.TreeFamily{
-		forest.TreeFamilyIntent,
-		forest.TreeFamilyConstraint,
-		forest.TreeFamilyEvidence,
-		forest.TreeFamilyOutcome,
-		forest.TreeFamilyAntiPattern,
 	}
 }
 

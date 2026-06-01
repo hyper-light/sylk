@@ -53,6 +53,8 @@ type ForestGovernanceProposal struct {
 	GuardianReviewRequired bool
 	PermissionDiff         ForestAuthorityDiff
 	ApprovalClaimID        string
+	ClaimEmittedAt         time.Time
+	ClaimEmitError         string
 	Metadata               map[string]any
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
@@ -102,12 +104,15 @@ func (m *MemoryForest) ProposeGovernedForestChange(ctx context.Context, input Fo
 		return ForestGovernanceProposal{}, err
 	}
 	if !inserted {
-		return m.loadGovernanceProposal(ctx, proposal.ProposalID)
+		proposal, err = m.loadGovernanceProposal(ctx, proposal.ProposalID)
+		if err != nil {
+			return ForestGovernanceProposal{}, err
+		}
 	}
-	if err := m.ProposeForestClaim(ctx, proposal.toClaimProposal()); err != nil {
+	if err := emitGovernanceProposalClaim(ctx, m.db, m.proposalSink, proposal); err != nil {
 		return ForestGovernanceProposal{}, err
 	}
-	return proposal, nil
+	return m.loadGovernanceProposal(ctx, proposal.ProposalID)
 }
 
 func normalizeGovernedChange(input ForestGovernedChange) (ForestGovernanceProposal, error) {
@@ -190,12 +195,14 @@ func insertGovernanceProposalTx(ctx context.Context, tx *sql.Tx, proposal Forest
 			(proposal_id, proposal_kind, subject_type, subject_id, status,
 			 claim_id, artifact_id, evidence_refs, rollback_path,
 			 guardian_review_required, permission_diff, approval_claim_id,
+			 claim_emitted_at, claim_emit_error,
 			 created_at, updated_at, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, proposal.ProposalID, proposal.Kind, proposal.SubjectType, proposal.SubjectID, proposal.Status,
 		proposal.ClaimID, proposal.ArtifactID, encodeStringList(proposal.EvidenceRefs), proposal.RollbackPath,
 		boolInt(proposal.GuardianReviewRequired), proposal.PermissionDiff.Canonical(),
-		proposal.ApprovalClaimID, proposal.CreatedAt.Unix(), proposal.UpdatedAt.Unix(), marshalJSON(proposal.Metadata))
+		proposal.ApprovalClaimID, unixTimestampOrZero(proposal.ClaimEmittedAt), strings.TrimSpace(proposal.ClaimEmitError),
+		proposal.CreatedAt.Unix(), proposal.UpdatedAt.Unix(), marshalJSON(proposal.Metadata))
 	if err != nil {
 		return false, fmt.Errorf("insert governance proposal: %w", err)
 	}
@@ -241,6 +248,68 @@ func (p ForestGovernanceProposal) toClaimProposal() ForestClaimProposal {
 	}
 }
 
+func emitGovernanceProposalClaim(ctx context.Context, db *sql.DB, sink ForestProposalSink, proposal ForestGovernanceProposal) error {
+	return emitGovernanceProposalClaimWithProposal(ctx, db, sink, proposal, proposal.toClaimProposal())
+}
+
+func emitGovernanceProposalClaimWithProposal(ctx context.Context, db *sql.DB, sink ForestProposalSink, proposal ForestGovernanceProposal, claimProposal ForestClaimProposal) error {
+	if sink == nil {
+		return nil
+	}
+	emitted, err := governanceProposalClaimAlreadyEmitted(ctx, db, proposal.ProposalID)
+	if err != nil {
+		return err
+	}
+	if emitted {
+		return nil
+	}
+	if err := sink.ProposeClaim(ctx, claimProposal); err != nil {
+		_ = markGovernanceProposalClaimEmissionError(ctx, db, proposal.ProposalID, err)
+		return err
+	}
+	return markGovernanceProposalClaimEmitted(ctx, db, proposal.ProposalID)
+}
+
+func governanceProposalClaimAlreadyEmitted(ctx context.Context, db *sql.DB, proposalID string) (bool, error) {
+	var emittedAt int64
+	err := db.QueryRowContext(ctx, `
+		SELECT claim_emitted_at
+		FROM forest_governance_proposals
+		WHERE proposal_id = ?
+	`, strings.TrimSpace(proposalID)).Scan(&emittedAt)
+	if err != nil {
+		return false, fmt.Errorf("load governance proposal claim emission state: %w", err)
+	}
+	return emittedAt > 0, nil
+}
+
+func markGovernanceProposalClaimEmitted(ctx context.Context, db *sql.DB, proposalID string) error {
+	_, err := db.ExecContext(ctx, `
+		UPDATE forest_governance_proposals
+		SET claim_emitted_at = ?, claim_emit_error = '', updated_at = ?
+		WHERE proposal_id = ? AND claim_emitted_at = 0
+	`, time.Now().UTC().Unix(), time.Now().UTC().Unix(), strings.TrimSpace(proposalID))
+	if err != nil {
+		return fmt.Errorf("mark governance proposal claim emitted: %w", err)
+	}
+	return nil
+}
+
+func markGovernanceProposalClaimEmissionError(ctx context.Context, db *sql.DB, proposalID string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `
+		UPDATE forest_governance_proposals
+		SET claim_emit_error = ?, updated_at = ?
+		WHERE proposal_id = ? AND claim_emitted_at = 0
+	`, truncateRuntimeError(cause.Error()), time.Now().UTC().Unix(), strings.TrimSpace(proposalID))
+	if err != nil {
+		return fmt.Errorf("mark governance proposal claim emission error: %w", err)
+	}
+	return nil
+}
+
 func (p ForestGovernanceProposal) Summary() string {
 	if raw, ok := p.Metadata["summary"].(string); ok && strings.TrimSpace(raw) != "" {
 		return strings.TrimSpace(raw)
@@ -253,6 +322,7 @@ func (m *MemoryForest) loadGovernanceProposal(ctx context.Context, proposalID st
 		SELECT proposal_id, proposal_kind, subject_type, subject_id, status,
 		       claim_id, artifact_id, evidence_refs, rollback_path,
 		       guardian_review_required, permission_diff, approval_claim_id,
+		       claim_emitted_at, claim_emit_error,
 		       created_at, updated_at, metadata
 		FROM forest_governance_proposals
 		WHERE proposal_id = ?
@@ -263,17 +333,21 @@ func (m *MemoryForest) loadGovernanceProposal(ctx context.Context, proposalID st
 func scanGovernanceProposal(row interface{ Scan(dest ...any) error }) (ForestGovernanceProposal, error) {
 	var evidence, permissionDiff, metadata string
 	var guardian int
-	var createdAt, updatedAt int64
+	var claimEmittedAt, createdAt, updatedAt int64
 	var proposal ForestGovernanceProposal
 	if err := row.Scan(&proposal.ProposalID, &proposal.Kind, &proposal.SubjectType, &proposal.SubjectID, &proposal.Status,
 		&proposal.ClaimID, &proposal.ArtifactID, &evidence, &proposal.RollbackPath, &guardian,
-		&permissionDiff, &proposal.ApprovalClaimID, &createdAt, &updatedAt, &metadata); err != nil {
+		&permissionDiff, &proposal.ApprovalClaimID, &claimEmittedAt, &proposal.ClaimEmitError,
+		&createdAt, &updatedAt, &metadata); err != nil {
 		return ForestGovernanceProposal{}, fmt.Errorf("scan governance proposal: %w", err)
 	}
 	_ = unmarshalJSON(permissionDiff, &proposal.PermissionDiff)
 	_ = unmarshalJSON(metadata, &proposal.Metadata)
 	proposal.EvidenceRefs = decodeStringList(evidence)
 	proposal.GuardianReviewRequired = guardian != 0
+	if claimEmittedAt > 0 {
+		proposal.ClaimEmittedAt = time.Unix(claimEmittedAt, 0).UTC()
+	}
 	proposal.CreatedAt = time.Unix(createdAt, 0).UTC()
 	proposal.UpdatedAt = time.Unix(updatedAt, 0).UTC()
 	if proposal.Metadata == nil {
@@ -577,4 +651,11 @@ func cloneStringAnyMap(input map[string]any) map[string]any {
 		out[key] = value
 	}
 	return out
+}
+
+func unixTimestampOrZero(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UTC().Unix()
 }
