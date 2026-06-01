@@ -317,7 +317,14 @@ func NewDefaultInfrastructureServiceHandler(participantID string) ServiceHandler
 }
 
 func InfrastructureSubsystemForParticipantID(participantID string) string {
-	switch strings.TrimSpace(participantID) {
+	participantID = strings.TrimSpace(participantID)
+	if strings.HasPrefix(participantID, "participant:service:") {
+		parts := strings.Split(participantID, ":")
+		if len(parts) >= 3 {
+			participantID = strings.TrimSpace(parts[2])
+		}
+	}
+	switch participantID {
 	case "sys:dag_processor", "dag_processor":
 		return "dag"
 	case "sys:vfs_pipeline_provisioner", "sys:vfs_tool_provisioner", "sys:vfs_global_provisioner", "vfs_pipeline_provisioner", "vfs_tool_provisioner", "vfs_global_provisioner":
@@ -332,7 +339,7 @@ func InfrastructureSubsystemForParticipantID(participantID string) string {
 		return "document"
 	case "sys:guardian_service", "guardian_service":
 		return "guardian"
-	case "sys:provider_gateway", "provider_gateway":
+	case "sys:provider_gateway", "sys_provider_gateway", "provider_gateway":
 		return "provider"
 	case "sys:activation_controller", "activation_controller":
 		return "activation"

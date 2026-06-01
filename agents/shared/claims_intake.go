@@ -865,6 +865,25 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 				)
 				return
 			}
+			if !role.Has(claims.RoleObserver) {
+				ok, reason := shouldDispatchClaimsProcessEntry(cfg, entry)
+				if !ok {
+					claims.RouteDebugLog().Info("claims_intake_on_resolved_stopped",
+						append([]any{
+							"agent_id", cfg.AgentID,
+							"session_id", cfg.SessionID,
+							"reason", reason,
+						}, claims.DeltaDebugArgs(entry.Delta)...)...,
+					)
+					claims.TraceRouteFlowDelta("claims_route_flow_intake_process_entry_skipped", entry.Delta,
+						"agent_id", cfg.AgentID,
+						"session_id", cfg.SessionID,
+						"claim_id", entryClaimID(entry),
+						"reason", reason,
+					)
+					return
+				}
+			}
 			slog.Info("claims_intake_resolved",
 				"agent_id", cfg.AgentID,
 				"session_id", cfg.SessionID,
@@ -1016,6 +1035,43 @@ func WireClaimsIntake(cfg ClaimsIntakeConfig) *claims.ClaimsInbox {
 	// avoid stale entries surviving a restart.
 	claims.DefaultSessionInboxRegistry().Register(cfg.SessionID, cfg.AgentID, inbox)
 	return inbox
+}
+
+func shouldDispatchClaimsProcessEntry(cfg ClaimsIntakeConfig, entry *claims.GraphEntryPoint) (bool, string) {
+	if cfg.ProcessEntry == nil {
+		return false, "process_entry_unconfigured"
+	}
+	if entry == nil {
+		return false, "nil_entry"
+	}
+	delta, ok := canonicalDeltaFromEntry(entry)
+	if !ok {
+		return false, "non_canonical_delta"
+	}
+	if delta.Action != claims.DeltaActionClaimPosted {
+		return false, "non_work_claim_lifecycle"
+	}
+	if !delta.DeliveredTo(cfg.AgentID) {
+		return false, "not_delivered_to_agent"
+	}
+	if entry.Node.Claim == nil {
+		return false, "missing_claim"
+	}
+	if claims.IsSystemInternalAction(entry.Node.Claim.ActionType) {
+		return false, "system_internal_action"
+	}
+	if claimTargetsInfrastructureForIntake(entry.Node.Claim) {
+		return false, "infrastructure_participant"
+	}
+	return true, ""
+}
+
+func claimTargetsInfrastructureForIntake(claim *claims.Claim) bool {
+	if claim == nil {
+		return false
+	}
+	return claims.InfrastructureSubsystemForParticipantID(claims.IssuerAgentID(claim.Relations)) != "" ||
+		claims.InfrastructureSubsystemForParticipantID(claims.SubjectAgentID(claim.Relations)) != ""
 }
 
 func claimIntakeContext(ctx context.Context, cfg ClaimsIntakeConfig, claimID string) (context.Context, claims.ClaimCancelRegistration) {

@@ -433,6 +433,11 @@ func (a *Architect) processGuideRoutedWorkClaimEntry(ctx context.Context, entry 
 	reqCtx = shared.WithToolCallEmitter(reqCtx, shared.NewToolCallEmitter(
 		a.bus, a.channels, a.id, fwd.CorrelationID, fwd.SourceAgentID,
 	))
+	reqCtx, flushForwardedAccumulator, beginErr := shared.BeginForwardedRequestCycle(reqCtx, a.id, fwd, a.scope)
+	if beginErr != nil {
+		return true, fmt.Errorf("architect claim-native route: begin forwarded cycle: %w", beginErr)
+	}
+	defer flushForwardedAccumulator()
 	if a.steering != nil {
 		ledger := a.steering.Create(fwd.CorrelationID, a.id, fwd.SessionID, a.activityPub, nil)
 		defer a.steering.Close(fwd.CorrelationID, reqCtx.Err() != nil)

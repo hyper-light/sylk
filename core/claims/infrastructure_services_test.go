@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+func TestInfrastructureSubsystemForParticipantIDRecognizesServiceUIDs(t *testing.T) {
+	if got := InfrastructureSubsystemForParticipantID("participant:service:sys_provider_gateway:abc123"); got != "provider" {
+		t.Fatalf("service uid subsystem = %q, want provider", got)
+	}
+	if got := InfrastructureSubsystemForParticipantID("sys_provider_gateway"); got != "provider" {
+		t.Fatalf("underscore subsystem = %q, want provider", got)
+	}
+}
+
 func TestInfrastructureServicePhase6DAGVFSAndToolArtifacts(t *testing.T) {
 	dag := NewDAGProcessorService(InfrastructureServiceConfig{DAGBackend: dagBackendFunc(func(_ context.Context, req DAGOperationRequest) (DAGOperationArtifactData, error) {
 		return req.Requested, nil

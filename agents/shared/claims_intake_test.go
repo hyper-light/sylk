@@ -856,3 +856,87 @@ func TestClaimsIntakeRegistersClaimWorkForSessionCancellation(t *testing.T) {
 		t.Fatal("claim intake work did not observe cancellation")
 	}
 }
+
+func TestClaimsIntakeDispatchGateOnlyRunsDirectedPostedWork(t *testing.T) {
+	cfg := ClaimsIntakeConfig{
+		AgentID: "architect",
+		ProcessEntry: func(context.Context, *claims.GraphEntryPoint) error {
+			return nil
+		},
+	}
+	entry := &claims.GraphEntryPoint{
+		Delta: claims.NewCanonicalDelta(
+			claims.DeltaActionClaimPosted,
+			"sess-intake-gate",
+			"board-intake-gate",
+			1,
+			time.Now(),
+			claims.DegradedAgentRef("guide", "test"),
+			[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-work"}},
+			&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef("architect", "test")}, Relationship: claims.RelationshipSubject},
+			map[string]any{"claim": map[string]any{"id": "claim-work", "lifecycle_status": string(claims.ClaimLifecyclePosted)}},
+		),
+		Node: claims.GraphNode{Claim: &claims.Claim{
+			ID:         "claim-work",
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "guide", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+		}},
+	}
+	ok, reason := shouldDispatchClaimsProcessEntry(cfg, entry)
+	if !ok {
+		t.Fatalf("directed posted work skipped: %s", reason)
+	}
+
+	entry.Delta = claims.NewCanonicalDelta(
+		claims.DeltaActionClaimValidationErrored,
+		"sess-intake-gate",
+		"board-intake-gate",
+		2,
+		time.Now(),
+		claims.DegradedAgentRef("sys:provider_gateway", "service"),
+		[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-work"}},
+		nil,
+		map[string]any{"claim": map[string]any{"id": "claim-work", "lifecycle_status": string(claims.ClaimLifecycleValidationErrored)}},
+	)
+	ok, reason = shouldDispatchClaimsProcessEntry(cfg, entry)
+	if ok || reason != "non_work_claim_lifecycle" {
+		t.Fatalf("validation error dispatch = %v/%s, want false/non_work_claim_lifecycle", ok, reason)
+	}
+}
+
+func TestClaimsIntakeDispatchGateSkipsInfrastructureParticipants(t *testing.T) {
+	cfg := ClaimsIntakeConfig{
+		AgentID: "architect",
+		ProcessEntry: func(context.Context, *claims.GraphEntryPoint) error {
+			return nil
+		},
+	}
+	entry := &claims.GraphEntryPoint{
+		Delta: claims.NewCanonicalDelta(
+			claims.DeltaActionClaimPosted,
+			"sess-intake-infra",
+			"board-intake-infra",
+			1,
+			time.Now(),
+			claims.DegradedAgentRef("architect", "test"),
+			[]claims.DeltaRef{{Role: "claim", Type: claims.RelatedTypeClaim, ID: "claim-provider"}},
+			&claims.DeltaDelivery{To: []claims.AgentRef{claims.DegradedAgentRef("architect", "test")}, Relationship: claims.RelationshipSubject},
+			map[string]any{"claim": map[string]any{"id": "claim-provider", "lifecycle_status": string(claims.ClaimLifecyclePosted)}},
+		),
+		Node: claims.GraphNode{Claim: &claims.Claim{
+			ID:         "claim-provider",
+			ActionType: claims.ActionTypeTask,
+			Relations: []claims.Relation{
+				{Related: "participant:service:sys_provider_gateway:abc123", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipIssuer},
+				{Related: "architect", RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipSubject},
+			},
+		}},
+	}
+	ok, reason := shouldDispatchClaimsProcessEntry(cfg, entry)
+	if ok || reason != "infrastructure_participant" {
+		t.Fatalf("infrastructure dispatch = %v/%s, want false/infrastructure_participant", ok, reason)
+	}
+}

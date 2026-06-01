@@ -42,6 +42,36 @@ func (f *fakeProvider) Stream(_ context.Context, _ *Request) (<-chan *StreamChun
 	return out, nil
 }
 
+type panicProvider struct {
+	fakeProvider
+}
+
+func (p *panicProvider) Complete(_ context.Context, _ *Request) (*Response, error) {
+	panic("nil provider state")
+}
+
+func TestProviderGatewayExecutionBackendReturnsFaultOnProviderPanic(t *testing.T) {
+	backend := newProviderGatewayExecutionBackend(&panicProvider{fakeProvider: fakeProvider{name: "panic-provider"}}, &Request{Model: "m"})
+	data, err := backend.HandleProviderGatewayCall(context.Background(), claims.ProviderGatewayCallRequest{
+		Call: claims.ExpectedToolCall{Tool: claims.ProviderGatewayToolComplete, Arguments: map[string]any{
+			"model":    "m",
+			"identity": "architect",
+			"prompt":   "hello",
+		}},
+		Requested: claims.ProviderGatewayCallArtifactData{Operation: claims.ProviderGatewayToolComplete, Model: "m", Identity: "architect"},
+	})
+	if err == nil {
+		t.Fatal("expected provider gateway fault")
+	}
+	if !strings.Contains(err.Error(), "provider gateway execution fault") || data.Status != claims.InfrastructureStatusFailed {
+		t.Fatalf("data=%+v err=%v, want failed provider gateway fault", data, err)
+	}
+	stored, resp := backend.Result()
+	if resp != nil || stored.Status != claims.InfrastructureStatusFailed {
+		t.Fatalf("stored=%+v resp=%v, want failed data and nil response", stored, resp)
+	}
+}
+
 func TestInstrument_NilWrapsToNil(t *testing.T) {
 	if got := Instrument(nil); got != nil {
 		t.Fatalf("Instrument(nil) = %v, want nil", got)

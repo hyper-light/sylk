@@ -383,6 +383,11 @@ func TestGuideClassificationTestamentDirectAddressIncludesArtifactAndRelation(t 
 	if guideArtifactReference(testament.Artifacts, "route_reason") == "" {
 		t.Fatalf("route reason artifact missing: %+v", testament.Artifacts)
 	}
+	for _, artifact := range testament.Artifacts {
+		if !claims.IsPresentableToUserChat(artifact.Presentation) {
+			t.Fatalf("classification artifact %q is not user/chat presentable: %+v", artifact.Kind, artifact.Presentation)
+		}
+	}
 }
 
 func TestGuideClassificationReplayUsesValidatedRouteTestament(t *testing.T) {

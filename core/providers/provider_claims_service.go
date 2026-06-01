@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +34,31 @@ func newProviderGatewayExecutionBackend(provider ProviderAdapter, req *Request) 
 }
 
 func (b *providerGatewayExecutionBackend) HandleProviderGatewayCall(ctx context.Context, req claims.ProviderGatewayCallRequest) (data claims.ProviderGatewayCallArtifactData, err error) {
+	data = req.Requested
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		err = fmt.Errorf("provider gateway execution fault: %v", recovered)
+		data.Error = err.Error()
+		data.FailureReason = err.Error()
+		data.Status = claims.InfrastructureStatusFailed
+		if b != nil {
+			b.mu.Lock()
+			b.data = data
+			b.resp = nil
+			b.mu.Unlock()
+		}
+		claims.RouteDebugLog().Info("provider_gateway_execution_fault",
+			"error", err.Error(),
+			"operation", data.Operation,
+			"model", data.Model,
+			"identity", data.Identity,
+		)
+	}()
 	if b == nil || b.inner == nil {
-		return req.Requested, errProviderGatewayServiceUnavailable
+		return data, errProviderGatewayServiceUnavailable
 	}
 	data, resp, err := b.inner.ExecuteProviderGatewayCall(ctx, req)
 	b.mu.Lock()

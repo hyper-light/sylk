@@ -847,14 +847,14 @@ func (a *Architect) Start(bus guide.EventBus) error {
 	// with their original deadline.
 	a.continuationStore.RecoverPendingContinuations(context.Background())
 
-	// Claims intake: event-driven delta processing.
-	// Architect carries RoleRemediator so it sees rejection deltas
-	// across the session — the architect is the canonical author of
-	// corrective actions on rejection.
+	// Claims intake: event-driven directed-work processing. Generic
+	// remediation deltas are handled by deterministic claim validation
+	// and continuation paths; they must not wake a fresh Architect LLM
+	// loop as though they were user work.
 	if inbox := shared.WireClaimsIntake(shared.ClaimsIntakeConfig{
 		AgentID:             a.id,
 		SessionID:           a.config.SessionID,
-		Role:                claims.RoleSubject | claims.RoleRemediator,
+		Role:                claims.RoleSubject,
 		Bus:                 bus,
 		Board:               a.architectBoard(),
 		Scope:               a.scope,
@@ -876,7 +876,7 @@ func (a *Architect) Start(bus guide.EventBus) error {
 		claims.RouteDebugLog().Info("architect_claims_inbox_started",
 			"agent_id", a.id,
 			"session_id", a.config.SessionID,
-			"patterns", claims.InboxPatternsFor(claims.RoleSubject|claims.RoleRemediator, a.config.SessionID, a.id),
+			"patterns", claims.InboxPatternsFor(claims.RoleSubject, a.config.SessionID, a.id),
 		)
 	} else {
 		claims.RouteDebugLog().Info("architect_claims_inbox_not_wired",

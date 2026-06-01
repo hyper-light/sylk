@@ -585,12 +585,12 @@ func guideClassificationTestament(h *guideClassificationClaim, result *RouteResu
 	confidence := "committed"
 	summary := "Classified request: target=" + target
 	artifacts := []*claims.Artifact{
-		guideArtifact(h.sessionID, "duration_ms", fmt.Sprintf("%d", time.Since(h.started).Milliseconds())),
+		guideClassificationArtifact(h.sessionID, "duration_ms", fmt.Sprintf("%d", time.Since(h.started).Milliseconds())),
 	}
 	if classifyErr != nil {
 		confidence = "error"
 		summary = "Classification failed: " + classifyErr.Error()
-		artifacts = append(artifacts, guideArtifact(h.sessionID, claims.ArtifactKindError, classifyErr.Error()))
+		artifacts = append(artifacts, guideClassificationArtifact(h.sessionID, claims.ArtifactKindError, classifyErr.Error()))
 		return claims.Testament{
 			AgentID:    "guide",
 			SessionID:  h.sessionID,
@@ -603,17 +603,17 @@ func guideClassificationTestament(h *guideClassificationClaim, result *RouteResu
 	if result != nil {
 		summary = "Classified request: intent=" + string(result.Intent) + " target=" + target + " confidence=" + formatConfidence(result.Confidence)
 		artifacts = append(artifacts,
-			guideArtifact(h.sessionID, "intent", string(result.Intent)),
-			guideArtifact(h.sessionID, "domain", string(result.Domain)),
-			guideArtifact(h.sessionID, "target_agent", target),
-			guideArtifact(h.sessionID, "confidence", formatConfidence(result.Confidence)),
-			guideArtifact(h.sessionID, "method", result.ClassificationMethod),
+			guideClassificationArtifact(h.sessionID, "intent", string(result.Intent)),
+			guideClassificationArtifact(h.sessionID, "domain", string(result.Domain)),
+			guideClassificationArtifact(h.sessionID, "target_agent", target),
+			guideClassificationArtifact(h.sessionID, "confidence", formatConfidence(result.Confidence)),
+			guideClassificationArtifact(h.sessionID, "method", result.ClassificationMethod),
 		)
 		if strings.TrimSpace(result.Reason) != "" {
-			artifacts = append(artifacts, guideArtifact(h.sessionID, "route_reason", result.Reason))
+			artifacts = append(artifacts, guideClassificationArtifact(h.sessionID, "route_reason", result.Reason))
 		}
 		if h != nil && h.explicitTarget {
-			artifacts = append(artifacts, guideArtifact(h.sessionID, "direct_address", firstNonEmptyString(h.requestedTarget, target)))
+			artifacts = append(artifacts, guideClassificationArtifact(h.sessionID, "direct_address", firstNonEmptyString(h.requestedTarget, target)))
 			relations = append(relations, claims.Relation{
 				Related: target, RelatedType: claims.RelatedTypeAgent, Relationship: claims.RelationshipDirectAddressed,
 			})
@@ -719,6 +719,18 @@ func guideArtifact(sessionID, kind, reference string) *claims.Artifact {
 		Kind:      kind,
 		Reference: reference,
 	}
+}
+
+func guideClassificationArtifact(sessionID, kind, reference string) *claims.Artifact {
+	artifact := guideArtifact(sessionID, kind, reference)
+	artifact.Presentation = &claims.Presentation{
+		Audiences: []claims.PresentationAudience{claims.PresentationAudienceUser},
+		Surfaces:  []claims.PresentationSurface{claims.PresentationSurfaceChat},
+		Format:    claims.PresentationFormatText,
+		Title:     strings.TrimSpace(kind),
+		Placement: claims.PresentationPlacementInline,
+	}
+	return artifact
 }
 
 // guideJSONArtifact builds a JSON-serialized artifact.
